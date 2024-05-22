@@ -1,4 +1,6 @@
-#[derive(Debug, PartialEq)]
+use std::fmt;
+
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Register8 {
     A,
     B,
@@ -9,7 +11,13 @@ pub enum Register8 {
     L,
 }
 
-#[derive(Debug, PartialEq)]
+impl fmt::Display for Register8 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Register16 {
     BC,
     DE,
@@ -17,7 +25,13 @@ pub enum Register16 {
     SP,
 }
 
-#[derive(Debug, PartialEq)]
+impl fmt::Display for Register16 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Memory {
     HL,
     BC,
@@ -26,7 +40,13 @@ pub enum Memory {
     HLD,
 }
 
-#[derive(Debug, PartialEq)]
+impl fmt::Display for Memory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Operand {
     Register8(Register8),
     Register16(Register16),
@@ -36,3 +56,8 @@ pub enum Operand {
     Memory(Memory),
 }
 
+impl fmt::Display for Operand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}

@@ -1,5 +1,7 @@
-use crate::cpu::opcodes::decoder::{Decoder, Error};
-use crate::cpu::opcodes::operand::{Memory, Operand, Register8, Register16};
+use super::opcode::OpCode;
+use super::operand::*;
+
+use crate::cpu::cpu::{Cpu, Error};
 
 /// Adds the value of the operand to the accumulator register (A).
 pub struct Add8 {
@@ -7,22 +9,9 @@ pub struct Add8 {
     pub cycles: u8,
 }
 
-impl Decoder for Add8 {
-    type Opcode = Add8;
-
-    fn decode(opcode: u8) -> Result<Self::Opcode, Error> {
-        match opcode {
-            0x80 => Ok(Add8 { operand: Operand::Register8(Register8::B), cycles: 4 }),
-            0x81 => Ok(Add8 { operand: Operand::Register8(Register8::C), cycles: 4 }),
-            0x82 => Ok(Add8 { operand: Operand::Register8(Register8::D), cycles: 4 }),
-            0x83 => Ok(Add8 { operand: Operand::Register8(Register8::E), cycles: 4 }),
-            0x84 => Ok(Add8 { operand: Operand::Register8(Register8::H), cycles: 4 }),
-            0x85 => Ok(Add8 { operand: Operand::Register8(Register8::L), cycles: 4 }),
-            0x86 => Ok(Add8 { operand: Operand::Memory(Memory::HL), cycles: 8 }),
-            0x87 => Ok(Add8 { operand: Operand::Register8(Register8::A), cycles: 4 }),
-            0xC6 => Ok(Add8 { operand: Operand::Imm8, cycles: 8 }),
-            _ => Err(Error::InvalidOpcode(opcode)),
-        }
+impl OpCode for Add8 {
+    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+        cpu.add8(&self)
     }
 }
 
@@ -32,17 +21,9 @@ pub struct Add16 {
     pub cycles: u8,
 }
 
-impl Decoder for Add16 {
-    type Opcode = Add16;
-
-    fn decode(opcode: u8) -> Result<Self::Opcode, Error> {
-        match opcode {
-            0x09 => Ok(Add16 { operand: Operand::Register16(Register16::BC), cycles: 8 }),
-            0x19 => Ok(Add16 { operand: Operand::Register16(Register16::DE), cycles: 8 }),
-            0x29 => Ok(Add16 { operand: Operand::Register16(Register16::HL), cycles: 8 }),
-            0x39 => Ok(Add16 { operand: Operand::Register16(Register16::SP), cycles: 8 }),
-            _ => Err(Error::InvalidOpcode(opcode)),
-        }
+impl OpCode for Add16 {
+    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+        cpu.add16(&self)
     }
 }
 
@@ -52,14 +33,9 @@ pub struct AddSP16 {
     pub cycles: u8,
 }
 
-impl Decoder for AddSP16 {
-    type Opcode = AddSP16;
-
-    fn decode(opcode: u8) -> Result<Self::Opcode, Error> {
-        match opcode {
-            0xE8 => Ok(AddSP16 { operand: Operand::ImmSigned8, cycles: 16 }),
-            _ => Err(Error::InvalidOpcode(opcode)),
-        }
+impl OpCode for AddSP16 {
+    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+        cpu.add_sp16(&self)
     }
 }
 
@@ -67,134 +43,131 @@ impl Decoder for AddSP16 {
 mod tests {
     use super::*;
 
+    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+
     #[test]
-    fn test_decode_add8_b() {
-        let opcode = 0x80;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::B));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_b() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::B);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_c() {
-        let opcode = 0x81;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::C));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_c() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::C);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_d() {
-        let opcode = 0x82;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::D));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_d() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::D);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_e() {
-        let opcode = 0x83;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::E));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_e() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::E);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_h() {
-        let opcode = 0x84;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::H));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_h() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::H);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_l() {
-        let opcode = 0x85;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::L));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_l() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::L);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_hl() {
-        let opcode = 0x86;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Memory(Memory::HL));
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add8_hl() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Memory(Memory::HL);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_a() {
-        let opcode = 0x87;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register8(Register8::A));
-        assert_eq!(decoded_opcode.cycles, 4);
+    fn test_execute_add8_a() {
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::A);
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add8_imm8() {
-        let opcode = 0xC6;
-        let decoded_opcode = Add8::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Imm8);
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add8_imm8() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Imm8;
+        let opcode = Add8{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add16_bc() {
-        let opcode = 0x09;
-        let decoded_opcode = Add16::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register16(Register16::BC));
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add16_bc() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Register16(Register16::BC);
+        let opcode = Add16{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add16_de() {
-        let opcode = 0x19;
-        let decoded_opcode = Add16::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register16(Register16::DE));
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add16_de() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Register16(Register16::DE);
+        let opcode = Add16{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add16_hl() {
-        let opcode = 0x29;
-        let decoded_opcode = Add16::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register16(Register16::HL));
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add16_hl() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Register16(Register16::HL);
+        let opcode = Add16{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_add16_sp() {
-        let opcode = 0x39;
-        let decoded_opcode = Add16::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::Register16(Register16::SP));
-        assert_eq!(decoded_opcode.cycles, 8);
+    fn test_execute_add16_sp() {
+        let expected_cycles = 8;
+        let expected_operand = Operand::Register16(Register16::SP);
+        let opcode = Add16{operand: expected_operand, cycles: expected_cycles};
+
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
     #[test]
-    fn test_decode_addsp_imm_signed8() {
-        let opcode = 0xE8;
-        let decoded_opcode = AddSP16::decode(opcode).unwrap();
-        assert_eq!(decoded_opcode.operand, Operand::ImmSigned8);
-        assert_eq!(decoded_opcode.cycles, 16);
-    }
+    fn test_execute_addsp_imm_signed8() {
+        let expected_cycles = 16;
+        let expected_operand = Operand::ImmSigned8;
+        let opcode = AddSP16{operand: expected_operand, cycles: expected_cycles};
 
-    #[test]
-    fn test_invalid_opcode_add8() {
-        let opcode = 0xFF; // Example invalid opcode for Add8
-        assert!(Add8::decode(opcode).is_err());
-    }
-
-    #[test]
-    fn test_invalid_opcode_add16() {
-        let opcode = 0xFF; // Example invalid opcode for Add16
-        assert!(Add16::decode(opcode).is_err());
-    }
-
-    #[test]
-    fn test_invalid_opcode_addsp() {
-        let opcode = 0xFF; // Example invalid opcode for AddSP16
-        assert!(AddSP16::decode(opcode).is_err());
+        FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 }
-

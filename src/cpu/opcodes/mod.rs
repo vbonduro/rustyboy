@@ -1,3 +1,6 @@
-mod add;
-mod decoder;
-mod operand;
+pub mod add;
+pub mod decoders;
+pub mod operand;
+
+mod opcode;
+mod test_util;
