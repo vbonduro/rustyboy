@@ -1,6 +1,7 @@
 use crate::cpu::opcodes::opcode::OpCode;
 
 use super::add::{Add16Decoder, Add8Decoder, AddSP16Decoder};
+use super::adc::AdcDecoder;
 use super::decoder::{Decoder, Error};
 
 pub struct OpCodeDecoder {
@@ -13,7 +14,8 @@ impl OpCodeDecoder {
             opcodes: vec![
                 Box::new(Add8Decoder {}),
                 Box::new(Add16Decoder {}),
-                Box::new(AddSP16Decoder {})
+                Box::new(AddSP16Decoder {}),
+                Box::new(AdcDecoder{} ),
             ],
         }
     }
@@ -76,6 +78,15 @@ mod tests {
         FakeCpu::new().test_decode_operand(opcode, &OpCodeDecoder::new(), expected_cycles, expected_operand);
     }
 
+    #[test]
+    fn test_from_adc_a() {
+        let opcode = 0x8F;
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::A);
+
+        FakeCpu::new().test_decode_operand(opcode, &OpCodeDecoder::new(), expected_cycles, expected_operand);
+    }
+    
     #[test]
     fn test_invalid_opcode() {
         let opcode = 0xFF; // Example invalid opcode

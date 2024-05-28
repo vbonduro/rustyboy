@@ -2,6 +2,7 @@
 pub mod operand_test_util {
     use crate::cpu::cpu::{Cpu, Error};
     use crate::cpu::opcodes::add::{Add8, Add16, AddSP16};
+    use crate::cpu::opcodes::adc::Adc;
     use crate::cpu::opcodes::decoders::decoder::Decoder;
     use crate::cpu::opcodes::operand::Operand;
     use crate::cpu::opcodes::opcode::OpCode;
@@ -41,6 +42,11 @@ pub mod operand_test_util {
         }
 
         fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn adc(&mut self, opcode: &Adc) -> Result<u8, Error> {
             self.operand = Some(opcode.operand);
             Ok(opcode.cycles)
         }
