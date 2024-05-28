@@ -1,7 +1,6 @@
-use super::opcode::OpCode;
-use super::operand::*;
-
-use crate::cpu::cpu::{Cpu, Error};
+use crate::cpu::instructions::opcode::OpCode;
+use crate::cpu::instructions::operand::*;
+use crate::cpu::instructions::instructions::{Error, Instructions};
 
 /// Adds the value of the operand and the carry flag to the accumulator register (A).
 pub struct Adc {
@@ -10,8 +9,8 @@ pub struct Adc {
 }
 
 impl OpCode for Adc {
-    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
-        cpu.adc(&self)
+    fn execute(&self, instruction: &mut dyn Instructions) -> Result<u8, Error> {
+        instruction.adc(&self)
     }
 }
 
@@ -19,7 +18,7 @@ impl OpCode for Adc {
 mod tests {
     use super::*;
 
-    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+    use crate::cpu::instructions::test::util::FakeCpu;
 
     #[test]
     fn test_execute_adc_b() {

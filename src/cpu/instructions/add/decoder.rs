@@ -1,8 +1,8 @@
-use super::decoder::{Decoder, Error};
+use crate::cpu::instructions::decoder::{Decoder, Error};
+use crate::cpu::instructions::opcode::OpCode;
+use crate::cpu::instructions::operand::*;
 
-use crate::cpu::opcodes::add::{Add8, Add16, AddSP16};
-use crate::cpu::opcodes::opcode::OpCode;
-use crate::cpu::opcodes::operand::*;
+use super::opcode::{Add8, Add16, AddSP16};
 
 pub struct Add8Decoder;
 impl Decoder for Add8Decoder {
@@ -49,7 +49,7 @@ impl Decoder for AddSP16Decoder {
 mod tests {
     use super::*;
 
-    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+    use crate::cpu::instructions::test::util::FakeCpu;
 
     #[test]
     fn test_decode_add8_b() {

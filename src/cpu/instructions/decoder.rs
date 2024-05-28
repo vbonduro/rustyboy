@@ -1,5 +1,5 @@
 use std::fmt;
-use crate::cpu::opcodes::opcode::OpCode;
+use crate::cpu::instructions::opcode::OpCode;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

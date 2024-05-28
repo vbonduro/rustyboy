@@ -1,5 +1,5 @@
 mod cpu;
-mod opcodes;
+mod instructions;
 mod operations;
 mod registers;
 mod sm83;
