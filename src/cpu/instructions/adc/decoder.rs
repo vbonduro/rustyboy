@@ -1,8 +1,8 @@
-use super::decoder::{Decoder, Error};
+use crate::cpu::instructions::decoder::{Decoder, Error};
+use crate::cpu::instructions::opcode::OpCode;
+use crate::cpu::instructions::operand::*;
 
-use crate::cpu::opcodes::adc::Adc;
-use crate::cpu::opcodes::opcode::OpCode;
-use crate::cpu::opcodes::operand::*;
+use super::opcode::Adc;
 
 pub struct AdcDecoder;
 impl Decoder for AdcDecoder {
@@ -26,7 +26,7 @@ impl Decoder for AdcDecoder {
 mod tests {
     use super::*;
 
-    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+    use crate::cpu::instructions::test::util::FakeCpu;
 
     #[test]
     fn test_decode_adc_opcode_regb() {
@@ -116,4 +116,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

@@ -1,11 +1,11 @@
 #[cfg(test)]
-pub mod operand_test_util {
-    use crate::cpu::cpu::{Cpu, Error};
-    use crate::cpu::opcodes::add::{Add8, Add16, AddSP16};
-    use crate::cpu::opcodes::adc::Adc;
-    use crate::cpu::opcodes::decoders::decoder::Decoder;
-    use crate::cpu::opcodes::operand::Operand;
-    use crate::cpu::opcodes::opcode::OpCode;
+pub mod util {
+    use crate::cpu::instructions::adc::opcode::Adc;
+    use crate::cpu::instructions::add::opcode::{Add8, Add16, AddSP16};
+    use crate::cpu::instructions::decoder::Decoder;
+    use crate::cpu::instructions::instructions::{Error, Instructions};
+    use crate::cpu::instructions::opcode::OpCode;
+    use crate::cpu::instructions::operand::Operand;
 
     pub struct FakeCpu {
         operand: Option<Operand>,
@@ -30,7 +30,7 @@ pub mod operand_test_util {
         }
     }
 
-    impl Cpu for FakeCpu {
+    impl Instructions for FakeCpu {
         fn add8(&mut self, opcode: &Add8) -> Result<u8, Error> {
             self.operand = Some(opcode.operand);
             Ok(opcode.cycles)

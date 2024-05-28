@@ -1,7 +1,6 @@
-use crate::cpu::opcodes::opcode::OpCode;
-
-use super::add::{Add16Decoder, Add8Decoder, AddSP16Decoder};
-use super::adc::AdcDecoder;
+use super::adc::decoder::AdcDecoder;
+use super::add::decoder::{Add16Decoder, Add8Decoder, AddSP16Decoder};
+use super::opcode::OpCode;
 use super::decoder::{Decoder, Error};
 
 pub struct OpCodeDecoder {
@@ -30,8 +29,8 @@ impl Decoder for OpCodeDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::opcodes::operand::*;
-    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+    use crate::cpu::instructions::operand::*;
+    use crate::cpu::instructions::test::util::FakeCpu;
 
     #[test]
     fn test_from_add8() {

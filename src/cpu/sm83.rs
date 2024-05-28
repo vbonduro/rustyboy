@@ -1,21 +1,21 @@
 use std::error::Error;
 
-use super::cpu::{Cpu, Error as CpuError};
+use super::cpu::Cpu;
+use super::instructions::decoder::Decoder;
+use super::instructions::operand::*;
+use super::instructions::adc::opcode::Adc;
+use super::instructions::add::opcode::{Add8, Add16, AddSP16};
+use super::instructions::instructions::{Error as InstructionError, Instructions};
 use super::operations::add::*;
-use super::opcodes::add::{Add8, Add16, AddSP16};
-use super::opcodes::adc::Adc;
-use super::opcodes::decoders::decoder::Decoder;
-use super::opcodes::operand::*;
 use super::registers::{Flags, Registers};
 
 use crate::memory::rom::{Error as RomError, ReadOnlyMemory};
 
-impl From<RomError> for CpuError {
+impl From<RomError> for InstructionError {
     fn from(error: RomError) -> Self {
-        CpuError::Failed(format!("Failed to read ROM: {}", error))
+        InstructionError::Failed(format!("Failed to read ROM: {}", error))
     }
 }
-
 
 pub struct Sm83 {
     rom: Box<dyn ReadOnlyMemory>,
@@ -32,14 +32,6 @@ impl Sm83 {
         }
     }
 
-    // Read the next instruction from the program and execute it.
-    // Returns the number of ticks from the instruction.
-    pub fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
-        let opcode = self.read_next_pc()?;
-
-        Ok(self.opcodes.decode(opcode)?.execute(self)?)
-    }
-
     // Retrieve a copy of the CPU registers.
     pub fn registers(&self) -> Registers {
         self.registers.clone()
@@ -51,12 +43,12 @@ impl Sm83 {
         Ok(byte)
     }
 
-    fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, CpuError> {
+    fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, InstructionError> {
         match operand {
             Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
-            Operand::Memory(Memory::HL) => return Err(CpuError::InvalidOperand(format!("{} not implemented yet.", operand))),
+            Operand::Memory(Memory::HL) => return Err(InstructionError::InvalidOperand(format!("{} not implemented yet.", operand))),
             Operand::Imm8 => Ok(self.read_next_pc()?),
-            _ => return Err(CpuError::InvalidOperand(format!("{} for instruction Add8", operand))),
+            _ => return Err(InstructionError::InvalidOperand(format!("{} for instruction Add8", operand))),
         }
     }
 
@@ -83,15 +75,23 @@ impl Sm83 {
 }
 
 impl Cpu for Sm83 {
-    fn add8(&mut self, opcode: &Add8) -> Result<u8, CpuError> {
+     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
+        let opcode = self.read_next_pc()?;
+
+        Ok(self.opcodes.decode(opcode)?.execute(self)?)
+    }
+}
+
+impl Instructions for Sm83 {
+    fn add8(&mut self, opcode: &Add8) -> Result<u8, InstructionError> {
         (self.registers.a, self.registers.f) = add_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 
-    fn add16(&mut self, opcode: &Add16) -> Result<u8, CpuError> {
+    fn add16(&mut self, opcode: &Add16) -> Result<u8, InstructionError> {
         let operand: u16 = match opcode.operand {
             Operand::Register16(reg) => self.get_register16_operand(reg),
-            _ => return Err(CpuError::InvalidOperand(format!("{} for instruction Add16", opcode.operand))),
+            _ => return Err(InstructionError::InvalidOperand(format!("{} for instruction Add16", opcode.operand))),
         };
 
         let hl: u16;
@@ -100,9 +100,9 @@ impl Cpu for Sm83 {
         Ok(opcode.cycles)
     }
 
-    fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, CpuError> {
+    fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, InstructionError> {
         if opcode.operand != Operand::ImmSigned8 {
-            return Err(CpuError::InvalidOperand(format!("{} for instruction AddSP16", opcode.operand)));
+            return Err(InstructionError::InvalidOperand(format!("{} for instruction AddSP16", opcode.operand)));
         }
 
         let operand: u16 = self.read_next_pc()? as i8 as i16 as u16;
@@ -111,7 +111,7 @@ impl Cpu for Sm83 {
         Ok(opcode.cycles)
     }
 
-    fn adc(&mut self, opcode: &Adc) -> Result<u8, CpuError> {
+    fn adc(&mut self, opcode: &Adc) -> Result<u8, InstructionError> {
         let carry: u8 = self.registers.f.contains(Flags::C) as u8;
 
         let flags: Flags;
@@ -128,7 +128,7 @@ mod tests {
     use super::*;
     use crate::memory::rom::ROMVec;
     use crate::cpu::registers::Flags;
-    use crate::cpu::opcodes::decoders::opcode::OpCodeDecoder;
+    use crate::cpu::instructions::opcodes::OpCodeDecoder;
 
     impl Sm83 {
         pub fn set_registers(mut self, registers: Registers) -> Sm83 {
@@ -188,7 +188,7 @@ mod tests {
         let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
         assert!(cpu.add8(&Add8{operand: Operand::Imm16, cycles: 4}).is_err());
     }
 
@@ -267,7 +267,7 @@ mod tests {
         let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
         assert!(cpu.add16(&Add16{operand: Operand::Imm8, cycles: 4}).is_err());
     }
 
@@ -285,7 +285,7 @@ mod tests {
         let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
         assert!(cpu.add_sp16(&AddSP16{operand: Operand::Imm8, cycles: 4}).is_err());
     }
 
@@ -372,7 +372,7 @@ mod tests {
         let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
         assert!(cpu.adc(&Adc{operand: Operand::Register16(Register16::BC), cycles: 4}).is_err());
     }
 }

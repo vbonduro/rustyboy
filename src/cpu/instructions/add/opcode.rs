@@ -1,7 +1,6 @@
-use super::opcode::OpCode;
-use super::operand::*;
-
-use crate::cpu::cpu::{Cpu, Error};
+use crate::cpu::instructions::opcode::OpCode;
+use crate::cpu::instructions::operand::*;
+use crate::cpu::instructions::instructions::{Error, Instructions};
 
 /// Adds the value of the operand to the accumulator register (A).
 pub struct Add8 {
@@ -10,7 +9,7 @@ pub struct Add8 {
 }
 
 impl OpCode for Add8 {
-    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
         cpu.add8(&self)
     }
 }
@@ -22,7 +21,7 @@ pub struct Add16 {
 }
 
 impl OpCode for Add16 {
-    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
         cpu.add16(&self)
     }
 }
@@ -34,7 +33,7 @@ pub struct AddSP16 {
 }
 
 impl OpCode for AddSP16 {
-    fn execute(&self, cpu: &mut dyn Cpu) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
         cpu.add_sp16(&self)
     }
 }
@@ -43,7 +42,7 @@ impl OpCode for AddSP16 {
 mod tests {
     use super::*;
 
-    use crate::cpu::opcodes::test_util::operand_test_util::FakeCpu;
+    use crate::cpu::instructions::test::util::FakeCpu;
 
     #[test]
     fn test_execute_add8_b() {
