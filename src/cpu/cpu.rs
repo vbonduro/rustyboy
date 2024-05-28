@@ -1,5 +1,6 @@
 use std::fmt;
 use super::opcodes::add::{Add16, Add8, AddSP16};
+use super::opcodes::adc::Adc;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -21,17 +22,15 @@ impl fmt::Display for Error {
 }
 
 /// This trait includes all of the various instructions that a Gameboy CPU must implement.
-/// todo: Rename to Cpu.
 pub trait Cpu {
     fn add8(&mut self, opcode: &Add8) -> Result<u8, Error>;
     fn add16(&mut self, opcode: &Add16) -> Result<u8, Error>;
     fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, Error>;
+    fn adc(&mut self, opcode: &Adc) -> Result<u8, Error>;
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::cpu::opcodes::operand;
-
     use super::*;
 
     #[test]

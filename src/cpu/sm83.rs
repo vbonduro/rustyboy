@@ -3,11 +3,19 @@ use std::error::Error;
 use super::cpu::{Cpu, Error as CpuError};
 use super::operations::add::*;
 use super::opcodes::add::{Add8, Add16, AddSP16};
+use super::opcodes::adc::Adc;
 use super::opcodes::decoders::decoder::Decoder;
 use super::opcodes::operand::*;
-use super::registers::Registers;
+use super::registers::{Flags, Registers};
 
 use crate::memory::rom::{Error as RomError, ReadOnlyMemory};
+
+impl From<RomError> for CpuError {
+    fn from(error: RomError) -> Self {
+        CpuError::Failed(format!("Failed to read ROM: {}", error))
+    }
+}
+
 
 pub struct Sm83 {
     rom: Box<dyn ReadOnlyMemory>,
@@ -43,6 +51,15 @@ impl Sm83 {
         Ok(byte)
     }
 
+    fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, CpuError> {
+        match operand {
+            Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
+            Operand::Memory(Memory::HL) => return Err(CpuError::InvalidOperand(format!("{} not implemented yet.", operand))),
+            Operand::Imm8 => Ok(self.read_next_pc()?),
+            _ => return Err(CpuError::InvalidOperand(format!("{} for instruction Add8", operand))),
+        }
+    }
+
     fn get_register8_operand(&self, operand: Register8) -> u8 {
         match operand {
             Register8::A => self.registers.a,
@@ -65,22 +82,9 @@ impl Sm83 {
     }
 }
 
-impl From<RomError> for CpuError {
-    fn from(error: RomError) -> Self {
-        CpuError::Failed(format!("Failed to read ROM: {}", error))
-    }
-}
-
 impl Cpu for Sm83 {
     fn add8(&mut self, opcode: &Add8) -> Result<u8, CpuError> {
-        let operand: u8 = match opcode.operand {
-            Operand::Register8(reg) => self.get_register8_operand(reg),
-            Operand::Memory(Memory::HL) => return Err(CpuError::InvalidOperand(format!("{} not implemented yet.", opcode.operand))),
-            Operand::Imm8 => self.read_next_pc()?,
-            _ => return Err(CpuError::InvalidOperand(format!("{} for instruction Add8", opcode.operand))),
-        };
-
-        (self.registers.a, self.registers.f) = add_u8(self.registers.a, operand);
+        (self.registers.a, self.registers.f) = add_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 
@@ -103,6 +107,17 @@ impl Cpu for Sm83 {
 
         let operand: u16 = self.read_next_pc()? as i8 as i16 as u16;
         (self.registers.sp, self.registers.f) = add_u16(self.registers.sp, operand);
+
+        Ok(opcode.cycles)
+    }
+
+    fn adc(&mut self, opcode: &Adc) -> Result<u8, CpuError> {
+        let carry: u8 = self.registers.f.contains(Flags::C) as u8;
+
+        let flags: Flags;
+        (self.registers.a, flags) = add_u8(self.registers.a, carry);
+        (self.registers.a, self.registers.f) = add_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
+        self.registers.f |= flags;
 
         Ok(opcode.cycles)
     }
@@ -272,5 +287,92 @@ mod tests {
 
         let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
         assert!(cpu.add_sp16(&AddSP16{operand: Operand::Imm8, cycles: 4}).is_err());
+    }
+
+    #[test]
+    fn test_adc_b() {
+        let mut cpu = make_test_cpu(vec![0x88]).set_registers(Registers{a: 0x05, b: 0x03, ..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding B to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_c() {
+        let mut cpu = make_test_cpu(vec![0x89]).set_registers(Registers{a: 0x05, c: 0x03, ..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding C to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_d() {
+        let mut cpu = make_test_cpu(vec![0x8A]).set_registers(Registers{a: 0x05, d: 0x03, ..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding D to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_e() {
+        let mut cpu = make_test_cpu(vec![0x8B]).set_registers(Registers{a: 0x05, e: 0x03, ..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding E to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_h() {
+        let mut cpu = make_test_cpu(vec![0x8C]).set_registers(Registers{a: 0x05, h: 0x03,..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding H to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_l() {
+        let mut cpu = make_test_cpu(vec![0x8D]).set_registers(Registers{a: 0x05, l: 0x03,..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding L to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[test]
+    fn test_adc_a() {
+        let mut cpu = make_test_cpu(vec![0x8F]).set_registers(Registers{a: 0x05,..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.registers().a, 0x0A); // Expected value after adding A to A
+        assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    // todo: mmu not implemented yet
+    #[test]
+    fn test_adc_memhl() {
+        let mut cpu = make_test_cpu(vec![0x8E]);
+        assert!(cpu.tick().is_err());
+    }
+
+    #[test]
+    fn test_adc_imm8() {
+        let mut cpu = make_test_cpu(vec![0xCE, 0x03]).set_registers(Registers{a: 0x05,..Default::default()});
+
+        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.registers().a, 0x08); // Expected value after adding immediate 8-bit value to A
+    }
+
+    #[test]
+    fn test_adc_invalid_operand() {
+        let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
+        let decoder = Box::new(OpCodeDecoder::new());
+
+        let mut cpu: Box<dyn Cpu> = Box::new(Sm83::new(rom, decoder));
+        assert!(cpu.adc(&Adc{operand: Operand::Register16(Register16::BC), cycles: 4}).is_err());
     }
 }
