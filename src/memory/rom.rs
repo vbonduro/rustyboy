@@ -10,7 +10,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::OutOfRange(address) => write!(f, "Address 0x{:04X} is out of range", address),
-            _ => write!(f, "Unknown error: {:?}", self),
         }
     }
 }

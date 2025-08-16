@@ -7,6 +7,7 @@ use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add8, Add16, AddSP16};
 use super::instructions::sub::opcode::Sub8;
 use super::instructions::sbc::opcode::Sbc8;
+use super::instructions::cp::opcode::Cp8;
 use super::instructions::instructions::{Error as InstructionError, Instructions};
 use super::operations::add::*;
 use super::operations::sub::*;
@@ -133,6 +134,11 @@ impl Instructions for Sm83 {
     fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, InstructionError> {
         let carry: u8 = self.registers.f.contains(Flags::C) as u8;
         (self.registers.a, self.registers.f) = sbc_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?, carry);
+        Ok(opcode.cycles)
+    }
+
+    fn cp8(&mut self, opcode: &Cp8) -> Result<u8, InstructionError> {
+        self.registers.f = cp_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 }
@@ -478,5 +484,25 @@ mod tests {
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x0B);
         assert_eq!(cpu.registers().f, Flags::N | Flags::H);
+    }
+
+    #[test]
+    fn test_cp8_imm8() {
+        let mut cpu = make_test_cpu(vec![0xFE, 0x05]).set_registers(Registers{a: 0x05, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x05);  // A register unchanged
+        assert_eq!(cpu.registers().f, Flags::Z | Flags::N);
+    }
+
+    #[test]
+    fn test_cp8_regb() {
+        let mut cpu = make_test_cpu(vec![0xB8]).set_registers(Registers{a: 0x05, b: 0x10, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.registers().a, 0x05);  // A register unchanged  
+        assert_eq!(cpu.registers().f, Flags::N | Flags::C);
     }
 }

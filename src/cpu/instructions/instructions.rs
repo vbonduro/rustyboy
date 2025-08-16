@@ -3,6 +3,7 @@ use super::add::opcode::{Add16, Add8, AddSP16};
 use super::adc::opcode::Adc;
 use super::sub::opcode::Sub8;
 use super::sbc::opcode::Sbc8;
+use super::cp::opcode::Cp8;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -30,6 +31,7 @@ pub trait Instructions {
     fn adc(&mut self, opcode: &Adc) -> Result<u8, Error>;
     fn sub8(&mut self, opcode: &Sub8) -> Result<u8, Error>;
     fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, Error>;
+    fn cp8(&mut self, opcode: &Cp8) -> Result<u8, Error>;
 }
 
 #[cfg(test)]

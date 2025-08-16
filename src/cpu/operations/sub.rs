@@ -30,6 +30,18 @@ pub fn sbc_u8(a: u8, b: u8, carry: u8) -> (u8, Flags) {
     (final_result, Flags::from_sub(final_result.into(), total_borrow, half_borrow))
 }
 
+/// Compares a with b by performing a - b and returns only the flags.
+/// The result of the subtraction is discarded.
+/// Possible Flag values:
+/// - Z: When a == b.
+/// - N: true (always set for subtraction)
+/// - H: Set if borrow from bit 4.
+/// - C: Set if borrow (a < b).
+pub fn cp_u8(a: u8, b: u8) -> Flags {
+    let (_result, flags) = sub_u8(a, b);
+    flags  // Discard the result, return only flags
+}
+
 fn sub_has_half_borrow(a: usize, b: usize, nbits: usize) -> bool {
     let half_mask = (1 << (nbits / 2)) - 1;
     (a & half_mask) < (b & half_mask)
@@ -121,5 +133,35 @@ mod tests {
         let (result, flags) = sbc_u8(5, 10, 1);
         assert_eq!(result, 250);
         assert_eq!(flags, Flags::N | Flags::H | Flags::C);  // Half-borrow occurs because 5 < (10 + 1)
+    }
+
+    #[test]
+    fn test_cp_u8_equal() {
+        let flags = cp_u8(5, 5);
+        assert_eq!(flags, Flags::Z | Flags::N);
+    }
+
+    #[test]
+    fn test_cp_u8_greater() {
+        let flags = cp_u8(10, 5);
+        assert_eq!(flags, Flags::N);
+    }
+
+    #[test]
+    fn test_cp_u8_less() {
+        let flags = cp_u8(5, 10);
+        assert_eq!(flags, Flags::N | Flags::H | Flags::C);
+    }
+
+    #[test]
+    fn test_cp_u8_half_borrow() {
+        let flags = cp_u8(16, 1);
+        assert_eq!(flags, Flags::N | Flags::H);
+    }
+
+    #[test]
+    fn test_cp_u8_borrow_and_half_borrow() {
+        let flags = cp_u8(0, 1);
+        assert_eq!(flags, Flags::N | Flags::C | Flags::H);
     }
 }
