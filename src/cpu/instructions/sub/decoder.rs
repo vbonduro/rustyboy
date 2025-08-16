@@ -22,6 +22,7 @@ impl Decoder for Sub8Decoder {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,4 +115,5 @@ mod tests {
         let opcode = 0xFF; // Example invalid opcode for Sub8
         assert!(Sub8Decoder{}.decode(opcode).is_err());
     }
+
 }

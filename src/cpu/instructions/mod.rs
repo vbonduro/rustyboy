@@ -1,6 +1,7 @@
 pub mod adc;
 pub mod add;
 pub mod sub;
+pub mod sbc;
 pub mod decoder;
 pub mod opcodes;
 pub mod operand;

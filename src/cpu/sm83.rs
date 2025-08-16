@@ -6,6 +6,7 @@ use super::instructions::operand::*;
 use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add8, Add16, AddSP16};
 use super::instructions::sub::opcode::Sub8;
+use super::instructions::sbc::opcode::Sbc8;
 use super::instructions::instructions::{Error as InstructionError, Instructions};
 use super::operations::add::*;
 use super::operations::sub::*;
@@ -126,6 +127,12 @@ impl Instructions for Sm83 {
 
     fn sub8(&mut self, opcode: &Sub8) -> Result<u8, InstructionError> {
         (self.registers.a, self.registers.f) = sub_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
+        Ok(opcode.cycles)
+    }
+
+    fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, InstructionError> {
+        let carry: u8 = self.registers.f.contains(Flags::C) as u8;
+        (self.registers.a, self.registers.f) = sbc_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?, carry);
         Ok(opcode.cycles)
     }
 }
@@ -430,6 +437,46 @@ mod tests {
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0F);
+        assert_eq!(cpu.registers().f, Flags::N | Flags::H);
+    }
+
+    #[test]
+    fn test_sbc8_no_carry() {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).set_registers(Registers{a: 0x10, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x0D);
+        assert_eq!(cpu.registers().f, Flags::N | Flags::H);  // Half-borrow: 0x0 < 0x3
+    }
+
+    #[test]
+    fn test_sbc8_with_carry() {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).set_registers(Registers{a: 0x10, f: Flags::C, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x0C);
+        assert_eq!(cpu.registers().f, Flags::N | Flags::H);  // Half-borrow: 0x0 < 0x3 + 1
+    }
+
+    #[test]
+    fn test_sbc8_zero_result() {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x04]).set_registers(Registers{a: 0x05, f: Flags::C, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x00);
+        assert_eq!(cpu.registers().f, Flags::Z | Flags::N);
+    }
+
+    #[test]
+    fn test_sbc8_regb() {
+        let mut cpu = make_test_cpu(vec![0x98]).set_registers(Registers{a: 0x10, b: 0x05, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.registers().a, 0x0B);
         assert_eq!(cpu.registers().f, Flags::N | Flags::H);
     }
 }
