@@ -2,6 +2,7 @@ use super::adc::decoder::AdcDecoder;
 use super::add::decoder::{Add16Decoder, Add8Decoder, AddSP16Decoder};
 use super::sub::decoder::Sub8Decoder;
 use super::sbc::decoder::Sbc8Decoder;
+use super::cp::decoder::Cp8Decoder;
 use super::opcode::OpCode;
 use super::decoder::{Decoder, Error};
 
@@ -19,6 +20,7 @@ impl OpCodeDecoder {
                 Box::new(AdcDecoder{} ),
                 Box::new(Sub8Decoder {}),
                 Box::new(Sbc8Decoder {}),
+                Box::new(Cp8Decoder {}),
             ],
         }
     }
@@ -102,6 +104,15 @@ mod tests {
     #[test]
     fn test_from_sbc8_b() {
         let opcode = 0x98;
+        let expected_cycles = 4;
+        let expected_operand = Operand::Register8(Register8::B);
+
+        FakeCpu::new().test_decode_operand(opcode, &OpCodeDecoder::new(), expected_cycles, expected_operand);
+    }
+
+    #[test]
+    fn test_from_cp8_b() {
+        let opcode = 0xB8;
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::B);
 
