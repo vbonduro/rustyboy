@@ -30,6 +30,16 @@ impl Flags {
         flags.set(Self::Z, sum == 0);
         flags
     }
+
+    /// Create a new set of flags from the result of a subtraction operation.
+    pub fn from_sub(result: usize, borrow: bool, half_borrow: bool) -> Self {
+        let mut flags = Self::empty();
+        flags.set(Self::C, borrow);
+        flags.set(Self::H, half_borrow);
+        flags.set(Self::N, true);
+        flags.set(Self::Z, result == 0);
+        flags
+    }
 }
 
 /// Registers for the Gameboy CPU
