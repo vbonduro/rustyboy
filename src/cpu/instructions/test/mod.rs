@@ -3,6 +3,7 @@ pub mod util {
     use crate::cpu::instructions::adc::opcode::Adc;
     use crate::cpu::instructions::add::opcode::{Add8, Add16, AddSP16};
     use crate::cpu::instructions::sub::opcode::Sub8;
+    use crate::cpu::instructions::sbc::opcode::Sbc8;
     use crate::cpu::instructions::decoder::Decoder;
     use crate::cpu::instructions::instructions::{Error, Instructions};
     use crate::cpu::instructions::opcode::OpCode;
@@ -53,6 +54,11 @@ pub mod util {
         }
 
         fn sub8(&mut self, opcode: &Sub8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, Error> {
             self.operand = Some(opcode.operand);
             Ok(opcode.cycles)
         }
