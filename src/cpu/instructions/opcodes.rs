@@ -3,6 +3,7 @@ use super::add::decoder::{Add16Decoder, Add8Decoder, AddSP16Decoder};
 use super::sub::decoder::Sub8Decoder;
 use super::sbc::decoder::Sbc8Decoder;
 use super::cp::decoder::Cp8Decoder;
+use super::ld::decoder::Ld8Decoder;
 use super::opcode::OpCode;
 use super::decoder::{Decoder, Error};
 
@@ -14,6 +15,7 @@ impl OpCodeDecoder {
     pub fn new() -> Self {
         OpCodeDecoder {
             opcodes: vec![
+                Box::new(Ld8Decoder {}),
                 Box::new(Add8Decoder {}),
                 Box::new(Add16Decoder {}),
                 Box::new(AddSP16Decoder {}),
