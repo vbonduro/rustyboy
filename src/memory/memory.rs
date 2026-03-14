@@ -24,6 +24,34 @@ pub trait Memory {
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error>;
 }
 
+/// Resolved mapping for a given address: which region and the offset within it.
+enum RegionMapping {
+    Rom(u16),
+    Vram(u16),
+    ExternalRam(u16),
+    Wram(u16),
+    /// Echo RAM: mirrors WRAM on reads, but is not writable.
+    EchoRam(u16),
+    Oam(u16),
+    Hram(u16),
+    Unmapped,
+}
+
+impl RegionMapping {
+    fn for_address(address: u16) -> Self {
+        match address {
+            0x0000..=0x7FFF => RegionMapping::Rom(address),
+            0x8000..=0x9FFF => RegionMapping::Vram(address - 0x8000),
+            0xA000..=0xBFFF => RegionMapping::ExternalRam(address - 0xA000),
+            0xC000..=0xDFFF => RegionMapping::Wram(address - 0xC000),
+            0xE000..=0xFDFF => RegionMapping::EchoRam(address - 0xE000),
+            0xFE00..=0xFE9F => RegionMapping::Oam(address - 0xFE00),
+            0xFF80..=0xFFFE => RegionMapping::Hram(address - 0xFF80),
+            _ => RegionMapping::Unmapped,
+        }
+    }
+}
+
 /// Game Boy memory map dispatching reads/writes to the appropriate region.
 ///
 /// Address map:
@@ -31,11 +59,10 @@ pub trait Memory {
 ///   0x8000–0x9FFF  VRAM
 ///   0xA000–0xBFFF  External RAM
 ///   0xC000–0xDFFF  Work RAM (WRAM)
-///   0xE000–0xFDFF  Echo RAM (mirrors WRAM 0xC000–0xDDFF)
+///   0xE000–0xFDFF  Echo RAM (mirrors WRAM reads, writes are read-only)
 ///   0xFE00–0xFE9F  OAM
 ///   0xFF80–0xFFFE  High RAM (HRAM)
-///   0xFFFF         Interrupt Enable register (stub)
-///   Everything else: unmapped (returns 0xFF on read, error on write)
+///   Everything else: unmapped (returns 0xFF on read, silently ignored on write)
 pub struct GameBoyMemory {
     rom: ROMVec,
     vram: Ram,
@@ -74,28 +101,28 @@ impl GameBoyMemory {
 
 impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
-        match address {
-            0x0000..=0x7FFF => self.rom.read(address).map_err(|_| Error::OutOfRange(address)),
-            0x8000..=0x9FFF => self.vram.read(address - 0x8000).map_err(|_| Error::OutOfRange(address)),
-            0xA000..=0xBFFF => self.external_ram.read(address - 0xA000).map_err(|_| Error::OutOfRange(address)),
-            0xC000..=0xDFFF => self.wram.read(address - 0xC000).map_err(|_| Error::OutOfRange(address)),
-            0xE000..=0xFDFF => self.wram.read(address - 0xE000).map_err(|_| Error::OutOfRange(address)),
-            0xFE00..=0xFE9F => self.oam.read(address - 0xFE00).map_err(|_| Error::OutOfRange(address)),
-            0xFF80..=0xFFFE => self.hram.read(address - 0xFF80).map_err(|_| Error::OutOfRange(address)),
-            _ => Ok(0xFF), // Unmapped regions return 0xFF (open bus)
+        match RegionMapping::for_address(address) {
+            RegionMapping::Rom(offset)         => self.rom.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Vram(offset)        => self.vram.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::ExternalRam(offset) => self.external_ram.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Wram(offset)        => self.wram.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::EchoRam(offset)     => self.wram.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Oam(offset)         => self.oam.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Hram(offset)        => self.hram.read(offset).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Unmapped            => Ok(0xFF),
         }
     }
 
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
-        match address {
-            0x0000..=0x7FFF => Err(Error::ReadOnly(address)),
-            0x8000..=0x9FFF => self.vram.write(address - 0x8000, value).map_err(|_| Error::OutOfRange(address)),
-            0xA000..=0xBFFF => self.external_ram.write(address - 0xA000, value).map_err(|_| Error::OutOfRange(address)),
-            0xC000..=0xDFFF => self.wram.write(address - 0xC000, value).map_err(|_| Error::OutOfRange(address)),
-            0xE000..=0xFDFF => Err(Error::ReadOnly(address)), // Echo RAM not writable
-            0xFE00..=0xFE9F => self.oam.write(address - 0xFE00, value).map_err(|_| Error::OutOfRange(address)),
-            0xFF80..=0xFFFE => self.hram.write(address - 0xFF80, value).map_err(|_| Error::OutOfRange(address)),
-            _ => Ok(()), // Unmapped writes silently ignored
+        match RegionMapping::for_address(address) {
+            RegionMapping::Rom(_)              => Err(Error::ReadOnly(address)),
+            RegionMapping::Vram(offset)        => self.vram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::ExternalRam(offset) => self.external_ram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Wram(offset)        => self.wram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::EchoRam(_)          => Err(Error::ReadOnly(address)),
+            RegionMapping::Oam(offset)         => self.oam.write(offset, value).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Hram(offset)        => self.hram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Unmapped            => Ok(()),
         }
     }
 }
