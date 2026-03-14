@@ -13,24 +13,24 @@ use super::operations::add::*;
 use super::operations::sub::*;
 use super::registers::{Flags, Registers};
 
-use crate::memory::rom::{Error as RomError, ReadOnlyMemory};
+use crate::memory::memory::{Error as MemoryError, Memory as MemoryBus};
 
-impl From<RomError> for InstructionError {
-    fn from(error: RomError) -> Self {
-        InstructionError::Failed(format!("Failed to read ROM: {}", error))
+impl From<MemoryError> for InstructionError {
+    fn from(error: MemoryError) -> Self {
+        InstructionError::Failed(format!("Failed to access memory: {}", error))
     }
 }
 
 pub struct Sm83 {
-    rom: Box<dyn ReadOnlyMemory>,
+    memory: Box<dyn MemoryBus>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
 }
 
 impl Sm83 {
-    pub fn new(rom: Box<dyn ReadOnlyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
+    pub fn new(memory: Box<dyn MemoryBus>, opcode_decoder: Box<dyn Decoder>) -> Self {
         Self {
-            rom,
+            memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
         }
@@ -41,8 +41,8 @@ impl Sm83 {
         self.registers.clone()
     }
 
-    fn read_next_pc(&mut self) -> Result<u8, RomError> {
-        let byte = self.rom.read(self.registers.pc)?;
+    fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
+        let byte = self.memory.read(self.registers.pc)?;
         self.registers.pc = self.registers.pc.wrapping_add(1);
         Ok(byte)
     }
@@ -50,7 +50,10 @@ impl Sm83 {
     fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, InstructionError> {
         match operand {
             Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
-            Operand::Memory(Memory::HL) => return Err(InstructionError::InvalidOperand(format!("{} not implemented yet.", operand))),
+            Operand::Memory(Memory::HL) => {
+                let address = self.registers.hl();
+                Ok(self.memory.read(address)?)
+            },
             Operand::Imm8 => Ok(self.read_next_pc()?),
             _ => return Err(InstructionError::InvalidOperand(format!("{} for instruction Add8", operand))),
         }
@@ -146,7 +149,8 @@ impl Instructions for Sm83 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::rom::ROMVec;
+    use crate::memory::memory::GameBoyMemory;
+    use crate::memory::fake::FakeMemory;
     use crate::cpu::registers::Flags;
     use crate::cpu::instructions::opcodes::OpCodeDecoder;
 
@@ -158,10 +162,20 @@ mod tests {
     }
 
     pub fn make_test_cpu(rom_data: Vec<u8>) -> Sm83 {
-        let rom: Box<ROMVec> = Box::new(ROMVec::new(rom_data));
+        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::with_rom(rom_data));
         let decoder = Box::new(OpCodeDecoder::new());
 
-        Sm83::new(rom, decoder)
+        Sm83::new(memory, decoder)
+    }
+
+    pub fn make_test_cpu_with_memory(memory: FakeMemory, rom_data: Vec<u8>) -> Sm83 {
+        // Load ROM bytes into FakeMemory starting at address 0
+        let mut mem = memory;
+        for (i, byte) in rom_data.iter().enumerate() {
+            mem.set(i as u16, *byte);
+        }
+        let decoder = Box::new(OpCodeDecoder::new());
+        Sm83::new(Box::new(mem), decoder)
     }
 
     /// Add a constant to the accumulator register and expect the register's value to be the
@@ -196,19 +210,27 @@ mod tests {
         assert_eq!(cpu.registers().a, 0x05);
     }
 
-    // todo: MMU not implemented yet.
+    /// ADD A, (HL) — opcode 0x86 — reads from memory at address pointed to by HL.
+    /// HL=0xC000, memory[0xC000]=0x07, A=0x03 → A should become 0x0A.
     #[test]
-    fn test_add8_memory_to_accumulator() {
-        let mut cpu = make_test_cpu(vec![0x86]);
-        assert!(cpu.tick().is_err());
+    fn test_add8_memory_hl_to_accumulator() {
+        let mut mem = FakeMemory::new();
+        mem.set(0xC000, 0x07); // value at (HL)
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x86])
+            .set_registers(Registers{a: 0x03, h: 0xC0, l: 0x00, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x0A);
+        assert_eq!(cpu.registers().f, Flags::empty());
     }
 
     #[test]
     fn test_add8_invalid_opcode() {
-        let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
+        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
         assert!(cpu.add8(&Add8{operand: Operand::Imm16, cycles: 4}).is_err());
     }
 
@@ -284,10 +306,10 @@ mod tests {
 
     #[test]
     fn test_add16_invalid_opcode() {
-        let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
+        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
         assert!(cpu.add16(&Add16{operand: Operand::Imm8, cycles: 4}).is_err());
     }
 
@@ -302,10 +324,10 @@ mod tests {
 
     #[test]
     fn test_add_sp16_invalid_opcode() {
-        let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
+        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
         assert!(cpu.add_sp16(&AddSP16{operand: Operand::Imm8, cycles: 4}).is_err());
     }
 
@@ -372,11 +394,19 @@ mod tests {
         assert_eq!(cpu.registers().f, Flags::empty());
     }
 
-    // todo: mmu not implemented yet
+    /// ADC A, (HL) — opcode 0x8E — reads from memory at address in HL, adds with carry.
+    /// HL=0xC001, memory[0xC001]=0x04, A=0x05, carry=0 → A should become 0x09.
     #[test]
     fn test_adc_memhl() {
-        let mut cpu = make_test_cpu(vec![0x8E]);
-        assert!(cpu.tick().is_err());
+        let mut mem = FakeMemory::new();
+        mem.set(0xC001, 0x04);
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x8E])
+            .set_registers(Registers{a: 0x05, h: 0xC0, l: 0x01, ..Default::default()});
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x09);
+        assert_eq!(cpu.registers().f, Flags::empty());
     }
 
     #[test]
@@ -389,10 +419,10 @@ mod tests {
 
     #[test]
     fn test_adc_invalid_operand() {
-        let rom: Box<ROMVec> = Box::new(ROMVec::new(vec![0]));
+        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
         let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(rom, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
         assert!(cpu.adc(&Adc{operand: Operand::Register16(Register16::BC), cycles: 4}).is_err());
     }
 
@@ -502,7 +532,28 @@ mod tests {
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 4);
-        assert_eq!(cpu.registers().a, 0x05);  // A register unchanged  
+        assert_eq!(cpu.registers().a, 0x05);  // A register unchanged
         assert_eq!(cpu.registers().f, Flags::N | Flags::C);
+    }
+
+    /// Integration test: ADD A, (HL) via GameBoyMemory.
+    /// ROM: [0x86] at address 0x0000.
+    /// Memory at 0xC010 = 0x0F. A = 0x01, HL = 0xC010.
+    /// Expected: A = 0x10, H flag set (lower nibble overflow 1+F=10).
+    #[test]
+    fn test_integration_add8_memory_hl_gameboy_memory() {
+        let mut memory = GameBoyMemory::with_rom(vec![0x86]);
+        // Pre-populate the memory location HL will point to
+        memory.write(0xC010, 0x0F).unwrap();
+
+        let decoder = Box::new(OpCodeDecoder::new());
+        let mut cpu = Sm83::new(Box::new(memory), decoder)
+            .set_registers(Registers{a: 0x01, h: 0xC0, l: 0x10, ..Default::default()});
+
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x10);
+        assert_eq!(cpu.registers().f, Flags::H); // half-carry: low nibble 1 + F = 10
     }
 }
