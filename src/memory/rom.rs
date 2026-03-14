@@ -14,16 +14,16 @@ impl fmt::Display for Error {
     }
 }
 
-pub trait ReadOnlyMemory {
-    // Read a byte of the ROM at the specific address.
-    // Error out if the address is beyond the allocated memory.
-    fn read(&self, address: u16) -> Result<u8, Error>;
-}
-
 impl std::fmt::Debug for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fmt::Display::fmt(self, f)
     }
+}
+
+pub trait ReadOnlyMemory {
+    // Read a byte at the specific address.
+    // Error out if the address is beyond the allocated memory.
+    fn read(&self, address: u16) -> Result<u8, Error>;
 }
 
 pub struct ROMVec {
@@ -47,6 +47,34 @@ impl ROMVec {
     }
 }
 
+/// A fixed-size writable RAM region. Addresses are relative to the start of the region.
+pub struct Ram {
+    data: Vec<u8>,
+}
+
+impl Ram {
+    pub fn new(size: usize) -> Self {
+        Self { data: vec![0u8; size] }
+    }
+
+    pub fn read(&self, address: u16) -> Result<u8, Error> {
+        let index = address as usize;
+        if index >= self.data.len() {
+            return Err(Error::OutOfRange(address));
+        }
+        Ok(self.data[index])
+    }
+
+    pub fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
+        let index = address as usize;
+        if index >= self.data.len() {
+            return Err(Error::OutOfRange(address));
+        }
+        self.data[index] = value;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +88,38 @@ mod tests {
         assert_eq!(rom.read(2).unwrap(), 0x56);
         assert_eq!(rom.read(3).unwrap(), 0x78);
         assert!(rom.read(4).is_err());
+    }
+
+    #[test]
+    fn test_ram_zero_initialized() {
+        let ram = Ram::new(256);
+        assert_eq!(ram.read(0).unwrap(), 0x00);
+        assert_eq!(ram.read(255).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn test_ram_write_then_read() {
+        let mut ram = Ram::new(256);
+        ram.write(0x10, 0xAB).unwrap();
+        assert_eq!(ram.read(0x10).unwrap(), 0xAB);
+    }
+
+    #[test]
+    fn test_ram_write_does_not_affect_other_addresses() {
+        let mut ram = Ram::new(256);
+        ram.write(0x10, 0xAB).unwrap();
+        assert_eq!(ram.read(0x11).unwrap(), 0x00);
+    }
+
+    #[test]
+    fn test_ram_out_of_range_read() {
+        let ram = Ram::new(4);
+        assert!(ram.read(4).is_err());
+    }
+
+    #[test]
+    fn test_ram_out_of_range_write() {
+        let mut ram = Ram::new(4);
+        assert!(ram.write(4, 0xFF).is_err());
     }
 }
