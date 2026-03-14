@@ -22,36 +22,28 @@ pub struct Ld8Decoder;
 
 impl Decoder for Ld8Decoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
-        // LD r, r' — range 0x40–0x7F, excluding 0x76 (HALT)
-        if opcode >= 0x40 && opcode <= 0x7F {
-            if opcode == 0x76 {
-                return Err(Error::InvalidOpcode(opcode));
+        let mut cycles = 8;
+        let (dest, src) = match opcode {
+            0x06 => (Operand::Register8(Register8::B), Operand::Imm8),
+            0x0E => (Operand::Register8(Register8::C), Operand::Imm8),
+            0x16 => (Operand::Register8(Register8::D), Operand::Imm8),
+            0x1E => (Operand::Register8(Register8::E), Operand::Imm8),
+            0x26 => (Operand::Register8(Register8::H), Operand::Imm8),
+            0x2E => (Operand::Register8(Register8::L), Operand::Imm8),
+            0x36 => { cycles = 12; (Operand::Memory(Memory::HL), Operand::Imm8) },
+            0x3E => (Operand::Register8(Register8::A), Operand::Imm8),
+            0x40..=0x7F if opcode != 0x76 => {
+                let dest = reg_from_bits((opcode >> 3) & 0x07).ok_or(Error::InvalidOpcode(opcode))?;
+                let src  = reg_from_bits(opcode & 0x07).ok_or(Error::InvalidOpcode(opcode))?;
+                if !matches!((&dest, &src), (Operand::Memory(_), _) | (_, Operand::Memory(_))) {
+                    cycles = 4;
+                }
+                (dest, src)
             }
-            let dest_bits = (opcode >> 3) & 0x07;
-            let src_bits = opcode & 0x07;
-            let dest = reg_from_bits(dest_bits).ok_or(Error::InvalidOpcode(opcode))?;
-            let src = reg_from_bits(src_bits).ok_or(Error::InvalidOpcode(opcode))?;
-            let cycles = match (dest, src) {
-                (Operand::Memory(Memory::HL), _) => 8,
-                (_, Operand::Memory(Memory::HL)) => 8,
-                _ => 4,
-            };
-            return Ok(Box::new(Ld8 { dest, src, cycles }));
-        }
+            _ => return Err(Error::InvalidOpcode(opcode)),
+        };
 
-        // LD r, n — immediate byte into register (8 cycles)
-        match opcode {
-            0x06 => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::B), src: Operand::Imm8, cycles: 8 })),
-            0x0E => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::C), src: Operand::Imm8, cycles: 8 })),
-            0x16 => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::D), src: Operand::Imm8, cycles: 8 })),
-            0x1E => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::E), src: Operand::Imm8, cycles: 8 })),
-            0x26 => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::H), src: Operand::Imm8, cycles: 8 })),
-            0x2E => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::L), src: Operand::Imm8, cycles: 8 })),
-            0x3E => Ok(Box::new(Ld8 { dest: Operand::Register8(Register8::A), src: Operand::Imm8, cycles: 8 })),
-            // LD (HL), n — immediate byte into memory at HL (12 cycles)
-            0x36 => Ok(Box::new(Ld8 { dest: Operand::Memory(Memory::HL), src: Operand::Imm8, cycles: 12 })),
-            _ => Err(Error::InvalidOpcode(opcode)),
-        }
+        Ok(Box::new(Ld8 { dest, src, cycles }))
     }
 }
 
