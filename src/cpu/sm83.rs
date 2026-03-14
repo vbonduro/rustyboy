@@ -8,6 +8,7 @@ use super::instructions::add::opcode::{Add8, Add16, AddSP16};
 use super::instructions::sub::opcode::Sub8;
 use super::instructions::sbc::opcode::Sbc8;
 use super::instructions::cp::opcode::Cp8;
+use super::instructions::ld::opcode::Ld8;
 use super::instructions::instructions::{Error as InstructionError, Instructions};
 use super::operations::add::*;
 use super::operations::sub::*;
@@ -79,6 +80,18 @@ impl Sm83 {
             Register16::SP => self.registers.sp,
         }
     }
+
+    fn set_register8_operand(&mut self, operand: Register8, value: u8) {
+        match operand {
+            Register8::A => self.registers.a = value,
+            Register8::B => self.registers.b = value,
+            Register8::C => self.registers.c = value,
+            Register8::D => self.registers.d = value,
+            Register8::E => self.registers.e = value,
+            Register8::H => self.registers.h = value,
+            Register8::L => self.registers.l = value,
+        }
+    }
 }
 
 impl Cpu for Sm83 {
@@ -142,6 +155,31 @@ impl Instructions for Sm83 {
 
     fn cp8(&mut self, opcode: &Cp8) -> Result<u8, InstructionError> {
         self.registers.f = cp_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
+        Ok(opcode.cycles)
+    }
+
+    fn ld8(&mut self, opcode: &Ld8) -> Result<u8, InstructionError> {
+        // Read the source value
+        let value = match opcode.src {
+            Operand::Register8(reg) => self.get_register8_operand(reg),
+            Operand::Memory(Memory::HL) => {
+                let address = self.registers.hl();
+                self.memory.read(address)?
+            },
+            Operand::Imm8 => self.read_next_pc()?,
+            _ => return Err(InstructionError::InvalidOperand(format!("{} for instruction Ld8 src", opcode.src))),
+        };
+
+        // Write to the destination
+        match opcode.dest {
+            Operand::Register8(reg) => self.set_register8_operand(reg, value),
+            Operand::Memory(Memory::HL) => {
+                let address = self.registers.hl();
+                self.memory.write(address, value)?;
+            },
+            _ => return Err(InstructionError::InvalidOperand(format!("{} for instruction Ld8 dest", opcode.dest))),
+        }
+
         Ok(opcode.cycles)
     }
 }
@@ -534,6 +572,95 @@ mod tests {
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x05);  // A register unchanged
         assert_eq!(cpu.registers().f, Flags::N | Flags::C);
+    }
+
+    // --- LD 8-bit integration tests ---
+
+    /// LD B, C — register to register: copies C into B.
+    /// C=0x42, opcode 0x41 (LD B,C), expect B=0x42, 4 cycles.
+    #[test]
+    fn test_ld8_reg_to_reg() {
+        let mut cpu = make_test_cpu(vec![0x41])
+            .set_registers(Registers { c: 0x42, ..Default::default() });
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.registers().b, 0x42);
+    }
+
+    /// LD A, (HL) — load from memory at HL into A.
+    /// HL=0xC000, memory[0xC000]=0x55, opcode 0x7E, expect A=0x55, 8 cycles.
+    #[test]
+    fn test_ld8_a_from_mem_hl() {
+        let mut mem = FakeMemory::new();
+        mem.set(0xC000, 0x55);
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x7E])
+            .set_registers(Registers { h: 0xC0, l: 0x00, ..Default::default() });
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0x55);
+    }
+
+    /// LD (HL), A — store A into memory at HL, then LD A, (HL) to verify write.
+    /// ROM: [0x77 (LD (HL),A), 0x7E (LD A,(HL))].
+    /// A=0xCD, HL=0xC000 initially. After store A=0 is zeroed then restored via the read-back.
+    #[test]
+    fn test_ld8_mem_hl_from_a_verify_memory() {
+        // ROM: store A to (HL), then load A from (HL); HL=0xC000, A=0xCD
+        // After tick 1 (LD (HL),A): memory[0xC000]=0xCD, cycles=8
+        // After tick 2 (LD A,(HL)): A=0xCD, cycles=8
+        let mut memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
+        let decoder = Box::new(OpCodeDecoder::new());
+        let mut cpu = Sm83::new(Box::new(memory), decoder)
+            .set_registers(Registers { a: 0xCD, h: 0xC0, l: 0x00, ..Default::default() });
+
+        // Store A into (HL)
+        let cycles1 = cpu.tick().unwrap();
+        assert_eq!(cycles1, 8);
+
+        // Zero out A (keep HL pointing to 0xC000) so we know the next tick loads from memory
+        let regs_after_store = cpu.registers();
+        cpu = cpu.set_registers(Registers { a: 0x00, ..regs_after_store });
+
+        // Load A from (HL) — should restore 0xCD from memory
+        let cycles2 = cpu.tick().unwrap();
+        assert_eq!(cycles2, 8);
+        assert_eq!(cpu.registers().a, 0xCD);
+    }
+
+    /// LD B, n — load immediate byte into B.
+    /// ROM: [0x06, 0x7F], expect B=0x7F, 8 cycles.
+    #[test]
+    fn test_ld8_b_imm8() {
+        let mut cpu = make_test_cpu(vec![0x06, 0x7F]);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().b, 0x7F);
+    }
+
+    /// LD (HL), n — store immediate byte into memory at HL, then LD A,(HL) to verify.
+    /// ROM: [0x36, 0x99, 0x7E], HL=0xC000.
+    /// Tick 1: store 0x99 to (HL), 12 cycles.
+    /// Tick 2: load A from (HL), expect A=0x99, 8 cycles.
+    #[test]
+    fn test_ld8_mem_hl_imm8() {
+        let mut memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
+        let decoder = Box::new(OpCodeDecoder::new());
+        let mut cpu = Sm83::new(Box::new(memory), decoder)
+            .set_registers(Registers { h: 0xC0, l: 0x00, ..Default::default() });
+
+        // LD (HL), 0x99
+        let cycles1 = cpu.tick().unwrap();
+        assert_eq!(cycles1, 12);
+
+        // LD A, (HL) — verify that 0x99 was stored
+        let regs = cpu.registers();
+        cpu = cpu.set_registers(Registers { a: 0x00, ..regs });
+        let cycles2 = cpu.tick().unwrap();
+        assert_eq!(cycles2, 8);
+        assert_eq!(cpu.registers().a, 0x99);
     }
 
     /// Integration test: ADD A, (HL) via GameBoyMemory.
