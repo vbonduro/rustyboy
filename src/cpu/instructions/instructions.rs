@@ -5,6 +5,12 @@ use super::sub::opcode::Sub8;
 use super::sbc::opcode::Sbc8;
 use super::cp::opcode::Cp8;
 use super::ld::opcode::Ld8;
+use super::ld16::opcode::Ld16;
+use super::inc_dec::opcode::{Inc8, Dec8, Inc16, Dec16};
+use super::rotate::opcode::Rotate;
+use super::logic::opcode::{And8, Or8, Xor8};
+use super::jump::opcode::Jump;
+use super::misc::opcode::Misc;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -34,6 +40,17 @@ pub trait Instructions {
     fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, Error>;
     fn cp8(&mut self, opcode: &Cp8) -> Result<u8, Error>;
     fn ld8(&mut self, opcode: &Ld8) -> Result<u8, Error>;
+    fn ld16(&mut self, opcode: &Ld16) -> Result<u8, Error>;
+    fn inc8(&mut self, opcode: &Inc8) -> Result<u8, Error>;
+    fn dec8(&mut self, opcode: &Dec8) -> Result<u8, Error>;
+    fn inc16(&mut self, opcode: &Inc16) -> Result<u8, Error>;
+    fn dec16(&mut self, opcode: &Dec16) -> Result<u8, Error>;
+    fn rotate_accumulator(&mut self, opcode: &Rotate) -> Result<u8, Error>;
+    fn and8(&mut self, opcode: &And8) -> Result<u8, Error>;
+    fn or8(&mut self, opcode: &Or8) -> Result<u8, Error>;
+    fn xor8(&mut self, opcode: &Xor8) -> Result<u8, Error>;
+    fn jump(&mut self, opcode: &Jump) -> Result<u8, Error>;
+    fn misc(&mut self, opcode: &Misc) -> Result<u8, Error>;
 }
 
 #[cfg(test)]
