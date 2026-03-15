@@ -4,6 +4,12 @@ use super::sub::decoder::Sub8Decoder;
 use super::sbc::decoder::Sbc8Decoder;
 use super::cp::decoder::Cp8Decoder;
 use super::ld::decoder::Ld8Decoder;
+use super::ld16::decoder::Ld16Decoder;
+use super::inc_dec::decoder::IncDecDecoder;
+use super::rotate::decoder::RotateDecoder;
+use super::jump::decoder::JumpDecoder;
+use super::logic::decoder::LogicDecoder;
+use super::misc::decoder::MiscDecoder;
 use super::opcode::OpCode;
 use super::decoder::{Decoder, Error};
 
@@ -23,6 +29,12 @@ impl OpCodeDecoder {
                 Box::new(Sub8Decoder {}),
                 Box::new(Sbc8Decoder {}),
                 Box::new(Cp8Decoder {}),
+                Box::new(Ld16Decoder {}),
+                Box::new(IncDecDecoder {}),
+                Box::new(RotateDecoder {}),
+                Box::new(JumpDecoder {}),
+                Box::new(LogicDecoder {}),
+                Box::new(MiscDecoder {}),
             ],
         }
     }

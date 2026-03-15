@@ -6,6 +6,12 @@ pub mod util {
     use crate::cpu::instructions::sbc::opcode::Sbc8;
     use crate::cpu::instructions::cp::opcode::Cp8;
     use crate::cpu::instructions::ld::opcode::Ld8;
+    use crate::cpu::instructions::ld16::opcode::Ld16;
+    use crate::cpu::instructions::inc_dec::opcode::{Inc8, Dec8, Inc16, Dec16};
+    use crate::cpu::instructions::rotate::opcode::Rotate;
+    use crate::cpu::instructions::jump::opcode::Jump;
+    use crate::cpu::instructions::logic::opcode::{And8, Or8, Xor8};
+    use crate::cpu::instructions::misc::opcode::Misc;
     use crate::cpu::instructions::decoder::Decoder;
     use crate::cpu::instructions::instructions::{Error, Instructions};
     use crate::cpu::instructions::opcode::OpCode;
@@ -92,6 +98,55 @@ pub mod util {
         fn ld8(&mut self, opcode: &Ld8) -> Result<u8, Error> {
             self.ld8_dest = Some(opcode.dest);
             self.ld8_src = Some(opcode.src);
+            Ok(opcode.cycles)
+        }
+
+        fn inc8(&mut self, opcode: &Inc8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn dec8(&mut self, opcode: &Dec8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn inc16(&mut self, opcode: &Inc16) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn dec16(&mut self, opcode: &Dec16) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn rotate_accumulator(&mut self, opcode: &Rotate) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn ld16(&mut self, opcode: &Ld16) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn jump(&mut self, opcode: &Jump) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn and8(&mut self, opcode: &And8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn or8(&mut self, opcode: &Or8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn xor8(&mut self, opcode: &Xor8) -> Result<u8, Error> {
+            self.operand = Some(opcode.operand);
+            Ok(opcode.cycles)
+        }
+
+        fn misc(&mut self, opcode: &Misc) -> Result<u8, Error> {
             Ok(opcode.cycles)
         }
     }
