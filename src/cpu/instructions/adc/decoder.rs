@@ -8,15 +8,42 @@ pub struct AdcDecoder;
 impl Decoder for AdcDecoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
         match opcode {
-            0x88 => Ok(Box::new(Adc { operand: Operand::Register8(Register8::B), cycles: 4 })),
-            0x89 => Ok(Box::new(Adc { operand: Operand::Register8(Register8::C), cycles: 4 })),
-            0x8A => Ok(Box::new(Adc { operand: Operand::Register8(Register8::D), cycles: 4 })),
-            0x8B => Ok(Box::new(Adc { operand: Operand::Register8(Register8::E), cycles: 4 })),
-            0x8C => Ok(Box::new(Adc { operand: Operand::Register8(Register8::H), cycles: 4 })),
-            0x8D => Ok(Box::new(Adc { operand: Operand::Register8(Register8::L), cycles: 4 })),
-            0x8E => Ok(Box::new(Adc { operand: Operand::Memory(Memory::HL), cycles: 8 })),
-            0x8F => Ok(Box::new(Adc { operand: Operand::Register8(Register8::A), cycles: 4 })),
-            0xCE => Ok(Box::new(Adc { operand: Operand::Imm8, cycles: 8 })),
+            0x88 => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::B),
+                cycles: 4,
+            })),
+            0x89 => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::C),
+                cycles: 4,
+            })),
+            0x8A => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::D),
+                cycles: 4,
+            })),
+            0x8B => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::E),
+                cycles: 4,
+            })),
+            0x8C => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::H),
+                cycles: 4,
+            })),
+            0x8D => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::L),
+                cycles: 4,
+            })),
+            0x8E => Ok(Box::new(Adc {
+                operand: Operand::Memory(Memory::HL),
+                cycles: 8,
+            })),
+            0x8F => Ok(Box::new(Adc {
+                operand: Operand::Register8(Register8::A),
+                cycles: 4,
+            })),
+            0xCE => Ok(Box::new(Adc {
+                operand: Operand::Imm8,
+                cycles: 8,
+            })),
             _ => Err(Error::InvalidOpcode(opcode)),
         }
     }

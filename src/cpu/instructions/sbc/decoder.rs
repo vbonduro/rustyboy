@@ -8,15 +8,42 @@ pub struct Sbc8Decoder;
 impl Decoder for Sbc8Decoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
         match opcode {
-            0x98 => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::B), cycles: 4 })),
-            0x99 => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::C), cycles: 4 })),
-            0x9A => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::D), cycles: 4 })),
-            0x9B => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::E), cycles: 4 })),
-            0x9C => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::H), cycles: 4 })),
-            0x9D => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::L), cycles: 4 })),
-            0x9E => Ok(Box::new(Sbc8 { operand: Operand::Memory(Memory::HL), cycles: 8 })),
-            0x9F => Ok(Box::new(Sbc8 { operand: Operand::Register8(Register8::A), cycles: 4 })),
-            0xDE => Ok(Box::new(Sbc8 { operand: Operand::Imm8, cycles: 8 })),
+            0x98 => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::B),
+                cycles: 4,
+            })),
+            0x99 => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::C),
+                cycles: 4,
+            })),
+            0x9A => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::D),
+                cycles: 4,
+            })),
+            0x9B => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::E),
+                cycles: 4,
+            })),
+            0x9C => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::H),
+                cycles: 4,
+            })),
+            0x9D => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::L),
+                cycles: 4,
+            })),
+            0x9E => Ok(Box::new(Sbc8 {
+                operand: Operand::Memory(Memory::HL),
+                cycles: 8,
+            })),
+            0x9F => Ok(Box::new(Sbc8 {
+                operand: Operand::Register8(Register8::A),
+                cycles: 4,
+            })),
+            0xDE => Ok(Box::new(Sbc8 {
+                operand: Operand::Imm8,
+                cycles: 8,
+            })),
             _ => Err(Error::InvalidOpcode(opcode)),
         }
     }
@@ -112,6 +139,6 @@ mod tests {
     #[test]
     fn test_invalid_opcode_sbc8() {
         let opcode = 0xFF; // Example invalid opcode for Sbc8
-        assert!(Sbc8Decoder{}.decode(opcode).is_err());
+        assert!(Sbc8Decoder {}.decode(opcode).is_err());
     }
 }

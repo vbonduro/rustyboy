@@ -27,7 +27,7 @@ pub trait ReadOnlyMemory {
 }
 
 pub struct ROMVec {
-    memory: Vec<u8>
+    memory: Vec<u8>,
 }
 
 impl ReadOnlyMemory for ROMVec {
@@ -54,7 +54,9 @@ pub struct Ram {
 
 impl Ram {
     pub fn new(size: usize) -> Self {
-        Self { data: vec![0u8; size] }
+        Self {
+            data: vec![0u8; size],
+        }
     }
 
     pub fn read(&self, address: u16) -> Result<u8, Error> {

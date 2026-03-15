@@ -1,6 +1,6 @@
+use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
-use crate::cpu::instructions::instructions::{Error, Instructions};
 
 /// Loads the value of src into dest.
 pub struct Ld8 {
@@ -25,7 +25,11 @@ mod tests {
         let expected_cycles = 4;
         let dest = Operand::Register8(Register8::B);
         let src = Operand::Register8(Register8::C);
-        let opcode = Ld8 { dest, src, cycles: expected_cycles };
+        let opcode = Ld8 {
+            dest,
+            src,
+            cycles: expected_cycles,
+        };
 
         FakeCpu::new().test_execute_ld8_opcode(&opcode, expected_cycles, dest, src);
     }
@@ -35,7 +39,11 @@ mod tests {
         let expected_cycles = 8;
         let dest = Operand::Register8(Register8::A);
         let src = Operand::Memory(Memory::HL);
-        let opcode = Ld8 { dest, src, cycles: expected_cycles };
+        let opcode = Ld8 {
+            dest,
+            src,
+            cycles: expected_cycles,
+        };
 
         FakeCpu::new().test_execute_ld8_opcode(&opcode, expected_cycles, dest, src);
     }
@@ -45,7 +53,11 @@ mod tests {
         let expected_cycles = 8;
         let dest = Operand::Memory(Memory::HL);
         let src = Operand::Register8(Register8::A);
-        let opcode = Ld8 { dest, src, cycles: expected_cycles };
+        let opcode = Ld8 {
+            dest,
+            src,
+            cycles: expected_cycles,
+        };
 
         FakeCpu::new().test_execute_ld8_opcode(&opcode, expected_cycles, dest, src);
     }
@@ -55,7 +67,11 @@ mod tests {
         let expected_cycles = 8;
         let dest = Operand::Register8(Register8::B);
         let src = Operand::Imm8;
-        let opcode = Ld8 { dest, src, cycles: expected_cycles };
+        let opcode = Ld8 {
+            dest,
+            src,
+            cycles: expected_cycles,
+        };
 
         FakeCpu::new().test_execute_ld8_opcode(&opcode, expected_cycles, dest, src);
     }
@@ -65,7 +81,11 @@ mod tests {
         let expected_cycles = 12;
         let dest = Operand::Memory(Memory::HL);
         let src = Operand::Imm8;
-        let opcode = Ld8 { dest, src, cycles: expected_cycles };
+        let opcode = Ld8 {
+            dest,
+            src,
+            cycles: expected_cycles,
+        };
 
         FakeCpu::new().test_execute_ld8_opcode(&opcode, expected_cycles, dest, src);
     }

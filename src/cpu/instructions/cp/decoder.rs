@@ -8,15 +8,42 @@ pub struct Cp8Decoder;
 impl Decoder for Cp8Decoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
         match opcode {
-            0xB8 => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::B), cycles: 4 })),
-            0xB9 => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::C), cycles: 4 })),
-            0xBA => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::D), cycles: 4 })),
-            0xBB => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::E), cycles: 4 })),
-            0xBC => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::H), cycles: 4 })),
-            0xBD => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::L), cycles: 4 })),
-            0xBE => Ok(Box::new(Cp8 { operand: Operand::Memory(Memory::HL), cycles: 8 })),
-            0xBF => Ok(Box::new(Cp8 { operand: Operand::Register8(Register8::A), cycles: 4 })),
-            0xFE => Ok(Box::new(Cp8 { operand: Operand::Imm8, cycles: 8 })),
+            0xB8 => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::B),
+                cycles: 4,
+            })),
+            0xB9 => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::C),
+                cycles: 4,
+            })),
+            0xBA => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::D),
+                cycles: 4,
+            })),
+            0xBB => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::E),
+                cycles: 4,
+            })),
+            0xBC => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::H),
+                cycles: 4,
+            })),
+            0xBD => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::L),
+                cycles: 4,
+            })),
+            0xBE => Ok(Box::new(Cp8 {
+                operand: Operand::Memory(Memory::HL),
+                cycles: 8,
+            })),
+            0xBF => Ok(Box::new(Cp8 {
+                operand: Operand::Register8(Register8::A),
+                cycles: 4,
+            })),
+            0xFE => Ok(Box::new(Cp8 {
+                operand: Operand::Imm8,
+                cycles: 8,
+            })),
             _ => Err(Error::InvalidOpcode(opcode)),
         }
     }
@@ -112,6 +139,6 @@ mod tests {
     #[test]
     fn test_invalid_opcode_cp8() {
         let opcode = 0xFF; // Example invalid opcode for Cp8
-        assert!(Cp8Decoder{}.decode(opcode).is_err());
+        assert!(Cp8Decoder {}.decode(opcode).is_err());
     }
 }

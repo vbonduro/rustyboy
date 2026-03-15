@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::rom::{Ram, ROMVec, ReadOnlyMemory};
+use super::rom::{ROMVec, Ram, ReadOnlyMemory};
 
 #[derive(Debug)]
 pub enum Error {
@@ -102,27 +102,63 @@ impl GameBoyMemory {
 impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(offset)         => self.rom.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Vram(offset)        => self.vram.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::ExternalRam(offset) => self.external_ram.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Wram(offset)        => self.wram.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::EchoRam(offset)     => self.wram.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Oam(offset)         => self.oam.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Hram(offset)        => self.hram.read(offset).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Unmapped            => Ok(0xFF),
+            RegionMapping::Rom(offset) => self
+                .rom
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Vram(offset) => self
+                .vram
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::ExternalRam(offset) => self
+                .external_ram
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Wram(offset) => self
+                .wram
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::EchoRam(offset) => self
+                .wram
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Oam(offset) => self
+                .oam
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Hram(offset) => self
+                .hram
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Unmapped => Ok(0xFF),
         }
     }
 
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(_)              => Err(Error::ReadOnly(address)),
-            RegionMapping::Vram(offset)        => self.vram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::ExternalRam(offset) => self.external_ram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Wram(offset)        => self.wram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::EchoRam(_)          => Err(Error::ReadOnly(address)),
-            RegionMapping::Oam(offset)         => self.oam.write(offset, value).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Hram(offset)        => self.hram.write(offset, value).map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Unmapped            => Ok(()),
+            RegionMapping::Rom(_) => Err(Error::ReadOnly(address)),
+            RegionMapping::Vram(offset) => self
+                .vram
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::ExternalRam(offset) => self
+                .external_ram
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Wram(offset) => self
+                .wram
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::EchoRam(_) => Err(Error::ReadOnly(address)),
+            RegionMapping::Oam(offset) => self
+                .oam
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Hram(offset) => self
+                .hram
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Unmapped => Ok(()),
         }
     }
 }

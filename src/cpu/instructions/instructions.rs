@@ -1,16 +1,16 @@
-use std::fmt;
-use super::add::opcode::{Add16, Add8, AddSP16};
 use super::adc::opcode::Adc;
-use super::sub::opcode::Sub8;
-use super::sbc::opcode::Sbc8;
+use super::add::opcode::{Add16, Add8, AddSP16};
 use super::cp::opcode::Cp8;
+use super::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
+use super::jump::opcode::Jump;
 use super::ld::opcode::Ld8;
 use super::ld16::opcode::Ld16;
-use super::inc_dec::opcode::{Inc8, Dec8, Inc16, Dec16};
-use super::rotate::opcode::Rotate;
 use super::logic::opcode::{And8, Or8, Xor8};
-use super::jump::opcode::Jump;
 use super::misc::opcode::Misc;
+use super::rotate::opcode::Rotate;
+use super::sbc::opcode::Sbc8;
+use super::sub::opcode::Sub8;
+use std::fmt;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {

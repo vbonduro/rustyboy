@@ -2,45 +2,73 @@ use crate::cpu::instructions::decoder::{Decoder, Error};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
 
-use super::opcode::{Dec8, Dec16, Inc8, Inc16};
+use super::opcode::{Dec16, Dec8, Inc16, Inc8};
 
-pub struct IncDecDecoder;
+pub struct Inc8Decoder;
 
-impl Decoder for IncDecDecoder {
+impl Decoder for Inc8Decoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
-        match opcode {
-            // INC r — 8-bit register increment (4 cycles)
-            0x04 => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::B), cycles: 4 })),
-            0x0C => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::C), cycles: 4 })),
-            0x14 => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::D), cycles: 4 })),
-            0x1C => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::E), cycles: 4 })),
-            0x24 => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::H), cycles: 4 })),
-            0x2C => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::L), cycles: 4 })),
-            0x3C => Ok(Box::new(Inc8 { operand: Operand::Register8(Register8::A), cycles: 4 })),
-            // INC (HL) — increment memory at HL (12 cycles)
-            0x34 => Ok(Box::new(Inc8 { operand: Operand::Memory(Memory::HL), cycles: 12 })),
-            // DEC r — 8-bit register decrement (4 cycles)
-            0x05 => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::B), cycles: 4 })),
-            0x0D => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::C), cycles: 4 })),
-            0x15 => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::D), cycles: 4 })),
-            0x1D => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::E), cycles: 4 })),
-            0x25 => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::H), cycles: 4 })),
-            0x2D => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::L), cycles: 4 })),
-            0x3D => Ok(Box::new(Dec8 { operand: Operand::Register8(Register8::A), cycles: 4 })),
-            // DEC (HL) — decrement memory at HL (12 cycles)
-            0x35 => Ok(Box::new(Dec8 { operand: Operand::Memory(Memory::HL), cycles: 12 })),
-            // INC rr — 16-bit register pair increment (8 cycles), NO flags affected
-            0x03 => Ok(Box::new(Inc16 { operand: Register16::BC, cycles: 8 })),
-            0x13 => Ok(Box::new(Inc16 { operand: Register16::DE, cycles: 8 })),
-            0x23 => Ok(Box::new(Inc16 { operand: Register16::HL, cycles: 8 })),
-            0x33 => Ok(Box::new(Inc16 { operand: Register16::SP, cycles: 8 })),
-            // DEC rr — 16-bit register pair decrement (8 cycles), NO flags affected
-            0x0B => Ok(Box::new(Dec16 { operand: Register16::BC, cycles: 8 })),
-            0x1B => Ok(Box::new(Dec16 { operand: Register16::DE, cycles: 8 })),
-            0x2B => Ok(Box::new(Dec16 { operand: Register16::HL, cycles: 8 })),
-            0x3B => Ok(Box::new(Dec16 { operand: Register16::SP, cycles: 8 })),
-            _ => Err(Error::InvalidOpcode(opcode)),
-        }
+        let (operand, cycles) = match opcode {
+            0x04 => (Operand::Register8(Register8::B), 4),
+            0x0C => (Operand::Register8(Register8::C), 4),
+            0x14 => (Operand::Register8(Register8::D), 4),
+            0x1C => (Operand::Register8(Register8::E), 4),
+            0x24 => (Operand::Register8(Register8::H), 4),
+            0x2C => (Operand::Register8(Register8::L), 4),
+            0x3C => (Operand::Register8(Register8::A), 4),
+            0x34 => (Operand::Memory(Memory::HL), 12),
+            _ => return Err(Error::InvalidOpcode(opcode)),
+        };
+        Ok(Box::new(Inc8 { operand, cycles }))
+    }
+}
+
+pub struct Dec8Decoder;
+
+impl Decoder for Dec8Decoder {
+    fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
+        let (operand, cycles) = match opcode {
+            0x05 => (Operand::Register8(Register8::B), 4),
+            0x0D => (Operand::Register8(Register8::C), 4),
+            0x15 => (Operand::Register8(Register8::D), 4),
+            0x1D => (Operand::Register8(Register8::E), 4),
+            0x25 => (Operand::Register8(Register8::H), 4),
+            0x2D => (Operand::Register8(Register8::L), 4),
+            0x3D => (Operand::Register8(Register8::A), 4),
+            0x35 => (Operand::Memory(Memory::HL), 12),
+            _ => return Err(Error::InvalidOpcode(opcode)),
+        };
+        Ok(Box::new(Dec8 { operand, cycles }))
+    }
+}
+
+pub struct Inc16Decoder;
+
+impl Decoder for Inc16Decoder {
+    fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
+        let operand = match opcode {
+            0x03 => Register16::BC,
+            0x13 => Register16::DE,
+            0x23 => Register16::HL,
+            0x33 => Register16::SP,
+            _ => return Err(Error::InvalidOpcode(opcode)),
+        };
+        Ok(Box::new(Inc16 { operand, cycles: 8 }))
+    }
+}
+
+pub struct Dec16Decoder;
+
+impl Decoder for Dec16Decoder {
+    fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
+        let operand = match opcode {
+            0x0B => Register16::BC,
+            0x1B => Register16::DE,
+            0x2B => Register16::HL,
+            0x3B => Register16::SP,
+            _ => return Err(Error::InvalidOpcode(opcode)),
+        };
+        Ok(Box::new(Dec16 { operand, cycles: 8 }))
     }
 }
 
@@ -49,153 +77,151 @@ mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
 
-    // --- INC r decode tests ---
-
     #[test]
     fn test_decode_inc8_b() {
-        FakeCpu::new().test_decode_operand(0x04, &IncDecDecoder, 4, Operand::Register8(Register8::B));
+        FakeCpu::new().test_decode_operand(0x04, &Inc8Decoder, 4, Operand::Register8(Register8::B));
     }
 
     #[test]
     fn test_decode_inc8_c() {
-        FakeCpu::new().test_decode_operand(0x0C, &IncDecDecoder, 4, Operand::Register8(Register8::C));
+        FakeCpu::new().test_decode_operand(0x0C, &Inc8Decoder, 4, Operand::Register8(Register8::C));
     }
 
     #[test]
     fn test_decode_inc8_d() {
-        FakeCpu::new().test_decode_operand(0x14, &IncDecDecoder, 4, Operand::Register8(Register8::D));
+        FakeCpu::new().test_decode_operand(0x14, &Inc8Decoder, 4, Operand::Register8(Register8::D));
     }
 
     #[test]
     fn test_decode_inc8_e() {
-        FakeCpu::new().test_decode_operand(0x1C, &IncDecDecoder, 4, Operand::Register8(Register8::E));
+        FakeCpu::new().test_decode_operand(0x1C, &Inc8Decoder, 4, Operand::Register8(Register8::E));
     }
 
     #[test]
     fn test_decode_inc8_h() {
-        FakeCpu::new().test_decode_operand(0x24, &IncDecDecoder, 4, Operand::Register8(Register8::H));
+        FakeCpu::new().test_decode_operand(0x24, &Inc8Decoder, 4, Operand::Register8(Register8::H));
     }
 
     #[test]
     fn test_decode_inc8_l() {
-        FakeCpu::new().test_decode_operand(0x2C, &IncDecDecoder, 4, Operand::Register8(Register8::L));
+        FakeCpu::new().test_decode_operand(0x2C, &Inc8Decoder, 4, Operand::Register8(Register8::L));
     }
 
     #[test]
     fn test_decode_inc8_a() {
-        FakeCpu::new().test_decode_operand(0x3C, &IncDecDecoder, 4, Operand::Register8(Register8::A));
+        FakeCpu::new().test_decode_operand(0x3C, &Inc8Decoder, 4, Operand::Register8(Register8::A));
     }
 
     #[test]
     fn test_decode_inc8_mem_hl() {
-        FakeCpu::new().test_decode_operand(0x34, &IncDecDecoder, 12, Operand::Memory(Memory::HL));
+        FakeCpu::new().test_decode_operand(0x34, &Inc8Decoder, 12, Operand::Memory(Memory::HL));
     }
 
-    // --- DEC r decode tests ---
+    #[test]
+    fn test_decode_inc8_invalid() {
+        assert!(Inc8Decoder.decode(0xFF).is_err());
+    }
 
     #[test]
     fn test_decode_dec8_b() {
-        FakeCpu::new().test_decode_operand(0x05, &IncDecDecoder, 4, Operand::Register8(Register8::B));
+        FakeCpu::new().test_decode_operand(0x05, &Dec8Decoder, 4, Operand::Register8(Register8::B));
     }
 
     #[test]
     fn test_decode_dec8_c() {
-        FakeCpu::new().test_decode_operand(0x0D, &IncDecDecoder, 4, Operand::Register8(Register8::C));
+        FakeCpu::new().test_decode_operand(0x0D, &Dec8Decoder, 4, Operand::Register8(Register8::C));
     }
 
     #[test]
     fn test_decode_dec8_d() {
-        FakeCpu::new().test_decode_operand(0x15, &IncDecDecoder, 4, Operand::Register8(Register8::D));
+        FakeCpu::new().test_decode_operand(0x15, &Dec8Decoder, 4, Operand::Register8(Register8::D));
     }
 
     #[test]
     fn test_decode_dec8_e() {
-        FakeCpu::new().test_decode_operand(0x1D, &IncDecDecoder, 4, Operand::Register8(Register8::E));
+        FakeCpu::new().test_decode_operand(0x1D, &Dec8Decoder, 4, Operand::Register8(Register8::E));
     }
 
     #[test]
     fn test_decode_dec8_h() {
-        FakeCpu::new().test_decode_operand(0x25, &IncDecDecoder, 4, Operand::Register8(Register8::H));
+        FakeCpu::new().test_decode_operand(0x25, &Dec8Decoder, 4, Operand::Register8(Register8::H));
     }
 
     #[test]
     fn test_decode_dec8_l() {
-        FakeCpu::new().test_decode_operand(0x2D, &IncDecDecoder, 4, Operand::Register8(Register8::L));
+        FakeCpu::new().test_decode_operand(0x2D, &Dec8Decoder, 4, Operand::Register8(Register8::L));
     }
 
     #[test]
     fn test_decode_dec8_a() {
-        FakeCpu::new().test_decode_operand(0x3D, &IncDecDecoder, 4, Operand::Register8(Register8::A));
+        FakeCpu::new().test_decode_operand(0x3D, &Dec8Decoder, 4, Operand::Register8(Register8::A));
     }
 
     #[test]
     fn test_decode_dec8_mem_hl() {
-        FakeCpu::new().test_decode_operand(0x35, &IncDecDecoder, 12, Operand::Memory(Memory::HL));
+        FakeCpu::new().test_decode_operand(0x35, &Dec8Decoder, 12, Operand::Memory(Memory::HL));
     }
 
-    // --- INC rr decode tests ---
-    // Note: Inc16/Dec16 use Register16 not Operand, so we test cycles only via execute
+    #[test]
+    fn test_decode_dec8_invalid() {
+        assert!(Dec8Decoder.decode(0xFF).is_err());
+    }
 
     #[test]
     fn test_decode_inc16_bc() {
-        let decoded = IncDecDecoder.decode(0x03).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Inc16Decoder.decode(0x03).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_de() {
-        let decoded = IncDecDecoder.decode(0x13).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Inc16Decoder.decode(0x13).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_hl() {
-        let decoded = IncDecDecoder.decode(0x23).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Inc16Decoder.decode(0x23).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_sp() {
-        let decoded = IncDecDecoder.decode(0x33).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Inc16Decoder.decode(0x33).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
-    // --- DEC rr decode tests ---
+    #[test]
+    fn test_decode_inc16_invalid() {
+        assert!(Inc16Decoder.decode(0xFF).is_err());
+    }
 
     #[test]
     fn test_decode_dec16_bc() {
-        let decoded = IncDecDecoder.decode(0x0B).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Dec16Decoder.decode(0x0B).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_de() {
-        let decoded = IncDecDecoder.decode(0x1B).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Dec16Decoder.decode(0x1B).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_hl() {
-        let decoded = IncDecDecoder.decode(0x2B).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Dec16Decoder.decode(0x2B).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_sp() {
-        let decoded = IncDecDecoder.decode(0x3B).unwrap();
-        let mut cpu = FakeCpu::new();
-        assert_eq!(decoded.execute(&mut cpu).unwrap(), 8);
+        let decoded = Dec16Decoder.decode(0x3B).unwrap();
+        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
     }
 
     #[test]
-    fn test_invalid_opcode() {
-        assert!(IncDecDecoder.decode(0xFF).is_err());
+    fn test_decode_dec16_invalid() {
+        assert!(Dec16Decoder.decode(0xFF).is_err());
     }
 }
