@@ -9,10 +9,30 @@ pub struct Ld16Decoder;
 impl Decoder for Ld16Decoder {
     fn decode(&self, opcode: u8) -> Result<Box<dyn OpCode>, Error> {
         let (op, cycles) = match opcode {
-            0x01 => (Ld16Op::RrImm16 { dest: Register16::BC }, 12),
-            0x11 => (Ld16Op::RrImm16 { dest: Register16::DE }, 12),
-            0x21 => (Ld16Op::RrImm16 { dest: Register16::HL }, 12),
-            0x31 => (Ld16Op::RrImm16 { dest: Register16::SP }, 12),
+            0x01 => (
+                Ld16Op::RrImm16 {
+                    dest: Register16::BC,
+                },
+                12,
+            ),
+            0x11 => (
+                Ld16Op::RrImm16 {
+                    dest: Register16::DE,
+                },
+                12,
+            ),
+            0x21 => (
+                Ld16Op::RrImm16 {
+                    dest: Register16::HL,
+                },
+                12,
+            ),
+            0x31 => (
+                Ld16Op::RrImm16 {
+                    dest: Register16::SP,
+                },
+                12,
+            ),
             0x08 => (Ld16Op::NnSp, 20),
             0xF9 => (Ld16Op::SpHl, 8),
             0xF8 => (Ld16Op::HlSpE, 12),

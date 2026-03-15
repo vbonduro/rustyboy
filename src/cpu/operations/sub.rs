@@ -9,7 +9,14 @@ use crate::cpu::registers::Flags;
 pub fn sub_u8(a: u8, b: u8) -> (u8, Flags) {
     let (result, borrow) = a.overflowing_sub(b);
     let nbits: usize = 8;
-    (result, Flags::from_sub(result.into(), borrow, sub_has_half_borrow(a.into(), b.into(), nbits)))
+    (
+        result,
+        Flags::from_sub(
+            result.into(),
+            borrow,
+            sub_has_half_borrow(a.into(), b.into(), nbits),
+        ),
+    )
 }
 
 /// Subtracts b and carry from a and returns the result and the flags.
@@ -23,11 +30,14 @@ pub fn sbc_u8(a: u8, b: u8, carry: u8) -> (u8, Flags) {
     let (temp_result, borrow1) = a.overflowing_sub(b);
     let (final_result, borrow2) = temp_result.overflowing_sub(carry);
     let total_borrow = borrow1 || borrow2;
-    
+
     // Calculate half-borrow: borrow from bit 4 during the entire operation
     let half_borrow = (a & 0x0F) < (b & 0x0F) + carry;
-    
-    (final_result, Flags::from_sub(final_result.into(), total_borrow, half_borrow))
+
+    (
+        final_result,
+        Flags::from_sub(final_result.into(), total_borrow, half_borrow),
+    )
 }
 
 /// Compares a with b by performing a - b and returns only the flags.
@@ -39,7 +49,7 @@ pub fn sbc_u8(a: u8, b: u8, carry: u8) -> (u8, Flags) {
 /// - C: Set if borrow (a < b).
 pub fn cp_u8(a: u8, b: u8) -> Flags {
     let (_result, flags) = sub_u8(a, b);
-    flags  // Discard the result, return only flags
+    flags // Discard the result, return only flags
 }
 
 fn sub_has_half_borrow(a: usize, b: usize, nbits: usize) -> bool {
@@ -132,7 +142,7 @@ mod tests {
     fn test_sbc_u8_complex_borrow() {
         let (result, flags) = sbc_u8(5, 10, 1);
         assert_eq!(result, 250);
-        assert_eq!(flags, Flags::N | Flags::H | Flags::C);  // Half-borrow occurs because 5 < (10 + 1)
+        assert_eq!(flags, Flags::N | Flags::H | Flags::C); // Half-borrow occurs because 5 < (10 + 1)
     }
 
     #[test]

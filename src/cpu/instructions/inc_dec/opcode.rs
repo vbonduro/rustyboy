@@ -1,6 +1,6 @@
+use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
-use crate::cpu::instructions::instructions::{Error, Instructions};
 
 /// Increments an 8-bit register or memory location at (HL).
 /// Affects Z (set if result is 0), N=0, H (set if carry from bit 3). C is NOT affected.
@@ -63,7 +63,10 @@ mod tests {
     fn test_execute_inc8_b() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::B);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -71,7 +74,10 @@ mod tests {
     fn test_execute_inc8_c() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::C);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -79,7 +85,10 @@ mod tests {
     fn test_execute_inc8_d() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::D);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -87,7 +96,10 @@ mod tests {
     fn test_execute_inc8_e() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::E);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -95,7 +107,10 @@ mod tests {
     fn test_execute_inc8_h() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::H);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -103,7 +118,10 @@ mod tests {
     fn test_execute_inc8_l() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::L);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -111,7 +129,10 @@ mod tests {
     fn test_execute_inc8_a() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::A);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -119,7 +140,10 @@ mod tests {
     fn test_execute_inc8_mem_hl() {
         let expected_cycles = 12;
         let expected_operand = Operand::Memory(Memory::HL);
-        let opcode = Inc8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Inc8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -129,7 +153,10 @@ mod tests {
     fn test_execute_dec8_b() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::B);
-        let opcode = Dec8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Dec8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -137,7 +164,10 @@ mod tests {
     fn test_execute_dec8_c() {
         let expected_cycles = 4;
         let expected_operand = Operand::Register8(Register8::C);
-        let opcode = Dec8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Dec8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -145,7 +175,10 @@ mod tests {
     fn test_execute_dec8_mem_hl() {
         let expected_cycles = 12;
         let expected_operand = Operand::Memory(Memory::HL);
-        let opcode = Dec8 { operand: expected_operand, cycles: expected_cycles };
+        let opcode = Dec8 {
+            operand: expected_operand,
+            cycles: expected_cycles,
+        };
         FakeCpu::new().test_execute_opcode(&opcode, expected_cycles, expected_operand);
     }
 
@@ -154,7 +187,10 @@ mod tests {
     #[test]
     fn test_execute_inc16_bc() {
         let expected_cycles = 8;
-        let opcode = Inc16 { operand: Register16::BC, cycles: expected_cycles };
+        let opcode = Inc16 {
+            operand: Register16::BC,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
@@ -163,7 +199,10 @@ mod tests {
     #[test]
     fn test_execute_inc16_de() {
         let expected_cycles = 8;
-        let opcode = Inc16 { operand: Register16::DE, cycles: expected_cycles };
+        let opcode = Inc16 {
+            operand: Register16::DE,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
@@ -172,7 +211,10 @@ mod tests {
     #[test]
     fn test_execute_inc16_hl() {
         let expected_cycles = 8;
-        let opcode = Inc16 { operand: Register16::HL, cycles: expected_cycles };
+        let opcode = Inc16 {
+            operand: Register16::HL,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
@@ -181,7 +223,10 @@ mod tests {
     #[test]
     fn test_execute_inc16_sp() {
         let expected_cycles = 8;
-        let opcode = Inc16 { operand: Register16::SP, cycles: expected_cycles };
+        let opcode = Inc16 {
+            operand: Register16::SP,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
@@ -192,7 +237,10 @@ mod tests {
     #[test]
     fn test_execute_dec16_bc() {
         let expected_cycles = 8;
-        let opcode = Dec16 { operand: Register16::BC, cycles: expected_cycles };
+        let opcode = Dec16 {
+            operand: Register16::BC,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
@@ -201,7 +249,10 @@ mod tests {
     #[test]
     fn test_execute_dec16_sp() {
         let expected_cycles = 8;
-        let opcode = Dec16 { operand: Register16::SP, cycles: expected_cycles };
+        let opcode = Dec16 {
+            operand: Register16::SP,
+            cycles: expected_cycles,
+        };
         let mut cpu = FakeCpu::new();
         let actual_cycles = opcode.execute(&mut cpu).unwrap();
         assert_eq!(actual_cycles, expected_cycles);

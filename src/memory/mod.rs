@@ -1,7 +1,7 @@
-pub mod rom;
-pub mod memory;
 pub mod fake;
+pub mod memory;
+pub mod rom;
 
-pub use rom::{ReadOnlyMemory, ROMVec, Ram};
-pub use memory::{Memory, GameBoyMemory};
 pub use fake::FakeMemory;
+pub use memory::{GameBoyMemory, Memory};
+pub use rom::{ROMVec, Ram, ReadOnlyMemory};

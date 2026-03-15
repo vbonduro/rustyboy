@@ -1,6 +1,6 @@
+use super::opcode::{Misc, MiscOp};
 use crate::cpu::instructions::decoder::{Decoder, Error};
 use crate::cpu::instructions::opcode::OpCode;
-use super::opcode::{Misc, MiscOp};
 
 pub struct MiscDecoder;
 
@@ -33,8 +33,8 @@ mod tests {
         // We verify by re-encoding: decode, downcast not possible, so test via execution cycle.
         // Use a direct match on known opcodes to verify correct op is produced.
         let _ = decoded; // suppress unused warning
-        // Since we can't downcast Box<dyn OpCode>, we test the complete pipeline in integration tests.
-        // Here we just ensure no panic and the correct opcode is produced via the op enum.
+                         // Since we can't downcast Box<dyn OpCode>, we test the complete pipeline in integration tests.
+                         // Here we just ensure no panic and the correct opcode is produced via the op enum.
         match opcode {
             0x00 => MiscOp::Nop,
             0x10 => MiscOp::Stop,
