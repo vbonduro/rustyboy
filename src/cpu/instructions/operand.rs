@@ -19,6 +19,7 @@ impl fmt::Display for Register8 {
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Register16 {
+    AF,
     BC,
     DE,
     HL,

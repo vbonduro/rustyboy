@@ -13,6 +13,7 @@ use super::misc::decoder::MiscDecoder;
 use super::opcode::OpCode;
 use super::rotate::decoder::RotateDecoder;
 use super::sbc::decoder::Sbc8Decoder;
+use super::stack::decoder::{Pop16Decoder, Push16Decoder};
 use super::sub::decoder::Sub8Decoder;
 
 pub struct OpCodeDecoder {
@@ -42,6 +43,8 @@ impl OpCodeDecoder {
                 Box::new(Or8Decoder {}),
                 Box::new(Xor8Decoder {}),
                 Box::new(MiscDecoder {}),
+                Box::new(Push16Decoder {}),
+                Box::new(Pop16Decoder {}),
             ],
         }
     }

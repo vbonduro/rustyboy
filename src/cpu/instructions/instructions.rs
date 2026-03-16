@@ -9,6 +9,7 @@ use super::logic::opcode::{And8, Or8, Xor8};
 use super::misc::opcode::Misc;
 use super::rotate::opcode::Rotate;
 use super::sbc::opcode::Sbc8;
+use super::stack::opcode::{Pop16, Push16};
 use super::sub::opcode::Sub8;
 use std::fmt;
 
@@ -51,6 +52,8 @@ pub trait Instructions {
     fn xor8(&mut self, opcode: &Xor8) -> Result<u8, Error>;
     fn jump(&mut self, opcode: &Jump) -> Result<u8, Error>;
     fn misc(&mut self, opcode: &Misc) -> Result<u8, Error>;
+    fn push16(&mut self, opcode: &Push16) -> Result<u8, Error>;
+    fn pop16(&mut self, opcode: &Pop16) -> Result<u8, Error>;
 }
 
 #[cfg(test)]

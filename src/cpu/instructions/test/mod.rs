@@ -15,6 +15,7 @@ pub mod util {
     use crate::cpu::instructions::operand::Operand;
     use crate::cpu::instructions::rotate::opcode::Rotate;
     use crate::cpu::instructions::sbc::opcode::Sbc8;
+    use crate::cpu::instructions::stack::opcode::{Pop16, Push16};
     use crate::cpu::instructions::sub::opcode::Sub8;
 
     pub struct FakeCpu {
@@ -179,6 +180,16 @@ pub mod util {
         }
 
         fn misc(&mut self, opcode: &Misc) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn push16(&mut self, opcode: &Push16) -> Result<u8, Error> {
+            self.operand = Some(Operand::Register16(opcode.operand));
+            Ok(opcode.cycles)
+        }
+
+        fn pop16(&mut self, opcode: &Pop16) -> Result<u8, Error> {
+            self.operand = Some(Operand::Register16(opcode.operand));
             Ok(opcode.cycles)
         }
     }

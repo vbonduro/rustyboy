@@ -88,6 +88,16 @@ impl Registers {
         self.h = (hl >> 8) as u8;
         self.l = (hl & 0xFF) as u8;
     }
+
+    pub fn af(&self) -> u16 {
+        (self.a as u16) << 8 | self.f.bits() as u16
+    }
+
+    /// Set AF. The lower nibble of F is always 0 on the Game Boy.
+    pub fn set_af(&mut self, af: u16) {
+        self.a = (af >> 8) as u8;
+        self.f = Flags::from_bits_truncate((af & 0xF0) as u8);
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +150,29 @@ mod tests {
         registers.set_hl(0xdead);
         assert_eq!(registers.h, 0xde);
         assert_eq!(registers.l, 0xad);
+    }
+
+    #[test]
+    fn test_af() {
+        let mut registers = Registers::default();
+        registers.a = 0xAB;
+        registers.f = Flags::Z | Flags::C;
+        assert_eq!(registers.af(), 0xAB90);
+    }
+
+    #[test]
+    fn test_set_af() {
+        let mut registers = Registers::default();
+        registers.set_af(0xAB90);
+        assert_eq!(registers.a, 0xAB);
+        assert_eq!(registers.f, Flags::Z | Flags::C);
+    }
+
+    #[test]
+    fn test_set_af_clears_low_nibble() {
+        let mut registers = Registers::default();
+        // Lower nibble of F should always be masked to 0
+        registers.set_af(0x001F);
+        assert_eq!(registers.f.bits(), 0x10);
     }
 }
