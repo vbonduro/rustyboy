@@ -15,6 +15,7 @@ use super::instructions::misc::opcode::Misc;
 use super::instructions::operand::*;
 use super::instructions::rotate::opcode::{Rotate, RotateOp};
 use super::instructions::sbc::opcode::Sbc8;
+use super::instructions::stack::opcode::{Pop16, Push16};
 use super::instructions::sub::opcode::Sub8;
 use super::operations::add::*;
 use super::operations::inc_dec::{dec_u8, inc_u8};
@@ -88,6 +89,7 @@ impl Sm83 {
 
     fn get_register16_operand(&self, operand: Register16) -> u16 {
         match operand {
+            Register16::AF => self.registers.af(),
             Register16::BC => self.registers.bc(),
             Register16::DE => self.registers.de(),
             Register16::HL => self.registers.hl(),
@@ -109,6 +111,7 @@ impl Sm83 {
 
     fn set_register16_operand(&mut self, operand: Register16, value: u16) {
         match operand {
+            Register16::AF => self.registers.set_af(value),
             Register16::BC => self.registers.set_bc(value),
             Register16::DE => self.registers.set_de(value),
             Register16::HL => self.registers.set_hl(value),
@@ -512,6 +515,24 @@ impl Instructions for Sm83 {
                 // Enable interrupts — IME not yet implemented
             }
         }
+        Ok(opcode.cycles)
+    }
+
+    fn push16(&mut self, opcode: &Push16) -> Result<u8, InstructionError> {
+        let value = self.get_register16_operand(opcode.operand);
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, (value >> 8) as u8)?;
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, (value & 0xFF) as u8)?;
+        Ok(opcode.cycles)
+    }
+
+    fn pop16(&mut self, opcode: &Pop16) -> Result<u8, InstructionError> {
+        let lo = self.memory.read(self.registers.sp)? as u16;
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        let hi = self.memory.read(self.registers.sp)? as u16;
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        self.set_register16_operand(opcode.operand, (hi << 8) | lo);
         Ok(opcode.cycles)
     }
 }
@@ -2036,5 +2057,113 @@ mod tests {
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().hl(), 0x1233);
         assert_eq!(cpu.registers().f, Flags::N | Flags::H); // flags unchanged
+    }
+
+    // --- PUSH / POP ---
+
+    #[test]
+    fn test_push_bc_writes_to_stack() {
+        let mut registers = Registers::default();
+        registers.set_bc(0xABCD);
+        registers.sp = 0xC010;
+        // PUSH BC = 0xC5, then POP DE = 0xD1 to verify round-trip via registers
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC5, 0xD1]).set_registers(registers);
+        let cycles = cpu.tick().unwrap(); // PUSH BC
+        assert_eq!(cycles, 16);
+        assert_eq!(cpu.registers().sp, 0xC00E);
+        cpu.tick().unwrap(); // POP DE
+        assert_eq!(cpu.registers().de(), 0xABCD);
+        assert_eq!(cpu.registers().sp, 0xC010);
+    }
+
+    #[test]
+    fn test_push_af_writes_to_stack() {
+        let mut registers = Registers::default();
+        registers.a = 0x12;
+        registers.f = Flags::Z | Flags::C;
+        registers.sp = 0xC010;
+        // PUSH AF = 0xF5, then POP AF = 0xF1 round-trip
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1]).set_registers(registers);
+        cpu.tick().unwrap(); // PUSH AF
+        assert_eq!(cpu.registers().sp, 0xC00E);
+        // Clear A and F to confirm POP restores them
+        let mut cleared = cpu.registers();
+        cleared.a = 0x00;
+        cleared.f = Flags::empty();
+        let cpu = cpu.set_registers(cleared);
+        let mut cpu = cpu;
+        cpu.tick().unwrap(); // POP AF
+        assert_eq!(cpu.registers().a, 0x12);
+        assert_eq!(cpu.registers().f, Flags::Z | Flags::C);
+    }
+
+    #[test]
+    fn test_pop_bc_reads_from_stack() {
+        // PUSH HL with known value, then POP BC to verify
+        let mut registers = Registers::default();
+        registers.set_hl(0xABCD);
+        registers.sp = 0xC010;
+        // PUSH HL = 0xE5, POP BC = 0xC1
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1]).set_registers(registers);
+        cpu.tick().unwrap(); // PUSH HL
+        let cycles = cpu.tick().unwrap(); // POP BC
+
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.registers().sp, 0xC010);
+        assert_eq!(cpu.registers().bc(), 0xABCD);
+    }
+
+    #[test]
+    fn test_pop_af_restores_flags() {
+        let mut registers = Registers::default();
+        registers.a = 0x42;
+        registers.f = Flags::Z | Flags::H;
+        registers.sp = 0xC010;
+        // PUSH AF = 0xF5, clear registers, POP AF = 0xF1
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1]).set_registers(registers);
+        cpu.tick().unwrap(); // PUSH AF
+        let mut cleared = cpu.registers();
+        cleared.a = 0x00;
+        cleared.f = Flags::empty();
+        let mut cpu = cpu.set_registers(cleared);
+        cpu.tick().unwrap(); // POP AF
+
+        assert_eq!(cpu.registers().a, 0x42);
+        assert_eq!(cpu.registers().f, Flags::Z | Flags::H);
+        assert_eq!(cpu.registers().sp, 0xC010);
+    }
+
+    #[test]
+    fn test_pop_af_ignores_low_nibble() {
+        // Use FakeMemory to inject a raw F byte with garbage low nibble
+        let mut mem = FakeMemory::new();
+        mem.set(0xC00E, 0x9F); // Z|C|garbage_low_nibble
+        mem.set(0xC00F, 0x00); // A
+        let mut registers = Registers::default();
+        registers.sp = 0xC00E;
+        // POP AF = 0xF1
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0xF1]).set_registers(registers);
+        cpu.tick().unwrap();
+
+        assert_eq!(cpu.registers().f.bits() & 0x0F, 0x00);
+    }
+
+    #[test]
+    fn test_push_then_pop_roundtrip() {
+        let mut registers = Registers::default();
+        registers.set_hl(0x1234);
+        registers.sp = 0xC010;
+        // PUSH HL = 0xE5, POP BC = 0xC1
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1]).set_registers(registers);
+        cpu.tick().unwrap(); // PUSH HL
+        cpu.tick().unwrap(); // POP BC
+
+        assert_eq!(cpu.registers().bc(), 0x1234);
+        assert_eq!(cpu.registers().sp, 0xC010);
     }
 }

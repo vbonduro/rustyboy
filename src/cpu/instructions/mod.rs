@@ -13,6 +13,7 @@ pub mod opcodes;
 pub mod operand;
 pub mod rotate;
 pub mod sbc;
+pub mod stack;
 pub mod sub;
 
 mod opcode;
