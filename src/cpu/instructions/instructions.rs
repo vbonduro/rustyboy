@@ -1,5 +1,6 @@
 use super::adc::opcode::Adc;
 use super::add::opcode::{Add16, Add8, AddSP16};
+use super::call::opcode::Call;
 use super::cp::opcode::Cp8;
 use super::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
 use super::jump::opcode::Jump;
@@ -7,7 +8,9 @@ use super::ld::opcode::Ld8;
 use super::ld16::opcode::Ld16;
 use super::logic::opcode::{And8, Or8, Xor8};
 use super::misc::opcode::Misc;
+use super::ret::opcode::Ret;
 use super::rotate::opcode::Rotate;
+use super::rst::opcode::Rst;
 use super::sbc::opcode::Sbc8;
 use super::stack::opcode::{Pop16, Push16};
 use super::sub::opcode::Sub8;
@@ -54,6 +57,9 @@ pub trait Instructions {
     fn misc(&mut self, opcode: &Misc) -> Result<u8, Error>;
     fn push16(&mut self, opcode: &Push16) -> Result<u8, Error>;
     fn pop16(&mut self, opcode: &Pop16) -> Result<u8, Error>;
+    fn call(&mut self, opcode: &Call) -> Result<u8, Error>;
+    fn ret(&mut self, opcode: &Ret) -> Result<u8, Error>;
+    fn rst(&mut self, opcode: &Rst) -> Result<u8, Error>;
 }
 
 #[cfg(test)]

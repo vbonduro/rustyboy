@@ -2,6 +2,7 @@
 pub mod util {
     use crate::cpu::instructions::adc::opcode::Adc;
     use crate::cpu::instructions::add::opcode::{Add16, Add8, AddSP16};
+    use crate::cpu::instructions::call::opcode::Call;
     use crate::cpu::instructions::cp::opcode::Cp8;
     use crate::cpu::instructions::decoder::Decoder;
     use crate::cpu::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
@@ -13,7 +14,9 @@ pub mod util {
     use crate::cpu::instructions::misc::opcode::Misc;
     use crate::cpu::instructions::opcode::OpCode;
     use crate::cpu::instructions::operand::Operand;
+    use crate::cpu::instructions::ret::opcode::Ret;
     use crate::cpu::instructions::rotate::opcode::Rotate;
+    use crate::cpu::instructions::rst::opcode::Rst;
     use crate::cpu::instructions::sbc::opcode::Sbc8;
     use crate::cpu::instructions::stack::opcode::{Pop16, Push16};
     use crate::cpu::instructions::sub::opcode::Sub8;
@@ -190,6 +193,18 @@ pub mod util {
 
         fn pop16(&mut self, opcode: &Pop16) -> Result<u8, Error> {
             self.operand = Some(Operand::Register16(opcode.operand));
+            Ok(opcode.cycles)
+        }
+
+        fn call(&mut self, opcode: &Call) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn ret(&mut self, opcode: &Ret) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn rst(&mut self, opcode: &Rst) -> Result<u8, Error> {
             Ok(opcode.cycles)
         }
     }

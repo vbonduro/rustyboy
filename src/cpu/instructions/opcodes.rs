@@ -1,5 +1,6 @@
 use super::adc::decoder::AdcDecoder;
 use super::add::decoder::{Add16Decoder, Add8Decoder, AddSP16Decoder};
+use super::call::decoder::CallDecoder;
 use super::cp::decoder::Cp8Decoder;
 use super::decoder::{Decoder, Error};
 use super::inc_dec::decoder::{Dec16Decoder, Dec8Decoder, Inc16Decoder, Inc8Decoder};
@@ -11,7 +12,9 @@ use super::logic::or::decoder::Or8Decoder;
 use super::logic::xor::decoder::Xor8Decoder;
 use super::misc::decoder::MiscDecoder;
 use super::opcode::OpCode;
+use super::ret::decoder::RetDecoder;
 use super::rotate::decoder::RotateDecoder;
+use super::rst::decoder::RstDecoder;
 use super::sbc::decoder::Sbc8Decoder;
 use super::stack::decoder::{Pop16Decoder, Push16Decoder};
 use super::sub::decoder::Sub8Decoder;
@@ -45,6 +48,9 @@ impl OpCodeDecoder {
                 Box::new(MiscDecoder {}),
                 Box::new(Push16Decoder {}),
                 Box::new(Pop16Decoder {}),
+                Box::new(CallDecoder),
+                Box::new(RetDecoder),
+                Box::new(RstDecoder),
             ],
         }
     }
@@ -193,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_invalid_opcode() {
-        let opcode = 0xFF; // Example invalid opcode
+        let opcode = 0xFC; // Truly unimplemented opcode
         assert!(OpCodeDecoder::new().decode(opcode).is_err());
     }
 }
