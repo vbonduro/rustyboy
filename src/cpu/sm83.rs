@@ -3,6 +3,7 @@ use std::error::Error;
 use super::cpu::Cpu;
 use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add16, Add8, AddSP16};
+use super::instructions::call::opcode::{Call, CallOp};
 use super::instructions::cp::opcode::Cp8;
 use super::instructions::decoder::Decoder;
 use super::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
@@ -13,7 +14,9 @@ use super::instructions::ld16::opcode::Ld16;
 use super::instructions::logic::opcode::{And8, Or8, Xor8};
 use super::instructions::misc::opcode::Misc;
 use super::instructions::operand::*;
+use super::instructions::ret::opcode::{Ret, RetOp};
 use super::instructions::rotate::opcode::{Rotate, RotateOp};
+use super::instructions::rst::opcode::Rst;
 use super::instructions::sbc::opcode::Sbc8;
 use super::instructions::stack::opcode::{Pop16, Push16};
 use super::instructions::sub::opcode::Sub8;
@@ -134,6 +137,23 @@ impl Sm83 {
                 operand
             ))),
         }
+    }
+
+    fn push_pc(&mut self) -> Result<(), MemoryError> {
+        let pc = self.registers.pc;
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, (pc >> 8) as u8)?;
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, (pc & 0xFF) as u8)?;
+        Ok(())
+    }
+
+    fn pop_pc(&mut self) -> Result<u16, MemoryError> {
+        let lo = self.memory.read(self.registers.sp)? as u16;
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        let hi = self.memory.read(self.registers.sp)? as u16;
+        self.registers.sp = self.registers.sp.wrapping_add(1);
+        Ok((hi << 8) | lo)
     }
 
     fn check_condition(&self, cond: &Condition) -> bool {
@@ -533,6 +553,56 @@ impl Instructions for Sm83 {
         let hi = self.memory.read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
         self.set_register16_operand(opcode.operand, (hi << 8) | lo);
+        Ok(opcode.cycles)
+    }
+
+    fn call(&mut self, opcode: &Call) -> Result<u8, InstructionError> {
+        let lo = self.read_next_pc()? as u16;
+        let hi = self.read_next_pc()? as u16;
+        let target = (hi << 8) | lo;
+        match &opcode.op {
+            CallOp::Call => {
+                self.push_pc()?;
+                self.registers.pc = target;
+                Ok(opcode.cycles)
+            }
+            CallOp::CallCc(cond) => {
+                if self.check_condition(cond) {
+                    self.push_pc()?;
+                    self.registers.pc = target;
+                    Ok(opcode.cycles) // 24 cycles taken
+                } else {
+                    Ok(12) // 12 cycles not taken
+                }
+            }
+        }
+    }
+
+    fn ret(&mut self, opcode: &Ret) -> Result<u8, InstructionError> {
+        match &opcode.op {
+            RetOp::Ret => {
+                self.registers.pc = self.pop_pc()?;
+                Ok(opcode.cycles)
+            }
+            RetOp::RetCc(cond) => {
+                if self.check_condition(cond) {
+                    self.registers.pc = self.pop_pc()?;
+                    Ok(opcode.cycles) // 20 cycles taken
+                } else {
+                    Ok(8) // 8 cycles not taken
+                }
+            }
+            RetOp::Reti => {
+                self.registers.pc = self.pop_pc()?;
+                // IME (interrupt master enable) would be set here
+                Ok(opcode.cycles)
+            }
+        }
+    }
+
+    fn rst(&mut self, opcode: &Rst) -> Result<u8, InstructionError> {
+        self.push_pc()?;
+        self.registers.pc = opcode.vector as u16;
         Ok(opcode.cycles)
     }
 }
@@ -2165,5 +2235,103 @@ mod tests {
 
         assert_eq!(cpu.registers().bc(), 0x1234);
         assert_eq!(cpu.registers().sp, 0xC010);
+    }
+
+    // --- CALL / RET ---
+
+    #[test]
+    fn test_call_nn_pushes_pc_and_jumps() {
+        // CALL nn = 0xCD, target = 0x0050
+        // ROM: [0xCD, 0x50, 0x00, ...]
+        // PC starts at 0, after fetch opcode PC=1, after fetch lo PC=2, after fetch hi PC=3
+        let mut registers = Registers::default();
+        registers.sp = 0xC010;
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCD, 0x50, 0x00])
+            .set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 24);
+        assert_eq!(cpu.registers().pc, 0x0050);
+        assert_eq!(cpu.registers().sp, 0xC00E);
+        // Return address (0x0003) should be on stack
+        assert_eq!(cpu.registers().sp, 0xC00E);
+    }
+
+    #[test]
+    fn test_call_then_ret_returns_to_caller() {
+        // ROM: CALL 0x0005, NOP, NOP, NOP, RET
+        // Addr: 0x0000 0xCD 0x05 0x00  (CALL 0x0005)
+        // Addr: 0x0003 0x00            (NOP — never reached)
+        // Addr: 0x0004 0x00            (NOP — never reached)
+        // Addr: 0x0005 0xC9            (RET)
+        let mut registers = Registers::default();
+        registers.sp = 0xC010;
+        let rom = vec![0xCD, 0x05, 0x00, 0x00, 0x00, 0xC9];
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), rom).set_registers(registers);
+        cpu.tick().unwrap(); // CALL 0x0005 — PC becomes 0x0005
+        assert_eq!(cpu.registers().pc, 0x0005);
+        cpu.tick().unwrap(); // RET — PC becomes 0x0003
+        assert_eq!(cpu.registers().pc, 0x0003);
+        assert_eq!(cpu.registers().sp, 0xC010);
+    }
+
+    #[test]
+    fn test_call_cc_not_taken() {
+        // CALL NZ with Z flag set — should not jump, 12 cycles
+        // 0xC4 = CALL NZ, nn
+        let mut registers = Registers::default();
+        registers.f = Flags::Z;
+        registers.sp = 0xC010;
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xC4, 0x50, 0x00])
+            .set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.registers().pc, 0x0003); // advanced past operands
+        assert_eq!(cpu.registers().sp, 0xC010); // SP unchanged
+    }
+
+    #[test]
+    fn test_call_cc_taken() {
+        // CALL Z with Z flag set — should jump, 24 cycles
+        // 0xCC = CALL Z, nn
+        let mut registers = Registers::default();
+        registers.f = Flags::Z;
+        registers.sp = 0xC010;
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCC, 0x50, 0x00])
+            .set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 24);
+        assert_eq!(cpu.registers().pc, 0x0050);
+    }
+
+    #[test]
+    fn test_ret_cc_not_taken() {
+        // RET NZ with Z set — not taken, 8 cycles
+        // 0xC0 = RET NZ
+        let mut registers = Registers::default();
+        registers.f = Flags::Z;
+        registers.sp = 0xC010;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC0]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().sp, 0xC010); // SP unchanged
+    }
+
+    #[test]
+    fn test_rst_pushes_pc_and_jumps_to_vector() {
+        // RST 0x08 = 0xCF
+        let mut registers = Registers::default();
+        registers.sp = 0xC010;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCF]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 16);
+        assert_eq!(cpu.registers().pc, 0x0008);
+        assert_eq!(cpu.registers().sp, 0xC00E);
     }
 }
