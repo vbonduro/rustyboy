@@ -4,6 +4,8 @@ use super::cpu::Cpu;
 use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add16, Add8, AddSP16};
 use super::instructions::call::opcode::{Call, CallOp};
+use super::instructions::cb::decoder::CbDecoder;
+use super::instructions::cb::opcode::{CbInstruction, CbOp, CbTarget};
 use super::instructions::cp::opcode::Cp8;
 use super::instructions::decoder::Decoder;
 use super::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
@@ -21,6 +23,9 @@ use super::instructions::sbc::opcode::Sbc8;
 use super::instructions::stack::opcode::{Pop16, Push16};
 use super::instructions::sub::opcode::Sub8;
 use super::operations::add::*;
+use super::operations::cb::{
+    bit_u8, res_u8, rl_u8, rlc_u8, rr_u8, rrc_u8, set_u8, sla_u8, sra_u8, srl_u8, swap_u8,
+};
 use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
@@ -139,6 +144,19 @@ impl Sm83 {
         }
     }
 
+    fn write_cb_target(&mut self, target: CbTarget, value: u8) -> Result<(), InstructionError> {
+        match target {
+            CbTarget::Reg(reg) => {
+                self.set_register8_operand(reg, value);
+                Ok(())
+            }
+            CbTarget::HLMem => {
+                self.memory.write(self.registers.hl(), value)?;
+                Ok(())
+            }
+        }
+    }
+
     fn push_pc(&mut self) -> Result<(), MemoryError> {
         let pc = self.registers.pc;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
@@ -169,7 +187,10 @@ impl Sm83 {
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
         let opcode = self.read_next_pc()?;
-
+        if opcode == 0xCB {
+            let cb_opcode = self.read_next_pc()?;
+            return Ok(CbDecoder.decode(cb_opcode)?.execute(self)?);
+        }
         Ok(self.opcodes.decode(opcode)?.execute(self)?)
     }
 }
@@ -603,6 +624,46 @@ impl Instructions for Sm83 {
     fn rst(&mut self, opcode: &Rst) -> Result<u8, InstructionError> {
         self.push_pc()?;
         self.registers.pc = opcode.vector as u16;
+        Ok(opcode.cycles)
+    }
+
+    fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, InstructionError> {
+        let carry_in = self.registers.f.contains(Flags::C);
+
+        let val = match opcode.target {
+            CbTarget::Reg(reg) => self.get_register8_operand(reg),
+            CbTarget::HLMem => self.memory.read(self.registers.hl())?,
+        };
+
+        match opcode.op {
+            CbOp::Bit(bit) => {
+                self.registers.f = bit_u8(val, bit, self.registers.f);
+            }
+            CbOp::Res(bit) => {
+                let result = res_u8(val, bit);
+                self.write_cb_target(opcode.target, result)?;
+            }
+            CbOp::Set(bit) => {
+                let result = set_u8(val, bit);
+                self.write_cb_target(opcode.target, result)?;
+            }
+            _ => {
+                let (result, flags) = match opcode.op {
+                    CbOp::Rlc => rlc_u8(val),
+                    CbOp::Rrc => rrc_u8(val),
+                    CbOp::Rl => rl_u8(val, carry_in),
+                    CbOp::Rr => rr_u8(val, carry_in),
+                    CbOp::Sla => sla_u8(val),
+                    CbOp::Sra => sra_u8(val),
+                    CbOp::Swap => swap_u8(val),
+                    CbOp::Srl => srl_u8(val),
+                    _ => unreachable!(),
+                };
+                self.registers.f = flags;
+                self.write_cb_target(opcode.target, result)?;
+            }
+        }
+
         Ok(opcode.cycles)
     }
 }
@@ -2333,5 +2394,126 @@ mod tests {
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().pc, 0x0008);
         assert_eq!(cpu.registers().sp, 0xC00E);
+    }
+
+    #[test]
+    fn test_cb_rlc_b() {
+        // RLC B = 0xCB 0x00, B = 0b10110001 => result = 0b01100011, carry = 1
+        let mut registers = Registers::default();
+        registers.b = 0b10110001;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().b, 0b01100011);
+        assert!(cpu.registers().f.contains(Flags::C));
+        assert!(!cpu.registers().f.contains(Flags::Z));
+        assert!(!cpu.registers().f.contains(Flags::N));
+        assert!(!cpu.registers().f.contains(Flags::H));
+    }
+
+    #[test]
+    fn test_cb_rlc_b_zero() {
+        // RLC B = 0xCB 0x00, B = 0 => result = 0, zero flag set
+        let mut registers = Registers::default();
+        registers.b = 0;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00]).set_registers(registers);
+        cpu.tick().unwrap();
+
+        assert_eq!(cpu.registers().b, 0);
+        assert!(cpu.registers().f.contains(Flags::Z));
+        assert!(!cpu.registers().f.contains(Flags::C));
+    }
+
+    #[test]
+    fn test_cb_swap_a() {
+        // SWAP A = 0xCB 0x37, A = 0xAB => result = 0xBA
+        let mut registers = Registers::default();
+        registers.a = 0xAB;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x37]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().a, 0xBA);
+        assert!(!cpu.registers().f.contains(Flags::Z));
+        assert!(!cpu.registers().f.contains(Flags::C));
+        assert!(!cpu.registers().f.contains(Flags::N));
+        assert!(!cpu.registers().f.contains(Flags::H));
+    }
+
+    #[test]
+    fn test_cb_bit_3_b_clear() {
+        // BIT 3, B = 0xCB 0x58, B = 0b11110111 (bit 3 = 0) => Z flag set, H flag set, N clear
+        let mut registers = Registers::default();
+        registers.b = 0b11110111;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert!(cpu.registers().f.contains(Flags::Z));
+        assert!(cpu.registers().f.contains(Flags::H));
+        assert!(!cpu.registers().f.contains(Flags::N));
+        // B unchanged
+        assert_eq!(cpu.registers().b, 0b11110111);
+    }
+
+    #[test]
+    fn test_cb_bit_3_b_set() {
+        // BIT 3, B = 0xCB 0x58, B = 0b00001000 (bit 3 = 1) => Z flag clear, H flag set
+        let mut registers = Registers::default();
+        registers.b = 0b00001000;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58]).set_registers(registers);
+        cpu.tick().unwrap();
+
+        assert!(!cpu.registers().f.contains(Flags::Z));
+        assert!(cpu.registers().f.contains(Flags::H));
+        assert!(!cpu.registers().f.contains(Flags::N));
+    }
+
+    #[test]
+    fn test_cb_res_3_b() {
+        // RES 3, B = 0xCB 0x98, B = 0xFF => result = 0xF7
+        let mut registers = Registers::default();
+        registers.b = 0xFF;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x98]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().b, 0xF7);
+    }
+
+    #[test]
+    fn test_cb_set_3_b() {
+        // SET 3, B = 0xCB 0xD8, B = 0x00 => result = 0x08
+        let mut registers = Registers::default();
+        registers.b = 0x00;
+        let mut cpu =
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0xD8]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 8);
+        assert_eq!(cpu.registers().b, 0x08);
+    }
+
+    #[test]
+    fn test_cb_rlc_hl_mem() {
+        // RLC (HL) = 0xCB 0x06, (HL) = 0b10110001 => result = 0b01100011, carry = 1
+        let mut memory = FakeMemory::new();
+        memory.write(0xC000, 0b10110001).unwrap();
+        let mut registers = Registers::default();
+        registers.set_hl(0xC000);
+        let mut cpu = make_test_cpu_with_memory(memory, vec![0xCB, 0x06]).set_registers(registers);
+        let cycles = cpu.tick().unwrap();
+
+        assert_eq!(cycles, 16);
+        assert_eq!(cpu.memory.read(0xC000).unwrap(), 0b01100011);
+        assert!(cpu.registers().f.contains(Flags::C));
+        assert!(!cpu.registers().f.contains(Flags::Z));
     }
 }

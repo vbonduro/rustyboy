@@ -3,6 +3,7 @@ pub mod util {
     use crate::cpu::instructions::adc::opcode::Adc;
     use crate::cpu::instructions::add::opcode::{Add16, Add8, AddSP16};
     use crate::cpu::instructions::call::opcode::Call;
+    use crate::cpu::instructions::cb::opcode::CbInstruction;
     use crate::cpu::instructions::cp::opcode::Cp8;
     use crate::cpu::instructions::decoder::Decoder;
     use crate::cpu::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
@@ -205,6 +206,10 @@ pub mod util {
         }
 
         fn rst(&mut self, opcode: &Rst) -> Result<u8, Error> {
+            Ok(opcode.cycles)
+        }
+
+        fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, Error> {
             Ok(opcode.cycles)
         }
     }

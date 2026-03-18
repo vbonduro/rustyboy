@@ -1,6 +1,7 @@
 use super::adc::opcode::Adc;
 use super::add::opcode::{Add16, Add8, AddSP16};
 use super::call::opcode::Call;
+use super::cb::opcode::CbInstruction;
 use super::cp::opcode::Cp8;
 use super::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
 use super::jump::opcode::Jump;
@@ -60,6 +61,7 @@ pub trait Instructions {
     fn call(&mut self, opcode: &Call) -> Result<u8, Error>;
     fn ret(&mut self, opcode: &Ret) -> Result<u8, Error>;
     fn rst(&mut self, opcode: &Rst) -> Result<u8, Error>;
+    fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, Error>;
 }
 
 #[cfg(test)]
