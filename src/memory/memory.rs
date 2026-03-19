@@ -33,7 +33,11 @@ enum RegionMapping {
     /// Echo RAM: mirrors WRAM on reads, but is not writable.
     EchoRam(u16),
     Oam(u16),
+    /// I/O registers: 0xFF00–0xFF7F
+    Io(u16),
     Hram(u16),
+    /// Interrupt Enable register: 0xFFFF
+    InterruptEnable,
     Unmapped,
 }
 
@@ -46,7 +50,9 @@ impl RegionMapping {
             0xC000..=0xDFFF => RegionMapping::Wram(address - 0xC000),
             0xE000..=0xFDFF => RegionMapping::EchoRam(address - 0xE000),
             0xFE00..=0xFE9F => RegionMapping::Oam(address - 0xFE00),
+            0xFF00..=0xFF7F => RegionMapping::Io(address - 0xFF00),
             0xFF80..=0xFFFE => RegionMapping::Hram(address - 0xFF80),
+            0xFFFF => RegionMapping::InterruptEnable,
             _ => RegionMapping::Unmapped,
         }
     }
@@ -69,7 +75,9 @@ pub struct GameBoyMemory {
     external_ram: Ram,
     wram: Ram,
     oam: Ram,
+    io: Ram,
     hram: Ram,
+    ie: u8,
 }
 
 impl GameBoyMemory {
@@ -80,7 +88,9 @@ impl GameBoyMemory {
             external_ram: Ram::new(0x2000),
             wram: Ram::new(0x2000),
             oam: Ram::new(0xA0),
+            io: Ram::new(0x80),
             hram: Ram::new(0x7F),
+            ie: 0,
         }
     }
 
@@ -94,7 +104,9 @@ impl GameBoyMemory {
             external_ram: Ram::new(0x2000),
             wram: Ram::new(0x2000),
             oam: Ram::new(0xA0),
+            io: Ram::new(0x80),
             hram: Ram::new(0x7F),
+            ie: 0,
         }
     }
 }
@@ -126,10 +138,14 @@ impl Memory for GameBoyMemory {
                 .oam
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Io(offset) => {
+                self.io.read(offset).map_err(|_| Error::OutOfRange(address))
+            }
             RegionMapping::Hram(offset) => self
                 .hram
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::InterruptEnable => Ok(self.ie),
             RegionMapping::Unmapped => Ok(0xFF),
         }
     }
@@ -154,10 +170,18 @@ impl Memory for GameBoyMemory {
                 .oam
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Io(offset) => self
+                .io
+                .write(offset, value)
+                .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Hram(offset) => self
                 .hram
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::InterruptEnable => {
+                self.ie = value;
+                Ok(())
+            }
             RegionMapping::Unmapped => Ok(()),
         }
     }
@@ -266,13 +290,56 @@ mod tests {
         assert_eq!(mem.read(0xFFFE).unwrap(), 0x20);
     }
 
+    // --- I/O registers (0xFF00–0xFF7F) ---
+
+    #[test]
+    fn test_io_write_then_read() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF00, 0x42).unwrap();
+        assert_eq!(mem.read(0xFF00).unwrap(), 0x42);
+    }
+
+    #[test]
+    fn test_io_boundary_low() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF00, 0x11).unwrap();
+        assert_eq!(mem.read(0xFF00).unwrap(), 0x11);
+    }
+
+    #[test]
+    fn test_io_boundary_high() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF7F, 0x99).unwrap();
+        assert_eq!(mem.read(0xFF7F).unwrap(), 0x99);
+    }
+
+    #[test]
+    fn test_io_zero_initialized() {
+        let mem = GameBoyMemory::new();
+        assert_eq!(mem.read(0xFF01).unwrap(), 0x00);
+    }
+
+    // --- IE register (0xFFFF) ---
+
+    #[test]
+    fn test_ie_write_then_read() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFFFF, 0x1F).unwrap();
+        assert_eq!(mem.read(0xFFFF).unwrap(), 0x1F);
+    }
+
+    #[test]
+    fn test_ie_zero_initialized() {
+        let mem = GameBoyMemory::new();
+        assert_eq!(mem.read(0xFFFF).unwrap(), 0x00);
+    }
+
     // --- Unmapped regions ---
 
     #[test]
     fn test_unmapped_read_returns_0xff() {
         let mem = GameBoyMemory::new();
         assert_eq!(mem.read(0xFEA0).unwrap(), 0xFF); // Restricted OAM
-        assert_eq!(mem.read(0xFF00).unwrap(), 0xFF); // I/O registers (stub)
     }
 
     // --- Error display ---
