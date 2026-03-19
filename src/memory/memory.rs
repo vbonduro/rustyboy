@@ -1,6 +1,14 @@
+use std::collections::VecDeque;
 use std::fmt;
 
 use super::rom::{ROMVec, Ram, ReadOnlyMemory};
+
+/// An event produced when a write occurs to an I/O or IE register address.
+#[derive(Debug, PartialEq, Clone)]
+pub struct BusEvent {
+    pub address: u16,
+    pub value: u8,
+}
 
 #[derive(Debug)]
 pub enum Error {
@@ -78,6 +86,7 @@ pub struct GameBoyMemory {
     io: Ram,
     hram: Ram,
     ie: u8,
+    events: VecDeque<BusEvent>,
 }
 
 impl GameBoyMemory {
@@ -91,6 +100,7 @@ impl GameBoyMemory {
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
             ie: 0,
+            events: VecDeque::new(),
         }
     }
 
@@ -107,7 +117,13 @@ impl GameBoyMemory {
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
             ie: 0,
+            events: VecDeque::new(),
         }
+    }
+
+    /// Drains and returns all pending bus events, clearing the internal queue.
+    pub fn drain_events(&mut self) -> Vec<BusEvent> {
+        self.events.drain(..).collect()
     }
 }
 
@@ -170,16 +186,20 @@ impl Memory for GameBoyMemory {
                 .oam
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Io(offset) => self
-                .io
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Io(offset) => {
+                self.io
+                    .write(offset, value)
+                    .map_err(|_| Error::OutOfRange(address))?;
+                self.events.push_back(BusEvent { address, value });
+                Ok(())
+            }
             RegionMapping::Hram(offset) => self
                 .hram
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::InterruptEnable => {
                 self.ie = value;
+                self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
             RegionMapping::Unmapped => Ok(()),
@@ -354,5 +374,57 @@ mod tests {
     fn test_error_out_of_range_display() {
         let err = Error::OutOfRange(0xABCD);
         assert!(format!("{}", err).contains("0xABCD"));
+    }
+
+    // --- BusEvent queue ---
+
+    #[test]
+    fn test_io_write_produces_bus_event() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF01, 0x48).unwrap();
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].address, 0xFF01);
+        assert_eq!(events[0].value, 0x48);
+    }
+
+    #[test]
+    fn test_ie_write_produces_bus_event() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFFFF, 0x1F).unwrap();
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].address, 0xFFFF);
+        assert_eq!(events[0].value, 0x1F);
+    }
+
+    #[test]
+    fn test_non_io_write_produces_no_bus_event() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xC000, 0x42).unwrap(); // WRAM — not I/O
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_drain_events_clears_queue() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF01, 0x01).unwrap();
+        let _ = mem.drain_events();
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_io_writes_produce_ordered_events() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF01, 0x41).unwrap(); // 'A'
+        mem.write(0xFF02, 0x81).unwrap(); // SC transfer start
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].address, 0xFF01);
+        assert_eq!(events[0].value, 0x41);
+        assert_eq!(events[1].address, 0xFF02);
+        assert_eq!(events[1].value, 0x81);
     }
 }
