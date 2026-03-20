@@ -256,8 +256,11 @@ impl Instructions for Sm83 {
             }
         };
 
-        let hl: u16;
-        (hl, self.registers.f) = add_u16(self.registers.hl(), operand);
+        let (hl, new_flags) = add_u16(self.registers.hl(), operand);
+        // ADD HL,rr preserves Z — merge new H/C/N flags into existing flags
+        self.registers.f.set(Flags::N, false);
+        self.registers.f.set(Flags::H, new_flags.contains(Flags::H));
+        self.registers.f.set(Flags::C, new_flags.contains(Flags::C));
         self.registers.set_hl(hl);
         Ok(opcode.cycles)
     }

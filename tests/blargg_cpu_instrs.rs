@@ -2,6 +2,12 @@
 //!
 //! These tests load a real Game Boy ROM, run it to completion (until HALT),
 //! and assert the expected serial output. ROM files live under roms/blargg/.
+//!
+//! Failing tests are marked #[ignore] — they document known gaps and serve as
+//! the red phase for future TDD work:
+//!   02-interrupts: requires interrupt dispatch (IME/IE/IF)
+//!   03-op sp,hl:   ADD HL,SP (opcode 0x39) produces wrong flags
+//!   05-op rp:      ADD HL,rr (09/19/29) produce wrong flags
 
 use rustyboy::cpu::cpu::Cpu;
 use rustyboy::cpu::instructions::opcodes::OpCodeDecoder;
@@ -12,7 +18,6 @@ use rustyboy::memory::memory::{BusEvent, GameBoyMemory, Memory};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// Wraps SerialPort behind Rc<RefCell> so we can inspect output after the run.
 struct SharedSerial(Rc<RefCell<SerialPort>>);
 
 impl Peripheral for SharedSerial {
@@ -47,12 +52,104 @@ fn run_rom(path: &str) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
-#[test]
-fn test_blargg_01_special() {
-    let output = run_rom("roms/blargg/cpu_instrs/individual/01-special.gb");
+fn assert_passed(output: &str, rom: &str) {
     assert!(
         output.contains("Passed"),
-        "Expected 'Passed' in serial output, got: {:?}",
+        "{}: expected 'Passed' in serial output, got: {:?}",
+        rom,
         output
+    );
+}
+
+// --- Passing tests ---
+
+#[test]
+fn test_blargg_01_special() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/01-special.gb"),
+        "01-special",
+    );
+}
+
+#[test]
+fn test_blargg_04_op_r_imm() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/04-op r,imm.gb"),
+        "04-op r,imm",
+    );
+}
+
+#[test]
+fn test_blargg_06_ld_r_r() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/06-ld r,r.gb"),
+        "06-ld r,r",
+    );
+}
+
+#[test]
+fn test_blargg_07_jr_jp_call_ret_rst() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/07-jr,jp,call,ret,rst.gb"),
+        "07-jr,jp,call,ret,rst",
+    );
+}
+
+#[test]
+fn test_blargg_08_misc_instrs() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/08-misc instrs.gb"),
+        "08-misc instrs",
+    );
+}
+
+#[test]
+fn test_blargg_09_op_r_r() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/09-op r,r.gb"),
+        "09-op r,r",
+    );
+}
+
+#[test]
+fn test_blargg_10_bit_ops() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/10-bit ops.gb"),
+        "10-bit ops",
+    );
+}
+
+#[test]
+fn test_blargg_11_op_a_hl() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/11-op a,(hl).gb"),
+        "11-op a,(hl)",
+    );
+}
+
+// --- Known failing tests (red phase for future TDD) ---
+
+#[test]
+#[ignore = "requires interrupt dispatch: IME/IE/IF not yet implemented"]
+fn test_blargg_02_interrupts() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/02-interrupts.gb"),
+        "02-interrupts",
+    );
+}
+
+#[test]
+fn test_blargg_03_op_sp_hl() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/03-op sp,hl.gb"),
+        "03-op sp,hl",
+    );
+}
+
+#[test]
+fn test_blargg_05_op_rp() {
+    assert_passed(
+        &run_rom("roms/blargg/cpu_instrs/individual/05-op rp.gb"),
+        "05-op rp",
     );
 }
