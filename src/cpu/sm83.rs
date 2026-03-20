@@ -86,14 +86,11 @@ impl Sm83 {
         self.halted
     }
 
-    /// Set the program counter. Used to skip the boot ROM in integration tests.
-    pub fn set_pc(&mut self, pc: u16) {
-        self.registers.pc = pc;
-    }
-
-    /// Set the stack pointer.
-    pub fn set_sp(&mut self, sp: u16) {
-        self.registers.sp = sp;
+    /// Builder method to set initial register state. Used to skip the boot ROM
+    /// by setting PC to 0x0100 and SP to 0xFFFE.
+    pub fn with_registers(mut self, registers: Registers) -> Self {
+        self.registers = registers;
+        self
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
@@ -722,13 +719,6 @@ mod tests {
     use crate::memory::fake::FakeMemory;
     use crate::memory::memory::GameBoyMemory;
 
-    impl Sm83 {
-        pub fn set_registers(mut self, registers: Registers) -> Sm83 {
-            self.registers = registers;
-            self
-        }
-    }
-
     pub fn make_test_cpu(rom_data: Vec<u8>) -> Sm83 {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::with_rom(rom_data));
         let decoder = Box::new(OpCodeDecoder::new());
@@ -771,7 +761,7 @@ mod tests {
     // Set the expected value for register b and confirm the add operation takes place as expected.
     #[test]
     fn test_add8_regb_to_accumulator() {
-        let mut cpu = make_test_cpu(vec![0x80]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x80]).with_registers(Registers {
             b: 0x05,
             ..Default::default()
         });
@@ -787,7 +777,7 @@ mod tests {
     fn test_add8_memory_hl_to_accumulator() {
         let mut mem = FakeMemory::new();
         mem.set(0xC000, 0x07); // value at (HL)
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x86]).set_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x86]).with_registers(Registers {
             a: 0x03,
             h: 0xC0,
             l: 0x00,
@@ -829,7 +819,7 @@ mod tests {
         };
         let rom_data = vec![0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87];
         let num_instructions = rom_data.len();
-        let mut cpu = make_test_cpu(rom_data).set_registers(registers.clone());
+        let mut cpu = make_test_cpu(rom_data).with_registers(registers.clone());
 
         let total_cycles: u8 = (0..num_instructions).map(|_| cpu.tick().unwrap()).sum();
 
@@ -843,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_add8_rollover_flags() {
-        let mut cpu = make_test_cpu(vec![0xC6, 0xFF]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xC6, 0xFF]).with_registers(Registers {
             a: 0x01,
             ..Default::default()
         }); // Add 0xFF to accumulator
@@ -858,7 +848,7 @@ mod tests {
     fn test_add16_bc_to_hl() {
         let mut registers = Registers::default();
         registers.set_bc(0xbeef);
-        let mut cpu = make_test_cpu(vec![0x09]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x09]).with_registers(registers);
 
         assert_eq!(cpu.tick().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xbeef); // Expected value after adding BC to HL
@@ -868,7 +858,7 @@ mod tests {
     fn test_add16_de_to_hl() {
         let mut registers = Registers::default();
         registers.set_de(0xbeef);
-        let mut cpu = make_test_cpu(vec![0x19]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x19]).with_registers(registers);
 
         assert_eq!(cpu.tick().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xbeef); // Expected value after adding DE to HL
@@ -878,7 +868,7 @@ mod tests {
     fn test_add16_hl_to_hl() {
         let mut registers = Registers::default();
         registers.set_hl(0xffff);
-        let mut cpu = make_test_cpu(vec![0x29]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x29]).with_registers(registers);
 
         assert_eq!(cpu.tick().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xfffe); // Expected value after adding HL to HL
@@ -889,7 +879,7 @@ mod tests {
     fn test_add16_sp_to_hl() {
         let mut registers = Registers::default();
         registers.sp = 0xffff;
-        let mut cpu = make_test_cpu(vec![0x39]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x39]).with_registers(registers);
 
         assert_eq!(cpu.tick().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xffff); // Expected value after adding SP to HL
@@ -934,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_adc_b() {
-        let mut cpu = make_test_cpu(vec![0x88]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x88]).with_registers(Registers {
             a: 0x05,
             b: 0x03,
             ..Default::default()
@@ -947,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_adc_c() {
-        let mut cpu = make_test_cpu(vec![0x89]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x89]).with_registers(Registers {
             a: 0x05,
             c: 0x03,
             ..Default::default()
@@ -960,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_adc_d() {
-        let mut cpu = make_test_cpu(vec![0x8A]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x8A]).with_registers(Registers {
             a: 0x05,
             d: 0x03,
             ..Default::default()
@@ -973,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_adc_e() {
-        let mut cpu = make_test_cpu(vec![0x8B]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x8B]).with_registers(Registers {
             a: 0x05,
             e: 0x03,
             ..Default::default()
@@ -986,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_adc_h() {
-        let mut cpu = make_test_cpu(vec![0x8C]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x8C]).with_registers(Registers {
             a: 0x05,
             h: 0x03,
             ..Default::default()
@@ -999,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_adc_l() {
-        let mut cpu = make_test_cpu(vec![0x8D]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x8D]).with_registers(Registers {
             a: 0x05,
             l: 0x03,
             ..Default::default()
@@ -1012,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_adc_a() {
-        let mut cpu = make_test_cpu(vec![0x8F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x8F]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1028,7 +1018,7 @@ mod tests {
     fn test_adc_memhl() {
         let mut mem = FakeMemory::new();
         mem.set(0xC001, 0x04);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x8E]).set_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x8E]).with_registers(Registers {
             a: 0x05,
             h: 0xC0,
             l: 0x01,
@@ -1043,7 +1033,7 @@ mod tests {
 
     #[test]
     fn test_adc_imm8() {
-        let mut cpu = make_test_cpu(vec![0xCE, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xCE, 0x03]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1068,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_sub8_imm8() {
-        let mut cpu = make_test_cpu(vec![0xD6, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xD6, 0x03]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1081,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_sub8_zero_result() {
-        let mut cpu = make_test_cpu(vec![0xD6, 0x05]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xD6, 0x05]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1094,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_sub8_regb() {
-        let mut cpu = make_test_cpu(vec![0x90]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x90]).with_registers(Registers {
             a: 0x10,
             b: 0x05,
             ..Default::default()
@@ -1108,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_sub8_borrow() {
-        let mut cpu = make_test_cpu(vec![0xD6, 0x10]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xD6, 0x10]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1121,7 +1111,7 @@ mod tests {
 
     #[test]
     fn test_sub8_half_borrow() {
-        let mut cpu = make_test_cpu(vec![0xD6, 0x01]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xD6, 0x01]).with_registers(Registers {
             a: 0x10,
             ..Default::default()
         });
@@ -1134,7 +1124,7 @@ mod tests {
 
     #[test]
     fn test_sbc8_no_carry() {
-        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).with_registers(Registers {
             a: 0x10,
             ..Default::default()
         });
@@ -1147,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_sbc8_with_carry() {
-        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x03]).with_registers(Registers {
             a: 0x10,
             f: Flags::C,
             ..Default::default()
@@ -1161,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_sbc8_zero_result() {
-        let mut cpu = make_test_cpu(vec![0xDE, 0x04]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xDE, 0x04]).with_registers(Registers {
             a: 0x05,
             f: Flags::C,
             ..Default::default()
@@ -1175,7 +1165,7 @@ mod tests {
 
     #[test]
     fn test_sbc8_regb() {
-        let mut cpu = make_test_cpu(vec![0x98]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x98]).with_registers(Registers {
             a: 0x10,
             b: 0x05,
             ..Default::default()
@@ -1189,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_cp8_imm8() {
-        let mut cpu = make_test_cpu(vec![0xFE, 0x05]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xFE, 0x05]).with_registers(Registers {
             a: 0x05,
             ..Default::default()
         });
@@ -1202,7 +1192,7 @@ mod tests {
 
     #[test]
     fn test_cp8_regb() {
-        let mut cpu = make_test_cpu(vec![0xB8]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xB8]).with_registers(Registers {
             a: 0x05,
             b: 0x10,
             ..Default::default()
@@ -1220,7 +1210,7 @@ mod tests {
     /// C=0x42, opcode 0x41 (LD B,C), expect B=0x42, 4 cycles.
     #[test]
     fn test_ld8_reg_to_reg() {
-        let mut cpu = make_test_cpu(vec![0x41]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x41]).with_registers(Registers {
             c: 0x42,
             ..Default::default()
         });
@@ -1236,7 +1226,7 @@ mod tests {
     fn test_ld8_a_from_mem_hl() {
         let mut mem = FakeMemory::new();
         mem.set(0xC000, 0x55);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x7E]).set_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x7E]).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -1257,7 +1247,7 @@ mod tests {
         // After tick 2 (LD A,(HL)): A=0xCD, cycles=8
         let mut memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
         let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).set_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             a: 0xCD,
             h: 0xC0,
             l: 0x00,
@@ -1270,7 +1260,7 @@ mod tests {
 
         // Zero out A (keep HL pointing to 0xC000) so we know the next tick loads from memory
         let regs_after_store = cpu.registers();
-        cpu = cpu.set_registers(Registers {
+        cpu = cpu.with_registers(Registers {
             a: 0x00,
             ..regs_after_store
         });
@@ -1300,7 +1290,7 @@ mod tests {
     fn test_ld8_mem_hl_imm8() {
         let mut memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
         let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).set_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -1312,7 +1302,7 @@ mod tests {
 
         // LD A, (HL) — verify that 0x99 was stored
         let regs = cpu.registers();
-        cpu = cpu.set_registers(Registers { a: 0x00, ..regs });
+        cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
         let cycles2 = cpu.tick().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x99);
@@ -1329,7 +1319,7 @@ mod tests {
         memory.write(0xC010, 0x0F).unwrap();
 
         let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).set_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             a: 0x01,
             h: 0xC0,
             l: 0x10,
@@ -1349,7 +1339,7 @@ mod tests {
     #[test]
     fn test_rlca_bit7_set() {
         // A = 0x80 (1000_0000): bit7=1, rotate left → result=0x01, C=1
-        let mut cpu = make_test_cpu(vec![0x07]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x07]).with_registers(Registers {
             a: 0x80,
             ..Default::default()
         });
@@ -1364,7 +1354,7 @@ mod tests {
     #[test]
     fn test_rlca_bit7_clear() {
         // A = 0x01 (0000_0001): bit7=0, rotate left → result=0x02, C=0
-        let mut cpu = make_test_cpu(vec![0x07]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x07]).with_registers(Registers {
             a: 0x01,
             ..Default::default()
         });
@@ -1379,7 +1369,7 @@ mod tests {
     #[test]
     fn test_rlca_z_always_zero() {
         // A = 0x00: result = 0x00, but Z must NOT be set
-        let mut cpu = make_test_cpu(vec![0x07]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x07]).with_registers(Registers {
             a: 0x00,
             ..Default::default()
         });
@@ -1393,7 +1383,7 @@ mod tests {
     #[test]
     fn test_rla_carry_goes_to_bit0() {
         // A = 0x00, carry=1: result = (0x00 << 1) | 1 = 0x01, C=0
-        let mut cpu = make_test_cpu(vec![0x17]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x17]).with_registers(Registers {
             a: 0x00,
             f: Flags::C,
             ..Default::default()
@@ -1409,7 +1399,7 @@ mod tests {
     #[test]
     fn test_rla_bit7_goes_to_carry() {
         // A = 0x80, carry=0: result = 0x00, C=1
-        let mut cpu = make_test_cpu(vec![0x17]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x17]).with_registers(Registers {
             a: 0x80,
             ..Default::default()
         });
@@ -1424,7 +1414,7 @@ mod tests {
     #[test]
     fn test_rrca_bit0_set() {
         // A = 0x01 (0000_0001): bit0=1, rotate right → result=0x80, C=1
-        let mut cpu = make_test_cpu(vec![0x0F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0F]).with_registers(Registers {
             a: 0x01,
             ..Default::default()
         });
@@ -1439,7 +1429,7 @@ mod tests {
     #[test]
     fn test_rrca_bit0_clear() {
         // A = 0x80: bit0=0, rotate right → result=0x40, C=0
-        let mut cpu = make_test_cpu(vec![0x0F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0F]).with_registers(Registers {
             a: 0x80,
             ..Default::default()
         });
@@ -1454,7 +1444,7 @@ mod tests {
     #[test]
     fn test_rra_carry_clear_bit0_set() {
         // A = 0x01, carry=0: result = (0x01 >> 1) | (0 << 7) = 0x00, C=1
-        let mut cpu = make_test_cpu(vec![0x1F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x1F]).with_registers(Registers {
             a: 0x01,
             ..Default::default()
         });
@@ -1469,7 +1459,7 @@ mod tests {
     #[test]
     fn test_rra_carry_goes_to_bit7() {
         // A = 0x00, carry=1: result = (0x00 >> 1) | (1 << 7) = 0x80, C=0
-        let mut cpu = make_test_cpu(vec![0x1F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x1F]).with_registers(Registers {
             a: 0x00,
             f: Flags::C,
             ..Default::default()
@@ -1485,7 +1475,7 @@ mod tests {
     #[test]
     fn test_rra_z_always_zero_when_result_zero() {
         // A = 0x00, carry=0: result = 0x00, C=0; Z must be 0
-        let mut cpu = make_test_cpu(vec![0x1F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x1F]).with_registers(Registers {
             a: 0x00,
             ..Default::default()
         });
@@ -1511,7 +1501,7 @@ mod tests {
     /// JP HL (0xE9) — jump to address in HL. HL=0x1234, expect PC=0x1234, 4 cycles.
     #[test]
     fn test_jp_hl_sets_pc_to_hl() {
-        let mut cpu = make_test_cpu(vec![0xE9]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xE9]).with_registers(Registers {
             h: 0x12,
             l: 0x34,
             ..Default::default()
@@ -1525,7 +1515,7 @@ mod tests {
     /// JP Z, nn (0xCA) with Z flag set — jump taken, 16 cycles, PC = target.
     #[test]
     fn test_jp_z_nn_taken_when_z_set() {
-        let mut cpu = make_test_cpu(vec![0xCA, 0x08, 0x00]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xCA, 0x08, 0x00]).with_registers(Registers {
             f: Flags::Z,
             ..Default::default()
         });
@@ -1538,7 +1528,7 @@ mod tests {
     /// JP Z, nn (0xCA) with Z flag clear — jump not taken, 12 cycles, PC past instruction.
     #[test]
     fn test_jp_z_nn_not_taken_when_z_clear() {
-        let mut cpu = make_test_cpu(vec![0xCA, 0x08, 0x00]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xCA, 0x08, 0x00]).with_registers(Registers {
             f: Flags::empty(),
             ..Default::default()
         });
@@ -1572,7 +1562,7 @@ mod tests {
     /// JR NZ, e (0x20) — Z clear, condition true, jump taken. PC = 2 + 3 = 5. 12 cycles.
     #[test]
     fn test_jr_nz_taken_when_z_clear() {
-        let mut cpu = make_test_cpu(vec![0x20, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x20, 0x03]).with_registers(Registers {
             f: Flags::empty(),
             ..Default::default()
         });
@@ -1585,7 +1575,7 @@ mod tests {
     /// JR NZ, e (0x20) — Z set, condition false, jump not taken. PC = 2. 8 cycles.
     #[test]
     fn test_jr_nz_not_taken_when_z_set() {
-        let mut cpu = make_test_cpu(vec![0x20, 0x03]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x20, 0x03]).with_registers(Registers {
             f: Flags::Z,
             ..Default::default()
         });
@@ -1600,7 +1590,7 @@ mod tests {
     /// AND B: A=0xFF, B=0x0F -> A=0x0F, H=1, Z=0, N=0, C=0
     #[test]
     fn test_and8_reg_b() {
-        let mut cpu = make_test_cpu(vec![0xA0]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xA0]).with_registers(Registers {
             a: 0xFF,
             b: 0x0F,
             ..Default::default()
@@ -1615,7 +1605,7 @@ mod tests {
     /// AND A when A=0: A = 0 & 0 = 0, Z=1, H=1, N=0, C=0
     #[test]
     fn test_and8_a_zero_result() {
-        let mut cpu = make_test_cpu(vec![0xA7]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xA7]).with_registers(Registers {
             a: 0x00,
             ..Default::default()
         });
@@ -1629,7 +1619,7 @@ mod tests {
     /// AND n (immediate): A=0xF0, n=0x3C -> A=0x30, H=1, Z=0
     #[test]
     fn test_and8_imm8() {
-        let mut cpu = make_test_cpu(vec![0xE6, 0x3C]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xE6, 0x3C]).with_registers(Registers {
             a: 0xF0,
             ..Default::default()
         });
@@ -1643,7 +1633,7 @@ mod tests {
     /// OR C: A=0xF0, C=0x0F -> A=0xFF, H=0, Z=0, N=0, C=0
     #[test]
     fn test_or8_reg_c() {
-        let mut cpu = make_test_cpu(vec![0xB1]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xB1]).with_registers(Registers {
             a: 0xF0,
             c: 0x0F,
             ..Default::default()
@@ -1658,7 +1648,7 @@ mod tests {
     /// OR n with result 0: A=0x00, n=0x00 -> Z=1, all others clear
     #[test]
     fn test_or8_imm8_zero_result() {
-        let mut cpu = make_test_cpu(vec![0xF6, 0x00]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xF6, 0x00]).with_registers(Registers {
             a: 0x00,
             ..Default::default()
         });
@@ -1672,7 +1662,7 @@ mod tests {
     /// XOR A (self): always produces 0, Z=1, N=0, H=0, C=0
     #[test]
     fn test_xor8_a_self() {
-        let mut cpu = make_test_cpu(vec![0xAF]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0xAF]).with_registers(Registers {
             a: 0x42,
             ..Default::default()
         });
@@ -1688,7 +1678,7 @@ mod tests {
     fn test_xor8_mem_hl() {
         let mut mem = FakeMemory::new();
         mem.set(0xC000, 0x0F);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0xAE]).set_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0xAE]).with_registers(Registers {
             a: 0xFF,
             h: 0xC0,
             l: 0x00,
@@ -1747,7 +1737,7 @@ mod tests {
     /// ROM: [0x08, 0x00, 0xC0] SP=0xBEEF -> memory[0xC000]=0xEF, memory[0xC001]=0xBE.
     #[test]
     fn test_ld16_nn_sp() {
-        let mut cpu = make_test_cpu(vec![0x08, 0x00, 0xC0]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x08, 0x00, 0xC0]).with_registers(Registers {
             sp: 0xBEEF,
             ..Default::default()
         });
@@ -1763,7 +1753,7 @@ mod tests {
     fn test_ld16_sp_hl() {
         let mut registers = Registers::default();
         registers.set_hl(0xDEAD);
-        let mut cpu = make_test_cpu(vec![0xF9]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0xF9]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1776,7 +1766,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.a = 0x42;
         registers.set_bc(0xC000);
-        let mut cpu = make_test_cpu(vec![0x02]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x02]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1790,7 +1780,7 @@ mod tests {
         mem.set(0xC005, 0x77);
         let mut registers = Registers::default();
         registers.set_de(0xC005);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x1A]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x1A]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1803,7 +1793,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.a = 0xAB;
         registers.set_hl(0xC010);
-        let mut cpu = make_test_cpu(vec![0x22]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x22]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1818,7 +1808,7 @@ mod tests {
         mem.set(0xC020, 0x55);
         let mut registers = Registers::default();
         registers.set_hl(0xC020);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x3A]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0x3A]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1831,7 +1821,7 @@ mod tests {
     fn test_ld16_nn_a() {
         let mut registers = Registers::default();
         registers.a = 0xCC;
-        let mut cpu = make_test_cpu(vec![0xEA, 0x30, 0xC0]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0xEA, 0x30, 0xC0]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 16);
@@ -1844,7 +1834,7 @@ mod tests {
     fn test_ld16_ldh_n_a() {
         let mut registers = Registers::default();
         registers.a = 0x11;
-        let mut cpu = make_test_cpu(vec![0xE0, 0x80]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0xE0, 0x80]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 12);
@@ -1858,7 +1848,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.a = 0x22;
         registers.c = 0x80;
-        let mut cpu = make_test_cpu(vec![0xE2]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0xE2]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1870,7 +1860,7 @@ mod tests {
     /// NOP (0x00): PC advances by 1, no registers changed.
     #[test]
     fn test_nop_advances_pc() {
-        let mut cpu = make_test_cpu(vec![0x00]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x00]).with_registers(Registers {
             ..Default::default()
         });
         let cycles = cpu.tick().unwrap();
@@ -1903,7 +1893,7 @@ mod tests {
     /// CPL (0x2F): A = ~A, N=1, H=1.
     #[test]
     fn test_cpl_complements_a() {
-        let mut cpu = make_test_cpu(vec![0x2F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x2F]).with_registers(Registers {
             a: 0b10110011,
             ..Default::default()
         });
@@ -1918,7 +1908,7 @@ mod tests {
     /// CPL preserves Z and C flags.
     #[test]
     fn test_cpl_preserves_z_and_c_flags() {
-        let mut cpu = make_test_cpu(vec![0x2F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x2F]).with_registers(Registers {
             a: 0xFF,
             f: Flags::Z | Flags::C,
             ..Default::default()
@@ -1935,7 +1925,7 @@ mod tests {
     /// SCF (0x37): C=1, N=0, H=0, Z unchanged.
     #[test]
     fn test_scf_sets_carry() {
-        let mut cpu = make_test_cpu(vec![0x37]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x37]).with_registers(Registers {
             f: Flags::Z | Flags::N | Flags::H,
             ..Default::default()
         });
@@ -1951,7 +1941,7 @@ mod tests {
     /// CCF with C set (0x3F): C should be cleared.
     #[test]
     fn test_ccf_clears_carry_when_set() {
-        let mut cpu = make_test_cpu(vec![0x3F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x3F]).with_registers(Registers {
             f: Flags::C,
             ..Default::default()
         });
@@ -1966,7 +1956,7 @@ mod tests {
     /// CCF with C clear (0x3F): C should be set.
     #[test]
     fn test_ccf_sets_carry_when_clear() {
-        let mut cpu = make_test_cpu(vec![0x3F]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x3F]).with_registers(Registers {
             f: Flags::empty(),
             ..Default::default()
         });
@@ -1982,7 +1972,7 @@ mod tests {
         // ADD A, B (0x80) then DAA (0x27)
         // A=0x08, B=0x09: (0x8+0x9=0x11), (8&0xF)+(9&0xF)=17>15 => H flag set
         // DAA: H=1 so add 0x06 -> 0x11+0x06=0x17
-        let mut cpu = make_test_cpu(vec![0x80, 0x27]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x80, 0x27]).with_registers(Registers {
             a: 0x08,
             b: 0x09,
             ..Default::default()
@@ -2017,7 +2007,7 @@ mod tests {
     /// B=0x05. Expected: B=0x06, Z=0, N=0, H=0, C unchanged.
     #[test]
     fn test_inc8_b() {
-        let mut cpu = make_test_cpu(vec![0x04]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x04]).with_registers(Registers {
             b: 0x05,
             ..Default::default()
         });
@@ -2031,7 +2021,7 @@ mod tests {
     /// INC B rollover (0xFF → 0x00): Z set, H set, C unchanged (C preserved).
     #[test]
     fn test_inc8_b_rollover() {
-        let mut cpu = make_test_cpu(vec![0x04]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x04]).with_registers(Registers {
             b: 0xFF,
             f: Flags::C,
             ..Default::default()
@@ -2046,7 +2036,7 @@ mod tests {
     /// INC B half-carry: lower nibble 0x0F → 0x10 sets H.
     #[test]
     fn test_inc8_b_half_carry() {
-        let mut cpu = make_test_cpu(vec![0x04]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x04]).with_registers(Registers {
             b: 0x0F,
             ..Default::default()
         });
@@ -2061,7 +2051,7 @@ mod tests {
     /// C=0x05. Expected: C=0x04, N=1, Z=0, H=0.
     #[test]
     fn test_dec8_c() {
-        let mut cpu = make_test_cpu(vec![0x0D]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0D]).with_registers(Registers {
             c: 0x05,
             ..Default::default()
         });
@@ -2075,7 +2065,7 @@ mod tests {
     /// DEC C to zero: Z set.
     #[test]
     fn test_dec8_c_to_zero() {
-        let mut cpu = make_test_cpu(vec![0x0D]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0D]).with_registers(Registers {
             c: 0x01,
             ..Default::default()
         });
@@ -2089,7 +2079,7 @@ mod tests {
     /// DEC C half-borrow: lower nibble 0x10 → 0x0F. H set.
     #[test]
     fn test_dec8_c_half_borrow() {
-        let mut cpu = make_test_cpu(vec![0x0D]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0D]).with_registers(Registers {
             c: 0x10,
             ..Default::default()
         });
@@ -2103,7 +2093,7 @@ mod tests {
     /// DEC C preserves C flag.
     #[test]
     fn test_dec8_c_preserves_carry() {
-        let mut cpu = make_test_cpu(vec![0x0D]).set_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x0D]).with_registers(Registers {
             c: 0x05,
             f: Flags::C,
             ..Default::default()
@@ -2123,7 +2113,7 @@ mod tests {
         let mut memory = GameBoyMemory::with_rom(vec![0x34, 0x7E]);
         memory.write(0xC000, 0x07).unwrap();
         let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).set_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -2135,7 +2125,7 @@ mod tests {
 
         // Verify memory was updated by loading via LD A,(HL)
         let regs = cpu.registers();
-        cpu = cpu.set_registers(Registers { a: 0x00, ..regs });
+        cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
         let cycles2 = cpu.tick().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x08);
@@ -2148,7 +2138,7 @@ mod tests {
         let mut memory = GameBoyMemory::with_rom(vec![0x35, 0x7E]);
         memory.write(0xC000, 0x07).unwrap();
         let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).set_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -2160,7 +2150,7 @@ mod tests {
 
         // Verify memory was updated by loading via LD A,(HL)
         let regs = cpu.registers();
-        cpu = cpu.set_registers(Registers { a: 0x00, ..regs });
+        cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
         let cycles2 = cpu.tick().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x06);
@@ -2173,7 +2163,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.set_bc(0x00FF);
         registers.f = Flags::Z | Flags::N | Flags::H | Flags::C; // all flags set
-        let mut cpu = make_test_cpu(vec![0x03]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x03]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2186,7 +2176,7 @@ mod tests {
     fn test_inc16_bc_rollover() {
         let mut registers = Registers::default();
         registers.set_bc(0xFFFF);
-        let mut cpu = make_test_cpu(vec![0x03]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x03]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2201,7 +2191,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0x0100;
         registers.f = Flags::Z | Flags::C;
-        let mut cpu = make_test_cpu(vec![0x3B]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x3B]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2214,7 +2204,7 @@ mod tests {
     fn test_inc16_hl() {
         let mut registers = Registers::default();
         registers.set_hl(0x1234);
-        let mut cpu = make_test_cpu(vec![0x23]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x23]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2228,7 +2218,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.set_hl(0x1234);
         registers.f = Flags::N | Flags::H;
-        let mut cpu = make_test_cpu(vec![0x2B]).set_registers(registers);
+        let mut cpu = make_test_cpu(vec![0x2B]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2244,8 +2234,8 @@ mod tests {
         registers.set_bc(0xABCD);
         registers.sp = 0xC010;
         // PUSH BC = 0xC5, then POP DE = 0xD1 to verify round-trip via registers
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC5, 0xD1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xC5, 0xD1])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap(); // PUSH BC
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().sp, 0xC00E);
@@ -2261,15 +2251,15 @@ mod tests {
         registers.f = Flags::Z | Flags::C;
         registers.sp = 0xC010;
         // PUSH AF = 0xF5, then POP AF = 0xF1 round-trip
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1])
+            .with_registers(registers);
         cpu.tick().unwrap(); // PUSH AF
         assert_eq!(cpu.registers().sp, 0xC00E);
         // Clear A and F to confirm POP restores them
         let mut cleared = cpu.registers();
         cleared.a = 0x00;
         cleared.f = Flags::empty();
-        let cpu = cpu.set_registers(cleared);
+        let cpu = cpu.with_registers(cleared);
         let mut cpu = cpu;
         cpu.tick().unwrap(); // POP AF
         assert_eq!(cpu.registers().a, 0x12);
@@ -2283,8 +2273,8 @@ mod tests {
         registers.set_hl(0xABCD);
         registers.sp = 0xC010;
         // PUSH HL = 0xE5, POP BC = 0xC1
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1])
+            .with_registers(registers);
         cpu.tick().unwrap(); // PUSH HL
         let cycles = cpu.tick().unwrap(); // POP BC
 
@@ -2300,13 +2290,13 @@ mod tests {
         registers.f = Flags::Z | Flags::H;
         registers.sp = 0xC010;
         // PUSH AF = 0xF5, clear registers, POP AF = 0xF1
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1])
+            .with_registers(registers);
         cpu.tick().unwrap(); // PUSH AF
         let mut cleared = cpu.registers();
         cleared.a = 0x00;
         cleared.f = Flags::empty();
-        let mut cpu = cpu.set_registers(cleared);
+        let mut cpu = cpu.with_registers(cleared);
         cpu.tick().unwrap(); // POP AF
 
         assert_eq!(cpu.registers().a, 0x42);
@@ -2323,7 +2313,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC00E;
         // POP AF = 0xF1
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0xF1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(mem, vec![0xF1]).with_registers(registers);
         cpu.tick().unwrap();
 
         assert_eq!(cpu.registers().f.bits() & 0x0F, 0x00);
@@ -2335,8 +2325,8 @@ mod tests {
         registers.set_hl(0x1234);
         registers.sp = 0xC010;
         // PUSH HL = 0xE5, POP BC = 0xC1
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1])
+            .with_registers(registers);
         cpu.tick().unwrap(); // PUSH HL
         cpu.tick().unwrap(); // POP BC
 
@@ -2354,7 +2344,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCD, 0x50, 0x00])
-            .set_registers(registers);
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 24);
@@ -2374,7 +2364,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC010;
         let rom = vec![0xCD, 0x05, 0x00, 0x00, 0x00, 0xC9];
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), rom).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), rom).with_registers(registers);
         cpu.tick().unwrap(); // CALL 0x0005 — PC becomes 0x0005
         assert_eq!(cpu.registers().pc, 0x0005);
         cpu.tick().unwrap(); // RET — PC becomes 0x0003
@@ -2390,7 +2380,7 @@ mod tests {
         registers.f = Flags::Z;
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xC4, 0x50, 0x00])
-            .set_registers(registers);
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 12);
@@ -2406,7 +2396,7 @@ mod tests {
         registers.f = Flags::Z;
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCC, 0x50, 0x00])
-            .set_registers(registers);
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 24);
@@ -2421,7 +2411,7 @@ mod tests {
         registers.f = Flags::Z;
         registers.sp = 0xC010;
         let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC0]).set_registers(registers);
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC0]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2434,7 +2424,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC010;
         let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCF]).set_registers(registers);
+            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCF]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 16);
@@ -2447,8 +2437,8 @@ mod tests {
         // RLC B = 0xCB 0x00, B = 0b10110001 => result = 0b01100011, carry = 1
         let mut registers = Registers::default();
         registers.b = 0b10110001;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2464,8 +2454,8 @@ mod tests {
         // RLC B = 0xCB 0x00, B = 0 => result = 0, zero flag set
         let mut registers = Registers::default();
         registers.b = 0;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00])
+            .with_registers(registers);
         cpu.tick().unwrap();
 
         assert_eq!(cpu.registers().b, 0);
@@ -2478,8 +2468,8 @@ mod tests {
         // SWAP A = 0xCB 0x37, A = 0xAB => result = 0xBA
         let mut registers = Registers::default();
         registers.a = 0xAB;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x37]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x37])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2495,8 +2485,8 @@ mod tests {
         // BIT 3, B = 0xCB 0x58, B = 0b11110111 (bit 3 = 0) => Z flag set, H flag set, N clear
         let mut registers = Registers::default();
         registers.b = 0b11110111;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2512,8 +2502,8 @@ mod tests {
         // BIT 3, B = 0xCB 0x58, B = 0b00001000 (bit 3 = 1) => Z flag clear, H flag set
         let mut registers = Registers::default();
         registers.b = 0b00001000;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58])
+            .with_registers(registers);
         cpu.tick().unwrap();
 
         assert!(!cpu.registers().f.contains(Flags::Z));
@@ -2526,8 +2516,8 @@ mod tests {
         // RES 3, B = 0xCB 0x98, B = 0xFF => result = 0xF7
         let mut registers = Registers::default();
         registers.b = 0xFF;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x98]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x98])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2539,8 +2529,8 @@ mod tests {
         // SET 3, B = 0xCB 0xD8, B = 0x00 => result = 0x08
         let mut registers = Registers::default();
         registers.b = 0x00;
-        let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0xD8]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0xD8])
+            .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2554,7 +2544,7 @@ mod tests {
         memory.write(0xC000, 0b10110001).unwrap();
         let mut registers = Registers::default();
         registers.set_hl(0xC000);
-        let mut cpu = make_test_cpu_with_memory(memory, vec![0xCB, 0x06]).set_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(memory, vec![0xCB, 0x06]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 16);

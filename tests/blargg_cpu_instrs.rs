@@ -32,11 +32,11 @@ fn run_rom(path: &str) -> String {
 
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
     let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder);
-
-    // Skip the boot ROM — jump straight to the cartridge entry point.
-    cpu.set_pc(0x0100);
-    cpu.set_sp(0xFFFE);
+    let mut cpu = Sm83::new(memory, decoder).with_registers(rustyboy::cpu::registers::Registers {
+        pc: 0x0100,
+        sp: 0xFFFE,
+        ..Default::default()
+    });
 
     let serial = Rc::new(RefCell::new(SerialPort::new()));
     cpu.subscribe_peripheral(0xFF02..=0xFF02, Box::new(SharedSerial(serial.clone())));
