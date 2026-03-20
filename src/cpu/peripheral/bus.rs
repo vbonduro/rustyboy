@@ -23,6 +23,12 @@ impl PeripheralBus {
 
     pub fn flush(&mut self, mem: &mut dyn Memory) {
         let events = mem.drain_events();
+        self.dispatch(events, mem);
+    }
+
+    /// Dispatch pre-drained events to subscribers. Used when the caller needs to
+    /// drain memory and call flush as separate borrows (e.g. from within Sm83::tick).
+    pub fn dispatch(&mut self, events: Vec<BusEvent>, mem: &mut dyn Memory) {
         for event in &events {
             for (range, peripheral) in &mut self.subscriptions {
                 if range.contains(&event.address) {

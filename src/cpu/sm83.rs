@@ -30,6 +30,7 @@ use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
+use super::peripheral::bus::PeripheralBus;
 use super::registers::{Flags, Registers};
 
 use crate::memory::memory::{Error as MemoryError, Memory as MemoryBus};
@@ -44,6 +45,7 @@ pub struct Sm83 {
     memory: Box<dyn MemoryBus>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
+    bus: PeripheralBus,
     ime: bool,
     halted: bool,
 }
@@ -54,9 +56,19 @@ impl Sm83 {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
+            bus: PeripheralBus::new(),
             ime: false,
             halted: false,
         }
+    }
+
+    /// Subscribe a peripheral to receive bus events for the given address range.
+    pub fn subscribe_peripheral(
+        &mut self,
+        range: std::ops::RangeInclusive<u16>,
+        peripheral: Box<dyn super::peripheral::bus::Peripheral>,
+    ) {
+        self.bus.subscribe(range, peripheral);
     }
 
     // Retrieve a copy of the CPU registers.
@@ -72,6 +84,16 @@ impl Sm83 {
     /// Returns true if the CPU is halted (waiting for an interrupt).
     pub fn is_halted(&self) -> bool {
         self.halted
+    }
+
+    /// Set the program counter. Used to skip the boot ROM in integration tests.
+    pub fn set_pc(&mut self, pc: u16) {
+        self.registers.pc = pc;
+    }
+
+    /// Set the stack pointer.
+    pub fn set_sp(&mut self, sp: u16) {
+        self.registers.sp = sp;
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
@@ -204,11 +226,15 @@ impl Cpu for Sm83 {
             return Ok(4);
         }
         let opcode = self.read_next_pc()?;
-        if opcode == 0xCB {
+        let cycles = if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
-            return Ok(CbDecoder.decode(cb_opcode)?.execute(self)?);
-        }
-        Ok(self.opcodes.decode(opcode)?.execute(self)?)
+            CbDecoder.decode(cb_opcode)?.execute(self)?
+        } else {
+            self.opcodes.decode(opcode)?.execute(self)?
+        };
+        let events = self.memory.drain_events();
+        self.bus.dispatch(events, &mut *self.memory);
+        Ok(cycles)
     }
 }
 
