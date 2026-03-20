@@ -30,6 +30,11 @@ impl fmt::Display for Error {
 pub trait Memory {
     fn read(&self, address: u16) -> Result<u8, Error>;
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error>;
+    /// Drains and returns all pending bus events. Defaults to returning an empty
+    /// vec for Memory implementations that do not produce events (e.g. FakeMemory).
+    fn drain_events(&mut self) -> Vec<BusEvent> {
+        Vec::new()
+    }
 }
 
 /// Resolved mapping for a given address: which region and the offset within it.
@@ -120,11 +125,6 @@ impl GameBoyMemory {
             events: VecDeque::new(),
         }
     }
-
-    /// Drains and returns all pending bus events, clearing the internal queue.
-    pub fn drain_events(&mut self) -> Vec<BusEvent> {
-        self.events.drain(..).collect()
-    }
 }
 
 impl Memory for GameBoyMemory {
@@ -204,6 +204,10 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::Unmapped => Ok(()),
         }
+    }
+
+    fn drain_events(&mut self) -> Vec<BusEvent> {
+        self.events.drain(..).collect()
     }
 }
 
