@@ -44,6 +44,8 @@ pub struct Sm83 {
     memory: Box<dyn MemoryBus>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
+    ime: bool,
+    halted: bool,
 }
 
 impl Sm83 {
@@ -52,12 +54,24 @@ impl Sm83 {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
+            ime: false,
+            halted: false,
         }
     }
 
     // Retrieve a copy of the CPU registers.
     pub fn registers(&self) -> Registers {
         self.registers.clone()
+    }
+
+    /// Returns true if the interrupt master enable flag is set.
+    pub fn ime(&self) -> bool {
+        self.ime
+    }
+
+    /// Returns true if the CPU is halted (waiting for an interrupt).
+    pub fn is_halted(&self) -> bool {
+        self.halted
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
@@ -186,6 +200,9 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
+        if self.halted {
+            return Ok(4);
+        }
         let opcode = self.read_next_pc()?;
         if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
@@ -521,7 +538,7 @@ impl Instructions for Sm83 {
                 // No operation
             }
             MiscOp::Halt => {
-                // Halt CPU until interrupt — for now just return cycles
+                self.halted = true;
             }
             MiscOp::Stop => {
                 // Consume the next byte (should be 0x00)
@@ -550,10 +567,10 @@ impl Instructions for Sm83 {
                 self.registers.f.set(Flags::C, !c);
             }
             MiscOp::Di => {
-                // Disable interrupts — IME not yet implemented
+                self.ime = false;
             }
             MiscOp::Ei => {
-                // Enable interrupts — IME not yet implemented
+                self.ime = true;
             }
         }
         Ok(opcode.cycles)
@@ -2515,5 +2532,51 @@ mod tests {
         assert_eq!(cpu.memory.read(0xC000).unwrap(), 0b01100011);
         assert!(cpu.registers().f.contains(Flags::C));
         assert!(!cpu.registers().f.contains(Flags::Z));
+    }
+
+    // --- IME and HALT ---
+
+    #[test]
+    fn test_ime_starts_false() {
+        let cpu = make_test_cpu(vec![0x00]);
+        assert!(!cpu.is_halted());
+    }
+
+    #[test]
+    fn test_di_clears_ime() {
+        // DI = 0xF3
+        let mut cpu = make_test_cpu(vec![0xFB, 0xF3]); // EI then DI
+        cpu.tick().unwrap(); // EI
+        cpu.tick().unwrap(); // DI
+        assert!(!cpu.ime());
+    }
+
+    #[test]
+    fn test_ei_sets_ime() {
+        // EI = 0xFB
+        let mut cpu = make_test_cpu(vec![0xFB]);
+        cpu.tick().unwrap();
+        assert!(cpu.ime());
+    }
+
+    #[test]
+    fn test_halt_sets_halted() {
+        // HALT = 0x76
+        let mut cpu = make_test_cpu(vec![0x76]);
+        assert!(!cpu.is_halted());
+        cpu.tick().unwrap();
+        assert!(cpu.is_halted());
+    }
+
+    #[test]
+    fn test_halted_cpu_returns_4_cycles_without_advancing_pc() {
+        // HALT then NOP — halted CPU should not execute NOP
+        let mut cpu = make_test_cpu(vec![0x76, 0x00]);
+        cpu.tick().unwrap(); // executes HALT, sets halted
+        let pc_after_halt = cpu.registers().pc;
+
+        let cycles = cpu.tick().unwrap(); // should return early, not execute NOP
+        assert_eq!(cycles, 4);
+        assert_eq!(cpu.registers().pc, pc_after_halt); // PC did not advance
     }
 }
