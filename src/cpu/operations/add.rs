@@ -20,22 +20,18 @@ pub fn add_u8(a: u8, b: u8) -> (u8, Flags) {
 }
 
 /// Adds two u16 values and returns the sum and the flags.
-/// Possible Flag values:
-/// - Z: When the sum is equal to 0.
+/// Per Game Boy spec for ADD HL,rr:
+/// - Z: unchanged (not set by this function — caller must preserve it)
 /// - N: false
-/// - H: Set if overflow from bit 7.
+/// - H: Set if overflow from bit 11.
 /// - C: Set if overflow from bit 15.
 pub fn add_u16(a: u16, b: u16) -> (u16, Flags) {
     let (sum, carry) = a.overflowing_add(b);
-    let nbits: usize = 16;
-    (
-        sum,
-        Flags::from_add(
-            sum.into(),
-            carry,
-            add_has_half_carry(a.into(), b.into(), nbits),
-        ),
-    )
+    let half_carry = (a & 0x0FFF) + (b & 0x0FFF) > 0x0FFF;
+    let mut flags = Flags::empty();
+    flags.set(Flags::H, half_carry);
+    flags.set(Flags::C, carry);
+    (sum, flags)
 }
 
 /// Adds two u8 values with a carry bit and returns the sum and the flags.
@@ -112,10 +108,12 @@ mod tests {
     }
 
     #[test]
-    fn test_add_u16_zero_flag() {
+    fn test_add_u16_zero_result_does_not_set_z() {
+        // ADD HL,rr spec: Z is unchanged — add_u16 must NOT set Z even when result is 0
         let (sum, flags) = add_u16(0, 0);
         assert_eq!(sum, 0);
-        assert_eq!(flags, Flags::Z);
+        assert!(!flags.contains(Flags::Z));
+        assert!(!flags.contains(Flags::N));
     }
 
     #[test]
@@ -127,23 +125,29 @@ mod tests {
 
     #[test]
     fn test_add_u16_half_carry() {
-        let (sum, flags) = add_u16(255, 1);
-        assert_eq!(sum, 256);
-        assert_eq!(flags, Flags::H);
+        // Half-carry for ADD HL,rr is at bit 11 (overflow from lower 12 bits)
+        let (sum, flags) = add_u16(0x0FFF, 1);
+        assert_eq!(sum, 0x1000);
+        assert!(flags.contains(Flags::H));
+        assert!(!flags.contains(Flags::C));
     }
 
     #[test]
     fn test_add_u16_almost_half_carry() {
-        let (sum, flags) = add_u16(254, 1);
-        assert_eq!(sum, 255);
-        assert_eq!(flags, Flags::empty());
+        let (sum, flags) = add_u16(0x0FFE, 1);
+        assert_eq!(sum, 0x0FFF);
+        assert!(!flags.contains(Flags::H));
     }
 
     #[test]
     fn test_add_u16_rollover() {
+        // Z not set — caller is responsible for preserving existing Z flag
         let (sum, flags) = add_u16(65535, 1);
         assert_eq!(sum, 0);
-        assert_eq!(flags, Flags::Z | Flags::C | Flags::H);
+        assert!(flags.contains(Flags::C));
+        assert!(flags.contains(Flags::H));
+        assert!(!flags.contains(Flags::Z));
+        assert!(!flags.contains(Flags::N));
     }
 
     #[test]
