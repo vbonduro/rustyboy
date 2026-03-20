@@ -1,6 +1,6 @@
-mod cpu;
-mod instructions;
+pub mod cpu;
+pub mod instructions;
 mod operations;
 pub mod peripheral;
-mod registers;
-mod sm83;
+pub mod registers;
+pub mod sm83;
