@@ -49,8 +49,8 @@ enum RegionMapping {
     /// I/O registers: 0xFF00–0xFF7F
     Io(u16),
     Hram(u16),
-    /// Interrupt Enable register: 0xFFFF
-    InterruptEnable,
+    /// 0xFFFF write-only event sink: queues a BusEvent but stores nothing.
+    InterruptEnableEvent,
     Unmapped,
 }
 
@@ -65,7 +65,7 @@ impl RegionMapping {
             0xFE00..=0xFE9F => RegionMapping::Oam(address - 0xFE00),
             0xFF00..=0xFF7F => RegionMapping::Io(address - 0xFF00),
             0xFF80..=0xFFFE => RegionMapping::Hram(address - 0xFF80),
-            0xFFFF => RegionMapping::InterruptEnable,
+            0xFFFF => RegionMapping::InterruptEnableEvent,
             _ => RegionMapping::Unmapped,
         }
     }
@@ -90,7 +90,6 @@ pub struct GameBoyMemory {
     oam: Ram,
     io: Ram,
     hram: Ram,
-    ie: u8,
     events: VecDeque<BusEvent>,
 }
 
@@ -104,7 +103,6 @@ impl GameBoyMemory {
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
-            ie: 0,
             events: VecDeque::new(),
         }
     }
@@ -121,7 +119,6 @@ impl GameBoyMemory {
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
-            ie: 0,
             events: VecDeque::new(),
         }
     }
@@ -161,7 +158,7 @@ impl Memory for GameBoyMemory {
                 .hram
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::InterruptEnable => Ok(self.ie),
+            RegionMapping::InterruptEnableEvent => Ok(0xFF),
             RegionMapping::Unmapped => Ok(0xFF),
         }
     }
@@ -197,8 +194,7 @@ impl Memory for GameBoyMemory {
                 .hram
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::InterruptEnable => {
-                self.ie = value;
+            RegionMapping::InterruptEnableEvent => {
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
@@ -343,19 +339,19 @@ mod tests {
         assert_eq!(mem.read(0xFF01).unwrap(), 0x00);
     }
 
-    // --- IE register (0xFFFF) ---
+    // --- IE register (0xFFFF) — event-only, not stored in memory ---
 
     #[test]
-    fn test_ie_write_then_read() {
+    fn test_ie_write_produces_bus_event_and_reads_as_unmapped() {
         let mut mem = GameBoyMemory::new();
         mem.write(0xFFFF, 0x1F).unwrap();
-        assert_eq!(mem.read(0xFFFF).unwrap(), 0x1F);
-    }
-
-    #[test]
-    fn test_ie_zero_initialized() {
-        let mem = GameBoyMemory::new();
-        assert_eq!(mem.read(0xFFFF).unwrap(), 0x00);
+        // IE is owned by InterruptController via the bus; memory returns 0xFF (unmapped)
+        assert_eq!(mem.read(0xFFFF).unwrap(), 0xFF);
+        // But the write still queued a BusEvent for the peripheral bus
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].address, 0xFFFF);
+        assert_eq!(events[0].value, 0x1F);
     }
 
     // --- Unmapped regions ---
@@ -390,16 +386,6 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].address, 0xFF01);
         assert_eq!(events[0].value, 0x48);
-    }
-
-    #[test]
-    fn test_ie_write_produces_bus_event() {
-        let mut mem = GameBoyMemory::new();
-        mem.write(0xFFFF, 0x1F).unwrap();
-        let events = mem.drain_events();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].address, 0xFFFF);
-        assert_eq!(events[0].value, 0x1F);
     }
 
     #[test]

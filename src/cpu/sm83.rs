@@ -31,9 +31,13 @@ use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
 use super::peripheral::bus::PeripheralBus;
+use super::peripheral::interrupt::{InterruptController, SharedInterruptController};
 use super::registers::{Flags, Registers};
 
 use crate::memory::memory::{Error as MemoryError, Memory as MemoryBus};
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 impl From<MemoryError> for InstructionError {
     fn from(error: MemoryError) -> Self {
@@ -46,6 +50,7 @@ pub struct Sm83 {
     registers: Registers,
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
+    interrupt_controller: Rc<RefCell<InterruptController>>,
     ime: bool,
     /// EI enables IME with a 1-instruction delay. When true, IME is set after the next instruction.
     ime_pending: bool,
@@ -54,11 +59,22 @@ pub struct Sm83 {
 
 impl Sm83 {
     pub fn new(memory: Box<dyn MemoryBus>, opcode_decoder: Box<dyn Decoder>) -> Self {
+        let ic = Rc::new(RefCell::new(InterruptController::new()));
+        let mut bus = PeripheralBus::new();
+        bus.subscribe(
+            0xFF0F..=0xFF0F,
+            Box::new(SharedInterruptController(ic.clone())),
+        );
+        bus.subscribe(
+            0xFFFF..=0xFFFF,
+            Box::new(SharedInterruptController(ic.clone())),
+        );
         Self {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
-            bus: PeripheralBus::new(),
+            bus,
+            interrupt_controller: ic,
             ime: false,
             ime_pending: false,
             halted: false,
@@ -96,25 +112,11 @@ impl Sm83 {
         self
     }
 
-    /// Returns the pending interrupt bit (lowest set bit in IE & IF), or None.
-    fn pending_interrupt(&self) -> Option<u8> {
-        let ie = self.memory.read(0xFFFF).unwrap_or(0);
-        let if_ = self.memory.read(0xFF0F).unwrap_or(0);
-        let pending = ie & if_;
-        if pending == 0 {
-            None
-        } else {
-            Some(pending.trailing_zeros() as u8)
-        }
-    }
-
-    /// Dispatch the highest-priority pending interrupt. Clears IME, clears IF bit,
-    /// pushes PC, jumps to vector. Returns the cycle cost (20 cycles).
+    /// Dispatch the highest-priority pending interrupt. Clears IME, pushes PC,
+    /// jumps to vector. IF bit already cleared by `InterruptController::take_pending`.
+    /// Returns the cycle cost (20 cycles).
     fn dispatch_interrupt(&mut self, bit: u8) -> Result<u8, InstructionError> {
         self.ime = false;
-        // Clear the bit in IF
-        let if_ = self.memory.read(0xFF0F).unwrap_or(0);
-        self.memory.write(0xFF0F, if_ & !(1 << bit))?;
         // Push current PC
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.memory.write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
@@ -254,7 +256,7 @@ impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
         // HALT: wake on pending interrupt (regardless of IME), else burn 4 cycles
         if self.halted {
-            if self.pending_interrupt().is_some() {
+            if self.interrupt_controller.borrow().has_pending() {
                 self.halted = false;
             } else {
                 return Ok(4);
@@ -280,7 +282,8 @@ impl Cpu for Sm83 {
 
         // Interrupt dispatch: after instruction, if IME and interrupt pending
         if self.ime {
-            if let Some(bit) = self.pending_interrupt() {
+            let pending_bit = self.interrupt_controller.borrow_mut().take_pending();
+            if let Some(bit) = pending_bit {
                 self.dispatch_interrupt(bit)?;
                 return Ok(cycles + 20);
             }
@@ -2673,23 +2676,27 @@ mod tests {
         // Set up: IE=1 (VBlank enabled), IF=1 (VBlank pending), IME=true
         // ROM: EI (0xFB), NOP (0x00), then padding
         let mut cpu = make_test_cpu(vec![0xFB, 0x00, 0x00, 0x00]);
-        // Set SP, IE, IF via memory
         let mut regs = Registers::default();
         regs.sp = 0xDFFE;
         cpu = cpu.with_registers(regs);
-        // Write IE=1 and IF=1 directly
+        // Set IE/IF directly on the interrupt controller
+        {
+            let mut ic = cpu.interrupt_controller.borrow_mut();
+            ic.request(0); // IF bit 0: VBlank pending
+            // Enable bit 0 in IE by writing through the ic fields directly
+        }
+        // Set IE via memory write — will be flushed on first tick
         cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE: VBlank enabled
-        cpu.memory.write(0xFF0F, 0x01).unwrap(); // IF: VBlank pending
 
-        cpu.tick().unwrap(); // EI (ime_pending=true, IME still false)
-        cpu.tick().unwrap(); // NOP (IME becomes true, interrupt dispatched after)
+        cpu.tick().unwrap(); // EI — flushes memory events (IE=1 reaches IC), ime_pending=true
+        cpu.tick().unwrap(); // NOP — IME becomes true, interrupt dispatched after
 
         // PC should now be at VBlank vector 0x0040
         assert_eq!(cpu.registers().pc, 0x0040);
         // SP decremented by 2
         assert_eq!(cpu.registers().sp, 0xDFFC);
-        // IF bit 0 cleared
-        assert_eq!(cpu.memory.read(0xFF0F).unwrap(), 0x00);
+        // IF bit 0 cleared in interrupt controller
+        assert!(!cpu.interrupt_controller.borrow().has_pending());
         // IME cleared during dispatch
         assert!(!cpu.ime());
     }
@@ -2698,10 +2705,14 @@ mod tests {
     fn test_halt_resumes_when_interrupt_pending() {
         // HALT with IE=1, IF=1 but IME=false: CPU wakes but doesn't dispatch
         let mut cpu = make_test_cpu(vec![0x76, 0x00]); // HALT, NOP
-        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE
-        cpu.memory.write(0xFF0F, 0x01).unwrap(); // IF
+        // Set IE/IF directly on the interrupt controller
+        {
+            let mut ic = cpu.interrupt_controller.borrow_mut();
+            ic.request(0); // IF bit 0 set
+        }
+        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE — flushed on first tick
 
-        cpu.tick().unwrap(); // HALT — sets halted=true
+        cpu.tick().unwrap(); // HALT — sets halted=true, flushes IE to IC
         assert!(cpu.is_halted()); // still halted after HALT instruction
         // Next tick: wakes (IE&IF!=0, even with IME=false), executes NOP
         let cycles = cpu.tick().unwrap();
