@@ -128,9 +128,10 @@ fn test_blargg_11_op_a_hl() {
 }
 
 // --- Known failing tests (red phase for future TDD) ---
+// 02-interrupts: interrupt dispatch works; fails on Timer (TIMA/TMA/TAC not implemented)
 
 #[test]
-#[ignore = "requires interrupt dispatch: IME/IE/IF not yet implemented"]
+#[ignore = "requires Timer peripheral (TIMA/TMA/TAC)"]
 fn test_blargg_02_interrupts() {
     assert_passed(
         &run_rom("roms/blargg/cpu_instrs/individual/02-interrupts.gb"),
