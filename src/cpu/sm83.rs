@@ -45,15 +45,22 @@ impl From<MemoryError> for InstructionError {
     }
 }
 
+/// Interrupt Master Enable state. EI has a 1-instruction delay before IME becomes active.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum ImeState {
+    Disabled,
+    /// EI was just executed — IME activates after the next instruction.
+    Pending,
+    Enabled,
+}
+
 pub struct Sm83 {
     memory: Box<dyn MemoryBus>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
     interrupt_controller: Rc<RefCell<InterruptController>>,
-    ime: bool,
-    /// EI enables IME with a 1-instruction delay. When true, IME is set after the next instruction.
-    ime_pending: bool,
+    ime: ImeState,
     halted: bool,
 }
 
@@ -75,8 +82,7 @@ impl Sm83 {
             opcodes: opcode_decoder,
             bus,
             interrupt_controller: ic,
-            ime: false,
-            ime_pending: false,
+            ime: ImeState::Disabled,
             halted: false,
         }
     }
@@ -95,9 +101,9 @@ impl Sm83 {
         self.registers.clone()
     }
 
-    /// Returns true if the interrupt master enable flag is set.
+    /// Returns true if the interrupt master enable flag is active.
     pub fn ime(&self) -> bool {
-        self.ime
+        self.ime == ImeState::Enabled
     }
 
     /// Returns true if the CPU is halted (waiting for an interrupt).
@@ -116,7 +122,7 @@ impl Sm83 {
     /// jumps to vector. IF bit already cleared by `InterruptController::take_pending`.
     /// Returns the cycle cost (20 cycles).
     fn dispatch_interrupt(&mut self, bit: u8) -> Result<u8, InstructionError> {
-        self.ime = false;
+        self.ime = ImeState::Disabled;
         // Push current PC
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.memory.write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
@@ -264,9 +270,8 @@ impl Cpu for Sm83 {
         }
 
         // EI delay: IME becomes active one instruction after EI
-        if self.ime_pending {
-            self.ime = true;
-            self.ime_pending = false;
+        if self.ime == ImeState::Pending {
+            self.ime = ImeState::Enabled;
         }
 
         let opcode = self.read_next_pc()?;
@@ -281,7 +286,7 @@ impl Cpu for Sm83 {
         self.bus.dispatch(events, &mut *self.memory);
 
         // Interrupt dispatch: after instruction, if IME and interrupt pending
-        if self.ime {
+        if self.ime == ImeState::Enabled {
             let pending_bit = self.interrupt_controller.borrow_mut().take_pending();
             if let Some(bit) = pending_bit {
                 self.dispatch_interrupt(bit)?;
@@ -651,10 +656,10 @@ impl Instructions for Sm83 {
                 self.registers.f.set(Flags::C, !c);
             }
             MiscOp::Di => {
-                self.ime = false;
+                self.ime = ImeState::Disabled;
             }
             MiscOp::Ei => {
-                self.ime_pending = true;
+                self.ime = ImeState::Pending;
             }
         }
         Ok(opcode.cycles)
