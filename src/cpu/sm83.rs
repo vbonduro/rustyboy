@@ -47,6 +47,8 @@ pub struct Sm83 {
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
     ime: bool,
+    /// EI enables IME with a 1-instruction delay. When true, IME is set after the next instruction.
+    ime_pending: bool,
     halted: bool,
 }
 
@@ -58,6 +60,7 @@ impl Sm83 {
             opcodes: opcode_decoder,
             bus: PeripheralBus::new(),
             ime: false,
+            ime_pending: false,
             halted: false,
         }
     }
@@ -91,6 +94,36 @@ impl Sm83 {
     pub fn with_registers(mut self, registers: Registers) -> Self {
         self.registers = registers;
         self
+    }
+
+    /// Returns the pending interrupt bit (lowest set bit in IE & IF), or None.
+    fn pending_interrupt(&self) -> Option<u8> {
+        let ie = self.memory.read(0xFFFF).unwrap_or(0);
+        let if_ = self.memory.read(0xFF0F).unwrap_or(0);
+        let pending = ie & if_;
+        if pending == 0 {
+            None
+        } else {
+            Some(pending.trailing_zeros() as u8)
+        }
+    }
+
+    /// Dispatch the highest-priority pending interrupt. Clears IME, clears IF bit,
+    /// pushes PC, jumps to vector. Returns the cycle cost (20 cycles).
+    fn dispatch_interrupt(&mut self, bit: u8) -> Result<u8, InstructionError> {
+        self.ime = false;
+        // Clear the bit in IF
+        let if_ = self.memory.read(0xFF0F).unwrap_or(0);
+        self.memory.write(0xFF0F, if_ & !(1 << bit))?;
+        // Push current PC
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.memory.write(self.registers.sp, self.registers.pc as u8)?;
+        // Jump to handler vector
+        let vector: u16 = 0x0040 + (bit as u16) * 8;
+        self.registers.pc = vector;
+        Ok(20)
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
@@ -219,9 +252,21 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
+        // HALT: wake on pending interrupt (regardless of IME), else burn 4 cycles
         if self.halted {
-            return Ok(4);
+            if self.pending_interrupt().is_some() {
+                self.halted = false;
+            } else {
+                return Ok(4);
+            }
         }
+
+        // EI delay: IME becomes active one instruction after EI
+        if self.ime_pending {
+            self.ime = true;
+            self.ime_pending = false;
+        }
+
         let opcode = self.read_next_pc()?;
         let cycles = if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
@@ -229,8 +274,18 @@ impl Cpu for Sm83 {
         } else {
             self.opcodes.decode(opcode)?.execute(self)?
         };
+
         let events = self.memory.drain_events();
         self.bus.dispatch(events, &mut *self.memory);
+
+        // Interrupt dispatch: after instruction, if IME and interrupt pending
+        if self.ime {
+            if let Some(bit) = self.pending_interrupt() {
+                self.dispatch_interrupt(bit)?;
+                return Ok(cycles + 20);
+            }
+        }
+
         Ok(cycles)
     }
 }
@@ -596,7 +651,7 @@ impl Instructions for Sm83 {
                 self.ime = false;
             }
             MiscOp::Ei => {
-                self.ime = true;
+                self.ime_pending = true;
             }
         }
         Ok(opcode.cycles)
@@ -2572,9 +2627,11 @@ mod tests {
 
     #[test]
     fn test_ei_sets_ime() {
-        // EI = 0xFB
-        let mut cpu = make_test_cpu(vec![0xFB]);
-        cpu.tick().unwrap();
+        // EI = 0xFB, NOP = 0x00: IME becomes active after the instruction following EI
+        let mut cpu = make_test_cpu(vec![0xFB, 0x00]);
+        cpu.tick().unwrap(); // EI — ime_pending set, IME still false
+        assert!(!cpu.ime());
+        cpu.tick().unwrap(); // NOP — IME activates at start of this tick
         assert!(cpu.ime());
     }
 
@@ -2597,5 +2654,58 @@ mod tests {
         let cycles = cpu.tick().unwrap(); // should return early, not execute NOP
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().pc, pc_after_halt); // PC did not advance
+    }
+
+    // --- Interrupt dispatch ---
+
+    #[test]
+    fn test_ei_delays_one_instruction() {
+        // EI (0xFB) then NOP (0x00): IME should NOT be set until after the NOP
+        let mut cpu = make_test_cpu(vec![0xFB, 0x00]);
+        cpu.tick().unwrap(); // EI — ime_pending, but IME still false
+        assert!(!cpu.ime()); // not yet
+        cpu.tick().unwrap(); // NOP — now IME becomes true
+        assert!(cpu.ime());
+    }
+
+    #[test]
+    fn test_interrupt_dispatch_jumps_to_vector_and_pushes_pc() {
+        // Set up: IE=1 (VBlank enabled), IF=1 (VBlank pending), IME=true
+        // ROM: EI (0xFB), NOP (0x00), then padding
+        let mut cpu = make_test_cpu(vec![0xFB, 0x00, 0x00, 0x00]);
+        // Set SP, IE, IF via memory
+        let mut regs = Registers::default();
+        regs.sp = 0xDFFE;
+        cpu = cpu.with_registers(regs);
+        // Write IE=1 and IF=1 directly
+        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE: VBlank enabled
+        cpu.memory.write(0xFF0F, 0x01).unwrap(); // IF: VBlank pending
+
+        cpu.tick().unwrap(); // EI (ime_pending=true, IME still false)
+        cpu.tick().unwrap(); // NOP (IME becomes true, interrupt dispatched after)
+
+        // PC should now be at VBlank vector 0x0040
+        assert_eq!(cpu.registers().pc, 0x0040);
+        // SP decremented by 2
+        assert_eq!(cpu.registers().sp, 0xDFFC);
+        // IF bit 0 cleared
+        assert_eq!(cpu.memory.read(0xFF0F).unwrap(), 0x00);
+        // IME cleared during dispatch
+        assert!(!cpu.ime());
+    }
+
+    #[test]
+    fn test_halt_resumes_when_interrupt_pending() {
+        // HALT with IE=1, IF=1 but IME=false: CPU wakes but doesn't dispatch
+        let mut cpu = make_test_cpu(vec![0x76, 0x00]); // HALT, NOP
+        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE
+        cpu.memory.write(0xFF0F, 0x01).unwrap(); // IF
+
+        cpu.tick().unwrap(); // HALT — sets halted=true
+        assert!(cpu.is_halted()); // still halted after HALT instruction
+        // Next tick: wakes (IE&IF!=0, even with IME=false), executes NOP
+        let cycles = cpu.tick().unwrap();
+        assert!(!cpu.is_halted());
+        assert_eq!(cycles, 4); // NOP
     }
 }
