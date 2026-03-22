@@ -1,80 +1,62 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+pub(crate) const DIV_ADDR: u16 = 0xFF04;
+pub(crate) const TIMA_ADDR: u16 = 0xFF05;
+pub(crate) const TMA_ADDR: u16 = 0xFF06;
+pub(crate) const TAC_ADDR: u16 = 0xFF07;
 
-use crate::cpu::peripheral::interrupt::InterruptController;
-use crate::memory::memory::IoDevice;
-
-const DIV_ADDR: u16 = 0xFF04;
-const TIMA_ADDR: u16 = 0xFF05;
-const TMA_ADDR: u16 = 0xFF06;
-const TAC_ADDR: u16 = 0xFF07;
-
-const TIMER_INTERRUPT_BIT: u8 = 2;
+pub(crate) const TIMER_INTERRUPT_BIT: u8 = 2;
 
 /// Divisors (in T-cycles) for each TAC clock-select value.
 const CLOCK_DIVISORS: [u16; 4] = [1024, 16, 64, 256];
 
+/// Input snapshot passed to the timer each tick.
+pub struct TimerInput {
+    pub tima: u8,
+    pub tma: u8,
+    pub tac: u8,
+}
+
+/// Result of a timer tick — CPU writes these back to IO registers.
+pub struct TimerOutput {
+    pub tima: u8,
+    pub div: u8,
+    pub interrupt: bool,
+}
+
 /// Game Boy Timer peripheral.
 ///
-/// Owns DIV (0xFF04), TIMA (0xFF05), TMA (0xFF06), TAC (0xFF07).
-/// `tick(cycles)` must be called after every instruction with the T-cycle cost.
-/// Register reads/writes are routed through IoDevice, making this the single
-/// source of truth for timer state.
+/// Only owns the 16-bit internal counter (hidden hardware state).
+/// TIMA, TMA, TAC, and DIV live in the IO register array owned by memory;
+/// the CPU passes them in via `TimerInput` and writes back `TimerOutput`.
 pub struct TimerPeripheral {
-    /// 16-bit internal counter. DIV register is its upper byte.
     internal_counter: u16,
-    tima: u8,
-    tma: u8,
-    tac: u8,
-    interrupt_controller: Rc<RefCell<InterruptController>>,
 }
 
 impl TimerPeripheral {
-    pub fn new(interrupt_controller: Rc<RefCell<InterruptController>>) -> Self {
+    pub fn new() -> Self {
         Self {
             internal_counter: 0,
-            tima: 0,
-            tma: 0,
-            tac: 0,
-            interrupt_controller,
         }
     }
 
-    /// Read a timer register.
-    pub fn read(&self, address: u16) -> u8 {
-        match address {
-            DIV_ADDR => (self.internal_counter >> 8) as u8,
-            TIMA_ADDR => self.tima,
-            TMA_ADDR => self.tma,
-            TAC_ADDR => self.tac,
-            _ => 0,
-        }
+    /// Upper byte of the internal counter (the DIV register value).
+    pub fn div(&self) -> u8 {
+        (self.internal_counter >> 8) as u8
     }
 
-    /// Write a timer register.
-    pub fn write_register(&mut self, address: u16, value: u8) {
-        match address {
-            DIV_ADDR => {
-                // Any write to DIV resets the internal counter to 0.
-                self.internal_counter = 0;
-            }
-            TIMA_ADDR => {
-                self.tima = value;
-            }
-            TMA_ADDR => {
-                self.tma = value;
-            }
-            TAC_ADDR => {
-                self.tac = value;
-            }
-            _ => {}
-        }
+    /// Any write to DIV resets the internal counter to 0.
+    pub fn reset_div(&mut self) {
+        self.internal_counter = 0;
     }
 
-    /// Advance the timer by `cycles` T-cycles. Call once per CPU instruction.
-    pub fn tick(&mut self, cycles: u16) {
-        let timer_enabled = self.tac & 0x04 != 0;
-        let divisor = CLOCK_DIVISORS[(self.tac & 0x03) as usize];
+    /// Advance the timer by `cycles` T-cycles.
+    ///
+    /// Pure transform: reads register state from `input`, returns new state
+    /// in `TimerOutput`. The caller (CPU) writes the results back to memory.
+    pub fn tick(&mut self, cycles: u16, input: TimerInput) -> TimerOutput {
+        let timer_enabled = input.tac & 0x04 != 0;
+        let divisor = CLOCK_DIVISORS[(input.tac & 0x03) as usize];
+        let mut tima = input.tima;
+        let mut interrupt = false;
 
         for _ in 0..cycles {
             let prev = self.internal_counter;
@@ -82,39 +64,24 @@ impl TimerPeripheral {
 
             if timer_enabled {
                 // TIMA increments on the falling edge of the relevant bit.
-                // Divisor/2 is the bit position; it falls 1→0 every `divisor` cycles.
                 let bit = divisor / 2;
                 if prev & bit != 0 && self.internal_counter & bit == 0 {
-                    self.increment_tima();
+                    let (new_tima, overflow) = tima.overflowing_add(1);
+                    if overflow {
+                        tima = input.tma;
+                        interrupt = true;
+                    } else {
+                        tima = new_tima;
+                    }
                 }
             }
         }
-    }
 
-    fn increment_tima(&mut self) {
-        let (new_tima, overflow) = self.tima.overflowing_add(1);
-        if overflow {
-            self.tima = self.tma;
-            self.interrupt_controller
-                .borrow_mut()
-                .request(TIMER_INTERRUPT_BIT);
-        } else {
-            self.tima = new_tima;
+        TimerOutput {
+            tima,
+            div: self.div(),
+            interrupt,
         }
-    }
-}
-
-/// IoDevice wrapper so an `Rc<RefCell<TimerPeripheral>>` can be registered
-/// on GameBoyMemory for addresses 0xFF04..=0xFF07.
-pub struct SharedTimerDevice(pub Rc<RefCell<TimerPeripheral>>);
-
-impl IoDevice for SharedTimerDevice {
-    fn read(&self, address: u16) -> u8 {
-        self.0.borrow().read(address)
-    }
-
-    fn write(&mut self, address: u16, value: u8) {
-        self.0.borrow_mut().write_register(address, value);
     }
 }
 
@@ -122,155 +89,117 @@ impl IoDevice for SharedTimerDevice {
 mod tests {
     use super::*;
 
-    fn make_timer() -> (TimerPeripheral, Rc<RefCell<InterruptController>>) {
-        let ic = Rc::new(RefCell::new(InterruptController::new()));
-        let timer = TimerPeripheral::new(ic.clone());
-        (timer, ic)
+    fn tick_with(timer: &mut TimerPeripheral, cycles: u16, tac: u8, tima: u8, tma: u8) -> TimerOutput {
+        timer.tick(cycles, TimerInput { tima, tma, tac })
     }
 
     // ── Initial state ──────────────────────────────────────────────────────────
 
     #[test]
-    fn timer_new_has_zeroed_registers() {
-        let (timer, _ic) = make_timer();
-        assert_eq!(timer.read(DIV_ADDR), 0);
-        assert_eq!(timer.read(TIMA_ADDR), 0);
-        assert_eq!(timer.read(TMA_ADDR), 0);
-        assert_eq!(timer.read(TAC_ADDR), 0);
+    fn timer_new_has_zero_div() {
+        let timer = TimerPeripheral::new();
+        assert_eq!(timer.div(), 0);
     }
 
     // ── Timer disabled ─────────────────────────────────────────────────────────
 
     #[test]
     fn timer_disabled_tima_does_not_increment() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TAC_ADDR, 0x00);
+        let mut timer = TimerPeripheral::new();
+        let mut tima = 0u8;
         for _ in 0..2048 {
-            timer.tick(1);
+            let out = tick_with(&mut timer, 1, 0x00, tima, 0);
+            tima = out.tima;
         }
-        assert_eq!(timer.read(TIMA_ADDR), 0);
+        assert_eq!(tima, 0);
     }
 
     // ── TIMA increment rates ───────────────────────────────────────────────────
 
     #[test]
     fn timer_increments_tima_every_1024_cycles_at_clock_select_00() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TAC_ADDR, 0x04); // enabled, /1024
-        timer.tick(1023);
-        assert_eq!(timer.read(TIMA_ADDR), 0, "not yet");
-        timer.tick(1);
-        assert_eq!(timer.read(TIMA_ADDR), 1, "should have incremented");
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 1023, 0x04, 0, 0);
+        assert_eq!(out.tima, 0, "not yet");
+        let out = tick_with(&mut timer, 1, 0x04, out.tima, 0);
+        assert_eq!(out.tima, 1, "should have incremented");
     }
 
     #[test]
     fn timer_increments_tima_every_16_cycles_at_clock_select_01() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TAC_ADDR, 0x05); // enabled, /16
-        timer.tick(15);
-        assert_eq!(timer.read(TIMA_ADDR), 0, "not yet");
-        timer.tick(1);
-        assert_eq!(timer.read(TIMA_ADDR), 1, "should have incremented");
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 15, 0x05, 0, 0);
+        assert_eq!(out.tima, 0, "not yet");
+        let out = tick_with(&mut timer, 1, 0x05, out.tima, 0);
+        assert_eq!(out.tima, 1, "should have incremented");
     }
 
     #[test]
     fn timer_increments_tima_every_64_cycles_at_clock_select_10() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TAC_ADDR, 0x06); // enabled, /64
-        timer.tick(63);
-        assert_eq!(timer.read(TIMA_ADDR), 0, "not yet");
-        timer.tick(1);
-        assert_eq!(timer.read(TIMA_ADDR), 1, "should have incremented");
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 63, 0x06, 0, 0);
+        assert_eq!(out.tima, 0, "not yet");
+        let out = tick_with(&mut timer, 1, 0x06, out.tima, 0);
+        assert_eq!(out.tima, 1, "should have incremented");
     }
 
     #[test]
     fn timer_increments_tima_every_256_cycles_at_clock_select_11() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TAC_ADDR, 0x07); // enabled, /256
-        timer.tick(255);
-        assert_eq!(timer.read(TIMA_ADDR), 0, "not yet");
-        timer.tick(1);
-        assert_eq!(timer.read(TIMA_ADDR), 1, "should have incremented");
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 255, 0x07, 0, 0);
+        assert_eq!(out.tima, 0, "not yet");
+        let out = tick_with(&mut timer, 1, 0x07, out.tima, 0);
+        assert_eq!(out.tima, 1, "should have incremented");
     }
 
     // ── Overflow and reload ────────────────────────────────────────────────────
 
     #[test]
     fn timer_overflow_reloads_tma() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TMA_ADDR, 0x42);
-        timer.write_register(TIMA_ADDR, 0xFF);
-        timer.write_register(TAC_ADDR, 0x05); // enabled, /16
-        timer.tick(16); // one increment → overflow
-        assert_eq!(timer.read(TIMA_ADDR), 0x42);
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 16, 0x05, 0xFF, 0x42);
+        assert_eq!(out.tima, 0x42);
     }
 
     #[test]
-    fn timer_overflow_requests_interrupt_bit_2() {
-        let (mut timer, ic) = make_timer();
-        ic.borrow_mut().set_ie(0xFF); // all interrupts enabled
-        timer.write_register(TIMA_ADDR, 0xFF);
-        timer.write_register(TAC_ADDR, 0x05); // enabled, /16
-        timer.tick(16);
-        assert!(ic.borrow().has_pending(), "timer interrupt should be pending");
-        assert_eq!(
-            ic.borrow_mut().take_pending(),
-            Some(TIMER_INTERRUPT_BIT),
-            "interrupt bit should be 2"
-        );
+    fn timer_overflow_sets_interrupt_flag() {
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 16, 0x05, 0xFF, 0x00);
+        assert!(out.interrupt, "timer interrupt should be signalled");
     }
 
     #[test]
     fn timer_no_interrupt_without_overflow() {
-        let (mut timer, ic) = make_timer();
-        ic.borrow_mut().set_ie(0xFF);
-        timer.write_register(TIMA_ADDR, 0x00);
-        timer.write_register(TAC_ADDR, 0x05); // enabled, /16
-        timer.tick(16); // TIMA goes 0 → 1, no overflow
-        assert!(!ic.borrow().has_pending());
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 16, 0x05, 0x00, 0x00);
+        assert!(!out.interrupt);
     }
 
     // ── DIV register ──────────────────────────────────────────────────────────
 
     #[test]
     fn div_reflects_upper_byte_of_internal_counter() {
-        let (mut timer, _ic) = make_timer();
-        timer.tick(255);
-        assert_eq!(timer.read(DIV_ADDR), 0, "not yet");
-        timer.tick(1);
-        assert_eq!(timer.read(DIV_ADDR), 1);
+        let mut timer = TimerPeripheral::new();
+        let out = tick_with(&mut timer, 255, 0x00, 0, 0);
+        assert_eq!(out.div, 0, "not yet");
+        let out = tick_with(&mut timer, 1, 0x00, 0, 0);
+        assert_eq!(out.div, 1);
     }
 
     #[test]
-    fn div_write_resets_internal_counter_to_zero() {
-        let (mut timer, _ic) = make_timer();
-        timer.tick(256);
-        assert_eq!(timer.read(DIV_ADDR), 1);
-        timer.write_register(DIV_ADDR, 0x00); // any write resets
-        assert_eq!(timer.read(DIV_ADDR), 0);
+    fn div_reset_clears_internal_counter() {
+        let mut timer = TimerPeripheral::new();
+        tick_with(&mut timer, 256, 0x00, 0, 0);
+        assert_eq!(timer.div(), 1);
+        timer.reset_div();
+        assert_eq!(timer.div(), 0);
     }
 
     #[test]
-    fn div_write_resets_regardless_of_written_value() {
-        let (mut timer, _ic) = make_timer();
-        timer.tick(512);
-        timer.write_register(DIV_ADDR, 0xFF); // value is irrelevant
-        assert_eq!(timer.read(DIV_ADDR), 0);
-    }
-
-    // ── TMA/TIMA writes ────────────────────────────────────────────────────────
-
-    #[test]
-    fn tma_write_updates_tma() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TMA_ADDR, 0xAB);
-        assert_eq!(timer.read(TMA_ADDR), 0xAB);
-    }
-
-    #[test]
-    fn tima_write_updates_tima() {
-        let (mut timer, _ic) = make_timer();
-        timer.write_register(TIMA_ADDR, 0x77);
-        assert_eq!(timer.read(TIMA_ADDR), 0x77);
+    fn div_reset_regardless_of_counter_value() {
+        let mut timer = TimerPeripheral::new();
+        tick_with(&mut timer, 512, 0x00, 0, 0);
+        timer.reset_div();
+        assert_eq!(timer.div(), 0);
     }
 }

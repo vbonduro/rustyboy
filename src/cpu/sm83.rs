@@ -31,14 +31,12 @@ use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
 use super::peripheral::bus::PeripheralBus;
-use super::peripheral::interrupt::{InterruptController, SharedInterruptDevice};
-use super::peripheral::timer::{SharedTimerDevice, TimerPeripheral};
+use super::peripheral::timer::{
+    TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
+};
 use super::registers::{Flags, Registers};
 
-use crate::memory::memory::{Error as MemoryError, Memory as MemoryBus};
-
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::memory::memory::{Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
 
 impl From<MemoryError> for InstructionError {
     fn from(error: MemoryError) -> Self {
@@ -55,45 +53,27 @@ enum ImeState {
     Enabled,
 }
 
+const IF_ADDR: u16 = 0xFF0F;
+const IE_ADDR: u16 = 0xFFFF;
+
 pub struct Sm83 {
-    memory: Box<dyn MemoryBus>,
+    memory: Box<GameBoyMemory>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
-    interrupt_controller: Rc<RefCell<InterruptController>>,
-    timer: Rc<RefCell<TimerPeripheral>>,
+    timer: TimerPeripheral,
     ime: ImeState,
     halted: bool,
 }
 
 impl Sm83 {
-    pub fn new(mut memory: Box<dyn MemoryBus>, opcode_decoder: Box<dyn Decoder>) -> Self {
-        let ic = Rc::new(RefCell::new(InterruptController::new()));
-        let timer = Rc::new(RefCell::new(TimerPeripheral::new(ic.clone())));
-        let bus = PeripheralBus::new();
-
-        // Register IoDevices — memory reads/writes to these addresses go
-        // directly through the peripheral, making it the single source of truth.
-        memory.register_io_device(
-            0xFF0F..=0xFF0F,
-            Box::new(SharedInterruptDevice(ic.clone())),
-        );
-        memory.register_io_device(
-            0xFFFF..=0xFFFF,
-            Box::new(SharedInterruptDevice(ic.clone())),
-        );
-        memory.register_io_device(
-            0xFF04..=0xFF07,
-            Box::new(SharedTimerDevice(timer.clone())),
-        );
-
+    pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
         Self {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
-            bus,
-            interrupt_controller: ic,
-            timer,
+            bus: PeripheralBus::new(),
+            timer: TimerPeripheral::new(),
             ime: ImeState::Disabled,
             halted: false,
         }
@@ -130,20 +110,67 @@ impl Sm83 {
         self
     }
 
-    /// Dispatch the highest-priority pending interrupt. Clears IME, pushes PC,
-    /// jumps to vector. IF bit already cleared by `InterruptController::take_pending`.
-    /// Returns the cycle cost (20 cycles).
-    fn dispatch_interrupt(&mut self, bit: u8) -> Result<u8, InstructionError> {
+    // ── Tick phase helpers ──────────────────────────────────────────────────
+
+    fn advance_ime(&mut self) {
+        if self.ime == ImeState::Pending {
+            self.ime = ImeState::Enabled;
+        }
+    }
+
+    fn route_bus_events(&mut self) {
+        let events = self.memory.drain_events();
+        for event in &events {
+            if event.address == DIV_ADDR {
+                self.timer.reset_div();
+            }
+        }
+        self.bus.dispatch(events, &mut *self.memory);
+    }
+
+    fn advance_timer(&mut self, cycles: u16) {
+        let output = self.timer.tick(
+            cycles,
+            TimerInput {
+                tima: self.memory.read_io(TIMA_ADDR),
+                tma: self.memory.read_io(TMA_ADDR),
+                tac: self.memory.read_io(TAC_ADDR),
+            },
+        );
+        self.memory.write_io(TIMA_ADDR, output.tima);
+        self.memory.write_io(DIV_ADDR, output.div);
+        if output.interrupt {
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
+        }
+    }
+
+    fn has_pending_interrupt(&self) -> bool {
+        let ie = self.memory.read_io(IE_ADDR);
+        let if_val = self.memory.read_io(IF_ADDR);
+        ie & if_val != 0
+    }
+
+    fn take_pending_interrupt(&mut self) -> Option<u8> {
+        let ie = self.memory.read_io(IE_ADDR);
+        let if_val = self.memory.read_io(IF_ADDR);
+        let pending = ie & if_val;
+        if pending == 0 {
+            return None;
+        }
+        let bit = pending.trailing_zeros() as u8;
+        self.memory.write_io(IF_ADDR, if_val & !(1 << bit));
+        Some(bit)
+    }
+
+    fn dispatch_interrupt(&mut self, bit: u8) -> Result<(), InstructionError> {
         self.ime = ImeState::Disabled;
-        // Push current PC
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.memory.write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.memory.write(self.registers.sp, self.registers.pc as u8)?;
-        // Jump to handler vector
-        let vector: u16 = 0x0040 + (bit as u16) * 8;
-        self.registers.pc = vector;
-        Ok(20)
+        self.registers.pc = 0x0040 + (bit as u16) * 8;
+        Ok(())
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
@@ -272,21 +299,16 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
-        // HALT: wake on pending interrupt (regardless of IME), else burn 4 cycles.
-        // The timer continues to run while halted.
         if self.halted {
-            if self.interrupt_controller.borrow().has_pending() {
+            self.advance_timer(4);
+            if self.has_pending_interrupt() {
                 self.halted = false;
             } else {
-                self.timer.borrow_mut().tick(4);
                 return Ok(4);
             }
         }
 
-        // EI delay: IME becomes active one instruction after EI
-        if self.ime == ImeState::Pending {
-            self.ime = ImeState::Enabled;
-        }
+        self.advance_ime();
 
         let opcode = self.read_next_pc()?;
         let cycles = if opcode == 0xCB {
@@ -296,16 +318,11 @@ impl Cpu for Sm83 {
             self.opcodes.decode(opcode)?.execute(self)?
         };
 
-        let events = self.memory.drain_events();
-        self.bus.dispatch(events, &mut *self.memory);
+        self.route_bus_events();
+        self.advance_timer(cycles as u16);
 
-        // Advance timer by the instruction's cycle cost.
-        self.timer.borrow_mut().tick(cycles as u16);
-
-        // Interrupt dispatch: after instruction, if IME and interrupt pending
         if self.ime == ImeState::Enabled {
-            let pending_bit = self.interrupt_controller.borrow_mut().take_pending();
-            if let Some(bit) = pending_bit {
+            if let Some(bit) = self.take_pending_interrupt() {
                 self.dispatch_interrupt(bit)?;
                 return Ok(cycles + 20);
             }
@@ -796,7 +813,7 @@ mod tests {
     use super::*;
     use crate::cpu::instructions::opcodes::OpCodeDecoder;
     use crate::cpu::registers::Flags;
-    use crate::memory::fake::FakeMemory;
+
     use crate::memory::memory::GameBoyMemory;
 
     pub fn make_test_cpu(rom_data: Vec<u8>) -> Sm83 {
@@ -806,12 +823,12 @@ mod tests {
         Sm83::new(memory, decoder)
     }
 
-    pub fn make_test_cpu_with_memory(memory: FakeMemory, rom_data: Vec<u8>) -> Sm83 {
-        // Load ROM bytes into FakeMemory starting at address 0
-        let mut mem = memory;
-        for (i, byte) in rom_data.iter().enumerate() {
-            mem.set(i as u16, *byte);
-        }
+    pub fn make_test_cpu_with_memory(
+        setup: impl FnOnce(&mut GameBoyMemory),
+        rom_data: Vec<u8>,
+    ) -> Sm83 {
+        let mut mem = GameBoyMemory::with_rom(rom_data);
+        setup(&mut mem);
         let decoder = Box::new(OpCodeDecoder::new());
         Sm83::new(Box::new(mem), decoder)
     }
@@ -855,9 +872,10 @@ mod tests {
     /// HL=0xC000, memory[0xC000]=0x07, A=0x03 → A should become 0x0A.
     #[test]
     fn test_add8_memory_hl_to_accumulator() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC000, 0x07); // value at (HL)
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x86]).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x07).unwrap(); },
+            vec![0x86],
+        ).with_registers(Registers {
             a: 0x03,
             h: 0xC0,
             l: 0x00,
@@ -1096,9 +1114,10 @@ mod tests {
     /// HL=0xC001, memory[0xC001]=0x04, A=0x05, carry=0 → A should become 0x09.
     #[test]
     fn test_adc_memhl() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC001, 0x04);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x8E]).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC001, 0x04).unwrap(); },
+            vec![0x8E],
+        ).with_registers(Registers {
             a: 0x05,
             h: 0xC0,
             l: 0x01,
@@ -1304,9 +1323,10 @@ mod tests {
     /// HL=0xC000, memory[0xC000]=0x55, opcode 0x7E, expect A=0x55, 8 cycles.
     #[test]
     fn test_ld8_a_from_mem_hl() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC000, 0x55);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x7E]).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x55).unwrap(); },
+            vec![0x7E],
+        ).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -1325,7 +1345,7 @@ mod tests {
         // ROM: store A to (HL), then load A from (HL); HL=0xC000, A=0xCD
         // After tick 1 (LD (HL),A): memory[0xC000]=0xCD, cycles=8
         // After tick 2 (LD A,(HL)): A=0xCD, cycles=8
-        let mut memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
+        let memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
         let decoder = Box::new(OpCodeDecoder::new());
         let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             a: 0xCD,
@@ -1368,7 +1388,7 @@ mod tests {
     /// Tick 2: load A from (HL), expect A=0x99, 8 cycles.
     #[test]
     fn test_ld8_mem_hl_imm8() {
-        let mut memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
+        let memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
         let decoder = Box::new(OpCodeDecoder::new());
         let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
             h: 0xC0,
@@ -1756,9 +1776,10 @@ mod tests {
     /// XOR (HL): reads from memory, A=0xFF, (HL)=0x0F -> A=0xF0, flags empty
     #[test]
     fn test_xor8_mem_hl() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC000, 0x0F);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0xAE]).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x0F).unwrap(); },
+            vec![0xAE],
+        ).with_registers(Registers {
             a: 0xFF,
             h: 0xC0,
             l: 0x00,
@@ -1856,11 +1877,12 @@ mod tests {
     /// LD A, (DE) — opcode 0x1A, load A from memory at DE.
     #[test]
     fn test_ld16_a_de() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC005, 0x77);
         let mut registers = Registers::default();
         registers.set_de(0xC005);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x1A]).with_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC005, 0x77).unwrap(); },
+            vec![0x1A],
+        ).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -1884,11 +1906,12 @@ mod tests {
     /// LD A, (HL-) — opcode 0x3A, load A from (HL), then HL--.
     #[test]
     fn test_ld16_a_hld() {
-        let mut mem = FakeMemory::new();
-        mem.set(0xC020, 0x55);
         let mut registers = Registers::default();
         registers.set_hl(0xC020);
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0x3A]).with_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC020, 0x55).unwrap(); },
+            vec![0x3A],
+        ).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2314,7 +2337,7 @@ mod tests {
         registers.set_bc(0xABCD);
         registers.sp = 0xC010;
         // PUSH BC = 0xC5, then POP DE = 0xD1 to verify round-trip via registers
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xC5, 0xD1])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xC5, 0xD1])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap(); // PUSH BC
         assert_eq!(cycles, 16);
@@ -2331,7 +2354,7 @@ mod tests {
         registers.f = Flags::Z | Flags::C;
         registers.sp = 0xC010;
         // PUSH AF = 0xF5, then POP AF = 0xF1 round-trip
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xF5, 0xF1])
             .with_registers(registers);
         cpu.tick().unwrap(); // PUSH AF
         assert_eq!(cpu.registers().sp, 0xC00E);
@@ -2353,7 +2376,7 @@ mod tests {
         registers.set_hl(0xABCD);
         registers.sp = 0xC010;
         // PUSH HL = 0xE5, POP BC = 0xC1
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xE5, 0xC1])
             .with_registers(registers);
         cpu.tick().unwrap(); // PUSH HL
         let cycles = cpu.tick().unwrap(); // POP BC
@@ -2370,7 +2393,7 @@ mod tests {
         registers.f = Flags::Z | Flags::H;
         registers.sp = 0xC010;
         // PUSH AF = 0xF5, clear registers, POP AF = 0xF1
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xF5, 0xF1])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xF5, 0xF1])
             .with_registers(registers);
         cpu.tick().unwrap(); // PUSH AF
         let mut cleared = cpu.registers();
@@ -2386,14 +2409,15 @@ mod tests {
 
     #[test]
     fn test_pop_af_ignores_low_nibble() {
-        // Use FakeMemory to inject a raw F byte with garbage low nibble
-        let mut mem = FakeMemory::new();
-        mem.set(0xC00E, 0x9F); // Z|C|garbage_low_nibble
-        mem.set(0xC00F, 0x00); // A
         let mut registers = Registers::default();
         registers.sp = 0xC00E;
-        // POP AF = 0xF1
-        let mut cpu = make_test_cpu_with_memory(mem, vec![0xF1]).with_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(
+            |m| {
+                m.write(0xC00E, 0x9F).unwrap(); // Z|C|garbage_low_nibble
+                m.write(0xC00F, 0x00).unwrap(); // A
+            },
+            vec![0xF1], // POP AF
+        ).with_registers(registers);
         cpu.tick().unwrap();
 
         assert_eq!(cpu.registers().f.bits() & 0x0F, 0x00);
@@ -2405,7 +2429,7 @@ mod tests {
         registers.set_hl(0x1234);
         registers.sp = 0xC010;
         // PUSH HL = 0xE5, POP BC = 0xC1
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xE5, 0xC1])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xE5, 0xC1])
             .with_registers(registers);
         cpu.tick().unwrap(); // PUSH HL
         cpu.tick().unwrap(); // POP BC
@@ -2423,7 +2447,7 @@ mod tests {
         // PC starts at 0, after fetch opcode PC=1, after fetch lo PC=2, after fetch hi PC=3
         let mut registers = Registers::default();
         registers.sp = 0xC010;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCD, 0x50, 0x00])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCD, 0x50, 0x00])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2444,7 +2468,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC010;
         let rom = vec![0xCD, 0x05, 0x00, 0x00, 0x00, 0xC9];
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), rom).with_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(|_| {}, rom).with_registers(registers);
         cpu.tick().unwrap(); // CALL 0x0005 — PC becomes 0x0005
         assert_eq!(cpu.registers().pc, 0x0005);
         cpu.tick().unwrap(); // RET — PC becomes 0x0003
@@ -2459,7 +2483,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.f = Flags::Z;
         registers.sp = 0xC010;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xC4, 0x50, 0x00])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xC4, 0x50, 0x00])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2475,7 +2499,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.f = Flags::Z;
         registers.sp = 0xC010;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCC, 0x50, 0x00])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCC, 0x50, 0x00])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2491,7 +2515,7 @@ mod tests {
         registers.f = Flags::Z;
         registers.sp = 0xC010;
         let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xC0]).with_registers(registers);
+            make_test_cpu_with_memory(|_| {}, vec![0xC0]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 8);
@@ -2504,7 +2528,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.sp = 0xC010;
         let mut cpu =
-            make_test_cpu_with_memory(FakeMemory::new(), vec![0xCF]).with_registers(registers);
+            make_test_cpu_with_memory(|_| {}, vec![0xCF]).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 16);
@@ -2517,7 +2541,7 @@ mod tests {
         // RLC B = 0xCB 0x00, B = 0b10110001 => result = 0b01100011, carry = 1
         let mut registers = Registers::default();
         registers.b = 0b10110001;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x00])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2534,7 +2558,7 @@ mod tests {
         // RLC B = 0xCB 0x00, B = 0 => result = 0, zero flag set
         let mut registers = Registers::default();
         registers.b = 0;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x00])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x00])
             .with_registers(registers);
         cpu.tick().unwrap();
 
@@ -2548,7 +2572,7 @@ mod tests {
         // SWAP A = 0xCB 0x37, A = 0xAB => result = 0xBA
         let mut registers = Registers::default();
         registers.a = 0xAB;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x37])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x37])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2565,7 +2589,7 @@ mod tests {
         // BIT 3, B = 0xCB 0x58, B = 0b11110111 (bit 3 = 0) => Z flag set, H flag set, N clear
         let mut registers = Registers::default();
         registers.b = 0b11110111;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x58])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2582,7 +2606,7 @@ mod tests {
         // BIT 3, B = 0xCB 0x58, B = 0b00001000 (bit 3 = 1) => Z flag clear, H flag set
         let mut registers = Registers::default();
         registers.b = 0b00001000;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x58])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x58])
             .with_registers(registers);
         cpu.tick().unwrap();
 
@@ -2596,7 +2620,7 @@ mod tests {
         // RES 3, B = 0xCB 0x98, B = 0xFF => result = 0xF7
         let mut registers = Registers::default();
         registers.b = 0xFF;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0x98])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x98])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2609,7 +2633,7 @@ mod tests {
         // SET 3, B = 0xCB 0xD8, B = 0x00 => result = 0x08
         let mut registers = Registers::default();
         registers.b = 0x00;
-        let mut cpu = make_test_cpu_with_memory(FakeMemory::new(), vec![0xCB, 0xD8])
+        let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0xD8])
             .with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
@@ -2620,11 +2644,12 @@ mod tests {
     #[test]
     fn test_cb_rlc_hl_mem() {
         // RLC (HL) = 0xCB 0x06, (HL) = 0b10110001 => result = 0b01100011, carry = 1
-        let mut memory = FakeMemory::new();
-        memory.write(0xC000, 0b10110001).unwrap();
         let mut registers = Registers::default();
         registers.set_hl(0xC000);
-        let mut cpu = make_test_cpu_with_memory(memory, vec![0xCB, 0x06]).with_registers(registers);
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0b10110001).unwrap(); },
+            vec![0xCB, 0x06],
+        ).with_registers(registers);
         let cycles = cpu.tick().unwrap();
 
         assert_eq!(cycles, 16);
@@ -2701,42 +2726,28 @@ mod tests {
         let mut regs = Registers::default();
         regs.sp = 0xDFFE;
         cpu = cpu.with_registers(regs);
-        // Set IE/IF directly on the interrupt controller
-        {
-            let mut ic = cpu.interrupt_controller.borrow_mut();
-            ic.request(0); // IF bit 0: VBlank pending
-            // Enable bit 0 in IE by writing through the ic fields directly
-        }
-        // Set IE via memory write — will be flushed on first tick
-        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE: VBlank enabled
+        cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
+        cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
 
-        cpu.tick().unwrap(); // EI — flushes memory events (IE=1 reaches IC), ime_pending=true
+        cpu.tick().unwrap(); // EI — ime_pending=true
         cpu.tick().unwrap(); // NOP — IME becomes true, interrupt dispatched after
 
-        // PC should now be at VBlank vector 0x0040
-        assert_eq!(cpu.registers().pc, 0x0040);
-        // SP decremented by 2
-        assert_eq!(cpu.registers().sp, 0xDFFC);
-        // IF bit 0 cleared in interrupt controller
-        assert!(!cpu.interrupt_controller.borrow().has_pending());
-        // IME cleared during dispatch
-        assert!(!cpu.ime());
+        assert_eq!(cpu.registers().pc, 0x0040); // VBlank vector
+        assert_eq!(cpu.registers().sp, 0xDFFC); // SP decremented by 2
+        assert_eq!(cpu.memory.read_io(IF_ADDR) & 0x01, 0); // IF bit 0 cleared
+        assert!(!cpu.ime()); // IME cleared during dispatch
     }
 
     #[test]
     fn test_halt_resumes_when_interrupt_pending() {
         // HALT with IE=1, IF=1 but IME=false: CPU wakes but doesn't dispatch
         let mut cpu = make_test_cpu(vec![0x76, 0x00]); // HALT, NOP
-        // Set IE/IF directly on the interrupt controller
-        {
-            let mut ic = cpu.interrupt_controller.borrow_mut();
-            ic.request(0); // IF bit 0 set
-        }
-        cpu.memory.write(0xFFFF, 0x01).unwrap(); // IE — flushed on first tick
+        cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
+        cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
 
-        cpu.tick().unwrap(); // HALT — sets halted=true, flushes IE to IC
+        cpu.tick().unwrap(); // HALT — sets halted=true
         assert!(cpu.is_halted()); // still halted after HALT instruction
-        // Next tick: wakes (IE&IF!=0, even with IME=false), executes NOP
+        // Next tick: timer ticks, then wakes (IE&IF!=0), executes NOP
         let cycles = cpu.tick().unwrap();
         assert!(!cpu.is_halted());
         assert_eq!(cycles, 4); // NOP
