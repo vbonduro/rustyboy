@@ -43,9 +43,19 @@ fn run_rom(path: &str) -> String {
 
     const MAX_TICKS: u64 = 50_000_000;
     let mut ticks = 0u64;
-    while !cpu.is_halted() && ticks < MAX_TICKS {
+    while ticks < MAX_TICKS {
         cpu.tick().unwrap();
         ticks += 1;
+        // Check serial output periodically for completion markers.
+        // ROMs that use interrupts (e.g. 02-interrupts) HALT and wake multiple
+        // times, so we can't use is_halted() as a termination condition.
+        if ticks % 1024 == 0 {
+            let out = serial.borrow();
+            let bytes = out.output();
+            if bytes.ends_with(b"Passed\n") || bytes.ends_with(b"Failed\n") {
+                break;
+            }
+        }
     }
 
     let output = serial.borrow().output().to_vec();
@@ -128,10 +138,7 @@ fn test_blargg_11_op_a_hl() {
 }
 
 // --- Known failing tests (red phase for future TDD) ---
-// 02-interrupts: interrupt dispatch works; fails on Timer (TIMA/TMA/TAC not implemented)
-
 #[test]
-#[ignore = "requires Timer peripheral (TIMA/TMA/TAC)"]
 fn test_blargg_02_interrupts() {
     assert_passed(
         &run_rom("roms/blargg/cpu_instrs/individual/02-interrupts.gb"),
