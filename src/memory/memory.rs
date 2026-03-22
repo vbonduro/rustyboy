@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::ops::RangeInclusive;
 
 use super::rom::{ROMVec, Ram, ReadOnlyMemory};
 
@@ -28,14 +27,6 @@ impl fmt::Display for Error {
     }
 }
 
-/// A memory-mapped IO device that owns register state. Reads and writes to
-/// claimed addresses go directly through the device, making it the single
-/// source of truth (no stale RAM copies).
-pub trait IoDevice {
-    fn read(&self, address: u16) -> u8;
-    fn write(&mut self, address: u16, value: u8);
-}
-
 pub trait Memory {
     fn read(&self, address: u16) -> Result<u8, Error>;
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error>;
@@ -43,15 +34,6 @@ pub trait Memory {
     /// vec for Memory implementations that do not produce events (e.g. FakeMemory).
     fn drain_events(&mut self) -> Vec<BusEvent> {
         Vec::new()
-    }
-    /// Register an IO device to handle reads/writes for the given address range.
-    /// Defaults to no-op for Memory implementations that don't support devices
-    /// (e.g. FakeMemory used in instruction-level tests).
-    fn register_io_device(
-        &mut self,
-        _range: RangeInclusive<u16>,
-        _device: Box<dyn IoDevice>,
-    ) {
     }
 }
 
@@ -67,8 +49,8 @@ enum RegionMapping {
     /// I/O registers: 0xFF00–0xFF7F
     Io(u16),
     Hram(u16),
-    /// 0xFFFF write-only event sink: queues a BusEvent but stores nothing.
-    InterruptEnableEvent,
+    /// Interrupt Enable register at 0xFFFF.
+    InterruptEnable,
     Unmapped,
 }
 
@@ -83,7 +65,7 @@ impl RegionMapping {
             0xFE00..=0xFE9F => RegionMapping::Oam(address - 0xFE00),
             0xFF00..=0xFF7F => RegionMapping::Io(address - 0xFF00),
             0xFF80..=0xFFFE => RegionMapping::Hram(address - 0xFF80),
-            0xFFFF => RegionMapping::InterruptEnableEvent,
+            0xFFFF => RegionMapping::InterruptEnable,
             _ => RegionMapping::Unmapped,
         }
     }
@@ -98,7 +80,9 @@ impl RegionMapping {
 ///   0xC000–0xDFFF  Work RAM (WRAM)
 ///   0xE000–0xFDFF  Echo RAM (mirrors WRAM reads, writes are read-only)
 ///   0xFE00–0xFE9F  OAM
+///   0xFF00–0xFF7F  I/O registers
 ///   0xFF80–0xFFFE  High RAM (HRAM)
+///   0xFFFF         Interrupt Enable (IE) register
 ///   Everything else: unmapped (returns 0xFF on read, silently ignored on write)
 pub struct GameBoyMemory {
     rom: ROMVec,
@@ -108,8 +92,8 @@ pub struct GameBoyMemory {
     oam: Ram,
     io: Ram,
     hram: Ram,
+    ie: u8,
     events: VecDeque<BusEvent>,
-    io_devices: Vec<(RangeInclusive<u16>, Box<dyn IoDevice>)>,
 }
 
 impl GameBoyMemory {
@@ -122,8 +106,8 @@ impl GameBoyMemory {
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
+            ie: 0,
             events: VecDeque::new(),
-            io_devices: Vec::new(),
         }
     }
 
@@ -139,31 +123,33 @@ impl GameBoyMemory {
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
+            ie: 0,
             events: VecDeque::new(),
-            io_devices: Vec::new(),
         }
     }
-}
 
-impl GameBoyMemory {
-    /// Look up a registered IoDevice for the given address.
-    fn find_device(&self, address: u16) -> Option<&dyn IoDevice> {
-        for (range, device) in &self.io_devices {
-            if range.contains(&address) {
-                return Some(device.as_ref());
-            }
+    /// Direct read of an IO register. No bus events.
+    /// Handles 0xFF00-0xFF7F from io array, 0xFFFF from ie field.
+    pub fn read_io(&self, address: u16) -> u8 {
+        match address {
+            0xFF00..=0xFF7F => self.io.read(address - 0xFF00).unwrap_or(0xFF),
+            0xFFFF => self.ie,
+            _ => 0xFF,
         }
-        None
     }
 
-    /// Look up a registered IoDevice (mutable) for the given address.
-    fn find_device_mut(&mut self, address: u16) -> Option<&mut dyn IoDevice> {
-        for (range, device) in &mut self.io_devices {
-            if range.contains(&address) {
-                return Some(device.as_mut());
+    /// Direct write to an IO register. No bus events queued.
+    /// Used by CPU to write back peripheral state (timer, interrupts).
+    pub fn write_io(&mut self, address: u16, value: u8) {
+        match address {
+            0xFF00..=0xFF7F => {
+                let _ = self.io.write(address - 0xFF00, value);
             }
+            0xFFFF => {
+                self.ie = value;
+            }
+            _ => {}
         }
-        None
     }
 }
 
@@ -194,26 +180,15 @@ impl Memory for GameBoyMemory {
                 .oam
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Io(offset) => {
-                if let Some(device) = self.find_device(address) {
-                    Ok(device.read(address))
-                } else {
-                    self.io
-                        .read(offset)
-                        .map_err(|_| Error::OutOfRange(address))
-                }
-            }
+            RegionMapping::Io(offset) => self
+                .io
+                .read(offset)
+                .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Hram(offset) => self
                 .hram
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::InterruptEnableEvent => {
-                if let Some(device) = self.find_device(address) {
-                    Ok(device.read(address))
-                } else {
-                    Ok(0xFF)
-                }
-            }
+            RegionMapping::InterruptEnable => Ok(self.ie),
             RegionMapping::Unmapped => Ok(0xFF),
         }
     }
@@ -239,13 +214,9 @@ impl Memory for GameBoyMemory {
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Io(offset) => {
-                if let Some(device) = self.find_device_mut(address) {
-                    device.write(address, value);
-                } else {
-                    self.io
-                        .write(offset, value)
-                        .map_err(|_| Error::OutOfRange(address))?;
-                }
+                self.io
+                    .write(offset, value)
+                    .map_err(|_| Error::OutOfRange(address))?;
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
@@ -253,10 +224,8 @@ impl Memory for GameBoyMemory {
                 .hram
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::InterruptEnableEvent => {
-                if let Some(device) = self.find_device_mut(address) {
-                    device.write(address, value);
-                }
+            RegionMapping::InterruptEnable => {
+                self.ie = value;
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
@@ -266,14 +235,6 @@ impl Memory for GameBoyMemory {
 
     fn drain_events(&mut self) -> Vec<BusEvent> {
         self.events.drain(..).collect()
-    }
-
-    fn register_io_device(
-        &mut self,
-        range: RangeInclusive<u16>,
-        device: Box<dyn IoDevice>,
-    ) {
-        self.io_devices.push((range, device));
     }
 }
 
@@ -409,15 +370,13 @@ mod tests {
         assert_eq!(mem.read(0xFF01).unwrap(), 0x00);
     }
 
-    // --- IE register (0xFFFF) — event-only, not stored in memory ---
+    // --- IE register (0xFFFF) ---
 
     #[test]
-    fn test_ie_write_produces_bus_event_and_reads_as_unmapped() {
+    fn test_ie_write_stores_and_produces_bus_event() {
         let mut mem = GameBoyMemory::new();
         mem.write(0xFFFF, 0x1F).unwrap();
-        // IE is owned by InterruptController via the bus; memory returns 0xFF (unmapped)
-        assert_eq!(mem.read(0xFFFF).unwrap(), 0xFF);
-        // But the write still queued a BusEvent for the peripheral bus
+        assert_eq!(mem.read(0xFFFF).unwrap(), 0x1F);
         let events = mem.drain_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].address, 0xFFFF);
@@ -486,5 +445,36 @@ mod tests {
         assert_eq!(events[0].value, 0x41);
         assert_eq!(events[1].address, 0xFF02);
         assert_eq!(events[1].value, 0x81);
+    }
+
+    // --- read_io / write_io ---
+
+    #[test]
+    fn test_read_io_returns_io_register_value() {
+        let mut mem = GameBoyMemory::new();
+        mem.write(0xFF01, 0x42).unwrap();
+        assert_eq!(mem.read_io(0xFF01), 0x42);
+    }
+
+    #[test]
+    fn test_write_io_does_not_produce_bus_event() {
+        let mut mem = GameBoyMemory::new();
+        mem.write_io(0xFF01, 0x42);
+        let events = mem.drain_events();
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn test_write_io_ie_roundtrips() {
+        let mut mem = GameBoyMemory::new();
+        mem.write_io(0xFFFF, 0x1F);
+        assert_eq!(mem.read_io(0xFFFF), 0x1F);
+    }
+
+    #[test]
+    fn test_read_io_ie_matches_memory_read() {
+        let mut mem = GameBoyMemory::new();
+        mem.write_io(0xFFFF, 0x1F);
+        assert_eq!(mem.read(0xFFFF).unwrap(), 0x1F);
     }
 }
