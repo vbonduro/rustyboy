@@ -127,6 +127,14 @@ impl GameBoyMemory {
         }
     }
 
+    pub fn vram(&self) -> &[u8] {
+        self.vram.as_slice()
+    }
+
+    pub fn oam(&self) -> &[u8] {
+        self.oam.as_slice()
+    }
+
     /// Direct read of an IO register. No bus events.
     /// Handles 0xFF00-0xFF7F from io array, 0xFFFF from ie field.
     pub fn read_io(&self, address: u16) -> u8 {

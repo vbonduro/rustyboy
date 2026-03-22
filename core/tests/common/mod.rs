@@ -1,4 +1,5 @@
 //! Shared test harness utilities for integration tests.
+#![allow(dead_code)]
 
 use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
@@ -143,4 +144,63 @@ pub fn assert_mooneye_passed(path: &str, name: &str) {
             panic!("{}: Mooneye test ended with unexpected registers: {:?}", name, regs)
         }
     }
+}
+
+/// Run a ROM for a given number of frames and return a copy of the framebuffer.
+/// One frame = 70,224 dots = ~17,556 CPU ticks (at 4 cycles per tick average).
+pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
+    let rom_data = load_rom(path);
+    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
+    let decoder = Box::new(OpCodeDecoder::new());
+    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+        pc: 0x0100,
+        sp: 0xFFFE,
+        ..Default::default()
+    });
+
+    // Each frame is 154 scanlines * 456 dots = 70,224 dots.
+    // CPU tick returns ~4-20 cycles per instruction.
+    // Run enough ticks to cover the requested frames.
+    let total_dots: u64 = frames as u64 * 70_224;
+    let mut dots_elapsed: u64 = 0;
+    while dots_elapsed < total_dots {
+        let cycles = cpu.tick().unwrap() as u64;
+        dots_elapsed += cycles;
+    }
+
+    cpu.framebuffer().to_vec()
+}
+
+/// Load a reference PNG image and return the pixels as 2-bit shade values.
+/// The reference image should be 160x144 with 4 shades of gray.
+pub fn load_reference_png(path: &str) -> Vec<u8> {
+    let full_path = rom_path(path);
+    let file = std::fs::File::open(&full_path)
+        .unwrap_or_else(|_| panic!("Reference image not found: {}", full_path.display()));
+    let mut decoder = png::Decoder::new(file);
+    // Expand sub-byte grayscale (2-bit, 4-bit) to full 8-bit per pixel
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    let bytes = &buf[..info.buffer_size()];
+
+    // Map grayscale pixel values to 2-bit shade indices.
+    // After EXPAND, 2-bit values become: 0x00, 0x55, 0xAA, 0xFF
+    // DMG shades: 0=lightest, 3=darkest
+    let total_pixels = (info.width * info.height) as usize;
+    let mut shades = Vec::with_capacity(total_pixels);
+
+    for i in 0..total_pixels {
+        let gray = bytes[i];
+        let shade = match gray {
+            0xC0..=0xFF => 0, // white
+            0x80..=0xBF => 1, // light gray
+            0x40..=0x7F => 2, // dark gray
+            0x00..=0x3F => 3, // black
+        };
+        shades.push(shade);
+    }
+
+    shades
 }
