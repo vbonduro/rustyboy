@@ -89,6 +89,13 @@ pub struct PpuOutput {
     pub stat_interrupt: bool,
 }
 
+/// Event produced by a single dot advance.
+enum DotEvent {
+    None,
+    RenderScanline,
+    EnterVBlank,
+}
+
 /// Scanline-based PPU peripheral.
 pub struct PpuPeripheral {
     dot: u16,
@@ -118,16 +125,9 @@ impl PpuPeripheral {
     /// Advance the PPU by `cycles` T-cycles.
     pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
         let lcdc = Lcdc(input.lcdc);
-        let mut vblank_interrupt = false;
-        let mut stat_interrupt = false;
 
         if !lcdc.lcd_enabled() {
-            // LCD off: reset state, stay in mode 0
-            self.dot = 0;
-            self.ly = 0;
-            self.mode = PpuMode::HBlank;
-            self.window_line_counter = 0;
-            self.prev_stat_line = false;
+            self.reset_lcd();
             let stat = (input.stat & 0x78) | (PpuMode::HBlank as u8);
             return PpuOutput {
                 ly: 0,
@@ -137,64 +137,16 @@ impl PpuPeripheral {
             };
         }
 
+        let mut vblank_interrupt = false;
         for _ in 0..cycles {
-            self.dot += 1;
-
-            match self.mode {
-                PpuMode::OamScan => {
-                    if self.dot >= OAM_SCAN_DOTS {
-                        self.mode = PpuMode::PixelTransfer;
-                    }
-                }
-                PpuMode::PixelTransfer => {
-                    if self.dot >= OAM_SCAN_DOTS + PIXEL_TRANSFER_DOTS {
-                        // Render the scanline at mode 3→0 transition
-                        self.render_scanline(&input);
-                        self.mode = PpuMode::HBlank;
-                    }
-                }
-                PpuMode::HBlank => {
-                    if self.dot >= DOTS_PER_SCANLINE {
-                        self.dot = 0;
-                        self.ly += 1;
-                        if self.ly >= VISIBLE_SCANLINES {
-                            self.mode = PpuMode::VBlank;
-                            vblank_interrupt = true;
-                        } else {
-                            self.mode = PpuMode::OamScan;
-                        }
-                    }
-                }
-                PpuMode::VBlank => {
-                    if self.dot >= DOTS_PER_SCANLINE {
-                        self.dot = 0;
-                        self.ly += 1;
-                        if self.ly >= TOTAL_SCANLINES {
-                            self.ly = 0;
-                            self.mode = PpuMode::OamScan;
-                            self.window_line_counter = 0;
-                        }
-                    }
-                }
+            match self.advance_dot(&input) {
+                DotEvent::RenderScanline => self.render_scanline(&input),
+                DotEvent::EnterVBlank => vblank_interrupt = true,
+                DotEvent::None => {}
             }
         }
 
-        // Build STAT register
-        let lyc_match = self.ly == input.lyc;
-        let stat = (input.stat & 0x78) // preserve enable bits (bits 3-6)
-            | if lyc_match { 0x04 } else { 0x00 } // LYC=LY flag (bit 2)
-            | (self.mode as u8); // mode bits (bits 0-1)
-
-        // STAT interrupt rising edge detection
-        let stat_line = (lyc_match && (input.stat & 0x40 != 0))           // LYC=LY enable
-            || (self.mode == PpuMode::HBlank && (input.stat & 0x08 != 0)) // Mode 0 enable
-            || (self.mode == PpuMode::VBlank && (input.stat & 0x10 != 0)) // Mode 1 enable
-            || (self.mode == PpuMode::OamScan && (input.stat & 0x20 != 0)); // Mode 2 enable
-
-        if stat_line && !self.prev_stat_line {
-            stat_interrupt = true;
-        }
-        self.prev_stat_line = stat_line;
+        let (stat, stat_interrupt) = self.build_stat(&input);
 
         PpuOutput {
             ly: self.ly,
@@ -209,6 +161,82 @@ impl PpuPeripheral {
         self.ly = 0;
     }
 
+    /// Advance the dot counter by one and handle mode transitions.
+    fn advance_dot(&mut self, input: &PpuInput) -> DotEvent {
+        self.dot += 1;
+
+        match self.mode {
+            PpuMode::OamScan => {
+                if self.dot >= OAM_SCAN_DOTS {
+                    self.mode = PpuMode::PixelTransfer;
+                }
+                DotEvent::None
+            }
+            PpuMode::PixelTransfer => {
+                if self.dot >= OAM_SCAN_DOTS + PIXEL_TRANSFER_DOTS {
+                    self.mode = PpuMode::HBlank;
+                    DotEvent::RenderScanline
+                } else {
+                    DotEvent::None
+                }
+            }
+            PpuMode::HBlank => {
+                if self.dot >= DOTS_PER_SCANLINE {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= VISIBLE_SCANLINES {
+                        self.mode = PpuMode::VBlank;
+                        DotEvent::EnterVBlank
+                    } else {
+                        self.mode = PpuMode::OamScan;
+                        DotEvent::None
+                    }
+                } else {
+                    DotEvent::None
+                }
+            }
+            PpuMode::VBlank => {
+                if self.dot >= DOTS_PER_SCANLINE {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= TOTAL_SCANLINES {
+                        self.ly = 0;
+                        self.mode = PpuMode::OamScan;
+                        self.window_line_counter = 0;
+                    }
+                }
+                DotEvent::None
+            }
+        }
+    }
+
+    /// Build the STAT register value and detect STAT interrupt rising edge.
+    fn build_stat(&mut self, input: &PpuInput) -> (u8, bool) {
+        let lyc_match = self.ly == input.lyc;
+        let stat = (input.stat & 0x78)
+            | if lyc_match { 0x04 } else { 0x00 }
+            | (self.mode as u8);
+
+        let stat_line = (lyc_match && (input.stat & 0x40 != 0))
+            || (self.mode == PpuMode::HBlank && (input.stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank && (input.stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan && (input.stat & 0x20 != 0));
+
+        let interrupt = stat_line && !self.prev_stat_line;
+        self.prev_stat_line = stat_line;
+
+        (stat, interrupt)
+    }
+
+    /// Reset all PPU state when the LCD is disabled.
+    fn reset_lcd(&mut self) {
+        self.dot = 0;
+        self.ly = 0;
+        self.mode = PpuMode::HBlank;
+        self.window_line_counter = 0;
+        self.prev_stat_line = false;
+    }
+
     fn render_scanline(&mut self, input: &PpuInput) {
         let lcdc = Lcdc(input.lcdc);
         let ly = self.ly as usize;
@@ -218,22 +246,18 @@ impl PpuPeripheral {
 
         let row_start = ly * SCREEN_WIDTH;
 
-        // Background layer
         if lcdc.bg_enabled() {
             self.render_bg_scanline(input, lcdc, row_start);
         } else {
-            // BG disabled: fill with color 0
             for x in 0..SCREEN_WIDTH {
                 self.framebuffer[row_start + x] = 0;
             }
         }
 
-        // Window layer
         if lcdc.window_enabled() && lcdc.bg_enabled() {
             self.render_window_scanline(input, lcdc, row_start);
         }
 
-        // Sprite layer
         if lcdc.obj_enabled() {
             self.render_sprite_scanline(input, lcdc, row_start);
         }
@@ -254,20 +278,12 @@ impl PpuPeripheral {
             let tile_col = (x / 8) as usize;
             let fine_x = 7 - (x % 8);
 
-            let tilemap_addr = tilemap_base + tile_row * 32 + tile_col;
-            let tile_index = input.vram[tilemap_addr];
-
-            let tile_data_addr = tile_data_address(lcdc, tile_index, fine_y);
-            let lo = input.vram[tile_data_addr];
-            let hi = input.vram[tile_data_addr + 1];
-
-            let color_index = ((hi >> fine_x) & 1) << 1 | ((lo >> fine_x) & 1);
-            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color_index);
+            let color = fetch_tile_pixel(input.vram, lcdc, tilemap_base, tile_col, tile_row, fine_x, fine_y);
+            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
         }
     }
 
     fn render_window_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
-        // Window is visible if LY >= WY and WX <= 166
         if self.ly < input.wy || input.wx > 166 {
             return;
         }
@@ -288,15 +304,8 @@ impl PpuPeripheral {
             let tile_col = win_x / 8;
             let fine_x = 7 - (win_x % 8) as u8;
 
-            let tilemap_addr = tilemap_base + tile_row * 32 + tile_col;
-            let tile_index = input.vram[tilemap_addr];
-
-            let tile_data_addr = tile_data_address(lcdc, tile_index, fine_y);
-            let lo = input.vram[tile_data_addr];
-            let hi = input.vram[tile_data_addr + 1];
-
-            let color_index = ((hi >> fine_x) & 1) << 1 | ((lo >> fine_x) & 1);
-            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color_index);
+            let color = fetch_tile_pixel(input.vram, lcdc, tilemap_base, tile_col, tile_row, fine_x as u8, fine_y);
+            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
         }
 
         self.window_line_counter += 1;
@@ -306,7 +315,7 @@ impl PpuPeripheral {
         let sprite_height: u8 = if lcdc.obj_tall() { 16 } else { 8 };
         let ly = self.ly as i16;
 
-        // Collect visible sprites on this scanline
+        // Collect visible sprites on this scanline (max 10)
         let mut sprites: [(u8, u8, u8, u8, usize); 10] = [(0, 0, 0, 0, 0); 10];
         let mut count = 0usize;
 
@@ -326,8 +335,7 @@ impl PpuPeripheral {
             }
         }
 
-        // Sort by X coordinate (stable sort preserves OAM index order for ties)
-        // Simple insertion sort since max 10 elements
+        // Sort by X coordinate; insertion sort preserves OAM index order for ties
         for i in 1..count {
             let key = sprites[i];
             let mut j = i;
@@ -338,77 +346,103 @@ impl PpuPeripheral {
             sprites[j] = key;
         }
 
-        // Draw sprites in reverse priority order (lowest priority first, highest last)
-        // so that higher-priority sprites overwrite lower-priority ones
+        // Draw in reverse priority order so higher-priority sprites overwrite
         for idx in (0..count).rev() {
-            let (_, sprite_x, tile, attrs, _) = sprites[idx];
-            let sprite_screen_x = sprite_x as i16 - 8;
-            let sprite_y_pos = (input.oam[sprites[idx].4 * 4] as i16) - 16;
-
-            let y_flip = attrs & 0x40 != 0;
-            let x_flip = attrs & 0x20 != 0;
-            let bg_priority = attrs & 0x80 != 0;
-            let palette = if attrs & 0x10 != 0 {
-                input.obp1
-            } else {
-                input.obp0
-            };
-
-            let mut row_in_sprite = (ly - sprite_y_pos) as u8;
-            let tile_index = if lcdc.obj_tall() {
-                if y_flip {
-                    row_in_sprite = sprite_height - 1 - row_in_sprite;
-                }
-                if row_in_sprite < 8 {
-                    tile & 0xFE
-                } else {
-                    row_in_sprite -= 8;
-                    tile | 0x01
-                }
-            } else {
-                if y_flip {
-                    row_in_sprite = 7 - row_in_sprite;
-                }
-                tile
-            };
-
-            let tile_addr = (tile_index as usize) * 16 + (row_in_sprite as usize) * 2;
-            let lo = input.vram[tile_addr];
-            let hi = input.vram[tile_addr + 1];
-
-            for pixel in 0..8u8 {
-                let screen_x = sprite_screen_x + pixel as i16;
-                if screen_x < 0 || screen_x >= SCREEN_WIDTH as i16 {
-                    continue;
-                }
-                let sx = screen_x as usize;
-
-                let bit = if x_flip { pixel } else { 7 - pixel };
-                let color_index = ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1);
-
-                // Color 0 is transparent for sprites
-                if color_index == 0 {
-                    continue;
-                }
-
-                // BG priority: sprite hidden behind non-zero BG color
-                if bg_priority && self.framebuffer[row_start + sx] != 0 {
-                    continue;
-                }
-
-                self.framebuffer[row_start + sx] = apply_palette(palette, color_index);
-            }
+            self.draw_sprite(input, lcdc, row_start, sprite_height, &sprites[idx]);
         }
     }
+
+    fn draw_sprite(
+        &mut self,
+        input: &PpuInput,
+        lcdc: Lcdc,
+        row_start: usize,
+        sprite_height: u8,
+        sprite: &(u8, u8, u8, u8, usize),
+    ) {
+        let (_, sprite_x, tile, attrs, oam_index) = *sprite;
+        let sprite_screen_x = sprite_x as i16 - 8;
+        let sprite_y_pos = (input.oam[oam_index * 4] as i16) - 16;
+        let ly = self.ly as i16;
+
+        let y_flip = attrs & 0x40 != 0;
+        let x_flip = attrs & 0x20 != 0;
+        let bg_priority = attrs & 0x80 != 0;
+        let palette = if attrs & 0x10 != 0 { input.obp1 } else { input.obp0 };
+
+        let mut row_in_sprite = (ly - sprite_y_pos) as u8;
+        let tile_index = if lcdc.obj_tall() {
+            if y_flip {
+                row_in_sprite = sprite_height - 1 - row_in_sprite;
+            }
+            if row_in_sprite < 8 {
+                tile & 0xFE
+            } else {
+                row_in_sprite -= 8;
+                tile | 0x01
+            }
+        } else {
+            if y_flip {
+                row_in_sprite = 7 - row_in_sprite;
+            }
+            tile
+        };
+
+        let tile_addr = (tile_index as usize) * 16 + (row_in_sprite as usize) * 2;
+        let lo = input.vram[tile_addr];
+        let hi = input.vram[tile_addr + 1];
+
+        for pixel in 0..8u8 {
+            let screen_x = sprite_screen_x + pixel as i16;
+            if screen_x < 0 || screen_x >= SCREEN_WIDTH as i16 {
+                continue;
+            }
+            let sx = screen_x as usize;
+
+            let bit = if x_flip { pixel } else { 7 - pixel };
+            let color_index = decode_2bpp_pixel(lo, hi, bit);
+
+            if color_index == 0 {
+                continue;
+            }
+
+            if bg_priority && self.framebuffer[row_start + sx] != 0 {
+                continue;
+            }
+
+            self.framebuffer[row_start + sx] = apply_palette(palette, color_index);
+        }
+    }
+}
+
+/// Fetch a single tile pixel from VRAM given tilemap coordinates.
+fn fetch_tile_pixel(
+    vram: &[u8],
+    lcdc: Lcdc,
+    tilemap_base: usize,
+    tile_col: usize,
+    tile_row: usize,
+    fine_x: u8,
+    fine_y: usize,
+) -> u8 {
+    let tilemap_addr = tilemap_base + tile_row * 32 + tile_col;
+    let tile_index = vram[tilemap_addr];
+    let tile_data_addr = tile_data_address(lcdc, tile_index, fine_y);
+    let lo = vram[tile_data_addr];
+    let hi = vram[tile_data_addr + 1];
+    decode_2bpp_pixel(lo, hi, fine_x)
+}
+
+/// Decode a single pixel from a 2bpp tile row.
+fn decode_2bpp_pixel(lo: u8, hi: u8, bit: u8) -> u8 {
+    ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1)
 }
 
 /// Compute the VRAM address for a tile row given the tile index and addressing mode.
 fn tile_data_address(lcdc: Lcdc, tile_index: u8, fine_y: usize) -> usize {
     let base = if lcdc.bg_tile_data_unsigned() {
-        // Unsigned: tile 0 at 0x0000
         (tile_index as usize) * 16
     } else {
-        // Signed: tile 0 at 0x1000, indices are signed (-128..127)
         let signed_index = tile_index as i8 as i16;
         (0x1000 + signed_index * 16) as usize
     };
@@ -619,13 +653,10 @@ mod tests {
         let oam = [0u8; 0xA0];
 
         // Set up tile 0 at 0x0000: first row = all color 3
-        // Each tile row is 2 bytes: lo and hi planes
-        // Color 3 = both bits set
         vram[0] = 0xFF; // lo plane: all 1s
         vram[1] = 0xFF; // hi plane: all 1s
 
         // Set tilemap entry at (0,0) to tile 0
-        // Tilemap at 0x1800 (LCDC bit 3 = 0)
         vram[0x1800] = 0;
 
         let mut ppu = PpuPeripheral::new();
@@ -650,17 +681,15 @@ mod tests {
         let mut vram = [0u8; 0x2000];
         let mut oam = [0u8; 0xA0];
 
-        // BG: all color 0 (default zeros in vram tilemap)
-
         // Set up sprite tile 1: first row = all color 1
         vram[16] = 0xFF; // lo plane
         vram[17] = 0x00; // hi plane
 
         // OAM entry 0: Y=16 (screen Y=0), X=8 (screen X=0), tile=1, attrs=0
-        oam[0] = 16; // Y position (screen = Y - 16)
-        oam[1] = 8; // X position (screen = X - 8)
-        oam[2] = 1; // tile index
-        oam[3] = 0; // attributes
+        oam[0] = 16;
+        oam[1] = 8;
+        oam[2] = 1;
+        oam[3] = 0;
 
         let mut ppu = PpuPeripheral::new();
         let mut input = default_input(&vram, &oam);
@@ -715,7 +744,6 @@ mod tests {
         let mut vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
 
-        // BG: all zeros (color 0)
         // Window tile 0 at 0x0000: first row = all color 1
         vram[0] = 0xFF; // lo
         vram[1] = 0x00; // hi
@@ -773,5 +801,17 @@ mod tests {
         // Tile index 127 → 0x1000 + 127*16 = 0x17F0
         let addr = tile_data_address(lcdc, 127, 0);
         assert_eq!(addr, 0x17F0);
+    }
+
+    #[test]
+    fn test_decode_2bpp_pixel() {
+        // Both bits set = color 3
+        assert_eq!(decode_2bpp_pixel(0xFF, 0xFF, 7), 3);
+        // Only lo set = color 1
+        assert_eq!(decode_2bpp_pixel(0xFF, 0x00, 0), 1);
+        // Only hi set = color 2
+        assert_eq!(decode_2bpp_pixel(0x00, 0xFF, 0), 2);
+        // Neither set = color 0
+        assert_eq!(decode_2bpp_pixel(0x00, 0x00, 0), 0);
     }
 }
