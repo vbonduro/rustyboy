@@ -59,6 +59,7 @@ enum ImeState {
 }
 
 const IF_ADDR: u16 = 0xFF0F;
+const DMA_ADDR: u16 = 0xFF46;
 const IE_ADDR: u16 = 0xFFFF;
 
 pub struct Sm83 {
@@ -138,6 +139,9 @@ impl Sm83 {
             }
             if event.address == LY_ADDR {
                 self.ppu.reset_ly();
+            }
+            if event.address == DMA_ADDR {
+                self.memory.dma_to_oam(event.value);
             }
         }
         self.bus.dispatch(events, &mut *self.memory);

@@ -9,7 +9,6 @@ mod common;
 use common::assert_mooneye_passed;
 
 #[test]
-#[ignore] // Requires OAM DMA implementation
 fn test_mooneye_oam_dma_basic() {
     assert_mooneye_passed(
         "roms/mooneye/acceptance/oam_dma/basic.gb",
@@ -18,7 +17,6 @@ fn test_mooneye_oam_dma_basic() {
 }
 
 #[test]
-#[ignore] // Requires OAM DMA implementation
 fn test_mooneye_oam_dma_reg_read() {
     assert_mooneye_passed(
         "roms/mooneye/acceptance/oam_dma/reg_read.gb",
@@ -27,7 +25,7 @@ fn test_mooneye_oam_dma_reg_read() {
 }
 
 #[test]
-#[ignore] // Requires OAM DMA implementation
+#[ignore] // Requires MBC1 (ROM writes for bank switching)
 fn test_mooneye_oam_dma_sources_gs() {
     assert_mooneye_passed(
         "roms/mooneye/acceptance/oam_dma/sources-GS.gb",
