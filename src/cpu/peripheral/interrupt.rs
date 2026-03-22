@@ -1,8 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::cpu::peripheral::bus::Peripheral;
-use crate::memory::memory::{BusEvent, Memory};
+use crate::memory::memory::IoDevice;
 
 const IF_ADDR: u16 = 0xFF0F;
 const IE_ADDR: u16 = 0xFFFF;
@@ -19,6 +18,22 @@ pub struct InterruptController {
 impl InterruptController {
     pub fn new() -> Self {
         Self { ie: 0, if_: 0 }
+    }
+
+    pub fn ie(&self) -> u8 {
+        self.ie
+    }
+
+    pub fn set_ie(&mut self, value: u8) {
+        self.ie = value;
+    }
+
+    pub fn if_reg(&self) -> u8 {
+        self.if_
+    }
+
+    pub fn set_if(&mut self, value: u8) {
+        self.if_ = value;
     }
 
     /// Set an IF bit — called by peripherals (Timer, VBlank, etc.) to request an interrupt.
@@ -45,17 +60,26 @@ impl InterruptController {
     }
 }
 
-/// Newtype wrapper so an `Rc<RefCell<InterruptController>>` can be subscribed to the
-/// peripheral bus. Subscribe one instance to `0xFF0F..=0xFF0F` and another to
+/// IoDevice wrapper so an `Rc<RefCell<InterruptController>>` can be registered
+/// on GameBoyMemory. Register one for `0xFF0F..=0xFF0F` and another for
 /// `0xFFFF..=0xFFFF`.
-pub struct SharedInterruptController(pub Rc<RefCell<InterruptController>>);
+pub struct SharedInterruptDevice(pub Rc<RefCell<InterruptController>>);
 
-impl Peripheral for SharedInterruptController {
-    fn handle(&mut self, event: &BusEvent, _mem: &mut dyn Memory) {
+impl IoDevice for SharedInterruptDevice {
+    fn read(&self, address: u16) -> u8 {
+        let ic = self.0.borrow();
+        match address {
+            IF_ADDR => ic.if_reg(),
+            IE_ADDR => ic.ie(),
+            _ => 0xFF,
+        }
+    }
+
+    fn write(&mut self, address: u16, value: u8) {
         let mut ic = self.0.borrow_mut();
-        match event.address {
-            IF_ADDR => ic.if_ = event.value,
-            IE_ADDR => ic.ie = event.value,
+        match address {
+            IF_ADDR => ic.set_if(value),
+            IE_ADDR => ic.set_ie(value),
             _ => {}
         }
     }
@@ -75,7 +99,7 @@ mod tests {
     #[test]
     fn test_request_sets_pending() {
         let mut ic = InterruptController::new();
-        ic.ie = 0xFF; // all enabled
+        ic.set_ie(0xFF); // all enabled
         ic.request(0);
         assert!(ic.has_pending());
     }
@@ -83,7 +107,7 @@ mod tests {
     #[test]
     fn test_take_pending_returns_lowest_bit_and_clears_it() {
         let mut ic = InterruptController::new();
-        ic.ie = 0xFF;
+        ic.set_ie(0xFF);
         ic.request(0);
         ic.request(2);
         assert_eq!(ic.take_pending(), Some(0));
@@ -94,7 +118,7 @@ mod tests {
     #[test]
     fn test_has_pending_is_non_destructive() {
         let mut ic = InterruptController::new();
-        ic.ie = 0xFF;
+        ic.set_ie(0xFF);
         ic.request(1);
         assert!(ic.has_pending());
         assert!(ic.has_pending()); // still pending
@@ -103,7 +127,7 @@ mod tests {
     #[test]
     fn test_pending_requires_ie_enabled() {
         let mut ic = InterruptController::new();
-        ic.ie = 0x00; // all disabled
+        ic.set_ie(0x00); // all disabled
         ic.request(0);
         assert!(!ic.has_pending());
         assert!(ic.take_pending().is_none());

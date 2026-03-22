@@ -31,7 +31,8 @@ use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
 use super::peripheral::bus::PeripheralBus;
-use super::peripheral::interrupt::{InterruptController, SharedInterruptController};
+use super::peripheral::interrupt::{InterruptController, SharedInterruptDevice};
+use super::peripheral::timer::{SharedTimerDevice, TimerPeripheral};
 use super::registers::{Flags, Registers};
 
 use crate::memory::memory::{Error as MemoryError, Memory as MemoryBus};
@@ -60,28 +61,39 @@ pub struct Sm83 {
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
     interrupt_controller: Rc<RefCell<InterruptController>>,
+    timer: Rc<RefCell<TimerPeripheral>>,
     ime: ImeState,
     halted: bool,
 }
 
 impl Sm83 {
-    pub fn new(memory: Box<dyn MemoryBus>, opcode_decoder: Box<dyn Decoder>) -> Self {
+    pub fn new(mut memory: Box<dyn MemoryBus>, opcode_decoder: Box<dyn Decoder>) -> Self {
         let ic = Rc::new(RefCell::new(InterruptController::new()));
-        let mut bus = PeripheralBus::new();
-        bus.subscribe(
+        let timer = Rc::new(RefCell::new(TimerPeripheral::new(ic.clone())));
+        let bus = PeripheralBus::new();
+
+        // Register IoDevices — memory reads/writes to these addresses go
+        // directly through the peripheral, making it the single source of truth.
+        memory.register_io_device(
             0xFF0F..=0xFF0F,
-            Box::new(SharedInterruptController(ic.clone())),
+            Box::new(SharedInterruptDevice(ic.clone())),
         );
-        bus.subscribe(
+        memory.register_io_device(
             0xFFFF..=0xFFFF,
-            Box::new(SharedInterruptController(ic.clone())),
+            Box::new(SharedInterruptDevice(ic.clone())),
         );
+        memory.register_io_device(
+            0xFF04..=0xFF07,
+            Box::new(SharedTimerDevice(timer.clone())),
+        );
+
         Self {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
             bus,
             interrupt_controller: ic,
+            timer,
             ime: ImeState::Disabled,
             halted: false,
         }
@@ -260,11 +272,13 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, Box<dyn Error>> {
-        // HALT: wake on pending interrupt (regardless of IME), else burn 4 cycles
+        // HALT: wake on pending interrupt (regardless of IME), else burn 4 cycles.
+        // The timer continues to run while halted.
         if self.halted {
             if self.interrupt_controller.borrow().has_pending() {
                 self.halted = false;
             } else {
+                self.timer.borrow_mut().tick(4);
                 return Ok(4);
             }
         }
@@ -284,6 +298,9 @@ impl Cpu for Sm83 {
 
         let events = self.memory.drain_events();
         self.bus.dispatch(events, &mut *self.memory);
+
+        // Advance timer by the instruction's cycle cost.
+        self.timer.borrow_mut().tick(cycles as u16);
 
         // Interrupt dispatch: after instruction, if IME and interrupt pending
         if self.ime == ImeState::Enabled {
@@ -721,7 +738,7 @@ impl Instructions for Sm83 {
             }
             RetOp::Reti => {
                 self.registers.pc = self.pop_pc()?;
-                // IME (interrupt master enable) would be set here
+                self.ime = ImeState::Enabled;
                 Ok(opcode.cycles)
             }
         }

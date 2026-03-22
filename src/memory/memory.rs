@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::ops::RangeInclusive;
 
 use super::rom::{ROMVec, Ram, ReadOnlyMemory};
 
@@ -27,6 +28,14 @@ impl fmt::Display for Error {
     }
 }
 
+/// A memory-mapped IO device that owns register state. Reads and writes to
+/// claimed addresses go directly through the device, making it the single
+/// source of truth (no stale RAM copies).
+pub trait IoDevice {
+    fn read(&self, address: u16) -> u8;
+    fn write(&mut self, address: u16, value: u8);
+}
+
 pub trait Memory {
     fn read(&self, address: u16) -> Result<u8, Error>;
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error>;
@@ -34,6 +43,15 @@ pub trait Memory {
     /// vec for Memory implementations that do not produce events (e.g. FakeMemory).
     fn drain_events(&mut self) -> Vec<BusEvent> {
         Vec::new()
+    }
+    /// Register an IO device to handle reads/writes for the given address range.
+    /// Defaults to no-op for Memory implementations that don't support devices
+    /// (e.g. FakeMemory used in instruction-level tests).
+    fn register_io_device(
+        &mut self,
+        _range: RangeInclusive<u16>,
+        _device: Box<dyn IoDevice>,
+    ) {
     }
 }
 
@@ -91,6 +109,7 @@ pub struct GameBoyMemory {
     io: Ram,
     hram: Ram,
     events: VecDeque<BusEvent>,
+    io_devices: Vec<(RangeInclusive<u16>, Box<dyn IoDevice>)>,
 }
 
 impl GameBoyMemory {
@@ -104,6 +123,7 @@ impl GameBoyMemory {
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
             events: VecDeque::new(),
+            io_devices: Vec::new(),
         }
     }
 
@@ -120,7 +140,30 @@ impl GameBoyMemory {
             io: Ram::new(0x80),
             hram: Ram::new(0x7F),
             events: VecDeque::new(),
+            io_devices: Vec::new(),
         }
+    }
+}
+
+impl GameBoyMemory {
+    /// Look up a registered IoDevice for the given address.
+    fn find_device(&self, address: u16) -> Option<&dyn IoDevice> {
+        for (range, device) in &self.io_devices {
+            if range.contains(&address) {
+                return Some(device.as_ref());
+            }
+        }
+        None
+    }
+
+    /// Look up a registered IoDevice (mutable) for the given address.
+    fn find_device_mut(&mut self, address: u16) -> Option<&mut dyn IoDevice> {
+        for (range, device) in &mut self.io_devices {
+            if range.contains(&address) {
+                return Some(device.as_mut());
+            }
+        }
+        None
     }
 }
 
@@ -152,13 +195,25 @@ impl Memory for GameBoyMemory {
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Io(offset) => {
-                self.io.read(offset).map_err(|_| Error::OutOfRange(address))
+                if let Some(device) = self.find_device(address) {
+                    Ok(device.read(address))
+                } else {
+                    self.io
+                        .read(offset)
+                        .map_err(|_| Error::OutOfRange(address))
+                }
             }
             RegionMapping::Hram(offset) => self
                 .hram
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::InterruptEnableEvent => Ok(0xFF),
+            RegionMapping::InterruptEnableEvent => {
+                if let Some(device) = self.find_device(address) {
+                    Ok(device.read(address))
+                } else {
+                    Ok(0xFF)
+                }
+            }
             RegionMapping::Unmapped => Ok(0xFF),
         }
     }
@@ -184,9 +239,13 @@ impl Memory for GameBoyMemory {
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Io(offset) => {
-                self.io
-                    .write(offset, value)
-                    .map_err(|_| Error::OutOfRange(address))?;
+                if let Some(device) = self.find_device_mut(address) {
+                    device.write(address, value);
+                } else {
+                    self.io
+                        .write(offset, value)
+                        .map_err(|_| Error::OutOfRange(address))?;
+                }
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
@@ -195,6 +254,9 @@ impl Memory for GameBoyMemory {
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::InterruptEnableEvent => {
+                if let Some(device) = self.find_device_mut(address) {
+                    device.write(address, value);
+                }
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
@@ -204,6 +266,14 @@ impl Memory for GameBoyMemory {
 
     fn drain_events(&mut self) -> Vec<BusEvent> {
         self.events.drain(..).collect()
+    }
+
+    fn register_io_device(
+        &mut self,
+        range: RangeInclusive<u16>,
+        device: Box<dyn IoDevice>,
+    ) {
+        self.io_devices.push((range, device));
     }
 }
 
