@@ -31,6 +31,11 @@ use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
 use super::peripheral::bus::PeripheralBus;
+use super::peripheral::ppu::{
+    PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
+    LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
+    VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
+};
 use super::peripheral::timer::{
     TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
 };
@@ -62,6 +67,7 @@ pub struct Sm83 {
     opcodes: Box<dyn Decoder>,
     bus: PeripheralBus,
     timer: TimerPeripheral,
+    ppu: PpuPeripheral,
     ime: ImeState,
     halted: bool,
 }
@@ -74,6 +80,7 @@ impl Sm83 {
             opcodes: opcode_decoder,
             bus: PeripheralBus::new(),
             timer: TimerPeripheral::new(),
+            ppu: PpuPeripheral::new(),
             ime: ImeState::Disabled,
             halted: false,
         }
@@ -103,6 +110,11 @@ impl Sm83 {
         self.halted
     }
 
+    /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
+    pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
+        self.ppu.framebuffer()
+    }
+
     /// Builder method to set initial register state. Used to skip the boot ROM
     /// by setting PC to 0x0100 and SP to 0xFFFE.
     pub fn with_registers(mut self, registers: Registers) -> Self {
@@ -124,8 +136,41 @@ impl Sm83 {
             if event.address == DIV_ADDR {
                 self.timer.reset_div();
             }
+            if event.address == LY_ADDR {
+                self.ppu.reset_ly();
+            }
         }
         self.bus.dispatch(events, &mut *self.memory);
+    }
+
+    fn advance_ppu(&mut self, cycles: u16) {
+        let output = self.ppu.tick(
+            cycles,
+            PpuInput {
+                lcdc: self.memory.read_io(LCDC_ADDR),
+                stat: self.memory.read_io(STAT_ADDR),
+                scy: self.memory.read_io(SCY_ADDR),
+                scx: self.memory.read_io(SCX_ADDR),
+                lyc: self.memory.read_io(LYC_ADDR),
+                bgp: self.memory.read_io(BGP_ADDR),
+                obp0: self.memory.read_io(OBP0_ADDR),
+                obp1: self.memory.read_io(OBP1_ADDR),
+                wy: self.memory.read_io(WY_ADDR),
+                wx: self.memory.read_io(WX_ADDR),
+                vram: self.memory.vram(),
+                oam: self.memory.oam(),
+            },
+        );
+        self.memory.write_io(LY_ADDR, output.ly);
+        self.memory.write_io(STAT_ADDR, output.stat);
+        if output.vblank_interrupt {
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << VBLANK_INTERRUPT_BIT));
+        }
+        if output.stat_interrupt {
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << STAT_INTERRUPT_BIT));
+        }
     }
 
     fn advance_timer(&mut self, cycles: u16) {
@@ -301,6 +346,7 @@ impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, CpuError> {
         if self.halted {
             self.advance_timer(4);
+            self.advance_ppu(4);
             if self.has_pending_interrupt() {
                 self.halted = false;
             } else {
@@ -320,6 +366,7 @@ impl Cpu for Sm83 {
 
         self.route_bus_events();
         self.advance_timer(cycles as u16);
+        self.advance_ppu(cycles as u16);
 
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt() {

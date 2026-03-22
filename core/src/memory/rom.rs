@@ -66,6 +66,10 @@ impl Ram {
         Ok(self.data[index])
     }
 
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         let index = address as usize;
         if index >= self.data.len() {
