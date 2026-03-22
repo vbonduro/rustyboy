@@ -162,7 +162,7 @@ impl PpuPeripheral {
     }
 
     /// Advance the dot counter by one and handle mode transitions.
-    fn advance_dot(&mut self, input: &PpuInput) -> DotEvent {
+    fn advance_dot(&mut self, _input: &PpuInput) -> DotEvent {
         self.dot += 1;
 
         match self.mode {

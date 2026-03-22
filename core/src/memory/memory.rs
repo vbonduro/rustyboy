@@ -127,6 +127,16 @@ impl GameBoyMemory {
         }
     }
 
+    /// Perform OAM DMA: copy 160 bytes from the source page to OAM.
+    /// Source address = page * 0x100. Reads go through normal memory mapping.
+    pub fn dma_to_oam(&mut self, page: u8) {
+        let base = (page as u16) << 8;
+        for i in 0..0xA0u16 {
+            let byte = self.read(base + i).unwrap_or(0xFF);
+            let _ = self.oam.write(i, byte);
+        }
+    }
+
     pub fn vram(&self) -> &[u8] {
         self.vram.as_slice()
     }
