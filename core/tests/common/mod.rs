@@ -79,6 +79,64 @@ pub fn assert_blargg_passed(path: &str, name: &str) {
     );
 }
 
+/// Run a Blargg ROM that outputs results to memory at 0xA000.
+///
+/// Format: 0xA000 = status (0x80 running, 0x00 passed, else failed)
+///         0xA001-0xA003 = signature DE B0 61
+///         0xA004+ = zero-terminated text
+///
+/// Returns the text output as a string.
+pub fn run_blargg_mem_rom(path: &str) -> String {
+    let rom_data = load_rom(path);
+    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
+    let decoder = Box::new(OpCodeDecoder::new());
+    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+        pc: 0x0100,
+        sp: 0xFFFE,
+        ..Default::default()
+    });
+
+    const MAX_TICKS: u64 = 50_000_000;
+    let mut ticks = 0u64;
+    while ticks < MAX_TICKS {
+        cpu.tick().unwrap();
+        ticks += 1;
+        if ticks % 1024 == 0 {
+            // Check signature at 0xA001-0xA003
+            let sig_ok = cpu.read_memory(0xA001).unwrap_or(0) == 0xDE
+                && cpu.read_memory(0xA002).unwrap_or(0) == 0xB0
+                && cpu.read_memory(0xA003).unwrap_or(0) == 0x61;
+            if sig_ok {
+                let status = cpu.read_memory(0xA000).unwrap_or(0x80);
+                if status != 0x80 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Read text at 0xA004+
+    let mut text = String::new();
+    for addr in 0xA004u16.. {
+        match cpu.read_memory(addr) {
+            Ok(0) | Err(_) => break,
+            Ok(b) => text.push(b as char),
+        }
+    }
+    text
+}
+
+/// Assert that a Blargg memory-output ROM contains "Passed".
+pub fn assert_blargg_mem_passed(path: &str, name: &str) {
+    let output = run_blargg_mem_rom(path);
+    assert!(
+        output.contains("Passed"),
+        "{}: expected 'Passed' in memory output, got: {:?}",
+        name,
+        output
+    );
+}
+
 /// Run a Mooneye-style ROM that signals completion via HALT and
 /// indicates pass/fail via Fibonacci register values.
 ///
