@@ -154,8 +154,14 @@ impl Sm83 {
 
     /// Perform a bus read: advance all peripherals by one M-cycle (4 T-cycles),
     /// process any pending bus events, then read from memory.
+    /// Wave RAM reads (0xFF30-0xFF3F) are routed through the APU so that
+    /// reads while ch3 is on return the current sample buffer.
     fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
         self.tick_cycle();
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            return Ok(self.apu.read_wave_ram(offset));
+        }
         self.memory.read(addr)
     }
 
