@@ -212,7 +212,7 @@ impl Memory for GameBoyMemory {
 
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(_) => Err(Error::ReadOnly(address)),
+            RegionMapping::Rom(_) => Ok(()), // Writes to ROM are silently ignored (or handled by MBC)
             RegionMapping::Vram(offset) => self
                 .vram
                 .write(offset, value)
@@ -272,10 +272,12 @@ mod tests {
     }
 
     #[test]
-    fn test_rom_region_write_returns_readonly_error() {
-        let mut mem = GameBoyMemory::new();
-        assert!(matches!(mem.write(0x0000, 0xFF), Err(Error::ReadOnly(_))));
-        assert!(matches!(mem.write(0x7FFF, 0xFF), Err(Error::ReadOnly(_))));
+    fn test_rom_region_write_is_silently_ignored() {
+        let mem_with_rom = GameBoyMemory::with_rom(vec![0x11, 0x22]);
+        let mut mem = mem_with_rom;
+        assert!(mem.write(0x0000, 0xFF).is_ok());
+        // ROM data should be unchanged
+        assert_eq!(mem.read(0x0000).unwrap(), 0x11);
     }
 
     // --- VRAM (0x8000–0x9FFF) ---
