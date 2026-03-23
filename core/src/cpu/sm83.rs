@@ -30,6 +30,9 @@ use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
+use super::peripheral::apu::{
+    ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
+};
 use super::peripheral::bus::PeripheralBus;
 use super::peripheral::ppu::{
     PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
@@ -69,22 +72,41 @@ pub struct Sm83 {
     bus: PeripheralBus,
     timer: TimerPeripheral,
     ppu: PpuPeripheral,
+    apu: ApuPeripheral,
     ime: ImeState,
     halted: bool,
+    /// Cycle counter incremented by 4 on each M-cycle (bus_read/bus_write/tick_cycle).
+    cycle_counter: u64,
 }
 
 impl Sm83 {
     pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
-        Self {
+        let mut sm83 = Self {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
             bus: PeripheralBus::new(),
             timer: TimerPeripheral::new(),
             ppu: PpuPeripheral::new(),
+            apu: ApuPeripheral::new(),
             ime: ImeState::Disabled,
             halted: false,
+            cycle_counter: 0,
+        };
+        // Seed IO memory with initial APU register read values so games
+        // reading registers before any write see correct masked values.
+        for addr in NR10_ADDR..=NR52_ADDR {
+            sm83.memory.write_io(addr, sm83.apu.read_register(addr));
         }
+        // Unused APU addresses always read as 0xFF
+        for addr in 0xFF27u16..WAVE_RAM_START {
+            sm83.memory.write_io(addr, 0xFF);
+        }
+        for addr in WAVE_RAM_START..=WAVE_RAM_END {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
+        }
+        sm83
     }
 
     /// Subscribe a peripheral to receive bus events for the given address range.
@@ -111,6 +133,11 @@ impl Sm83 {
         self.halted
     }
 
+    /// Read a byte from the memory bus (for test/debug access).
+    pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
+        self.memory.read(address)
+    }
+
     /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
         self.ppu.framebuffer()
@@ -121,6 +148,42 @@ impl Sm83 {
     pub fn with_registers(mut self, registers: Registers) -> Self {
         self.registers = registers;
         self
+    }
+
+    // ── M-cycle–accurate bus access ─────────────────────────────────────────
+
+    /// Perform a bus read: advance all peripherals by one M-cycle (4 T-cycles),
+    /// process any pending bus events, then read from memory.
+    /// Wave RAM reads (0xFF30-0xFF3F) are routed through the APU so that
+    /// reads while ch3 is on return the current sample buffer.
+    fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
+        self.tick_cycle();
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            return Ok(self.apu.read_wave_ram(offset));
+        }
+        self.memory.read(addr)
+    }
+
+    /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
+    /// process any pending bus events, then write to memory.
+    fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
+        self.tick_cycle();
+        self.memory.write(addr, value)
+    }
+
+    /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
+    /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
+    fn tick_cycle(&mut self) {
+        self.cycle_counter += 4;
+        self.advance_peripherals(4);
+        self.route_bus_events();
+    }
+
+    fn advance_peripherals(&mut self, cycles: u16) {
+        self.advance_timer(cycles);
+        self.advance_ppu(cycles);
+        self.advance_apu(cycles);
     }
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
@@ -142,6 +205,28 @@ impl Sm83 {
             }
             if event.address == DMA_ADDR {
                 self.memory.dma_to_oam(event.value);
+            }
+            // APU registers: write to APU and write back masked value for correct read-back
+            if (NR10_ADDR..=NR52_ADDR).contains(&event.address) {
+                self.apu.write_register(event.address, event.value);
+                if event.address == NR52_ADDR {
+                    // NR52 writes can zero all registers (power off), so sync all
+                    for addr in NR10_ADDR..=NR52_ADDR {
+                        self.memory.write_io(addr, self.apu.read_register(addr));
+                    }
+                } else {
+                    self.memory.write_io(event.address, self.apu.read_register(event.address));
+                }
+            }
+            // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
+            if (0xFF27u16..WAVE_RAM_START).contains(&event.address) {
+                self.memory.write_io(event.address, 0xFF);
+            }
+            // Wave RAM: route through APU
+            if (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address) {
+                let offset = (event.address - WAVE_RAM_START) as u8;
+                self.apu.write_wave_ram(offset, event.value);
+                self.memory.write_io(event.address, self.apu.read_wave_ram(offset));
             }
         }
         self.bus.dispatch(events, &mut *self.memory);
@@ -194,6 +279,11 @@ impl Sm83 {
         }
     }
 
+    fn advance_apu(&mut self, cycles: u16) {
+        let output = self.apu.tick(cycles, self.timer.internal_counter());
+        self.memory.write_io(NR52_ADDR, output.nr52);
+    }
+
     fn has_pending_interrupt(&self) -> bool {
         let ie = self.memory.read_io(IE_ADDR);
         let if_val = self.memory.read_io(IF_ADDR);
@@ -214,16 +304,20 @@ impl Sm83 {
 
     fn dispatch_interrupt(&mut self, bit: u8) -> Result<(), InstructionError> {
         self.ime = ImeState::Disabled;
+        // Interrupt dispatch: 2 internal + push PC (2 writes) + 1 internal = 5 M-cycles
+        self.tick_cycle(); // internal
+        self.tick_cycle(); // internal
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
+        self.bus_write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, self.registers.pc as u8)?;
+        self.bus_write(self.registers.sp, self.registers.pc as u8)?;
+        self.tick_cycle(); // internal — load ISR address
         self.registers.pc = 0x0040 + (bit as u16) * 8;
         Ok(())
     }
 
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
-        let byte = self.memory.read(self.registers.pc)?;
+        let byte = self.bus_read(self.registers.pc)?;
         self.registers.pc = self.registers.pc.wrapping_add(1);
         Ok(byte)
     }
@@ -233,7 +327,7 @@ impl Sm83 {
             Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
             Operand::Memory(Memory::HL) => {
                 let address = self.registers.hl();
-                Ok(self.memory.read(address)?)
+                Ok(self.bus_read(address)?)
             }
             Operand::Imm8 => Ok(self.read_next_pc()?),
             _ => {
@@ -297,7 +391,7 @@ impl Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let address = self.registers.hl();
-                Ok(self.memory.write(address, value)?)
+                Ok(self.bus_write(address, value)?)
             }
             _ => Err(InstructionError::InvalidOperand(format!(
                 "{} for write operand",
@@ -313,7 +407,7 @@ impl Sm83 {
                 Ok(())
             }
             CbTarget::HLMem => {
-                self.memory.write(self.registers.hl(), value)?;
+                self.bus_write(self.registers.hl(), value)?;
                 Ok(())
             }
         }
@@ -322,16 +416,16 @@ impl Sm83 {
     fn push_pc(&mut self) -> Result<(), MemoryError> {
         let pc = self.registers.pc;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, (pc >> 8) as u8)?;
+        self.bus_write(self.registers.sp, (pc >> 8) as u8)?;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, (pc & 0xFF) as u8)?;
+        self.bus_write(self.registers.sp, (pc & 0xFF) as u8)?;
         Ok(())
     }
 
     fn pop_pc(&mut self) -> Result<u16, MemoryError> {
-        let lo = self.memory.read(self.registers.sp)? as u16;
+        let lo = self.bus_read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        let hi = self.memory.read(self.registers.sp)? as u16;
+        let hi = self.bus_read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
         Ok((hi << 8) | lo)
     }
@@ -348,38 +442,38 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     fn tick(&mut self) -> Result<u8, CpuError> {
+        let start_cycles = self.cycle_counter;
+
         if self.halted {
-            self.advance_timer(4);
-            self.advance_ppu(4);
+            self.tick_cycle(); // 1 M-cycle while halted
             if self.has_pending_interrupt() {
                 self.halted = false;
             } else {
-                return Ok(4);
+                return Ok((self.cycle_counter - start_cycles) as u8);
             }
         }
 
         self.advance_ime();
 
+        // Opcode fetch is the first M-cycle (via bus_read inside read_next_pc)
         let opcode = self.read_next_pc()?;
-        let cycles = if opcode == 0xCB {
+        if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
-            CbDecoder.decode(cb_opcode)?.execute(self)?
+            CbDecoder.decode(cb_opcode)?.execute(self)?;
         } else {
-            self.opcodes.decode(opcode)?.execute(self)?
+            self.opcodes.decode(opcode)?.execute(self)?;
         };
 
-        self.route_bus_events();
-        self.advance_timer(cycles as u16);
-        self.advance_ppu(cycles as u16);
+        // Peripherals and bus events are already advanced per M-cycle
+        // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
 
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt() {
                 self.dispatch_interrupt(bit)?;
-                return Ok(cycles + 20);
             }
         }
 
-        Ok(cycles)
+        Ok((self.cycle_counter - start_cycles) as u8)
     }
 }
 
@@ -407,6 +501,7 @@ impl Instructions for Sm83 {
         self.registers.f.set(Flags::H, new_flags.contains(Flags::H));
         self.registers.f.set(Flags::C, new_flags.contains(Flags::C));
         self.registers.set_hl(hl);
+        self.tick_cycle(); // internal — 16-bit ALU
         Ok(opcode.cycles)
     }
 
@@ -418,8 +513,11 @@ impl Instructions for Sm83 {
             )));
         }
 
+        // fetch + read e8 + internal + internal = 4 M-cycles
         let offset = self.read_next_pc()? as i8;
         (self.registers.sp, self.registers.f) = add_sp_u16(self.registers.sp, offset);
+        self.tick_cycle(); // internal
+        self.tick_cycle(); // internal
 
         Ok(opcode.cycles)
     }
@@ -461,7 +559,7 @@ impl Instructions for Sm83 {
             Operand::Register8(reg) => self.get_register8_operand(reg),
             Operand::Memory(Memory::HL) => {
                 let address = self.registers.hl();
-                self.memory.read(address)?
+                self.bus_read(address)?
             }
             Operand::Imm8 => self.read_next_pc()?,
             _ => {
@@ -477,7 +575,7 @@ impl Instructions for Sm83 {
             Operand::Register8(reg) => self.set_register8_operand(reg, value),
             Operand::Memory(Memory::HL) => {
                 let address = self.registers.hl();
-                self.memory.write(address, value)?;
+                self.bus_write(address, value)?;
             }
             _ => {
                 return Err(InstructionError::InvalidOperand(format!(
@@ -509,14 +607,14 @@ impl Instructions for Sm83 {
     fn inc16(&mut self, opcode: &Inc16) -> Result<u8, InstructionError> {
         let val = self.get_register16_operand(opcode.operand);
         self.set_register16_operand(opcode.operand, val.wrapping_add(1));
-        // NO flags affected
+        self.tick_cycle(); // internal
         Ok(opcode.cycles)
     }
 
     fn dec16(&mut self, opcode: &Dec16) -> Result<u8, InstructionError> {
         let val = self.get_register16_operand(opcode.operand);
         self.set_register16_operand(opcode.operand, val.wrapping_sub(1));
-        // NO flags affected
+        self.tick_cycle(); // internal
         Ok(opcode.cycles)
     }
 
@@ -555,93 +653,99 @@ impl Instructions for Sm83 {
         use super::instructions::ld16::opcode::Ld16Op;
         match &opcode.op {
             Ld16Op::RrImm16 { dest } => {
+                // fetch + read lo + read hi = 3 M-cycles
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 let val = (hi << 8) | lo;
                 self.set_register16_operand(*dest, val);
             }
             Ld16Op::NnSp => {
+                // fetch + read lo + read hi + write lo + write hi = 5 M-cycles
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 let addr = (hi << 8) | lo;
                 let sp = self.registers.sp;
-                self.memory.write(addr, (sp & 0xFF) as u8)?;
-                self.memory.write(addr.wrapping_add(1), (sp >> 8) as u8)?;
+                self.bus_write(addr, (sp & 0xFF) as u8)?;
+                self.bus_write(addr.wrapping_add(1), (sp >> 8) as u8)?;
             }
             Ld16Op::SpHl => {
+                // fetch + internal = 2 M-cycles
                 self.registers.sp = self.registers.hl();
+                self.tick_cycle(); // internal
             }
             Ld16Op::HlSpE => {
+                // fetch + read e8 + internal = 3 M-cycles
                 let offset = self.read_next_pc()? as i8;
                 let (result, flags) = add_sp_u16(self.registers.sp, offset);
                 self.registers.set_hl(result);
                 self.registers.f = flags;
+                self.tick_cycle(); // internal
             }
             Ld16Op::BcA => {
                 let addr = self.registers.bc();
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
             }
             Ld16Op::DeA => {
                 let addr = self.registers.de();
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
             }
             Ld16Op::ABc => {
                 let addr = self.registers.bc();
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
             }
             Ld16Op::ADe => {
                 let addr = self.registers.de();
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
             }
             Ld16Op::HliA => {
                 let addr = self.registers.hl();
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
                 self.registers.set_hl(addr.wrapping_add(1));
             }
             Ld16Op::HldA => {
                 let addr = self.registers.hl();
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
                 self.registers.set_hl(addr.wrapping_sub(1));
             }
             Ld16Op::AHli => {
                 let addr = self.registers.hl();
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
                 self.registers.set_hl(addr.wrapping_add(1));
             }
             Ld16Op::AHld => {
                 let addr = self.registers.hl();
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
                 self.registers.set_hl(addr.wrapping_sub(1));
             }
             Ld16Op::NnA => {
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 let addr = (hi << 8) | lo;
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
             }
             Ld16Op::ANn => {
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 let addr = (hi << 8) | lo;
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
             }
             Ld16Op::LdhNA => {
                 let offset = self.read_next_pc()? as u16;
                 let addr = 0xFF00 | offset;
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
             }
             Ld16Op::LdhAN => {
                 let offset = self.read_next_pc()? as u16;
                 let addr = 0xFF00 | offset;
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
             }
             Ld16Op::LdCA => {
                 let addr = 0xFF00 | (self.registers.c as u16);
-                self.memory.write(addr, self.registers.a)?;
+                self.bus_write(addr, self.registers.a)?;
             }
             Ld16Op::LdAC => {
                 let addr = 0xFF00 | (self.registers.c as u16);
-                self.registers.a = self.memory.read(addr)?;
+                self.registers.a = self.bus_read(addr)?;
             }
         }
         Ok(opcode.cycles)
@@ -650,38 +754,47 @@ impl Instructions for Sm83 {
     fn jump(&mut self, opcode: &Jump) -> Result<u8, InstructionError> {
         match &opcode.op {
             JumpOp::Jp => {
+                // fetch + read lo + read hi + internal = 4 M-cycles
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 self.registers.pc = (hi << 8) | lo;
+                self.tick_cycle(); // internal — load new PC
                 Ok(opcode.cycles)
             }
             JumpOp::JpHl => {
+                // fetch only = 1 M-cycle
                 self.registers.pc = self.registers.hl();
                 Ok(opcode.cycles)
             }
             JumpOp::JpCc(cond) => {
+                // fetch + read lo + read hi [+ internal if taken] = 3 or 4 M-cycles
                 let lo = self.read_next_pc()? as u16;
                 let hi = self.read_next_pc()? as u16;
                 let target = (hi << 8) | lo;
                 if self.check_condition(cond) {
                     self.registers.pc = target;
-                    Ok(opcode.cycles) // 16 cycles taken
+                    self.tick_cycle(); // internal — branch taken
+                    Ok(opcode.cycles)
                 } else {
-                    Ok(12) // 12 cycles not taken
+                    Ok(12)
                 }
             }
             JumpOp::Jr => {
+                // fetch + read e8 + internal = 3 M-cycles
                 let offset = self.read_next_pc()? as i8 as i16;
                 self.registers.pc = self.registers.pc.wrapping_add(offset as u16);
+                self.tick_cycle(); // internal — apply offset
                 Ok(opcode.cycles)
             }
             JumpOp::JrCc(cond) => {
+                // fetch + read e8 [+ internal if taken] = 2 or 3 M-cycles
                 let offset = self.read_next_pc()? as i8 as i16;
                 if self.check_condition(cond) {
                     self.registers.pc = self.registers.pc.wrapping_add(offset as u16);
-                    Ok(opcode.cycles) // 12 cycles taken
+                    self.tick_cycle(); // internal — branch taken
+                    Ok(opcode.cycles)
                 } else {
-                    Ok(8) // 8 cycles not taken
+                    Ok(8)
                 }
             }
         }
@@ -751,40 +864,46 @@ impl Instructions for Sm83 {
     }
 
     fn push16(&mut self, opcode: &Push16) -> Result<u8, InstructionError> {
+        // fetch + internal + write hi + write lo = 4 M-cycles
         let value = self.get_register16_operand(opcode.operand);
+        self.tick_cycle(); // internal
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, (value >> 8) as u8)?;
+        self.bus_write(self.registers.sp, (value >> 8) as u8)?;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.memory.write(self.registers.sp, (value & 0xFF) as u8)?;
+        self.bus_write(self.registers.sp, (value & 0xFF) as u8)?;
         Ok(opcode.cycles)
     }
 
     fn pop16(&mut self, opcode: &Pop16) -> Result<u8, InstructionError> {
-        let lo = self.memory.read(self.registers.sp)? as u16;
+        // fetch + read lo + read hi = 3 M-cycles
+        let lo = self.bus_read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        let hi = self.memory.read(self.registers.sp)? as u16;
+        let hi = self.bus_read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
         self.set_register16_operand(opcode.operand, (hi << 8) | lo);
         Ok(opcode.cycles)
     }
 
     fn call(&mut self, opcode: &Call) -> Result<u8, InstructionError> {
+        // fetch + read lo + read hi [+ internal + push hi + push lo] = 3 or 6 M-cycles
         let lo = self.read_next_pc()? as u16;
         let hi = self.read_next_pc()? as u16;
         let target = (hi << 8) | lo;
         match &opcode.op {
             CallOp::Call => {
-                self.push_pc()?;
+                self.tick_cycle(); // internal
+                self.push_pc()?;  // 2 bus writes
                 self.registers.pc = target;
                 Ok(opcode.cycles)
             }
             CallOp::CallCc(cond) => {
                 if self.check_condition(cond) {
-                    self.push_pc()?;
+                    self.tick_cycle(); // internal
+                    self.push_pc()?;  // 2 bus writes
                     self.registers.pc = target;
-                    Ok(opcode.cycles) // 24 cycles taken
+                    Ok(opcode.cycles)
                 } else {
-                    Ok(12) // 12 cycles not taken
+                    Ok(12)
                 }
             }
         }
@@ -793,19 +912,26 @@ impl Instructions for Sm83 {
     fn ret(&mut self, opcode: &Ret) -> Result<u8, InstructionError> {
         match &opcode.op {
             RetOp::Ret => {
+                // fetch + pop lo + pop hi + internal = 4 M-cycles
                 self.registers.pc = self.pop_pc()?;
+                self.tick_cycle(); // internal
                 Ok(opcode.cycles)
             }
             RetOp::RetCc(cond) => {
+                // fetch + internal [+ pop lo + pop hi + internal] = 2 or 5 M-cycles
+                self.tick_cycle(); // internal — condition eval
                 if self.check_condition(cond) {
                     self.registers.pc = self.pop_pc()?;
-                    Ok(opcode.cycles) // 20 cycles taken
+                    self.tick_cycle(); // internal
+                    Ok(opcode.cycles)
                 } else {
-                    Ok(8) // 8 cycles not taken
+                    Ok(8)
                 }
             }
             RetOp::Reti => {
+                // fetch + pop lo + pop hi + internal = 4 M-cycles
                 self.registers.pc = self.pop_pc()?;
+                self.tick_cycle(); // internal
                 self.ime = ImeState::Enabled;
                 Ok(opcode.cycles)
             }
@@ -813,7 +939,9 @@ impl Instructions for Sm83 {
     }
 
     fn rst(&mut self, opcode: &Rst) -> Result<u8, InstructionError> {
-        self.push_pc()?;
+        // fetch + internal + push hi + push lo = 4 M-cycles
+        self.tick_cycle(); // internal
+        self.push_pc()?;  // 2 bus writes
         self.registers.pc = opcode.vector as u16;
         Ok(opcode.cycles)
     }
@@ -823,7 +951,7 @@ impl Instructions for Sm83 {
 
         let val = match opcode.target {
             CbTarget::Reg(reg) => self.get_register8_operand(reg),
-            CbTarget::HLMem => self.memory.read(self.registers.hl())?,
+            CbTarget::HLMem => self.bus_read(self.registers.hl())?,
         };
 
         match opcode.op {
@@ -2041,7 +2169,7 @@ mod tests {
         let mut cpu = make_test_cpu(vec![0x10, 0x00]);
         let cycles = cpu.tick().unwrap();
 
-        assert_eq!(cycles, 4);
+        assert_eq!(cycles, 8); // fetch + consume next byte
         assert_eq!(cpu.registers().pc, 2); // consumed both 0x10 and 0x00
     }
 
@@ -2799,9 +2927,9 @@ mod tests {
 
         cpu.tick().unwrap(); // HALT — sets halted=true
         assert!(cpu.is_halted()); // still halted after HALT instruction
-        // Next tick: timer ticks, then wakes (IE&IF!=0), executes NOP
+        // Next tick: 1 halted M-cycle (4 T-cycles) then wakes (IE&IF!=0), executes NOP (4 T-cycles)
         let cycles = cpu.tick().unwrap();
         assert!(!cpu.is_halted());
-        assert_eq!(cycles, 4); // NOP
+        assert_eq!(cycles, 8); // halted M-cycle + NOP
     }
 }

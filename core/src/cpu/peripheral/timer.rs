@@ -43,6 +43,12 @@ impl TimerPeripheral {
         (self.internal_counter >> 8) as u8
     }
 
+    /// The full 16-bit internal counter. Used by the APU to synchronize
+    /// its frame sequencer with bit 12 (DIV bit 4) falling edge.
+    pub fn internal_counter(&self) -> u16 {
+        self.internal_counter
+    }
+
     /// Any write to DIV resets the internal counter to 0.
     pub fn reset_div(&mut self) {
         self.internal_counter = 0;
