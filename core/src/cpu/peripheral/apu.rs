@@ -4,7 +4,6 @@ pub(crate) const NR52_ADDR: u16 = 0xFF26;
 pub(crate) const WAVE_RAM_START: u16 = 0xFF30;
 pub(crate) const WAVE_RAM_END: u16 = 0xFF3F;
 
-const FRAME_SEQUENCER_PERIOD: u16 = 8192;
 
 /// OR masks for APU register reads. Indexed by (address - 0xFF10).
 /// Write-only bits read as 1.
@@ -293,10 +292,15 @@ impl NoiseChannel {
     }
 }
 
+/// Bit 12 of the timer's internal counter (= bit 4 of DIV).
+/// The frame sequencer clocks on the falling edge of this bit.
+const FRAME_SEQ_BIT: u16 = 1 << 12;
+
 /// Game Boy APU peripheral.
 pub struct ApuPeripheral {
     powered: bool,
-    frame_sequencer_counter: u16,
+    /// Previous state of FRAME_SEQ_BIT for falling-edge detection.
+    prev_div_bit: bool,
     frame_sequencer_step: u8,
 
     channel1: SquareChannel,
@@ -313,7 +317,7 @@ impl ApuPeripheral {
     pub fn new() -> Self {
         Self {
             powered: true,
-            frame_sequencer_counter: 0,
+            prev_div_bit: false,
             frame_sequencer_step: 0,
             channel1: SquareChannel::default(),
             sweep: SweepState::default(),
@@ -383,18 +387,26 @@ impl ApuPeripheral {
     }
 
     /// Advance the APU by `cycles` T-cycles.
-    pub fn tick(&mut self, cycles: u16) -> ApuOutput {
+    ///
+    /// `div_counter` is the timer's internal 16-bit counter *after* the timer
+    /// has been advanced for these cycles. The frame sequencer clocks on the
+    /// falling edge of bit 12 (DIV bit 4).
+    pub fn tick(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
         if !self.powered {
+            self.prev_div_bit = div_counter & FRAME_SEQ_BIT != 0;
             return ApuOutput { nr52: self.build_nr52() };
         }
 
-        for _ in 0..cycles {
-            // Frame sequencer
-            self.frame_sequencer_counter += 1;
-            if self.frame_sequencer_counter >= FRAME_SEQUENCER_PERIOD {
-                self.frame_sequencer_counter = 0;
+        // Reconstruct per-T-cycle DIV values to detect falling edge of bit 12.
+        let div_start = div_counter.wrapping_sub(cycles);
+        for i in 0..cycles {
+            let div_now = div_start.wrapping_add(i + 1);
+            let cur_bit = div_now & FRAME_SEQ_BIT != 0;
+
+            if self.prev_div_bit && !cur_bit {
                 self.clock_frame_sequencer();
             }
+            self.prev_div_bit = cur_bit;
 
             // Frequency timers
             self.channel1.clock_frequency();
@@ -464,18 +476,20 @@ impl ApuPeripheral {
             self.channel4 = NoiseChannel::default();
             self.channel4.length_counter = ch4_len;
             self.sweep = SweepState::default();
-            self.frame_sequencer_counter = 0;
             self.frame_sequencer_step = 0;
         } else if !was_powered && self.powered {
             // Power on: reset frame sequencer
             self.frame_sequencer_step = 0;
-            self.frame_sequencer_counter = 0;
         }
     }
 
-    /// Returns true if the frame sequencer is on a step that clocks length.
+    /// Returns true if the previous frame sequencer step clocked length
+    /// (i.e. we're in the "first half" of a length period, where enabling
+    /// length should cause an extra length clock).
+    /// After an even step (0,2,4,6) executes and clocks length, the step
+    /// counter is incremented to odd. So odd step = just clocked length.
     fn frame_step_clocks_length(&self) -> bool {
-        self.frame_sequencer_step % 2 == 0
+        self.frame_sequencer_step % 2 == 1
     }
 
     fn apply_register_write(&mut self, address: u16, value: u8) {
@@ -516,14 +530,15 @@ impl ApuPeripheral {
                 self.channel1.frequency =
                     (self.channel1.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
                 let new_len_enable = value & 0x40 != 0;
+                let on_length_step = self.frame_step_clocks_length();
                 // Extra length clock: enabling length on a length-clocking step
-                if new_len_enable && !self.channel1.length_enabled
-                    && self.frame_step_clocks_length()
-                {
+                if new_len_enable && !self.channel1.length_enabled && on_length_step {
+                    self.channel1.length_enabled = true;
                     self.channel1.clock_length();
                 }
                 self.channel1.length_enabled = new_len_enable;
                 if value & 0x80 != 0 {
+                    let len_was_zero = self.channel1.length_counter == 0;
                     self.channel1.trigger();
                     self.sweep.trigger(&self.channel1);
                     if self.sweep.shift != 0 {
@@ -531,6 +546,11 @@ impl ApuPeripheral {
                         if new_freq > 2047 {
                             self.channel1.enabled = false;
                         }
+                    }
+                    // If trigger reloaded length (was 0) and length is enabled
+                    // on a length-clocking step, extra clock
+                    if len_was_zero && new_len_enable && on_length_step {
+                        self.channel1.clock_length();
                     }
                 }
             }
@@ -558,14 +578,18 @@ impl ApuPeripheral {
                 self.channel2.frequency =
                     (self.channel2.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
                 let new_len_enable = value & 0x40 != 0;
-                if new_len_enable && !self.channel2.length_enabled
-                    && self.frame_step_clocks_length()
-                {
+                let on_length_step = self.frame_step_clocks_length();
+                if new_len_enable && !self.channel2.length_enabled && on_length_step {
+                    self.channel2.length_enabled = true;
                     self.channel2.clock_length();
                 }
                 self.channel2.length_enabled = new_len_enable;
                 if value & 0x80 != 0 {
+                    let len_was_zero = self.channel2.length_counter == 0;
                     self.channel2.trigger();
+                    if len_was_zero && new_len_enable && on_length_step {
+                        self.channel2.clock_length();
+                    }
                 }
             }
             // Channel 3: DAC enable
@@ -592,14 +616,18 @@ impl ApuPeripheral {
                 self.channel3.frequency =
                     (self.channel3.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
                 let new_len_enable = value & 0x40 != 0;
-                if new_len_enable && !self.channel3.length_enabled
-                    && self.frame_step_clocks_length()
-                {
+                let on_length_step = self.frame_step_clocks_length();
+                if new_len_enable && !self.channel3.length_enabled && on_length_step {
+                    self.channel3.length_enabled = true;
                     self.channel3.clock_length();
                 }
                 self.channel3.length_enabled = new_len_enable;
                 if value & 0x80 != 0 {
+                    let len_was_zero = self.channel3.length_counter == 0;
                     self.channel3.trigger();
+                    if len_was_zero && new_len_enable && on_length_step {
+                        self.channel3.clock_length();
+                    }
                 }
             }
             // Channel 4: Length
@@ -625,14 +653,18 @@ impl ApuPeripheral {
             // Channel 4: Trigger + Length enable
             0xFF23 => {
                 let new_len_enable = value & 0x40 != 0;
-                if new_len_enable && !self.channel4.length_enabled
-                    && self.frame_step_clocks_length()
-                {
+                let on_length_step = self.frame_step_clocks_length();
+                if new_len_enable && !self.channel4.length_enabled && on_length_step {
+                    self.channel4.length_enabled = true;
                     self.channel4.clock_length();
                 }
                 self.channel4.length_enabled = new_len_enable;
                 if value & 0x80 != 0 {
+                    let len_was_zero = self.channel4.length_counter == 0;
                     self.channel4.trigger();
+                    if len_was_zero && new_len_enable && on_length_step {
+                        self.channel4.clock_length();
+                    }
                 }
             }
             // NR50, NR51: master volume/panning — just stored in regs[]
@@ -645,6 +677,8 @@ impl ApuPeripheral {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FRAME_SEQUENCER_PERIOD: u16 = 8192;
 
     #[test]
     fn test_read_masks() {
@@ -785,10 +819,14 @@ mod tests {
         apu.write_register(0xFF12, 0xF0); // ch1 DAC on
         apu.write_register(0xFF14, 0x80); // trigger
 
-        // Each frame sequencer step is 8192 T-cycles
+        // Frame sequencer clocks on falling edge of bit 12.
+        // Simulate by advancing div_counter through 8 falling edges.
+        let mut div: u16 = 0;
         for expected_step in 0..8u8 {
             assert_eq!(apu.frame_sequencer_step, expected_step);
-            apu.tick(FRAME_SEQUENCER_PERIOD);
+            // Advance 8192 T-cycles — bit 12 will fall once
+            div = div.wrapping_add(FRAME_SEQUENCER_PERIOD);
+            apu.tick(FRAME_SEQUENCER_PERIOD, div);
         }
         // Should wrap to 0
         assert_eq!(apu.frame_sequencer_step, 0);

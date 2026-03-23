@@ -280,7 +280,7 @@ impl Sm83 {
     }
 
     fn advance_apu(&mut self, cycles: u16) {
-        let output = self.apu.tick(cycles);
+        let output = self.apu.tick(cycles, self.timer.internal_counter());
         self.memory.write_io(NR52_ADDR, output.nr52);
     }
 

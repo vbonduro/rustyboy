@@ -26,7 +26,6 @@ fn test_dmg_sound_02_len_ctr() {
 }
 
 #[test]
-#[ignore] // Requires DIV-synchronized frame sequencer for extra length clock timing
 fn test_dmg_sound_03_trigger() {
     assert_blargg_mem_passed(
         "roms/blargg/dmg_sound/individual/03-trigger.gb",
