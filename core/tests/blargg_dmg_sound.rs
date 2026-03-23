@@ -74,7 +74,7 @@ fn test_dmg_sound_08_len_ctr_during_power() {
 }
 
 #[test]
-#[ignore] // Requires cycle-accurate wave channel position tracking
+#[ignore] // Requires T-cycle (sub-M-cycle) wave channel position tracking
 fn test_dmg_sound_09_wave_read_while_on() {
     assert_blargg_mem_passed(
         "roms/blargg/dmg_sound/individual/09-wave read while on.gb",
@@ -83,7 +83,7 @@ fn test_dmg_sound_09_wave_read_while_on() {
 }
 
 #[test]
-#[ignore] // Requires cycle-accurate wave channel position tracking
+#[ignore] // Requires T-cycle (sub-M-cycle) wave channel position tracking
 fn test_dmg_sound_10_wave_trigger_while_on() {
     assert_blargg_mem_passed(
         "roms/blargg/dmg_sound/individual/10-wave trigger while on.gb",
@@ -100,7 +100,7 @@ fn test_dmg_sound_11_regs_after_power() {
 }
 
 #[test]
-#[ignore] // Requires cycle-accurate wave channel position tracking
+#[ignore] // Requires T-cycle (sub-M-cycle) wave channel position tracking
 fn test_dmg_sound_12_wave_write_while_on() {
     assert_blargg_mem_passed(
         "roms/blargg/dmg_sound/individual/12-wave write while on.gb",
