@@ -185,6 +185,9 @@ struct WaveChannel {
     position: u8,
     sample_buffer: u8,
     wave_ram: [u8; 16],
+    /// Tracks whether a new sample was just read this T-cycle.
+    /// Used by wave RAM reads to determine if sample_buffer is accessible.
+    just_read: bool,
 }
 
 impl WaveChannel {
@@ -193,7 +196,9 @@ impl WaveChannel {
         if self.length_counter == 0 {
             self.length_counter = 256;
         }
-        self.frequency_timer = (2048 - self.frequency) * 2;
+        // Timer counts in 2 MHz cycles. DMG quirk: trigger adds 3 extra 2MHz-cycles
+        // to the initial timer reload (does NOT apply to clock_frequency() reload).
+        self.frequency_timer = (2048 - self.frequency) + 3;
         self.position = 0;
     }
 
@@ -206,15 +211,23 @@ impl WaveChannel {
         }
     }
 
+    /// Clock wave frequency timer at 2 MHz (called every other T-cycle).
+    /// `just_read` is cleared here (start of 2 MHz tick) and set on position
+    /// advance, giving a 2 T-cycle window where wave RAM is accessible.
     fn clock_frequency(&mut self) {
+        self.just_read = false;
+        if !self.enabled {
+            return;
+        }
         if self.frequency_timer > 0 {
             self.frequency_timer -= 1;
         }
         if self.frequency_timer == 0 {
-            self.frequency_timer = (2048 - self.frequency) * 2;
+            self.frequency_timer = 2048 - self.frequency;
             self.position = (self.position + 1) % 32;
             let byte_index = (self.position / 2) as usize;
             self.sample_buffer = self.wave_ram[byte_index];
+            self.just_read = true;
         }
     }
 }
@@ -302,6 +315,9 @@ pub struct ApuPeripheral {
     /// Previous state of FRAME_SEQ_BIT for falling-edge detection.
     prev_div_bit: bool,
     frame_sequencer_step: u8,
+    /// Phase divider for wave channel's 2 MHz clock (toggles each T-cycle).
+    /// Wave frequency timer ticks only when this is `true`.
+    wave_2mhz_phase: bool,
 
     channel1: SquareChannel,
     sweep: SweepState,
@@ -319,6 +335,7 @@ impl ApuPeripheral {
             powered: true,
             prev_div_bit: false,
             frame_sequencer_step: 0,
+            wave_2mhz_phase: false,
             channel1: SquareChannel::default(),
             sweep: SweepState::default(),
             channel2: SquareChannel::default(),
@@ -366,21 +383,37 @@ impl ApuPeripheral {
     }
 
     /// Read wave RAM byte.
+    ///
+    /// On DMG, reading wave RAM while ch3 is active only returns valid data
+    /// during the 2 T-cycle window when the wave channel reads a new sample
+    /// (`just_read` is true). Any other time returns 0xFF, and the returned
+    /// byte is always the one at the wave channel's current position (not the
+    /// requested offset).
     pub fn read_wave_ram(&self, offset: u8) -> u8 {
         if self.channel3.enabled {
-            // Read while ch3 is on: return the byte currently being read
-            self.channel3.sample_buffer
+            if self.channel3.just_read {
+                self.channel3.sample_buffer
+            } else {
+                0xFF
+            }
         } else {
             self.channel3.wave_ram[offset as usize]
         }
     }
 
     /// Write wave RAM byte.
+    ///
+    /// On DMG, writing wave RAM while ch3 is active is ignored unless it
+    /// coincides with the wave channel's sample read window (`just_read`).
+    /// When it does coincide, the write goes to the wave channel's current
+    /// position (not the requested offset).
     pub fn write_wave_ram(&mut self, offset: u8, value: u8) {
         if self.channel3.enabled {
-            // Write while ch3 is on: write to the byte currently being read
-            let byte_index = (self.channel3.position / 2) as usize;
-            self.channel3.wave_ram[byte_index] = value;
+            if self.channel3.just_read {
+                let byte_index = (self.channel3.position / 2) as usize;
+                self.channel3.wave_ram[byte_index] = value;
+            }
+            // else: write ignored on DMG when ch3 is active outside read window
         } else {
             self.channel3.wave_ram[offset as usize] = value;
         }
@@ -408,10 +441,15 @@ impl ApuPeripheral {
             }
             self.prev_div_bit = cur_bit;
 
-            // Frequency timers
             self.channel1.clock_frequency();
             self.channel2.clock_frequency();
-            self.channel3.clock_frequency();
+            // Wave channel period divider clocks at 2 MHz (once per 2 T-cycles).
+            // `just_read` is cleared at the start of each 2 MHz tick, giving a
+            // 2 T-cycle coincidence window for wave RAM reads/writes.
+            self.wave_2mhz_phase = !self.wave_2mhz_phase;
+            if self.wave_2mhz_phase {
+                self.channel3.clock_frequency();
+            }
             self.channel4.clock_frequency();
         }
 
@@ -624,6 +662,22 @@ impl ApuPeripheral {
                 self.channel3.length_enabled = new_len_enable;
                 if value & 0x80 != 0 {
                     let len_was_zero = self.channel3.length_counter == 0;
+                    // DMG corruption quirk: retriggering ch3 while it is active and the
+                    // timer is about to advance (timer == 1, fires on next 2MHz tick).
+                    // SameBoy uses sample_countdown == 0; our timer is 1 when about to fire
+                    // because we decrement before checking (1 → 0 → fire).
+                    if self.channel3.enabled && self.channel3.frequency_timer == 1 {
+                        let next_pos_byte = ((self.channel3.position + 1) / 2) as usize & 0x0F;
+                        if next_pos_byte < 4 {
+                            self.channel3.wave_ram[0] = self.channel3.wave_ram[next_pos_byte];
+                        } else {
+                            let block_start = next_pos_byte & !3;
+                            self.channel3.wave_ram[0] = self.channel3.wave_ram[block_start];
+                            self.channel3.wave_ram[1] = self.channel3.wave_ram[block_start + 1];
+                            self.channel3.wave_ram[2] = self.channel3.wave_ram[block_start + 2];
+                            self.channel3.wave_ram[3] = self.channel3.wave_ram[block_start + 3];
+                        }
+                    }
                     self.channel3.trigger();
                     if len_was_zero && new_len_enable && on_length_step {
                         self.channel3.clock_length();
@@ -843,6 +897,78 @@ mod tests {
         // Disable DAC
         apu.write_register(0xFF1A, 0x00);
         assert!(!apu.channel3.enabled);
+    }
+
+    /// Verifies wave channel phase at the read point for test 09 iteration 1.
+    ///
+    /// Iteration 1: a=0x99, freq=0x799, initial_timer = (2048-0x799)+3 = 106.
+    /// T-cycle sequence (trigger → freq change → delay → read):
+    ///   NR34 bus_write:  3T advance + trigger + 1T = 4T total
+    ///   wreg NR33,-2:    4 tick_cycles (ld a + ldh opcode + ldh read_n) + 3T advance + write + 1T = 20T
+    ///   delay_clocks 176: 44 tick_cycles = 176T
+    ///   lda WAVE:        2 tick_cycles (opcode + read_n) + 3T advance + read = 11T
+    ///
+    /// 2MHz-ticks from trigger to freq change: 20T/2 = 10
+    /// Timer at freq change: 106 - 10 = 96
+    /// 2MHz-ticks from freq change to read: (1+176+8+3)T / 2 = 188T/2 = 94
+    /// Since 96 > 94: timer never fires → position stays 0, just_read=false, read returns 0xFF.
+    #[test]
+    fn probe_wave_phase_at_read() {
+        let wave_data: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        ];
+        let a: u8 = 0x99;
+
+        // ---- Simulate from a fresh APU, matching bus_write(NR34)/bus_write(NR33)/delay/bus_read ----
+        // Each bus_write for APU regs: advance_apu(1) × 3, write, advance_apu(1) × 1
+        // Each tick_cycle (non-APU): advance_apu(1) × 4
+        // bus_read for WAVE: advance_apu(1) × 3, read, advance_apu(1) × 1
+
+        let mut apu = ApuPeripheral::new();
+        let mut div: u16 = 0;
+
+        // Write wave RAM while ch3 disabled (load_wave)
+        for i in 0..16u8 {
+            apu.write_wave_ram(i, wave_data[i as usize]);
+        }
+        apu.write_register(0xFF1A, 0x80); // NR30: DAC on
+        apu.write_register(0xFF1C, 0x00); // NR32: silent
+        apu.write_register(0xFF1D, a);    // NR33: initial freq lo
+
+        // bus_write NR34 = 0x87 (trigger):  3 advance + write + 1 advance = 4T
+        for _ in 0..3 { div = div.wrapping_add(1); apu.tick(1, div); }
+        apu.write_register(0xFF1E, 0x87);
+        div = div.wrapping_add(1); apu.tick(1, div);
+
+        // wreg NR33,-2 overhead: ld a,$FE (2M=8T) + ldh opcode(4T) + ldh read_n(4T) = 4 tick_cycles = 16T
+        // Then bus_write NR33: 3 advance + write + 1 advance = 4T
+        // Total: 20T (10 2MHz-ticks) from trigger to freq change
+        for _ in 0..16 { div = div.wrapping_add(1); apu.tick(1, div); } // 4 tick_cycles × 4T
+        for _ in 0..3 { div = div.wrapping_add(1); apu.tick(1, div); }
+        apu.write_register(0xFF1D, 0xFE); // freq = 0x7FE
+        div = div.wrapping_add(1); apu.tick(1, div);
+
+        // delay_clocks 176 = 44 M-cycles = 176 T-cycles = 176 tick calls
+        for _ in 0..176 { div = div.wrapping_add(1); apu.tick(1, div); }
+
+        // bus_read WAVE: ldh opcode(4T) + ldh read_n(4T) = 8 tick calls, then 3T advance + read + 1T
+        for _ in 0..8 { div = div.wrapping_add(1); apu.tick(1, div); }
+        for _ in 0..3 { div = div.wrapping_add(1); apu.tick(1, div); }
+        let value = apu.read_wave_ram(0);
+        div = div.wrapping_add(1); apu.tick(1, div);
+
+        let pos = apu.channel3.position;
+        let timer = apu.channel3.frequency_timer;
+        let just_read = apu.channel3.just_read;
+        // iteration 1 is non-coincident: timer 96 > 94 ticks available → no advance
+        // position stays 0, just_read=false, value=0xFF
+        assert_eq!(
+            (just_read, pos, timer, value),
+            (false, 0u8, 2u16, 0xFFu8),
+            "wave state: value={:02X} pos={} timer={} just_read={}",
+            value, pos, timer, just_read
+        );
     }
 
     #[test]
