@@ -50,20 +50,34 @@ pub struct ApuOutput {
     pub nr52: u8,
 }
 
+/// Pulse (square wave) channel — used by ch1 (with sweep) and ch2.
 #[derive(Default)]
 struct SquareChannel {
+    /// Channel output is active (DAC on and not silenced by length).
     enabled: bool,
+    /// DAC powered. When false, channel is immediately disabled.
     dac_enabled: bool,
+    /// Counts down to 0; channel disables when it reaches 0 (if length_enabled).
     length_counter: u16,
+    /// Whether the length counter is active (NRx4 bit 6).
     length_enabled: bool,
+    /// Current output volume (0–15). Modified by the envelope.
     volume: u8,
+    /// Initial volume loaded on trigger (NRx2 bits 7–4).
     volume_initial: u8,
+    /// Envelope direction: true = increase, false = decrease.
     envelope_add: bool,
+    /// Envelope sweep period in frame sequencer ticks (0 = disabled).
     envelope_period: u8,
+    /// Counts down each frame sequencer envelope step.
     envelope_timer: u8,
+    /// 11-bit frequency value (not the actual Hz, used to derive timer period).
     frequency: u16,
+    /// Counts down T-cycles; reloads to `(2048 - frequency) * 4` at 0.
     frequency_timer: u16,
+    /// Duty pattern index (0–3).
     duty: u8,
+    /// Current step within the 8-bit duty waveform (0–7).
     duty_position: u8,
 }
 
@@ -115,14 +129,26 @@ impl SquareChannel {
     }
 }
 
+/// Frequency sweep unit, attached to ch1 only.
+///
+/// Each frame sequencer sweep step adjusts ch1's frequency by a fraction of
+/// itself, and can disable ch1 on overflow.
 #[derive(Default)]
 struct SweepState {
+    /// Sweep unit is active (period != 0 or shift != 0 at trigger time).
     enabled: bool,
+    /// Sweep period in frame sequencer ticks (0 = disabled).
     period: u8,
+    /// Counts down each frame sequencer sweep step.
     timer: u8,
+    /// Direction: true = subtract (down-sweep), false = add (up-sweep).
     negate: bool,
+    /// Right-shift amount for the frequency delta calculation.
     shift: u8,
+    /// Shadow copy of ch1's frequency, updated each sweep iteration.
     shadow_frequency: u16,
+    /// Set when negate mode was used during the sweep. Used for the
+    /// "negate-then-positive" disable quirk.
     negate_used: bool,
 }
 
@@ -173,20 +199,37 @@ impl SweepState {
     }
 }
 
+/// Wave channel (ch3) — plays arbitrary 4-bit PCM samples from wave RAM.
+///
+/// The wave channel clocks at 2 MHz (once every 2 T-cycles) rather than 4 MHz.
+/// Wave RAM is only accessible from the CPU during the 2 T-cycle window immediately
+/// after a sample position advance (`just_read` is true). Outside this window,
+/// reads return 0xFF and writes are ignored while ch3 is active.
 #[derive(Default)]
 struct WaveChannel {
+    /// Channel output is active (DAC on and not silenced by length).
     enabled: bool,
+    /// DAC powered (NR30 bit 7). When false, channel is immediately disabled.
     dac_enabled: bool,
+    /// Counts down to 0; channel disables when it reaches 0 (if length_enabled).
     length_counter: u16,
+    /// Whether the length counter is active (NR34 bit 6).
     length_enabled: bool,
+    /// Output volume shift code (NR32 bits 6–5): 0=mute, 1=100%, 2=50%, 3=25%.
     volume_code: u8,
+    /// 11-bit frequency value. Timer period = `2048 - frequency` in 2MHz ticks.
     frequency: u16,
+    /// Counts down 2MHz ticks; reloads to `2048 - frequency` at 0.
     frequency_timer: u16,
+    /// Current sample position within the 32-nibble wave table (0–31).
     position: u8,
+    /// The wave RAM byte read at the current position (both nibbles).
     sample_buffer: u8,
+    /// 16-byte wave RAM table, each byte encoding two 4-bit samples.
     wave_ram: [u8; 16],
-    /// Tracks whether a new sample was just read this T-cycle.
-    /// Used by wave RAM reads to determine if sample_buffer is accessible.
+    /// True for 2 T-cycles after each position advance. During this window,
+    /// CPU reads return `sample_buffer` and CPU writes redirect to the current
+    /// position instead of the requested offset (DMG wave RAM access quirk).
     just_read: bool,
 }
 
@@ -232,21 +275,38 @@ impl WaveChannel {
     }
 }
 
+/// Noise channel (ch4) — generates pseudo-random noise via a linear feedback
+/// shift register (LFSR).
 #[derive(Default)]
 struct NoiseChannel {
+    /// Channel output is active (DAC on and not silenced by length).
     enabled: bool,
+    /// DAC powered. When false, channel is immediately disabled.
     dac_enabled: bool,
+    /// Counts down to 0; channel disables when it reaches 0 (if length_enabled).
     length_counter: u16,
+    /// Whether the length counter is active (NR44 bit 6).
     length_enabled: bool,
+    /// Current output volume (0–15). Modified by the envelope.
     volume: u8,
+    /// Initial volume loaded on trigger (NR42 bits 7–4).
     volume_initial: u8,
+    /// Envelope direction: true = increase, false = decrease.
     envelope_add: bool,
+    /// Envelope sweep period in frame sequencer ticks (0 = disabled).
     envelope_period: u8,
+    /// Counts down each frame sequencer envelope step.
     envelope_timer: u8,
+    /// LFSR clock shift (NR43 bits 7–4). Timer period = `divisor << clock_shift`.
     clock_shift: u8,
+    /// LFSR width mode (NR43 bit 3): false = 15-bit, true = 7-bit.
     width_mode: bool,
+    /// Index into `NOISE_DIVISORS` table (NR43 bits 2–0).
     divisor_code: u8,
+    /// Counts down T-cycles until the next LFSR step.
     frequency_timer: u16,
+    /// 15-bit (or 7-bit in width mode) linear feedback shift register.
+    /// Bit 0 is the output bit; XOR of bits 0 and 1 feeds back into bit 14 (and 6).
     lfsr: u16,
 }
 
@@ -309,14 +369,26 @@ impl NoiseChannel {
 /// The frame sequencer clocks on the falling edge of this bit.
 const FRAME_SEQ_BIT: u16 = 1 << 12;
 
-/// Game Boy APU peripheral.
+/// Game Boy APU (Audio Processing Unit) peripheral.
+///
+/// Contains the four sound channels (pulse×2, wave, noise), the frame sequencer
+/// that drives length/envelope/sweep clocking, and raw register storage for
+/// read-back through the IO bus.
+///
+/// `tick()` must be called once per T-cycle. The frame sequencer is driven by
+/// the falling edge of bit 12 of the timer's internal counter (DIV bit 4).
 pub struct ApuPeripheral {
+    /// Whether the APU is powered on (NR52 bit 7). When false, all registers
+    /// except NRx1 (length) are frozen and channels are silent.
     powered: bool,
-    /// Previous state of FRAME_SEQ_BIT for falling-edge detection.
+    /// Previous state of FRAME_SEQ_BIT used to detect the falling edge.
     prev_div_bit: bool,
+    /// Current frame sequencer step (0–7). Advances on each falling edge of
+    /// FRAME_SEQ_BIT. Drives length (steps 0,2,4,6), sweep (steps 2,6),
+    /// and envelope (step 7) clocking.
     frame_sequencer_step: u8,
-    /// Phase divider for wave channel's 2 MHz clock (toggles each T-cycle).
-    /// Wave frequency timer ticks only when this is `true`.
+    /// Phase divider for ch3's 2 MHz clock. Toggles every T-cycle; ch3's
+    /// frequency timer only ticks when this is `true`.
     wave_2mhz_phase: bool,
 
     channel1: SquareChannel,
@@ -325,7 +397,8 @@ pub struct ApuPeripheral {
     channel3: WaveChannel,
     channel4: NoiseChannel,
 
-    // Raw register values for read-back
+    /// Raw register bytes for NR10–NR51 (indices 0–21), stored as written.
+    /// Read-back ORs these with `READ_MASKS` to expose write-only bits as 1.
     regs: [u8; 23], // NR10 (0xFF10) through NR52 (0xFF26)
 }
 
@@ -532,198 +605,236 @@ impl ApuPeripheral {
 
     fn apply_register_write(&mut self, address: u16, value: u8) {
         match address {
-            // Channel 1: Sweep
-            0xFF10 => {
-                self.sweep.period = (value >> 4) & 0x07;
-                let new_negate = value & 0x08 != 0;
-                // Negate-then-positive quirk: if sweep was used in negate mode
-                // and is now switched to positive, disable channel
-                if self.sweep.negate_used && self.sweep.negate && !new_negate {
-                    self.channel1.enabled = false;
-                }
-                self.sweep.negate = new_negate;
-                self.sweep.shift = value & 0x07;
-            }
-            // Channel 1: Duty + Length
+            // ── Channel 1 (pulse + sweep) ─────────────────────────────────
+            0xFF10 => self.write_nr10_sweep(value),
             0xFF11 => {
+                // NR11: duty pattern (bits 7–6) and length counter (bits 5–0)
                 self.channel1.duty = (value >> 6) & 0x03;
                 self.channel1.length_counter = 64 - (value & 0x3F) as u16;
             }
-            // Channel 1: Volume Envelope
-            0xFF12 => {
-                self.channel1.volume_initial = (value >> 4) & 0x0F;
-                self.channel1.envelope_add = value & 0x08 != 0;
-                self.channel1.envelope_period = value & 0x07;
-                self.channel1.dac_enabled = value & 0xF8 != 0;
-                if !self.channel1.dac_enabled {
-                    self.channel1.enabled = false;
-                }
-            }
-            // Channel 1: Frequency lo
+            0xFF12 => self.write_ch1_envelope(value),
             0xFF13 => {
+                // NR13: frequency low byte
                 self.channel1.frequency = (self.channel1.frequency & 0x700) | value as u16;
             }
-            // Channel 1: Frequency hi + Trigger + Length enable
-            0xFF14 => {
-                self.channel1.frequency =
-                    (self.channel1.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
-                let new_len_enable = value & 0x40 != 0;
-                let on_length_step = self.frame_step_clocks_length();
-                // Extra length clock: enabling length on a length-clocking step
-                if new_len_enable && !self.channel1.length_enabled && on_length_step {
-                    self.channel1.length_enabled = true;
-                    self.channel1.clock_length();
-                }
-                self.channel1.length_enabled = new_len_enable;
-                if value & 0x80 != 0 {
-                    let len_was_zero = self.channel1.length_counter == 0;
-                    self.channel1.trigger();
-                    self.sweep.trigger(&self.channel1);
-                    if self.sweep.shift != 0 {
-                        let new_freq = self.sweep.calculate_frequency();
-                        if new_freq > 2047 {
-                            self.channel1.enabled = false;
-                        }
-                    }
-                    // If trigger reloaded length (was 0) and length is enabled
-                    // on a length-clocking step, extra clock
-                    if len_was_zero && new_len_enable && on_length_step {
-                        self.channel1.clock_length();
-                    }
-                }
-            }
-            // Channel 2: Duty + Length
+            0xFF14 => self.write_ch1_trigger(value),
+
+            // ── Channel 2 (pulse) ─────────────────────────────────────────
             0xFF16 => {
+                // NR21: duty pattern (bits 7–6) and length counter (bits 5–0)
                 self.channel2.duty = (value >> 6) & 0x03;
                 self.channel2.length_counter = 64 - (value & 0x3F) as u16;
             }
-            // Channel 2: Volume Envelope
-            0xFF17 => {
-                self.channel2.volume_initial = (value >> 4) & 0x0F;
-                self.channel2.envelope_add = value & 0x08 != 0;
-                self.channel2.envelope_period = value & 0x07;
-                self.channel2.dac_enabled = value & 0xF8 != 0;
-                if !self.channel2.dac_enabled {
-                    self.channel2.enabled = false;
-                }
-            }
-            // Channel 2: Frequency lo
+            0xFF17 => self.write_ch2_envelope(value),
             0xFF18 => {
+                // NR23: frequency low byte
                 self.channel2.frequency = (self.channel2.frequency & 0x700) | value as u16;
             }
-            // Channel 2: Frequency hi + Trigger + Length enable
-            0xFF19 => {
-                self.channel2.frequency =
-                    (self.channel2.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
-                let new_len_enable = value & 0x40 != 0;
-                let on_length_step = self.frame_step_clocks_length();
-                if new_len_enable && !self.channel2.length_enabled && on_length_step {
-                    self.channel2.length_enabled = true;
-                    self.channel2.clock_length();
-                }
-                self.channel2.length_enabled = new_len_enable;
-                if value & 0x80 != 0 {
-                    let len_was_zero = self.channel2.length_counter == 0;
-                    self.channel2.trigger();
-                    if len_was_zero && new_len_enable && on_length_step {
-                        self.channel2.clock_length();
-                    }
-                }
-            }
-            // Channel 3: DAC enable
+            0xFF19 => self.write_ch2_trigger(value),
+
+            // ── Channel 3 (wave) ──────────────────────────────────────────
             0xFF1A => {
+                // NR30: DAC enable (bit 7)
                 self.channel3.dac_enabled = value & 0x80 != 0;
                 if !self.channel3.dac_enabled {
                     self.channel3.enabled = false;
                 }
             }
-            // Channel 3: Length
             0xFF1B => {
+                // NR31: length counter (full byte, max 256)
                 self.channel3.length_counter = 256 - value as u16;
             }
-            // Channel 3: Volume
             0xFF1C => {
+                // NR32: output volume code (bits 6–5): 0=mute, 1=100%, 2=50%, 3=25%
                 self.channel3.volume_code = (value >> 5) & 0x03;
             }
-            // Channel 3: Frequency lo
             0xFF1D => {
+                // NR33: frequency low byte
                 self.channel3.frequency = (self.channel3.frequency & 0x700) | value as u16;
             }
-            // Channel 3: Frequency hi + Trigger + Length enable
-            0xFF1E => {
-                self.channel3.frequency =
-                    (self.channel3.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
-                let new_len_enable = value & 0x40 != 0;
-                let on_length_step = self.frame_step_clocks_length();
-                if new_len_enable && !self.channel3.length_enabled && on_length_step {
-                    self.channel3.length_enabled = true;
-                    self.channel3.clock_length();
-                }
-                self.channel3.length_enabled = new_len_enable;
-                if value & 0x80 != 0 {
-                    let len_was_zero = self.channel3.length_counter == 0;
-                    // DMG corruption quirk: retriggering ch3 while it is active and the
-                    // timer is about to advance (timer == 1, fires on next 2MHz tick).
-                    // SameBoy uses sample_countdown == 0; our timer is 1 when about to fire
-                    // because we decrement before checking (1 → 0 → fire).
-                    if self.channel3.enabled && self.channel3.frequency_timer == 1 {
-                        let next_pos_byte = ((self.channel3.position + 1) / 2) as usize & 0x0F;
-                        if next_pos_byte < 4 {
-                            self.channel3.wave_ram[0] = self.channel3.wave_ram[next_pos_byte];
-                        } else {
-                            let block_start = next_pos_byte & !3;
-                            self.channel3.wave_ram[0] = self.channel3.wave_ram[block_start];
-                            self.channel3.wave_ram[1] = self.channel3.wave_ram[block_start + 1];
-                            self.channel3.wave_ram[2] = self.channel3.wave_ram[block_start + 2];
-                            self.channel3.wave_ram[3] = self.channel3.wave_ram[block_start + 3];
-                        }
-                    }
-                    self.channel3.trigger();
-                    if len_was_zero && new_len_enable && on_length_step {
-                        self.channel3.clock_length();
-                    }
-                }
-            }
-            // Channel 4: Length
+            0xFF1E => self.write_ch3_trigger(value),
+
+            // ── Channel 4 (noise) ─────────────────────────────────────────
             0xFF20 => {
+                // NR41: length counter (bits 5–0, max 64)
                 self.channel4.length_counter = 64 - (value & 0x3F) as u16;
             }
-            // Channel 4: Volume Envelope
-            0xFF21 => {
-                self.channel4.volume_initial = (value >> 4) & 0x0F;
-                self.channel4.envelope_add = value & 0x08 != 0;
-                self.channel4.envelope_period = value & 0x07;
-                self.channel4.dac_enabled = value & 0xF8 != 0;
-                if !self.channel4.dac_enabled {
-                    self.channel4.enabled = false;
-                }
-            }
-            // Channel 4: Polynomial counter
+            0xFF21 => self.write_ch4_envelope(value),
             0xFF22 => {
+                // NR43: LFSR clock shift (bits 7–4), width mode (bit 3), divisor (bits 2–0)
                 self.channel4.clock_shift = (value >> 4) & 0x0F;
                 self.channel4.width_mode = value & 0x08 != 0;
                 self.channel4.divisor_code = value & 0x07;
             }
-            // Channel 4: Trigger + Length enable
-            0xFF23 => {
-                let new_len_enable = value & 0x40 != 0;
-                let on_length_step = self.frame_step_clocks_length();
-                if new_len_enable && !self.channel4.length_enabled && on_length_step {
-                    self.channel4.length_enabled = true;
-                    self.channel4.clock_length();
-                }
-                self.channel4.length_enabled = new_len_enable;
-                if value & 0x80 != 0 {
-                    let len_was_zero = self.channel4.length_counter == 0;
-                    self.channel4.trigger();
-                    if len_was_zero && new_len_enable && on_length_step {
-                        self.channel4.clock_length();
-                    }
-                }
-            }
-            // NR50, NR51: master volume/panning — just stored in regs[]
+            0xFF23 => self.write_ch4_trigger(value),
+
+            // NR50, NR51: master volume / stereo panning — stored in regs[] only
             0xFF24 | 0xFF25 => {}
             _ => {}
+        }
+    }
+
+    // ── NRx2 volume envelope + DAC helpers ──────────────────────────────────
+
+    /// NR12: ch1 volume envelope and DAC. DAC is disabled (and channel silenced)
+    /// when the upper 5 bits are all zero (no initial volume and no add mode).
+    fn write_ch1_envelope(&mut self, value: u8) {
+        self.channel1.volume_initial = (value >> 4) & 0x0F;
+        self.channel1.envelope_add = value & 0x08 != 0;
+        self.channel1.envelope_period = value & 0x07;
+        self.channel1.dac_enabled = value & 0xF8 != 0;
+        if !self.channel1.dac_enabled {
+            self.channel1.enabled = false;
+        }
+    }
+
+    /// NR22: ch2 volume envelope and DAC.
+    fn write_ch2_envelope(&mut self, value: u8) {
+        self.channel2.volume_initial = (value >> 4) & 0x0F;
+        self.channel2.envelope_add = value & 0x08 != 0;
+        self.channel2.envelope_period = value & 0x07;
+        self.channel2.dac_enabled = value & 0xF8 != 0;
+        if !self.channel2.dac_enabled {
+            self.channel2.enabled = false;
+        }
+    }
+
+    /// NR42: ch4 volume envelope and DAC.
+    fn write_ch4_envelope(&mut self, value: u8) {
+        self.channel4.volume_initial = (value >> 4) & 0x0F;
+        self.channel4.envelope_add = value & 0x08 != 0;
+        self.channel4.envelope_period = value & 0x07;
+        self.channel4.dac_enabled = value & 0xF8 != 0;
+        if !self.channel4.dac_enabled {
+            self.channel4.enabled = false;
+        }
+    }
+
+    // ── NRx4 trigger helpers ─────────────────────────────────────────────────
+
+    /// NR10: sweep period, direction, and shift. The "negate-then-positive" quirk
+    /// disables ch1 if sweep was used in subtract mode and is now switched to add.
+    fn write_nr10_sweep(&mut self, value: u8) {
+        self.sweep.period = (value >> 4) & 0x07;
+        let new_negate = value & 0x08 != 0;
+        if self.sweep.negate_used && self.sweep.negate && !new_negate {
+            self.channel1.enabled = false;
+        }
+        self.sweep.negate = new_negate;
+        self.sweep.shift = value & 0x07;
+    }
+
+    /// NR14: ch1 frequency high bits, length enable, and trigger.
+    ///
+    /// Trigger initialises the channel and fires the sweep unit. The sweep unit
+    /// does an immediate overflow check when shift is nonzero.
+    fn write_ch1_trigger(&mut self, value: u8) {
+        self.channel1.frequency =
+            (self.channel1.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        let new_len_enable = value & 0x40 != 0;
+        let on_length_step = self.frame_step_clocks_length();
+        if new_len_enable && !self.channel1.length_enabled && on_length_step {
+            self.channel1.length_enabled = true;
+            self.channel1.clock_length();
+        }
+        self.channel1.length_enabled = new_len_enable;
+        if value & 0x80 != 0 {
+            let len_was_zero = self.channel1.length_counter == 0;
+            self.channel1.trigger();
+            self.sweep.trigger(&self.channel1);
+            if self.sweep.shift != 0 {
+                let new_freq = self.sweep.calculate_frequency();
+                if new_freq > 2047 {
+                    self.channel1.enabled = false;
+                }
+            }
+            if len_was_zero && new_len_enable && on_length_step {
+                self.channel1.clock_length();
+            }
+        }
+    }
+
+    /// NR19: ch2 frequency high bits, length enable, and trigger.
+    fn write_ch2_trigger(&mut self, value: u8) {
+        self.channel2.frequency =
+            (self.channel2.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        let new_len_enable = value & 0x40 != 0;
+        let on_length_step = self.frame_step_clocks_length();
+        if new_len_enable && !self.channel2.length_enabled && on_length_step {
+            self.channel2.length_enabled = true;
+            self.channel2.clock_length();
+        }
+        self.channel2.length_enabled = new_len_enable;
+        if value & 0x80 != 0 {
+            let len_was_zero = self.channel2.length_counter == 0;
+            self.channel2.trigger();
+            if len_was_zero && new_len_enable && on_length_step {
+                self.channel2.clock_length();
+            }
+        }
+    }
+
+    /// NR1E: ch3 frequency high bits, length enable, and trigger.
+    ///
+    /// Includes the DMG wave RAM corruption quirk: retriggering while ch3 is
+    /// active and the wave timer is about to fire (`frequency_timer == 1`)
+    /// corrupts the first 4 bytes of wave RAM based on the upcoming position.
+    fn write_ch3_trigger(&mut self, value: u8) {
+        self.channel3.frequency =
+            (self.channel3.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        let new_len_enable = value & 0x40 != 0;
+        let on_length_step = self.frame_step_clocks_length();
+        if new_len_enable && !self.channel3.length_enabled && on_length_step {
+            self.channel3.length_enabled = true;
+            self.channel3.clock_length();
+        }
+        self.channel3.length_enabled = new_len_enable;
+        if value & 0x80 != 0 {
+            let len_was_zero = self.channel3.length_counter == 0;
+            self.apply_ch3_retrigger_corruption();
+            self.channel3.trigger();
+            if len_was_zero && new_len_enable && on_length_step {
+                self.channel3.clock_length();
+            }
+        }
+    }
+
+    /// NR23: ch4 length enable and trigger.
+    fn write_ch4_trigger(&mut self, value: u8) {
+        let new_len_enable = value & 0x40 != 0;
+        let on_length_step = self.frame_step_clocks_length();
+        if new_len_enable && !self.channel4.length_enabled && on_length_step {
+            self.channel4.length_enabled = true;
+            self.channel4.clock_length();
+        }
+        self.channel4.length_enabled = new_len_enable;
+        if value & 0x80 != 0 {
+            let len_was_zero = self.channel4.length_counter == 0;
+            self.channel4.trigger();
+            if len_was_zero && new_len_enable && on_length_step {
+                self.channel4.clock_length();
+            }
+        }
+    }
+
+    /// DMG wave RAM corruption on retrigger: when ch3 is active and its frequency
+    /// timer is 1 (about to fire on the next 2MHz tick), retriggering corrupts
+    /// the first 4 bytes of wave RAM. If the upcoming position byte is in the first
+    /// block (bytes 0–3), only that byte is copied to byte 0. Otherwise the entire
+    /// 4-byte block containing that position is copied into bytes 0–3.
+    fn apply_ch3_retrigger_corruption(&mut self) {
+        if !self.channel3.enabled || self.channel3.frequency_timer != 1 {
+            return;
+        }
+        let next_pos_byte = ((self.channel3.position + 1) / 2) as usize & 0x0F;
+        if next_pos_byte < 4 {
+            self.channel3.wave_ram[0] = self.channel3.wave_ram[next_pos_byte];
+        } else {
+            let block_start = next_pos_byte & !3;
+            self.channel3.wave_ram[0] = self.channel3.wave_ram[block_start];
+            self.channel3.wave_ram[1] = self.channel3.wave_ram[block_start + 1];
+            self.channel3.wave_ram[2] = self.channel3.wave_ram[block_start + 2];
+            self.channel3.wave_ram[3] = self.channel3.wave_ram[block_start + 3];
         }
     }
 }

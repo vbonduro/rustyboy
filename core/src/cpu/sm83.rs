@@ -160,7 +160,7 @@ impl Sm83 {
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
             // Wave RAM reads require T-cycle precision. The sample is latched
             // at T3 within the M-cycle on real hardware.
-            self.apu_mcycle_preamble();
+            self.tick_cycle_to_t3();
             let offset = (addr - WAVE_RAM_START) as u8;
             let value = self.apu.read_wave_ram(offset);
             self.advance_timer_apu(1);
@@ -177,13 +177,13 @@ impl Sm83 {
     /// for T-cycle accurate timing.
     fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
         if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
-            self.apu_mcycle_preamble();
+            self.tick_cycle_to_t3();
             self.write_apu_register(addr, value);
             self.advance_timer_apu(1);
             return Ok(());
         }
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            self.apu_mcycle_preamble();
+            self.tick_cycle_to_t3();
             self.write_wave_ram(addr, value);
             self.advance_timer_apu(1);
             return Ok(());
@@ -210,12 +210,13 @@ impl Sm83 {
         }
     }
 
-    /// Shared preamble for APU register/wave RAM bus accesses: increment the
-    /// cycle counter, route pending events, advance PPU for the full M-cycle,
-    /// then advance timer+APU for the first 3 T-cycles (T1–T3).
-    /// The caller performs the read/write at T3, then calls `advance_timer_apu(1)`
-    /// for T4 to complete the M-cycle.
-    fn apu_mcycle_preamble(&mut self) {
+    /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
+    /// stopping so the caller can perform a time-sensitive APU read or write at T3.
+    /// The caller must call `advance_timer_apu(1)` afterwards to complete T4.
+    ///
+    /// PPU advances for the full M-cycle up front; only timer+APU need per-T-cycle
+    /// precision for wave channel position tracking.
+    fn tick_cycle_to_t3(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
         self.advance_ppu(4);
