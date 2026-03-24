@@ -137,8 +137,9 @@ pub fn assert_blargg_mem_passed(path: &str, name: &str) {
     );
 }
 
-/// Run a Mooneye-style ROM that signals completion via HALT and
-/// indicates pass/fail via Fibonacci register values.
+/// Run a Mooneye-style ROM that signals completion via an infinite loop
+/// (`JR -2`, opcode sequence `0x18 0xFE`) and indicates pass/fail via
+/// Fibonacci register values.
 ///
 /// Pass: B=3, C=5, D=8, E=13, H=21, L=34
 /// Fail: B=0x42, C=0x42, D=0x42, E=0x42, H=0x42, L=0x42
@@ -152,11 +153,18 @@ pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
         ..Default::default()
     });
 
-    // Mooneye tests complete within 120 emulated seconds.
-    // At ~4 MHz that's ~480 million cycles, but most finish much faster.
-    const MAX_TICKS: u64 = 100_000_000;
+    // Mooneye ROMs signal completion with an infinite `JR -2` loop.
+    // Most finish in well under 1 million ticks; cap at 10M to be safe.
+    const MAX_TICKS: u64 = 10_000_000;
     let mut ticks = 0u64;
+    let mut prev_pc = 0u16;
     while ticks < MAX_TICKS {
+        let pc = cpu.registers().pc;
+        // Detect `JR -2` (0x18 0xFE): PC loops back to itself each tick.
+        if pc == prev_pc {
+            break;
+        }
+        prev_pc = pc;
         cpu.tick().unwrap();
         ticks += 1;
         if cpu.is_halted() {
