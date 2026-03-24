@@ -1,8 +1,10 @@
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use super::rom::{ROMVec, Ram, ReadOnlyMemory};
+use super::cartridge::{self, Cartridge, NoMbc};
+use super::rom::Ram;
 
 /// An event produced when a write occurs to an I/O or IE register address.
 #[derive(Debug, PartialEq, Clone)]
@@ -73,9 +75,9 @@ impl RegionMapping {
 /// Game Boy memory map dispatching reads/writes to the appropriate region.
 ///
 /// Address map:
-///   0x0000–0x7FFF  ROM (read-only cartridge)
+///   0x0000–0x7FFF  ROM (cartridge, may be bank-switched by MBC)
 ///   0x8000–0x9FFF  VRAM
-///   0xA000–0xBFFF  External RAM
+///   0xA000–0xBFFF  External RAM (cartridge, may be bank-switched by MBC)
 ///   0xC000–0xDFFF  Work RAM (WRAM)
 ///   0xE000–0xFDFF  Echo RAM (mirrors WRAM reads, writes are read-only)
 ///   0xFE00–0xFE9F  OAM
@@ -84,9 +86,8 @@ impl RegionMapping {
 ///   0xFFFF         Interrupt Enable (IE) register
 ///   Everything else: unmapped (returns 0xFF on read, silently ignored on write)
 pub struct GameBoyMemory {
-    rom: ROMVec,
+    cartridge: Box<dyn Cartridge>,
     vram: Ram,
-    external_ram: Ram,
     wram: Ram,
     oam: Ram,
     io: Ram,
@@ -98,9 +99,8 @@ pub struct GameBoyMemory {
 impl GameBoyMemory {
     pub fn new() -> Self {
         Self {
-            rom: ROMVec::new(vec![0u8; 0x8000]),
+            cartridge: Box::new(NoMbc::new(vec![0u8; 0x8000])),
             vram: Ram::new(0x2000),
-            external_ram: Ram::new(0x2000),
             wram: Ram::new(0x2000),
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
@@ -110,14 +110,12 @@ impl GameBoyMemory {
         }
     }
 
+    /// Construct memory with a cartridge ROM. The cartridge type is auto-detected
+    /// from the ROM header (byte 0x0147) to select the correct MBC.
     pub fn with_rom(data: Vec<u8>) -> Self {
-        assert!(data.len() <= 0x8000, "ROM data exceeds 32KiB");
-        let mut rom_data = vec![0u8; 0x8000];
-        rom_data[..data.len()].copy_from_slice(&data);
         Self {
-            rom: ROMVec::new(rom_data),
+            cartridge: cartridge::from_rom(data),
             vram: Ram::new(0x2000),
-            external_ram: Ram::new(0x2000),
             wram: Ram::new(0x2000),
             oam: Ram::new(0xA0),
             io: Ram::new(0x80),
@@ -173,18 +171,12 @@ impl GameBoyMemory {
 impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(offset) => self
-                .rom
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Rom(_) => Ok(self.cartridge.read_rom(address)),
             RegionMapping::Vram(offset) => self
                 .vram
                 .read(offset)
                 .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::ExternalRam(offset) => self
-                .external_ram
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::ExternalRam(offset) => Ok(self.cartridge.read_ram(offset)),
             RegionMapping::Wram(offset) => self
                 .wram
                 .read(offset)
@@ -212,13 +204,13 @@ impl Memory for GameBoyMemory {
 
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(_) => Ok(()), // Writes to ROM are silently ignored (or handled by MBC)
+            // ROM writes and external RAM writes go to the cartridge (MBC registers or RAM)
+            RegionMapping::Rom(_) | RegionMapping::ExternalRam(_) => {
+                self.cartridge.write(address, value);
+                Ok(())
+            }
             RegionMapping::Vram(offset) => self
                 .vram
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::ExternalRam(offset) => self
-                .external_ram
                 .write(offset, value)
                 .map_err(|_| Error::OutOfRange(address)),
             RegionMapping::Wram(offset) => self
@@ -268,7 +260,8 @@ mod tests {
         assert_eq!(mem.read(0x0000).unwrap(), 0x11);
         assert_eq!(mem.read(0x0001).unwrap(), 0x22);
         assert_eq!(mem.read(0x0002).unwrap(), 0x33);
-        assert_eq!(mem.read(0x0003).unwrap(), 0x00);
+        // Bytes beyond the ROM data read as 0xFF (open bus)
+        assert_eq!(mem.read(0x0003).unwrap(), 0xFF);
     }
 
     #[test]
