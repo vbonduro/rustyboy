@@ -157,17 +157,63 @@ impl Sm83 {
     /// Wave RAM reads (0xFF30-0xFF3F) are routed through the APU so that
     /// reads while ch3 is on return the current sample buffer.
     fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
-        self.tick_cycle();
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            // Wave RAM reads require T-cycle precision. Read the wave
+            // position partway through the M-cycle to match hardware timing.
+            self.cycle_counter += 4;
+            self.route_bus_events();
+            self.advance_ppu(4);
+            // Read after 3 T-cycles (T3 = data latch on real hardware for wave RAM)
+            for _ in 0..3 {
+                self.advance_timer(1);
+                self.advance_apu(1);
+            }
             let offset = (addr - WAVE_RAM_START) as u8;
-            return Ok(self.apu.read_wave_ram(offset));
+            let value = self.apu.read_wave_ram(offset);
+            self.advance_timer(1);
+            self.advance_apu(1);
+            return Ok(value);
         }
+        self.tick_cycle();
         self.memory.read(addr)
     }
 
     /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
     /// process any pending bus events, then write to memory.
+    ///
+    /// APU register writes and wave RAM writes are applied immediately mid-M-cycle
+    /// (not through the event queue) for T-cycle accurate timing.
     fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
+        if (NR10_ADDR..=NR52_ADDR).contains(&addr)
+            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr)
+        {
+            // APU writes happen mid-M-cycle: advance 3 T-cycles, apply write,
+            // then advance the final T-cycle.
+            self.cycle_counter += 4;
+            self.route_bus_events();
+            self.advance_ppu(4);
+            for _ in 0..3 {
+                self.advance_timer(1);
+                self.advance_apu(1);
+            }
+            if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+                let offset = (addr - WAVE_RAM_START) as u8;
+                self.apu.write_wave_ram(offset, value);
+                self.memory.write_io(addr, self.apu.read_wave_ram(offset));
+            } else {
+                self.apu.write_register(addr, value);
+                if addr == NR52_ADDR {
+                    for a in NR10_ADDR..=NR52_ADDR {
+                        self.memory.write_io(a, self.apu.read_register(a));
+                    }
+                } else {
+                    self.memory.write_io(addr, self.apu.read_register(addr));
+                }
+            }
+            self.advance_timer(1);
+            self.advance_apu(1);
+            return Ok(());
+        }
         self.tick_cycle();
         self.memory.write(addr, value)
     }
@@ -176,14 +222,19 @@ impl Sm83 {
     /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
     fn tick_cycle(&mut self) {
         self.cycle_counter += 4;
-        self.advance_peripherals(4);
         self.route_bus_events();
+        self.advance_peripherals(4);
     }
 
     fn advance_peripherals(&mut self, cycles: u16) {
-        self.advance_timer(cycles);
         self.advance_ppu(cycles);
-        self.advance_apu(cycles);
+        // Timer and APU advance per T-cycle so the APU sees the correct
+        // intermediate DIV counter at each step. This gives T-cycle accurate
+        // wave channel position tracking needed for dmg_sound tests 09/10/12.
+        for _ in 0..cycles {
+            self.advance_timer(1);
+            self.advance_apu(1);
+        }
     }
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
