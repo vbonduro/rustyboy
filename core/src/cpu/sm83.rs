@@ -158,20 +158,12 @@ impl Sm83 {
     /// reads while ch3 is on return the current sample buffer.
     fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            // Wave RAM reads require T-cycle precision. Read the wave
-            // position partway through the M-cycle to match hardware timing.
-            self.cycle_counter += 4;
-            self.route_bus_events();
-            self.advance_ppu(4);
-            // Read after 3 T-cycles (T3 = data latch on real hardware for wave RAM)
-            for _ in 0..3 {
-                self.advance_timer(1);
-                self.advance_apu(1);
-            }
+            // Wave RAM reads require T-cycle precision. The sample is latched
+            // at T3 within the M-cycle on real hardware.
+            self.apu_mcycle_preamble();
             let offset = (addr - WAVE_RAM_START) as u8;
             let value = self.apu.read_wave_ram(offset);
-            self.advance_timer(1);
-            self.advance_apu(1);
+            self.advance_timer_apu(1);
             return Ok(value);
         }
         self.tick_cycle();
@@ -181,37 +173,19 @@ impl Sm83 {
     /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
     /// process any pending bus events, then write to memory.
     ///
-    /// APU register writes and wave RAM writes are applied immediately mid-M-cycle
-    /// (not through the event queue) for T-cycle accurate timing.
+    /// APU register and wave RAM writes are applied at T3 within the M-cycle
+    /// for T-cycle accurate timing.
     fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
-        if (NR10_ADDR..=NR52_ADDR).contains(&addr)
-            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr)
-        {
-            // APU writes happen mid-M-cycle: advance 3 T-cycles, apply write,
-            // then advance the final T-cycle.
-            self.cycle_counter += 4;
-            self.route_bus_events();
-            self.advance_ppu(4);
-            for _ in 0..3 {
-                self.advance_timer(1);
-                self.advance_apu(1);
-            }
-            if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-                let offset = (addr - WAVE_RAM_START) as u8;
-                self.apu.write_wave_ram(offset, value);
-                self.memory.write_io(addr, self.apu.read_wave_ram(offset));
-            } else {
-                self.apu.write_register(addr, value);
-                if addr == NR52_ADDR {
-                    for a in NR10_ADDR..=NR52_ADDR {
-                        self.memory.write_io(a, self.apu.read_register(a));
-                    }
-                } else {
-                    self.memory.write_io(addr, self.apu.read_register(addr));
-                }
-            }
-            self.advance_timer(1);
-            self.advance_apu(1);
+        if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
+            self.apu_mcycle_preamble();
+            self.write_apu_register(addr, value);
+            self.advance_timer_apu(1);
+            return Ok(());
+        }
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            self.apu_mcycle_preamble();
+            self.write_wave_ram(addr, value);
+            self.advance_timer_apu(1);
             return Ok(());
         }
         self.tick_cycle();
@@ -232,6 +206,27 @@ impl Sm83 {
         // intermediate DIV counter at each step. This gives T-cycle accurate
         // wave channel position tracking needed for dmg_sound tests 09/10/12.
         for _ in 0..cycles {
+            self.advance_timer_apu(1);
+        }
+    }
+
+    /// Shared preamble for APU register/wave RAM bus accesses: increment the
+    /// cycle counter, route pending events, advance PPU for the full M-cycle,
+    /// then advance timer+APU for the first 3 T-cycles (T1–T3).
+    /// The caller performs the read/write at T3, then calls `advance_timer_apu(1)`
+    /// for T4 to complete the M-cycle.
+    fn apu_mcycle_preamble(&mut self) {
+        self.cycle_counter += 4;
+        self.route_bus_events();
+        self.advance_ppu(4);
+        for _ in 0..3 {
+            self.advance_timer_apu(1);
+        }
+    }
+
+    /// Advance timer and APU together by `cycles` T-cycles.
+    fn advance_timer_apu(&mut self, cycles: u16) {
+        for _ in 0..cycles {
             self.advance_timer(1);
             self.advance_apu(1);
         }
@@ -248,39 +243,42 @@ impl Sm83 {
     fn route_bus_events(&mut self) {
         let events = self.memory.drain_events();
         for event in &events {
-            if event.address == DIV_ADDR {
-                self.timer.reset_div();
-            }
-            if event.address == LY_ADDR {
-                self.ppu.reset_ly();
-            }
-            if event.address == DMA_ADDR {
-                self.memory.dma_to_oam(event.value);
-            }
-            // APU registers: write to APU and write back masked value for correct read-back
-            if (NR10_ADDR..=NR52_ADDR).contains(&event.address) {
-                self.apu.write_register(event.address, event.value);
-                if event.address == NR52_ADDR {
-                    // NR52 writes can zero all registers (power off), so sync all
-                    for addr in NR10_ADDR..=NR52_ADDR {
-                        self.memory.write_io(addr, self.apu.read_register(addr));
-                    }
-                } else {
-                    self.memory.write_io(event.address, self.apu.read_register(event.address));
-                }
-            }
-            // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
-            if (0xFF27u16..WAVE_RAM_START).contains(&event.address) {
-                self.memory.write_io(event.address, 0xFF);
-            }
-            // Wave RAM: route through APU
-            if (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address) {
-                let offset = (event.address - WAVE_RAM_START) as u8;
-                self.apu.write_wave_ram(offset, event.value);
-                self.memory.write_io(event.address, self.apu.read_wave_ram(offset));
-            }
+            self.handle_bus_event(event.address, event.value);
         }
         self.bus.dispatch(events, &mut *self.memory);
+    }
+
+    fn handle_bus_event(&mut self, addr: u16, value: u8) {
+        match addr {
+            a if a == DIV_ADDR => self.timer.reset_div(),
+            a if a == LY_ADDR => self.ppu.reset_ly(),
+            a if a == DMA_ADDR => self.memory.dma_to_oam(value),
+            a if (NR10_ADDR..=NR52_ADDR).contains(&a) => self.write_apu_register(a, value),
+            // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
+            a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
+            a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
+            _ => {}
+        }
+    }
+
+    /// Write an APU register and sync the masked read-back value to IO memory.
+    /// NR52 writes may power off all channels, so all registers are resynced.
+    fn write_apu_register(&mut self, addr: u16, value: u8) {
+        self.apu.write_register(addr, value);
+        if addr == NR52_ADDR {
+            for a in NR10_ADDR..=NR52_ADDR {
+                self.memory.write_io(a, self.apu.read_register(a));
+            }
+        } else {
+            self.memory.write_io(addr, self.apu.read_register(addr));
+        }
+    }
+
+    /// Write to wave RAM through the APU and sync the result to IO memory.
+    fn write_wave_ram(&mut self, addr: u16, value: u8) {
+        let offset = (addr - WAVE_RAM_START) as u8;
+        self.apu.write_wave_ram(offset, value);
+        self.memory.write_io(addr, self.apu.read_wave_ram(offset));
     }
 
     fn advance_ppu(&mut self, cycles: u16) {
