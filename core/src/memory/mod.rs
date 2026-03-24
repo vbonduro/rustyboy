@@ -1,3 +1,4 @@
+pub mod cartridge;
 #[cfg(test)]
 pub mod fake;
 pub mod memory;
