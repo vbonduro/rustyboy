@@ -514,6 +514,66 @@ mod tests {
         assert_eq!(cart.read_ram(0x0000), 0xBB);
     }
 
+    // ── NoMbc edge cases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn no_mbc_read_rom_oob_returns_0xff() {
+        // ROM is only 1 byte; any address beyond it should return open-bus 0xFF.
+        let cart = NoMbc::new(vec![0x42]);
+        assert_eq!(cart.read_rom(0x0001), 0xFF);
+        assert_eq!(cart.read_rom(0x7FFF), 0xFF);
+    }
+
+    #[test]
+    fn no_mbc_write_to_rom_space_is_ignored() {
+        let mut cart = NoMbc::new(vec![0u8; 0x8000]);
+        // Writes into ROM space (0x0000–0x9FFF) must not corrupt anything.
+        cart.write(0x0000, 0xFF);
+        cart.write(0x7FFF, 0xFF);
+        assert_eq!(cart.read_rom(0x0000), 0x00);
+        assert_eq!(cart.read_rom(0x7FFF), 0x00);
+    }
+
+    // ── MBC1 edge cases ───────────────────────────────────────────────────────
+
+    #[test]
+    fn mbc1_read_rom_oob_address_returns_0xff() {
+        let data = make_rom(64, 0x01);
+        let cart = Mbc1::new(data, 0);
+        // Addresses outside 0x0000–0x7FFF are not part of ROM space.
+        assert_eq!(cart.read_rom(0x8000), 0xFF);
+        assert_eq!(cart.read_rom(0xFFFF), 0xFF);
+    }
+
+    #[test]
+    fn mbc1_bank0_remapped_in_ram_mode() {
+        let data = make_rom(1024, 0x01); // 64 banks
+        let mut cart = Mbc1::new(data, 0);
+        cart.write(0x6000, 0x01); // RAM mode
+        cart.write(0x4000, 0x01); // upper = 1 → bank0 window remaps to bank 32
+        // In RAM mode the fixed window shows the start of the 32-bank group.
+        assert_eq!(cart.read_rom(0x0000), 32);
+    }
+
+    #[test]
+    fn mbc1_bank0_not_remapped_in_rom_mode() {
+        let data = make_rom(1024, 0x01); // 64 banks
+        let mut cart = Mbc1::new(data, 0);
+        // ROM mode (default): upper bits do not affect bank0 window.
+        cart.write(0x4000, 0x03); // upper = 3
+        assert_eq!(cart.read_rom(0x0000), 0x00);
+    }
+
+    #[test]
+    fn mbc1_ram_disable_after_enable() {
+        let data = make_rom(64, 0x02);
+        let mut cart = Mbc1::new(data, 8 * 1024);
+        cart.write(0x0000, 0x0A); // enable
+        cart.write(0xA000, 0x77);
+        cart.write(0x0000, 0x00); // disable
+        assert_eq!(cart.read_ram(0x0000), 0xFF); // disabled → open bus
+    }
+
     // ── from_rom dispatch ─────────────────────────────────────────────────────
 
     #[test]
@@ -530,5 +590,75 @@ mod tests {
         data[CART_TYPE_ADDR] = 0x01;
         let cart = from_rom(data);
         assert_eq!(cart.read_rom(0x4000), 0x01); // default bank 1
+    }
+
+    #[test]
+    fn from_rom_mbc1_ram_for_type_02() {
+        let mut data = make_rom(64, 0x02);
+        data[RAM_SIZE_ADDR] = 0x02; // 8 KiB RAM
+        let mut cart = from_rom(data);
+        cart.write(0x0000, 0x0A); // enable RAM
+        cart.write(0xA000, 0xCC);
+        assert_eq!(cart.read_ram(0x0000), 0xCC);
+    }
+
+    #[test]
+    fn from_rom_mbc1_battery_for_type_03() {
+        let mut data = make_rom(64, 0x03);
+        data[RAM_SIZE_ADDR] = 0x02; // 8 KiB RAM
+        let mut cart = from_rom(data);
+        cart.write(0x0000, 0x0A);
+        cart.write(0xA000, 0xDD);
+        assert_eq!(cart.read_ram(0x0000), 0xDD);
+    }
+
+    // ── Multicart detection ───────────────────────────────────────────────────
+
+    fn make_multicart_rom() -> Vec<u8> {
+        let mut data = make_rom(1024, 0x01); // 64 banks
+        // Plant the Nintendo logo at banks 0x10, 0x20, 0x30.
+        for &bank in &[0x10usize, 0x20, 0x30] {
+            let base = bank * 0x4000 + 0x0104;
+            data[base..base + NINTENDO_LOGO.len()].copy_from_slice(&NINTENDO_LOGO);
+        }
+        data
+    }
+
+    #[test]
+    fn from_rom_detects_multicart_by_logo_heuristic() {
+        let data = make_multicart_rom();
+        let mut cart = from_rom(data);
+        // Multicart: BANK2=1 shifts by 4, so bank = (1<<4)|1 = 17.
+        cart.write(0x4000, 0x01); // upper = 1
+        cart.write(0x2000, 0x01); // lower = 1
+        assert_eq!(cart.read_rom(0x4000), 17);
+    }
+
+    #[test]
+    fn from_rom_no_multicart_without_logos() {
+        // 64-bank MBC1 but logos missing → normal MBC1 (upper << 5 shift).
+        let data = make_rom(1024, 0x01);
+        let mut cart = from_rom(data);
+        cart.write(0x4000, 0x01); // upper = 1
+        cart.write(0x2000, 0x01); // lower = 1
+        // Normal MBC1: bank = (1<<5)|1 = 33.
+        assert_eq!(cart.read_rom(0x4000), 33);
+    }
+
+    #[test]
+    fn from_rom_no_multicart_for_non_64bank_rom() {
+        // 32-bank MBC1 with logos at 0x10 etc. → not multicart (wrong bank count).
+        let mut data = make_rom(512, 0x01); // 32 banks
+        for &bank in &[0x10usize, 0x20, 0x30] {
+            let base = bank * 0x4000 + 0x0104;
+            if base + NINTENDO_LOGO.len() <= data.len() {
+                data[base..base + NINTENDO_LOGO.len()].copy_from_slice(&NINTENDO_LOGO);
+            }
+        }
+        let mut cart = from_rom(data);
+        cart.write(0x4000, 0x01);
+        cart.write(0x2000, 0x01);
+        // Normal MBC1: bank = (1<<5)|1 = 33, masked to 32 banks → 33 % 32 = 1.
+        assert_eq!(cart.read_rom(0x4000), 1);
     }
 }
