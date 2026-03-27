@@ -34,6 +34,7 @@ use super::peripheral::apu::{
     ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
 };
 use super::peripheral::bus::PeripheralBus;
+use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
 use super::peripheral::ppu::{
     PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
     LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
@@ -73,6 +74,7 @@ pub struct Sm83 {
     timer: TimerPeripheral,
     ppu: PpuPeripheral,
     apu: ApuPeripheral,
+    joypad: JoypadPeripheral,
     ime: ImeState,
     halted: bool,
     /// Cycle counter incremented by 4 on each M-cycle (bus_read/bus_write/tick_cycle).
@@ -81,6 +83,7 @@ pub struct Sm83 {
 
 impl Sm83 {
     pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
+        let joypad = JoypadPeripheral::new();
         let mut sm83 = Self {
             memory,
             registers: Registers::default(),
@@ -89,10 +92,13 @@ impl Sm83 {
             timer: TimerPeripheral::new(),
             ppu: PpuPeripheral::new(),
             apu: ApuPeripheral::new(),
+            joypad,
             ime: ImeState::Disabled,
             halted: false,
             cycle_counter: 0,
         };
+        // Seed JOYP with no buttons pressed (all lines high).
+        sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
         // Seed IO memory with initial APU register read values so games
         // reading registers before any write see correct masked values.
         for addr in NR10_ADDR..=NR52_ADDR {
@@ -107,6 +113,17 @@ impl Sm83 {
             sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
         }
         sm83
+    }
+
+    /// Press or release a button. Fires the joypad interrupt if the button is
+    /// newly pressed and its select line is active.
+    pub fn set_button(&mut self, button: Button, pressed: bool) {
+        let interrupt = self.joypad.set_button(button, pressed);
+        self.memory.write_io(JOYP_ADDR, self.joypad.read());
+        if interrupt {
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << JOYPAD_INTERRUPT_BIT));
+        }
     }
 
     /// Subscribe a peripheral to receive bus events for the given address range.
@@ -251,6 +268,10 @@ impl Sm83 {
 
     fn handle_bus_event(&mut self, addr: u16, value: u8) {
         match addr {
+            a if a == JOYP_ADDR => {
+                self.joypad.write(value);
+                self.memory.write_io(JOYP_ADDR, self.joypad.read());
+            }
             a if a == DIV_ADDR => self.timer.reset_div(),
             a if a == LY_ADDR => self.ppu.reset_ly(),
             a if a == DMA_ADDR => self.memory.dma_to_oam(value),
