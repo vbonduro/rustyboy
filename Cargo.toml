@@ -1,3 +1,7 @@
 [workspace]
-members = ["core"]
+members = [
+    "core",
+    "platform/web/server",
+    "platform/web/client",
+]
 resolver = "2"

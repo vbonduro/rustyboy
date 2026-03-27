@@ -1,0 +1,620 @@
+/* ============================================================
+   rustyboy — DMG Game Boy skin
+   Pixel-accurate proportions for original DMG (1989)
+   Mobile-first, tuned for iPhone 14+ viewport
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+
+/* ── Reset & base ─────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  /* DMG body colours */
+  --dmg-body:        #C8C8C8;
+  --dmg-body-dark:   #AEAEAE;
+  --dmg-shadow:      #888888;
+  --dmg-plastic-hi:  #E0E0E0;
+  --dmg-indent:      #B0B0B0;
+
+  /* Screen */
+  --screen-bg:       #0C1A0C;
+  --screen-border:   #8A8A6E;
+  --phosphor:        #9BBC0F;
+  --phosphor-glow:   #6BAA0F;
+
+  /* Accent (Nintendo purple on DMG) */
+  --accent:          #8B1A8B;
+  --accent-light:    #B030B0;
+
+  /* Buttons */
+  --btn-ab:          #6A0048;
+  --btn-ab-hi:       #8A1060;
+  --btn-ab-shadow:   #3A0028;
+
+  --btn-dpad:        #2A2A2A;
+  --btn-dpad-hi:     #3E3E3E;
+  --btn-dpad-shadow: #111111;
+
+  --btn-mid:         #8A8A8A;
+  --btn-mid-hi:      #A4A4A4;
+
+  /* Dimensions — scale to device */
+  --gb-w:     min(390px, 94vw);
+  --gb-h:     auto;
+  --radius:   18px;
+
+  /* Font */
+  --pixel:    'Press Start 2P', monospace;
+}
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #1a1a1a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ── Scene wrapper ────────────────────────────────────── */
+.scene {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  padding: 12px 0;
+}
+
+/* ── Game Boy body ────────────────────────────────────── */
+.gameboy {
+  position: relative;
+  width: var(--gb-w);
+  background: var(--dmg-body);
+
+  /* DMG has a distinctive rounded-top, chamfered-corner shape */
+  border-radius: 18px 18px 14px 14px;
+  clip-path: polygon(
+    0%   8px,
+    8px  0%,
+    calc(100% - 8px) 0%,
+    100% 8px,
+    100% calc(100% - 24px),
+    calc(100% - 18px) 100%,
+    18px 100%,
+    0%  calc(100% - 24px)
+  );
+
+  padding: 14px 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+
+  /* Plastic depth illusion */
+  box-shadow:
+    inset 0 2px 0 var(--dmg-plastic-hi),
+    inset 0 -2px 0 var(--dmg-shadow),
+    inset -2px 0 0 var(--dmg-shadow),
+    inset 2px 0 0 var(--dmg-plastic-hi),
+    0 8px 32px rgba(0,0,0,0.55),
+    0 2px 6px rgba(0,0,0,0.3);
+}
+
+/* ── Top notch (cartridge slot reminder shape) ─────────── */
+.top-notch {
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 30%;
+  height: 6px;
+  background: var(--dmg-body-dark);
+  border-radius: 0 0 4px 4px;
+}
+
+/* ── Power LED ────────────────────────────────────────── */
+.power-led {
+  position: absolute;
+  top: 18px;
+  right: 20px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #222;
+  border: 1px solid #555;
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.power-led.on {
+  background: #44FF44;
+  box-shadow: 0 0 6px 2px rgba(68,255,68,0.7);
+}
+.power-led.menu {
+  background: #FF8800;
+  box-shadow: 0 0 5px 1px rgba(255,136,0,0.6);
+}
+
+/* ── Brand label ──────────────────────────────────────── */
+.brand {
+  margin-top: 4px;
+  margin-left: 2px;
+  line-height: 1;
+}
+.brand-name {
+  display: block;
+  font-family: var(--pixel);
+  font-size: 10px;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+  text-transform: lowercase;
+}
+.brand-sub {
+  display: block;
+  font-family: var(--pixel);
+  font-size: 4.5px;
+  color: var(--accent-light);
+  letter-spacing: 0.15em;
+  margin-top: 3px;
+  opacity: 0.85;
+}
+
+/* ── Screen housing ───────────────────────────────────── */
+.screen-housing {
+  position: relative;
+  background: var(--dmg-body-dark);
+  border-radius: 10px 10px 8px 8px;
+  padding: 14px 18px 16px;
+  margin: 0 2px;
+  box-shadow:
+    inset 0 3px 8px rgba(0,0,0,0.45),
+    inset 0 0 0 2px rgba(0,0,0,0.18);
+}
+
+.screen-bezel {
+  position: relative;
+  background: #2C2C20;
+  border-radius: 4px;
+  padding: 8px;
+  box-shadow:
+    inset 0 2px 4px rgba(0,0,0,0.6),
+    0 1px 0 rgba(255,255,255,0.07);
+}
+
+.screen-inner {
+  position: relative;
+  width: 100%;
+  /* maintain 160:144 ratio */
+  aspect-ratio: 160 / 144;
+  background: var(--screen-bg);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#gameCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  display: block;
+}
+
+/* ── Menu overlay ─────────────────────────────────────── */
+.menu-overlay {
+  position: absolute;
+  inset: 0;
+  background: #081408;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 6% 8%;
+  font-family: var(--pixel);
+  color: var(--phosphor);
+  overflow: hidden;
+  z-index: 10;
+}
+
+.menu-overlay.hidden { display: none; }
+
+.menu-header {
+  font-size: clamp(5px, 2.4vw, 10px);
+  color: var(--phosphor);
+  letter-spacing: 0.2em;
+  text-shadow: 0 0 8px var(--phosphor-glow);
+  margin-bottom: 4%;
+  text-align: center;
+}
+
+.menu-subtitle {
+  font-size: clamp(4px, 1.6vw, 7px);
+  color: #4A7A2A;
+  letter-spacing: 0.15em;
+  margin-bottom: 6%;
+}
+
+.menu-list {
+  flex: 1;
+  width: 100%;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 3%;
+}
+
+.menu-loading {
+  font-size: clamp(4px, 1.5vw, 6px);
+  color: #3A6020;
+  text-align: center;
+  margin-top: 15%;
+  animation: blink 1s step-start infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+.menu-item {
+  font-size: clamp(4px, 1.8vw, 7.5px);
+  color: #5A9040;
+  letter-spacing: 0.05em;
+  padding: 1% 2%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.1s;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6%;
+}
+
+.menu-item::before {
+  content: ' ';
+  display: inline-block;
+  width: 1em;
+}
+
+.menu-item.selected {
+  color: var(--phosphor);
+  text-shadow: 0 0 6px var(--phosphor-glow);
+}
+.menu-item.selected::before {
+  content: '▶';
+  color: var(--phosphor);
+}
+
+.menu-footer {
+  font-size: clamp(3px, 1.3vw, 5px);
+  color: #2E5020;
+  letter-spacing: 0.1em;
+  margin-top: 4%;
+  text-align: center;
+}
+
+/* ── Scanlines ────────────────────────────────────────── */
+.scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent             0px,
+    transparent             2px,
+    rgba(0, 0, 0, 0.18)    2px,
+    rgba(0, 0, 0, 0.18)    4px
+  );
+  z-index: 20;
+}
+
+/* ── Screen glare ─────────────────────────────────────── */
+.screen-glare {
+  position: absolute;
+  top: 8px;
+  left: 12px;
+  width: 38%;
+  height: 26%;
+  background: linear-gradient(
+    135deg,
+    rgba(255,255,255,0.09) 0%,
+    transparent 60%
+  );
+  border-radius: 3px;
+  pointer-events: none;
+}
+
+/* Phosphor glow when game running */
+.screen-inner.running #gameCanvas {
+  filter: brightness(1.05) saturate(1.1);
+}
+.screen-inner.running .scanlines {
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent            0px,
+    transparent            2px,
+    rgba(0, 0, 0, 0.12)   2px,
+    rgba(0, 0, 0, 0.12)   4px
+  );
+}
+.screen-bezel.running {
+  box-shadow:
+    inset 0 2px 4px rgba(0,0,0,0.6),
+    0 0 16px 3px rgba(100, 200, 60, 0.10),
+    0 1px 0 rgba(255,255,255,0.07);
+}
+
+/* ── Power button ─────────────────────────────────────── */
+.power-btn {
+  position: absolute;
+  top: 14px;
+  right: 44px;
+  width: 28px;
+  height: 18px;
+  background: var(--dmg-body-dark);
+  border: 1px solid #999;
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: #555;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.2),
+    inset 0 -1px 0 rgba(0,0,0,0.2),
+    0 1px 2px rgba(0,0,0,0.3);
+  transition: background 0.1s, transform 0.1s;
+  touch-action: manipulation;
+}
+.power-btn:active {
+  background: #999;
+  transform: translateY(1px);
+}
+.power-btn span {
+  font-size: 8px;
+  line-height: 1;
+  pointer-events: none;
+}
+
+/* ── Controls area ────────────────────────────────────── */
+.controls-area {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+  gap: 6px;
+}
+
+/* ── D-Pad ────────────────────────────────────────────── */
+.dpad-wrap {
+  flex: 0 0 auto;
+}
+
+.dpad {
+  position: relative;
+  width: clamp(90px, 24vw, 105px);
+  height: clamp(90px, 24vw, 105px);
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: 1fr 1fr 1fr;
+}
+
+.dpad-btn {
+  background: var(--btn-dpad);
+  border: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background 0.08s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.dpad-btn:active, .dpad-btn.pressed {
+  background: var(--btn-dpad-hi);
+}
+
+.dpad-up    { grid-column: 2; grid-row: 1; border-radius: 4px 4px 0 0; }
+.dpad-left  { grid-column: 1; grid-row: 2; border-radius: 4px 0 0 4px; }
+.dpad-center{ grid-column: 2; grid-row: 2; background: var(--btn-dpad); pointer-events: none; }
+.dpad-right { grid-column: 3; grid-row: 2; border-radius: 0 4px 4px 0; }
+.dpad-down  { grid-column: 2; grid-row: 3; border-radius: 0 0 4px 4px; }
+
+/* Cross-shaped dpad using inset box-shadow */
+.dpad-up, .dpad-down, .dpad-left, .dpad-right, .dpad-center {
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+}
+.dpad-up:active, .dpad-down:active, .dpad-left:active, .dpad-right:active {
+  box-shadow: inset 0 -1px 0 rgba(255,255,255,0.06);
+}
+
+/* ── Mid buttons (SELECT / START) ─────────────────────── */
+.mid-buttons {
+  flex: 1;
+  display: flex;
+  justify-content: center;
+  gap: clamp(8px, 3vw, 18px);
+  padding-top: 16px;
+}
+
+.mid-btn-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.mid-btn {
+  width: clamp(32px, 9vw, 42px);
+  height: clamp(10px, 2.8vw, 14px);
+  background: var(--btn-mid);
+  border: none;
+  border-radius: 20px;
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.15),
+    inset 0 -2px 0 rgba(0,0,0,0.25),
+    0 2px 3px rgba(0,0,0,0.3);
+  transition: transform 0.08s;
+  -webkit-tap-highlight-color: transparent;
+
+  /* Slight angled look like real DMG */
+  transform: rotate(-20deg);
+}
+.mid-btn:active, .mid-btn.pressed {
+  transform: rotate(-20deg) translateY(1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.05),
+    inset 0 -1px 0 rgba(0,0,0,0.15),
+    0 1px 1px rgba(0,0,0,0.2);
+}
+
+.mid-label {
+  font-family: var(--pixel);
+  font-size: clamp(4px, 1.1vw, 5.5px);
+  color: #666;
+  letter-spacing: 0.05em;
+  transform: rotate(-20deg);
+  display: block;
+}
+
+/* ── A / B buttons ────────────────────────────────────── */
+.ab-wrap {
+  flex: 0 0 auto;
+}
+
+.ab-cluster {
+  position: relative;
+  width: clamp(90px, 24vw, 108px);
+  height: clamp(70px, 19vw, 84px);
+}
+
+.action-btn {
+  position: absolute;
+  width: clamp(34px, 9.5vw, 42px);
+  height: clamp(34px, 9.5vw, 42px);
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  touch-action: manipulation;
+  font-family: var(--pixel);
+  font-size: clamp(7px, 2vw, 10px);
+  color: rgba(255,220,230,0.75);
+  background: var(--btn-ab);
+  box-shadow:
+    inset 0 2px 0 var(--btn-ab-hi),
+    inset 0 -3px 0 var(--btn-ab-shadow),
+    0 4px 8px rgba(0,0,0,0.4);
+  transition: transform 0.08s, box-shadow 0.08s;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.action-btn:active, .action-btn.pressed {
+  transform: translateY(2px);
+  box-shadow:
+    inset 0 1px 0 var(--btn-ab-hi),
+    inset 0 -1px 0 var(--btn-ab-shadow),
+    0 2px 4px rgba(0,0,0,0.3);
+}
+
+/* B top-left, A bottom-right — diagonal stagger like real DMG */
+.btn-b {
+  top: 0;
+  left: 0;
+}
+.btn-a {
+  bottom: 0;
+  right: 0;
+}
+
+/* ── Speaker grille ───────────────────────────────────── */
+.speaker-grille {
+  display: flex;
+  justify-content: flex-end;
+  padding-right: 6px;
+  margin-top: -4px;
+}
+
+.grille-dots {
+  display: grid;
+  grid-template-columns: repeat(6, 5px);
+  grid-template-rows: repeat(4, 5px);
+  gap: 3px;
+}
+
+.grille-dots::before {
+  content: '';
+  display: none;
+}
+
+/* Generate 24 speaker dots with ::before + outline trick */
+.speaker-grille {
+  position: relative;
+}
+
+.grille-dots {
+  position: relative;
+}
+
+/* Use background dot pattern instead of individual elements */
+.grille-dots {
+  width: 48px;
+  height: 32px;
+  background-image: radial-gradient(circle, #999 1.5px, transparent 1.5px);
+  background-size: 8px 8px;
+  background-position: 0 0;
+  opacity: 0.7;
+}
+
+/* ── Bottom ridge ─────────────────────────────────────── */
+.bottom-ridge {
+  height: 6px;
+  background: linear-gradient(
+    to bottom,
+    var(--dmg-body-dark),
+    var(--dmg-shadow)
+  );
+  border-radius: 2px;
+  margin: 0 -4px -8px;
+  opacity: 0.6;
+}
+
+/* ── Pressed state for all buttons via JS ─────────────── */
+button:focus { outline: none; }
+button:focus-visible {
+  outline: 2px solid var(--phosphor);
+  outline-offset: 2px;
+}
+
+/* ── Responsive: desktop — center & scale up slightly ──── */
+@media (min-width: 430px) {
+  :root {
+    --gb-w: min(420px, 90vw);
+  }
+}
+
+@media (min-width: 600px) {
+  :root {
+    --gb-w: 380px;
+  }
+  .scene {
+    padding: 24px 0;
+  }
+}
+
+/* ── Phosphor CRT glow animation on game start ─────────── */
+@keyframes screenOn {
+  0%   { opacity: 0; filter: brightness(3) blur(4px); }
+  40%  { opacity: 1; filter: brightness(1.4) blur(1px); }
+  100% { opacity: 1; filter: brightness(1)   blur(0);   }
+}
+
+.screen-inner.booting #gameCanvas {
+  animation: screenOn 0.4s ease-out forwards;
+}
