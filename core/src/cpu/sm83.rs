@@ -33,8 +33,8 @@ use super::operations::sub::*;
 use super::peripheral::apu::{
     ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
 };
-use super::peripheral::bus::PeripheralBus;
 use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
+use super::peripheral::serial::SerialPort;
 use super::peripheral::ppu::{
     PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
     LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
@@ -65,12 +65,14 @@ enum ImeState {
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
 const IE_ADDR: u16 = 0xFFFF;
+const SB_ADDR: u16 = 0xFF01;
+const SC_ADDR: u16 = 0xFF02;
 
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
     opcodes: Box<dyn Decoder>,
-    bus: PeripheralBus,
+    serial: SerialPort,
     timer: TimerPeripheral,
     ppu: PpuPeripheral,
     apu: ApuPeripheral,
@@ -88,7 +90,7 @@ impl Sm83 {
             memory,
             registers: Registers::default(),
             opcodes: opcode_decoder,
-            bus: PeripheralBus::new(),
+            serial: SerialPort::new(),
             timer: TimerPeripheral::new(),
             ppu: PpuPeripheral::new(),
             apu: ApuPeripheral::new(),
@@ -127,12 +129,9 @@ impl Sm83 {
     }
 
     /// Subscribe a peripheral to receive bus events for the given address range.
-    pub fn subscribe_peripheral(
-        &mut self,
-        range: core::ops::RangeInclusive<u16>,
-        peripheral: Box<dyn super::peripheral::bus::Peripheral>,
-    ) {
-        self.bus.subscribe(range, peripheral);
+    /// Returns all bytes captured by the serial port (SB transfers via SC).
+    pub fn serial_output(&self) -> &[u8] {
+        self.serial.output()
     }
 
     // Retrieve a copy of the CPU registers.
@@ -263,7 +262,6 @@ impl Sm83 {
         for event in &events {
             self.handle_bus_event(event.address, event.value);
         }
-        self.bus.dispatch(events, &mut *self.memory);
     }
 
     fn handle_bus_event(&mut self, addr: u16, value: u8) {
@@ -271,6 +269,10 @@ impl Sm83 {
             a if a == JOYP_ADDR => {
                 self.joypad.write(value);
                 self.memory.write_io(JOYP_ADDR, self.joypad.read());
+            }
+            a if a == SC_ADDR => {
+                let sb = self.memory.read_io(SB_ADDR);
+                self.serial.handle_sc_write(value, sb);
             }
             a if a == DIV_ADDR => self.timer.reset_div(),
             a if a == LY_ADDR => self.ppu.reset_ly(),
