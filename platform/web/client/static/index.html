@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>rustyboy</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <div class="scene">
+    <div class="gameboy">
+
+      <!-- Top edge notch -->
+      <div class="top-notch"></div>
+
+      <!-- Power LED -->
+      <div class="power-led" id="powerLed"></div>
+
+      <!-- Brand label -->
+      <div class="brand">
+        <span class="brand-name">rustyboy</span>
+        <span class="brand-sub">DOT MATRIX WITH STEREO SOUND</span>
+      </div>
+
+      <!-- Screen housing -->
+      <div class="screen-housing">
+        <div class="screen-bezel">
+          <div class="screen-inner">
+            <!-- Actual game canvas -->
+            <canvas id="gameCanvas" width="160" height="144"></canvas>
+            <!-- Menu overlay -->
+            <div class="menu-overlay" id="menuOverlay">
+              <div class="menu-header">RUSTYBOY</div>
+              <div class="menu-subtitle">SELECT GAME</div>
+              <div class="menu-list" id="romList">
+                <div class="menu-loading">SCANNING ROMS...</div>
+              </div>
+              <div class="menu-footer">▲▼ MOVE &nbsp;·&nbsp; A START</div>
+            </div>
+            <!-- Scanline overlay -->
+            <div class="scanlines"></div>
+          </div>
+        </div>
+        <!-- Screen glare highlight -->
+        <div class="screen-glare"></div>
+      </div>
+
+      <!-- Power button -->
+      <button class="power-btn" id="powerBtn" aria-label="Power / Menu">
+        <span>⏻</span>
+      </button>
+
+      <!-- Controls area -->
+      <div class="controls-area">
+
+        <!-- Left: D-pad -->
+        <div class="dpad-wrap">
+          <div class="dpad">
+            <button class="dpad-btn dpad-up"    data-btn="2" aria-label="Up"></button>
+            <button class="dpad-btn dpad-left"  data-btn="1" aria-label="Left"></button>
+            <div class="dpad-center"></div>
+            <button class="dpad-btn dpad-right" data-btn="0" aria-label="Right"></button>
+            <button class="dpad-btn dpad-down"  data-btn="3" aria-label="Down"></button>
+          </div>
+        </div>
+
+        <!-- Center: Select / Start -->
+        <div class="mid-buttons">
+          <div class="mid-btn-wrap">
+            <button class="mid-btn" data-btn="6" aria-label="Select">
+              <span class="mid-label">SELECT</span>
+            </button>
+          </div>
+          <div class="mid-btn-wrap">
+            <button class="mid-btn" data-btn="7" aria-label="Start">
+              <span class="mid-label">START</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Right: A / B -->
+        <div class="ab-wrap">
+          <div class="ab-cluster">
+            <button class="action-btn btn-b" data-btn="5" aria-label="B">B</button>
+            <button class="action-btn btn-a" data-btn="4" aria-label="A">A</button>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Speaker grille -->
+      <div class="speaker-grille" aria-hidden="true">
+        <div class="grille-dots"></div>
+      </div>
+
+      <!-- Bottom ridge -->
+      <div class="bottom-ridge"></div>
+
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
