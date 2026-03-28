@@ -56,7 +56,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
     h.insert("cross-origin-resource-policy",  HeaderValue::from_static("same-origin"));
     h.insert("permissions-policy",            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
     h.insert("content-security-policy",       HeaderValue::from_static(
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"
     ));
     res
 }
