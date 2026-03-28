@@ -82,6 +82,43 @@ Open `http://localhost:8080` in a browser.
 | `STATIC_DIR` | `/static` | Directory serving the built frontend assets |
 | `RUST_LOG` | _(unset)_ | Log level, e.g. `info` |
 
+## Deploying on Unraid
+
+### Prerequisites
+
+- Unraid 6.10 or later with the **Community Applications** plugin
+- Your ROM files accessible on the Unraid array
+
+### Install via template
+
+1. Copy the template to Unraid's template directory:
+
+   ```sh
+   # Run in the Unraid terminal
+   wget -O /boot/config/plugins/dockerMan/templates-user/rustyboy.xml \
+     https://raw.githubusercontent.com/vbonduro/rustyboy/main/deploy/unraid/rustyboy.xml
+   ```
+
+2. In the Unraid UI go to **Docker → Add Container** and select **rustyboy** from the template list.
+
+3. Set the **ROMs** path to the folder on your array containing your `.gb` and `.gbc` files, e.g.:
+
+   ```
+   /mnt/user/Games/GameBoy
+   ```
+
+4. Click **Apply**. The container pulls `ghcr.io/vbonduro/rustyboy:latest` and starts automatically.
+
+5. Open `http://<unraid-ip>:8080` in a browser — your ROMs appear in the menu.
+
+### Updating
+
+In the Unraid Docker tab, click the rustyboy container icon and choose **Update**. Or enable **Auto Update** via Unraid's settings.
+
+### Network access
+
+The server binds on port 8080. If you want to play from other devices on your LAN, make sure nothing is blocking that port on the Unraid host. No authentication is built in — keep it on your local network or behind a VPN.
+
 ## Directory layout
 
 ```
