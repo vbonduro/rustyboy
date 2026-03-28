@@ -6,6 +6,8 @@
 
 import init, { EmulatorHandle } from '/static/rustyboy_web_client.js';
 
+function dbg(msg) { console.debug('[rustyboy]', msg); }
+
 // ── Boot jingle ────────────────────────────────────────────────────────────
 // Plays the classic "Vintendo" power-on ding via Web Audio API.
 // Approximates the DMG startup: a short falling chime into a warm ding.
@@ -59,7 +61,69 @@ const state = {
   lastRomName:  localStorage.getItem('lastRom') || null,
   running:      false,
   rafId:        null,
+  audioCtx:     null,   // AudioContext | null
+  audioNode:    null,   // AudioWorkletNode | null
 };
+
+// ── Audio ───────────────────────────────────────────────────────────────────
+
+const AUDIO_SAMPLE_RATE = 48000;
+
+async function initAudio() {
+  if (state.audioCtx) return;
+  try {
+    state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: AUDIO_SAMPLE_RATE,
+    });
+    await state.audioCtx.resume();
+
+    // Ring buffer consumed by ScriptProcessorNode
+    state._ring     = new Float32Array(65536 * 2);
+    state._ringHead = 0;
+    state._ringTail = 0;
+    state._ringSize = 0;
+
+    const node = state.audioCtx.createScriptProcessor(4096, 0, 2);
+    node.onaudioprocess = (e) => {
+      const L = e.outputBuffer.getChannelData(0);
+      const R = e.outputBuffer.getChannelData(1);
+      for (let i = 0; i < L.length; i++) {
+        if (state._ringSize > 0) {
+          L[i] = state._ring[state._ringTail * 2];
+          R[i] = state._ring[state._ringTail * 2 + 1];
+          state._ringTail = (state._ringTail + 1) & 65535;
+          state._ringSize--;
+        } else {
+          L[i] = R[i] = 0;
+        }
+      }
+    };
+    node.connect(state.audioCtx.destination);
+    state.audioNode = node;
+    dbg(`audio init: ctx=${state.audioCtx.state} rate=${state.audioCtx.sampleRate}`);
+  } catch (e) {
+    console.warn('Audio init failed:', e);
+    dbg(`audio init failed: ${e}`);
+  }
+}
+
+function pushAudioSamples(samples) {
+  if (!state._ring || samples.length === 0) return;
+  const pairs = samples.length >> 1;
+  for (let i = 0; i < pairs; i++) {
+    if (state._ringSize >= 65536) break; // drop if full
+    state._ring[state._ringHead * 2]     = samples[i * 2];
+    state._ring[state._ringHead * 2 + 1] = samples[i * 2 + 1];
+    state._ringHead = (state._ringHead + 1) & 65535;
+    state._ringSize++;
+  }
+}
+
+function stopAudio() {
+  if (state.audioNode) { state.audioNode.disconnect(); state.audioNode = null; }
+  if (state.audioCtx)  { state.audioCtx.close(); state.audioCtx = null; }
+  state._ring = null; state._ringSize = 0;
+}
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
 
@@ -184,6 +248,7 @@ async function launchRom(name) {
   localStorage.setItem('lastRom', name);
   state.running = true;
 
+  initAudio();
   playBootJingle();
   menuOverlay.classList.add('hidden');
   screenInner.classList.add('booting');
@@ -209,6 +274,7 @@ function stopEmulation() {
     state.emulator = null;
   }
   state.running = false;
+  stopAudio();
   screenInner.classList.remove('running', 'booting');
   screenBezel.classList.remove('running');
 }
@@ -248,6 +314,10 @@ function startLoop() {
       } catch(e) {
         console.error('run_frame error:', e);
         return;
+      }
+
+      if (state.audioCtx) {
+        pushAudioSamples(state.emulator.drain_audio_samples());
       }
 
       drawFrame();

@@ -70,6 +70,13 @@ impl EmulatorHandle {
         self.rgba_buf.clone()
     }
 
+    /// Drain accumulated PCM audio samples since the last call.
+    /// Returns interleaved stereo f32 samples [L, R, L, R, ...] at 48,000 Hz.
+    /// Pass to an AudioContext for playback.
+    pub fn drain_audio_samples(&mut self) -> Vec<f32> {
+        self.cpu.drain_audio_samples()
+    }
+
     /// button: 0=Right 1=Left 2=Up 3=Down 4=A 5=B 6=Select 7=Start
     pub fn set_button(&mut self, button: u8, pressed: bool) {
         let btn = match button {
