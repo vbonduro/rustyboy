@@ -37,7 +37,7 @@ async fn main() {
         .route("/api/roms", get(list_roms))
         .route("/roms/:name", get(serve_rom))
         .nest_service("/static", ServeDir::new(&static_dir))
-        .layer(middleware::from_fn(no_cache))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
@@ -45,12 +45,19 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn no_cache(req: Request, next: Next) -> Response {
+async fn security_headers(req: Request, next: Next) -> Response {
     let mut res = next.run(req).await;
-    res.headers_mut().insert(
-        "cache-control",
-        HeaderValue::from_static("no-store"),
-    );
+    let h = res.headers_mut();
+    h.insert("cache-control",              HeaderValue::from_static("no-store"));
+    h.insert("x-content-type-options",     HeaderValue::from_static("nosniff"));
+    h.insert("x-frame-options",            HeaderValue::from_static("DENY"));
+    h.insert("cross-origin-embedder-policy",  HeaderValue::from_static("require-corp"));
+    h.insert("cross-origin-opener-policy",    HeaderValue::from_static("same-origin"));
+    h.insert("cross-origin-resource-policy",  HeaderValue::from_static("same-origin"));
+    h.insert("permissions-policy",            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
+    h.insert("content-security-policy",       HeaderValue::from_static(
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"
+    ));
     res
 }
 
