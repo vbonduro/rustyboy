@@ -155,6 +155,10 @@ impl Sm83 {
     }
 
     /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
+    pub fn cycle_counter(&self) -> u64 {
+        self.cycle_counter
+    }
+
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
         self.ppu.framebuffer()
     }
@@ -163,6 +167,18 @@ impl Sm83 {
     /// by setting PC to 0x0100 and SP to 0xFFFE.
     pub fn with_registers(mut self, registers: Registers) -> Self {
         self.registers = registers;
+        self
+    }
+
+    /// Seed IO registers to their DMG post-boot-ROM state so games that poll
+    /// LY or check LCDC before enabling the LCD work correctly without a boot ROM.
+    pub fn with_dmg_state(mut self) -> Self {
+        // Post-boot IO register values (DMG, SGB, MGB verified against Pan Docs)
+        self.memory.write_io(LCDC_ADDR, 0x91); // LCD on, BG on, sprites off, window off
+        self.memory.write_io(STAT_ADDR, 0x85); // PPU in VBlank (mode 1), LYC=LY
+        self.memory.write_io(BGP_ADDR,  0xFC); // background palette: 3,3,3,0
+        self.memory.write_io(OBP0_ADDR, 0xFF); // obj palette 0
+        self.memory.write_io(OBP1_ADDR, 0xFF); // obj palette 1
         self
     }
 

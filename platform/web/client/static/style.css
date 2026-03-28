@@ -224,19 +224,20 @@ html, body {
 .menu-overlay.hidden { display: none; }
 
 .menu-header {
-  font-size: clamp(5px, 2.4vw, 10px);
+  font-size: 8px;
   color: var(--phosphor);
   letter-spacing: 0.2em;
   text-shadow: 0 0 8px var(--phosphor-glow);
-  margin-bottom: 4%;
+  margin-bottom: 6px;
   text-align: center;
 }
 
 .menu-subtitle {
-  font-size: clamp(4px, 1.6vw, 7px);
+  font-size: 6px;
   color: #4A7A2A;
   letter-spacing: 0.15em;
-  margin-bottom: 6%;
+  margin-bottom: 8px;
+  text-align: center;
 }
 
 .menu-list {
@@ -245,14 +246,14 @@ html, body {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  gap: 3%;
+  gap: 4px;
 }
 
 .menu-loading {
-  font-size: clamp(4px, 1.5vw, 6px);
+  font-size: 6px;
   color: #3A6020;
   text-align: center;
-  margin-top: 15%;
+  margin-top: 20px;
   animation: blink 1s step-start infinite;
 }
 
@@ -262,10 +263,10 @@ html, body {
 }
 
 .menu-item {
-  font-size: clamp(4px, 1.8vw, 7.5px);
+  font-size: 6px;
   color: #5A9040;
   letter-spacing: 0.05em;
-  padding: 1% 2%;
+  padding: 2px 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -273,13 +274,15 @@ html, body {
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 6%;
+  gap: 4px;
+  text-align: left;
 }
 
 .menu-item::before {
   content: ' ';
   display: inline-block;
-  width: 1em;
+  width: 8px;
+  flex-shrink: 0;
 }
 
 .menu-item.selected {
@@ -292,10 +295,10 @@ html, body {
 }
 
 .menu-footer {
-  font-size: clamp(3px, 1.3vw, 5px);
+  font-size: 5px;
   color: #2E5020;
   letter-spacing: 0.1em;
-  margin-top: 4%;
+  margin-top: 6px;
   text-align: center;
 }
 

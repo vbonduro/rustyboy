@@ -184,15 +184,30 @@ function returnToMenu() {
 
 let imageData = null;
 
-function startLoop() {
-  // Allocate ImageData once
-  imageData = ctx.createImageData(160, 144);
+// DMG runs at 4194304 Hz / 70224 cycles per frame = 59.7275 fps
+const FRAME_DURATION_MS = 1000 / 59.7275;
 
-  function frame() {
+function startLoop() {
+  imageData = ctx.createImageData(160, 144);
+  let lastFrameTime = performance.now();
+
+  function frame(now) {
     if (!state.running || !state.emulator) return;
 
-    state.emulator.run_frame();
-    drawFrame();
+    const elapsed = now - lastFrameTime;
+    if (elapsed >= FRAME_DURATION_MS) {
+      const framesToRun = Math.min(2, Math.floor(elapsed / FRAME_DURATION_MS));
+      lastFrameTime = now - (elapsed % FRAME_DURATION_MS);
+
+      try {
+        for (let i = 0; i < framesToRun; i++) state.emulator.run_frame();
+      } catch(e) {
+        console.error('run_frame error:', e);
+        return;
+      }
+
+      drawFrame();
+    }
 
     state.rafId = requestAnimationFrame(frame);
   }
@@ -201,12 +216,7 @@ function startLoop() {
 }
 
 function drawFrame() {
-  const ptr = state.emulator.framebuffer_ptr();
-  const len = state.emulator.framebuffer_len();
-
-  // Zero-copy view into WASM memory
-  const mem  = state.wasm.memory.buffer;
-  const rgba = new Uint8ClampedArray(mem, ptr, len);
+  const rgba = state.emulator.framebuffer_rgba();
   imageData.data.set(rgba);
   ctx.putImageData(imageData, 0, 0);
 }
