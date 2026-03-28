@@ -139,6 +139,12 @@ impl SquareChannel {
             self.duty_position = (self.duty_position + 1) % 8;
         }
     }
+
+    fn digital_output(&self) -> u8 {
+        if !self.enabled { return 0; }
+        let high = DUTY_TABLE[self.duty as usize][self.duty_position as usize];
+        if high != 0 { self.volume } else { 0 }
+    }
 }
 
 /// Frequency sweep unit, attached to ch1 only.
@@ -266,6 +272,21 @@ impl WaveChannel {
         }
     }
 
+    fn digital_output(&self) -> u8 {
+        if !self.enabled { return 0; }
+        let nibble = if self.position & 1 == 0 {
+            self.sample_buffer >> 4
+        } else {
+            self.sample_buffer & 0x0F
+        };
+        match self.volume_code {
+            1 => nibble,
+            2 => nibble >> 1,
+            3 => nibble >> 2,
+            _ => 0,
+        }
+    }
+
     /// Clock wave frequency timer at 2 MHz (called every other T-cycle).
     /// `just_read` is cleared here (start of 2 MHz tick) and set on position
     /// advance, giving a 2 T-cycle window where wave RAM is accessible.
@@ -374,6 +395,12 @@ impl NoiseChannel {
                 self.lfsr |= xor_bit << 6;
             }
         }
+    }
+
+    fn digital_output(&self) -> u8 {
+        if !self.enabled { return 0; }
+        // LFSR bit 0 low = high output
+        if self.lfsr & 1 == 0 { self.volume } else { 0 }
     }
 }
 
@@ -592,63 +619,40 @@ impl ApuPeripheral {
     }
 
     /// Mix all four channels into a stereo sample pair using NR50/NR51.
-    /// Returns (left, right) in [-1.0, 1.0].
+    /// Returns (left, right) in [0.0, 1.0].
     fn mix_sample(&self) -> (f32, f32) {
-        // Channel digital outputs (0–15).
-        let ch1 = if self.channel1.enabled {
-            let high = DUTY_TABLE[self.channel1.duty as usize][self.channel1.duty_position as usize];
-            if high != 0 { self.channel1.volume } else { 0 }
-        } else { 0 };
+        let outputs = [
+            self.channel1.digital_output(),
+            self.channel2.digital_output(),
+            self.channel3.digital_output(),
+            self.channel4.digital_output(),
+        ];
+        let (left_mix, right_mix) = self.apply_panning(&outputs);
+        self.apply_master_volume(left_mix, right_mix)
+    }
 
-        let ch2 = if self.channel2.enabled {
-            let high = DUTY_TABLE[self.channel2.duty as usize][self.channel2.duty_position as usize];
-            if high != 0 { self.channel2.volume } else { 0 }
-        } else { 0 };
-
-        let ch3 = if self.channel3.enabled {
-            let nibble = if self.channel3.position & 1 == 0 {
-                self.channel3.sample_buffer >> 4
-            } else {
-                self.channel3.sample_buffer & 0x0F
-            };
-            match self.channel3.volume_code {
-                0 => 0,
-                1 => nibble,
-                2 => nibble >> 1,
-                3 => nibble >> 2,
-                _ => 0,
-            }
-        } else { 0 };
-
-        let ch4 = if self.channel4.enabled {
-            // LFSR bit 0 = 0 means high output.
-            if self.channel4.lfsr & 1 == 0 { self.channel4.volume } else { 0 }
-        } else { 0 };
-
-        // NR51 (regs[21]): panning. Bits 7-4 = ch4-ch1 left, bits 3-0 = ch4-ch1 right.
+    /// Apply NR51 panning: sum channels routed to each side.
+    /// NR51 bits 7-4 = ch4-ch1 left, bits 3-0 = ch4-ch1 right.
+    fn apply_panning(&self, outputs: &[u8; 4]) -> (f32, f32) {
         let nr51 = self.regs[21];
-        let left_mix =
-            if nr51 & 0x10 != 0 { ch1 as f32 } else { 0.0 }
-            + if nr51 & 0x20 != 0 { ch2 as f32 } else { 0.0 }
-            + if nr51 & 0x40 != 0 { ch3 as f32 } else { 0.0 }
-            + if nr51 & 0x80 != 0 { ch4 as f32 } else { 0.0 };
-        let right_mix =
-            if nr51 & 0x01 != 0 { ch1 as f32 } else { 0.0 }
-            + if nr51 & 0x02 != 0 { ch2 as f32 } else { 0.0 }
-            + if nr51 & 0x04 != 0 { ch3 as f32 } else { 0.0 }
-            + if nr51 & 0x08 != 0 { ch4 as f32 } else { 0.0 };
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for (i, &out) in outputs.iter().enumerate() {
+            if nr51 & (0x10 << i) != 0 { left  += out as f32; }
+            if nr51 & (0x01 << i) != 0 { right += out as f32; }
+        }
+        (left, right)
+    }
 
-        // NR50 (regs[20]): master volume. Bits 6-4 = left vol (0-7), bits 2-0 = right vol (0-7).
+    /// Apply NR50 master volume and normalize to [0.0, 1.0].
+    /// NR50 bits 6-4 = left vol (0-7), bits 2-0 = right vol (0-7).
+    fn apply_master_volume(&self, left: f32, right: f32) -> (f32, f32) {
         let nr50 = self.regs[20];
         let left_vol  = ((nr50 >> 4) & 0x07) as f32 + 1.0; // 1–8
         let right_vol = ( nr50       & 0x07) as f32 + 1.0; // 1–8
-
-        // Normalize: max possible mix = 4 channels × 15 volume × 8 master = 480
+        // Max possible: 4 channels × vol 15 × master 8 = 480
         const NORM: f32 = 4.0 * 15.0 * 8.0;
-        let left  = (left_mix  * left_vol)  / NORM;
-        let right = (right_mix * right_vol) / NORM;
-
-        (left, right)
+        (left * left_vol / NORM, right * right_vol / NORM)
     }
 
     fn build_nr52(&self) -> u8 {
