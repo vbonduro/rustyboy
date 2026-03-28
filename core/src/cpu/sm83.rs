@@ -81,6 +81,17 @@ pub struct Sm83 {
     halted: bool,
     /// Cycle counter incremented by 4 on each M-cycle (bus_read/bus_write/tick_cycle).
     cycle_counter: u64,
+    /// Pending OAM DMA transfer. When Some, holds the source page and number of
+    /// bytes already copied. Each M-cycle advances the transfer by one byte.
+    dma: Option<DmaState>,
+}
+
+/// State for an in-progress OAM DMA transfer.
+struct DmaState {
+    /// Source base address (page << 8).
+    source: u16,
+    /// Number of bytes copied so far (0–159).
+    progress: u8,
 }
 
 impl Sm83 {
@@ -98,6 +109,7 @@ impl Sm83 {
             ime: ImeState::Disabled,
             halted: false,
             cycle_counter: 0,
+            dma: None,
         };
         // Seed JOYP with no buttons pressed (all lines high).
         sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
@@ -239,7 +251,24 @@ impl Sm83 {
     fn tick_cycle(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
+        self.advance_dma();
         self.advance_peripherals(4);
+    }
+
+    /// Advance the OAM DMA transfer by one byte (one M-cycle).
+    fn advance_dma(&mut self) {
+        let (source, progress) = match self.dma {
+            Some(ref d) => (d.source, d.progress),
+            None => return,
+        };
+        let byte = self.memory.read(source + progress as u16).unwrap_or(0xFF);
+        let _ = self.memory.write(0xFE00 + progress as u16, byte);
+        let next = progress + 1;
+        self.dma = if next < 160 {
+            Some(DmaState { source, progress: next })
+        } else {
+            None
+        };
     }
 
     fn advance_peripherals(&mut self, cycles: u16) {
@@ -261,6 +290,7 @@ impl Sm83 {
     fn tick_cycle_to_t3(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
+        self.advance_dma();
         self.advance_ppu(4);
         for _ in 0..3 {
             self.advance_timer_apu(1);
@@ -302,7 +332,9 @@ impl Sm83 {
             }
             a if a == DIV_ADDR => self.timer.reset_div(),
             a if a == LY_ADDR => self.ppu.reset_ly(),
-            a if a == DMA_ADDR => self.memory.dma_to_oam(value),
+            a if a == DMA_ADDR => {
+                self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
+            }
             a if (NR10_ADDR..=NR52_ADDR).contains(&a) => self.write_apu_register(a, value),
             // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
             a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
