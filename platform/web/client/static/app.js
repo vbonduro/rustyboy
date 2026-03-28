@@ -133,6 +133,7 @@ const menuOverlay = document.getElementById('menuOverlay');
 const romList     = document.getElementById('romList');
 const powerBtn    = document.getElementById('powerBtn');
 const powerLed    = document.getElementById('powerLed');
+const resetLed    = document.getElementById('resetLed');
 const screenInner = canvas.parentElement;
 const screenBezel = screenInner.parentElement;
 
@@ -179,7 +180,7 @@ async function loadRomList() {
 }
 
 function renderMenu() {
-  const maxVisible = 7;
+  const maxVisible = 12;
   const total      = state.roms.length;
   const sel        = state.selectedIdx;
 
@@ -396,11 +397,15 @@ function bindButtons() {
     });
   });
 
-  // Power button
+  // Reset button — animate press, flash LED, then return to menu
   powerBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    returnToMenu();
+    powerBtn.classList.add('pressed');
+    flashResetLed();
   });
+  powerBtn.addEventListener('pointerup',     () => { powerBtn.classList.remove('pressed'); returnToMenu(); });
+  powerBtn.addEventListener('pointerleave',  () => { powerBtn.classList.remove('pressed'); });
+  powerBtn.addEventListener('pointercancel', () => { powerBtn.classList.remove('pressed'); });
 }
 
 // ── Keyboard support ───────────────────────────────────────────────────────
@@ -445,6 +450,17 @@ function bindKeyboard() {
 
 function setLed(mode) {
   powerLed.className = 'power-led ' + (mode || '');
+  // Keep reset LED in sync: red when running, off when in menu
+  if (resetLed) resetLed.className = 'reset-led' + (mode === 'on' ? ' on' : '');
+}
+
+function flashResetLed() {
+  if (!resetLed) return;
+  resetLed.classList.remove('flash');
+  // Force reflow to restart animation
+  void resetLed.offsetWidth;
+  resetLed.classList.add('flash');
+  resetLed.addEventListener('animationend', () => resetLed.classList.remove('flash'), { once: true });
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
