@@ -6,6 +6,49 @@
 
 import init, { EmulatorHandle } from '/static/rustyboy_web_client.js';
 
+// ── Boot jingle ────────────────────────────────────────────────────────────
+// Plays the classic "Vintendo" power-on ding via Web Audio API.
+// Approximates the DMG startup: a short falling chime into a warm ding.
+
+function playBootJingle() {
+  let ctx;
+  try { ctx = new (window.AudioContext || window.webkitAudioContext)(); }
+  catch(e) { return; }
+
+  // "Vin-ten-do" approximated as three quick descending tones + one sustained ding
+  const notes = [
+    { freq: 1320, start: 0.00, dur: 0.08, gain: 0.25 }, // "Vin"
+    { freq: 1047, start: 0.09, dur: 0.08, gain: 0.25 }, // "ten"
+    { freq:  880, start: 0.18, dur: 0.08, gain: 0.25 }, // "do"
+    { freq:  523, start: 0.30, dur: 0.55, gain: 0.40 }, // the ding
+  ];
+
+  const master = ctx.createGain();
+  master.gain.setValueAtTime(1, ctx.currentTime);
+  master.connect(ctx.destination);
+
+  notes.forEach(({ freq, start, dur, gain }) => {
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+
+    env.gain.setValueAtTime(0, ctx.currentTime + start);
+    env.gain.linearRampToValueAtTime(gain, ctx.currentTime + start + 0.01);
+    env.gain.setValueAtTime(gain, ctx.currentTime + start + dur * 0.6);
+    env.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+
+    osc.connect(env);
+    env.connect(master);
+    osc.start(ctx.currentTime + start);
+    osc.stop(ctx.currentTime + start + dur + 0.05);
+  });
+
+  // Close context after jingle finishes
+  setTimeout(() => ctx.close(), 1200);
+}
+
 // ── State ──────────────────────────────────────────────────────────────────
 
 const state = {
@@ -141,6 +184,7 @@ async function launchRom(name) {
   localStorage.setItem('lastRom', name);
   state.running = true;
 
+  playBootJingle();
   menuOverlay.classList.add('hidden');
   screenInner.classList.add('booting');
   screenInner.classList.add('running');

@@ -13,45 +13,65 @@
   <div class="scene">
     <div class="gameboy">
 
-      <!-- Top edge notch -->
-      <div class="top-notch"></div>
-
-      <!-- Power LED -->
-      <div class="power-led" id="powerLed"></div>
-
-      <!-- Brand label -->
-      <div class="brand">
-        <span class="brand-name">rustyboy</span>
-        <span class="brand-sub">DOT MATRIX WITH STEREO SOUND</span>
-      </div>
-
-      <!-- Screen housing -->
-      <div class="screen-housing">
-        <div class="screen-bezel">
-          <div class="screen-inner">
-            <!-- Actual game canvas -->
-            <canvas id="gameCanvas" width="160" height="144"></canvas>
-            <!-- Menu overlay -->
-            <div class="menu-overlay" id="menuOverlay">
-              <div class="menu-header">RUSTYBOY</div>
-              <div class="menu-subtitle">SELECT GAME</div>
-              <div class="menu-list" id="romList">
-                <div class="menu-loading">SCANNING ROMS...</div>
-              </div>
-              <div class="menu-footer">▲▼ MOVE &nbsp;·&nbsp; A START</div>
-            </div>
-            <!-- Scanline overlay -->
-            <div class="scanlines"></div>
+      <!-- Top rail: power switch -->
+      <div class="top-rail">
+        <div class="power-switch" id="powerBtn" aria-label="Power / Menu">
+          <div class="power-switch-track">
+            <span class="power-switch-label left">◁OFF</span>
+            <div class="power-switch-knob"></div>
+            <span class="power-switch-label right">ON▷</span>
           </div>
         </div>
-        <!-- Screen glare highlight -->
-        <div class="screen-glare"></div>
+        <div class="top-rail-indent"></div>
       </div>
 
-      <!-- Power button -->
-      <button class="power-btn" id="powerBtn" aria-label="Power / Menu">
-        <span>⏻</span>
-      </button>
+      <!-- Screen section -->
+      <div class="screen-section">
+
+        <!-- Decorative lines + label above screen -->
+        <div class="screen-header">
+          <div class="dot-matrix-lines">
+            <div class="line line-red"></div>
+            <div class="line line-blue"></div>
+          </div>
+          <span class="dot-matrix-text">DOT MATRIX WITH STEREO SOUND</span>
+          <div class="dot-matrix-lines right">
+            <div class="line line-blue"></div>
+            <div class="line line-red"></div>
+          </div>
+        </div>
+
+        <!-- Battery LED -->
+        <div class="battery-led-wrap">
+          <div class="battery-led" id="powerLed"></div>
+          <span class="battery-label">BATTERY</span>
+        </div>
+
+        <!-- Screen housing (gray surround) -->
+        <div class="screen-housing">
+          <div class="screen-bezel">
+            <div class="screen-inner">
+              <canvas id="gameCanvas" width="160" height="144"></canvas>
+              <div class="menu-overlay" id="menuOverlay">
+                <div class="menu-header">RUSTYBOY</div>
+                <div class="menu-subtitle">SELECT GAME</div>
+                <div class="menu-list" id="romList">
+                  <div class="menu-loading">SCANNING ROMS...</div>
+                </div>
+                <div class="menu-footer">▲▼ MOVE &nbsp;·&nbsp; A START</div>
+              </div>
+              <div class="scanlines"></div>
+            </div>
+          </div>
+          <div class="screen-glare"></div>
+        </div>
+
+      </div>
+
+      <!-- Brand label below screen -->
+      <div class="brand">
+        <span class="brand-small">Vintendo</span><span class="brand-large">RUSTYBOY™</span>
+      </div>
 
       <!-- Controls area -->
       <div class="controls-area">
@@ -61,43 +81,54 @@
           <div class="dpad">
             <button class="dpad-btn dpad-up"    data-btn="2" aria-label="Up"></button>
             <button class="dpad-btn dpad-left"  data-btn="1" aria-label="Left"></button>
-            <div class="dpad-center"></div>
+            <div class="dpad-center"><div class="dpad-nub"></div></div>
             <button class="dpad-btn dpad-right" data-btn="0" aria-label="Right"></button>
             <button class="dpad-btn dpad-down"  data-btn="3" aria-label="Down"></button>
           </div>
         </div>
 
-        <!-- Center: Select / Start -->
-        <div class="mid-buttons">
-          <div class="mid-btn-wrap">
-            <button class="mid-btn" data-btn="6" aria-label="Select">
-              <span class="mid-label">SELECT</span>
-            </button>
-          </div>
-          <div class="mid-btn-wrap">
-            <button class="mid-btn" data-btn="7" aria-label="Start">
-              <span class="mid-label">START</span>
-            </button>
-          </div>
-        </div>
-
-        <!-- Right: A / B -->
+        <!-- Right: A / B (magenta, diagonal) -->
         <div class="ab-wrap">
           <div class="ab-cluster">
-            <button class="action-btn btn-b" data-btn="5" aria-label="B">B</button>
-            <button class="action-btn btn-a" data-btn="4" aria-label="A">A</button>
+            <div class="ab-btn-wrap btn-b-wrap">
+              <button class="action-btn btn-b" data-btn="5" aria-label="B"></button>
+              <span class="ab-label">B</span>
+            </div>
+            <div class="ab-btn-wrap btn-a-wrap">
+              <button class="action-btn btn-a" data-btn="4" aria-label="A"></button>
+              <span class="ab-label">A</span>
+            </div>
           </div>
         </div>
 
       </div>
 
-      <!-- Speaker grille -->
-      <div class="speaker-grille" aria-hidden="true">
-        <div class="grille-dots"></div>
+      <!-- Select / Start row -->
+      <div class="mid-row">
+        <div class="mid-btn-wrap">
+          <button class="mid-btn" data-btn="6" aria-label="Select"></button>
+          <span class="mid-label">SELECT</span>
+        </div>
+        <div class="mid-btn-wrap">
+          <button class="mid-btn" data-btn="7" aria-label="Start"></button>
+          <span class="mid-label">START</span>
+        </div>
       </div>
 
-      <!-- Bottom ridge -->
-      <div class="bottom-ridge"></div>
+      <!-- Bottom edge -->
+      <div class="bottom-edge">
+        <div class="phones-label">⊙ PHONES</div>
+      </div>
+
+      <!-- Speaker grille — absolutely positioned bottom-right -->
+      <div class="speaker-grille" aria-hidden="true">
+        <div class="slit"></div>
+        <div class="slit"></div>
+        <div class="slit"></div>
+        <div class="slit"></div>
+        <div class="slit"></div>
+        <div class="slit"></div>
+      </div>
 
     </div>
   </div>
