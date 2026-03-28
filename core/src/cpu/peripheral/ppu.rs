@@ -104,6 +104,8 @@ pub struct PpuPeripheral {
     window_line_counter: u8,
     prev_stat_line: bool,
     framebuffer: [u8; FRAMEBUFFER_SIZE],
+    /// Raw BG/window color indices (0-3) for the current scanline, used for sprite priority.
+    bg_color_indices: [u8; SCREEN_WIDTH],
 }
 
 impl PpuPeripheral {
@@ -115,6 +117,7 @@ impl PpuPeripheral {
             window_line_counter: 0,
             prev_stat_line: false,
             framebuffer: [0u8; FRAMEBUFFER_SIZE],
+            bg_color_indices: [0u8; SCREEN_WIDTH],
         }
     }
 
@@ -251,6 +254,7 @@ impl PpuPeripheral {
         } else {
             for x in 0..SCREEN_WIDTH {
                 self.framebuffer[row_start + x] = 0;
+                self.bg_color_indices[x] = 0;
             }
         }
 
@@ -279,6 +283,7 @@ impl PpuPeripheral {
             let fine_x = 7 - (x % 8);
 
             let color = fetch_tile_pixel(input.vram, lcdc, tilemap_base, tile_col, tile_row, fine_x, fine_y);
+            self.bg_color_indices[screen_x] = color;
             self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
         }
     }
@@ -305,6 +310,7 @@ impl PpuPeripheral {
             let fine_x = 7 - (win_x % 8) as u8;
 
             let color = fetch_tile_pixel(input.vram, lcdc, tilemap_base, tile_col, tile_row, fine_x as u8, fine_y);
+            self.bg_color_indices[screen_x] = color;
             self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
         }
 
@@ -406,7 +412,7 @@ impl PpuPeripheral {
                 continue;
             }
 
-            if bg_priority && self.framebuffer[row_start + sx] != 0 {
+            if bg_priority && self.bg_color_indices[sx] != 0 {
                 continue;
             }
 
