@@ -15,6 +15,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core
 COPY platform/web/client ./platform/web/client
+# Stub out server so workspace resolves
+COPY platform/web/server/Cargo.toml ./platform/web/server/Cargo.toml
+RUN mkdir -p platform/web/server/src && echo "fn main() {}" > platform/web/server/src/main.rs
 
 # Build WASM with wasm-pack (--target web = native ES module, no bundler)
 RUN wasm-pack build platform/web/client \
