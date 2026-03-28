@@ -1,9 +1,11 @@
 use axum::{
     Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Json, Response},
     routing::get,
+    extract::Request,
 };
 use std::{path::PathBuf, sync::Arc};
 use tower_http::services::ServeDir;
@@ -33,13 +35,23 @@ async fn main() {
     let app = Router::new()
         .route("/", get(serve_index))
         .route("/api/roms", get(list_roms))
-        .route("/roms/{name}", get(serve_rom))
+        .route("/roms/:name", get(serve_rom))
         .nest_service("/static", ServeDir::new(&static_dir))
+        .layer(middleware::from_fn(no_cache))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("Listening on http://0.0.0.0:8080");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn no_cache(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut().insert(
+        "cache-control",
+        HeaderValue::from_static("no-store"),
+    );
+    res
 }
 
 async fn serve_index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -79,7 +91,7 @@ async fn serve_rom(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let path = state.roms_dir.join(&name);
-    match tokio::fs::read(path).await {
+    match tokio::fs::read(&path).await {
         Ok(bytes) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],

@@ -5,6 +5,7 @@ use rustyboy_core::{
         cpu::Cpu,
         instructions::opcodes::OpCodeDecoder,
         peripheral::joypad::Button,
+        registers::{Flags, Registers},
         sm83::Sm83,
     },
     memory::GameBoyMemory,
@@ -35,7 +36,17 @@ impl EmulatorHandle {
     pub fn new(rom: Vec<u8>) -> EmulatorHandle {
         let memory = GameBoyMemory::with_rom(rom);
         let decoder = Box::new(OpCodeDecoder::new());
-        let cpu = Sm83::new(Box::new(memory), decoder);
+        // Start at 0x100 with DMG post-boot-ROM state (skips boot ROM).
+        let cpu = Sm83::new(Box::new(memory), decoder)
+            .with_registers(Registers {
+                a: 0x01, f: Flags::from_bits_truncate(0xB0),
+                b: 0x00, c: 0x13,
+                d: 0x00, e: 0xD8,
+                h: 0x01, l: 0x4D,
+                pc: 0x0100,
+                sp: 0xFFFE,
+            })
+            .with_dmg_state();
         EmulatorHandle {
             cpu,
             rgba_buf: vec![0u8; RGBA_FRAMEBUFFER_SIZE],
@@ -43,24 +54,20 @@ impl EmulatorHandle {
     }
 
     pub fn run_frame(&mut self) {
-        for _ in 0..CYCLES_PER_FRAME {
+        let start = self.cpu.cycle_counter();
+        while self.cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
             let _ = self.cpu.tick();
         }
     }
 
-    /// Returns pointer to internal RGBA buffer after converting the framebuffer.
-    /// Call framebuffer_len() for the byte count. Valid until next run_frame().
-    pub fn framebuffer_ptr(&mut self) -> *const u8 {
+    /// Returns the framebuffer as an RGBA8 Vec for use in JS as Uint8ClampedArray.
+    pub fn framebuffer_rgba(&mut self) -> Vec<u8> {
         let fb = self.cpu.framebuffer();
         for (i, &pixel) in fb.iter().enumerate() {
             let color = PALETTE[(pixel & 3) as usize];
             self.rgba_buf[i * 4..i * 4 + 4].copy_from_slice(&color);
         }
-        self.rgba_buf.as_ptr()
-    }
-
-    pub fn framebuffer_len(&self) -> usize {
-        RGBA_FRAMEBUFFER_SIZE
+        self.rgba_buf.clone()
     }
 
     /// button: 0=Right 1=Left 2=Up 3=Down 4=A 5=B 6=Select 7=Start
