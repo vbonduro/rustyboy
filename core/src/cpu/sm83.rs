@@ -163,6 +163,12 @@ impl Sm83 {
         self.ppu.framebuffer()
     }
 
+    /// Drain accumulated PCM audio samples since the last call.
+    /// Returns interleaved stereo f32 samples [L, R, L, R, ...] at 48,000 Hz.
+    pub fn drain_audio_samples(&mut self) -> alloc::vec::Vec<f32> {
+        self.apu.drain_samples()
+    }
+
     /// Builder method to set initial register state. Used to skip the boot ROM
     /// by setting PC to 0x0100 and SP to 0xFFFE.
     pub fn with_registers(mut self, registers: Registers) -> Self {
@@ -179,6 +185,10 @@ impl Sm83 {
         self.memory.write_io(BGP_ADDR,  0xFC); // background palette: 3,3,3,0
         self.memory.write_io(OBP0_ADDR, 0xFF); // obj palette 0
         self.memory.write_io(OBP1_ADDR, 0xFF); // obj palette 1
+        // APU post-boot state (Pan Docs)
+        self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
+        self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
+        self.write_apu_register(0xFF24, 0x77); // NR50: max volume both sides
         self
     }
 

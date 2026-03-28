@@ -45,6 +45,18 @@ const DUTY_TABLE: [[u8; 8]; 4] = [
 /// Noise channel divisor table.
 const NOISE_DIVISORS: [u16; 8] = [8, 16, 32, 48, 64, 80, 96, 112];
 
+/// Target sample rate for PCM output (Hz).
+pub const SAMPLE_RATE: u32 = 48_000;
+
+/// DMG T-cycle frequency.
+const CPU_FREQ: u32 = 4_194_304;
+
+/// Numerator/denominator for the downsampling accumulator.
+/// We emit one stereo sample every CPU_FREQ/SAMPLE_RATE T-cycles.
+/// Using fixed-point: accumulator counts in units of SAMPLE_RATE.
+const SAMPLE_PERIOD_NUM: u32 = CPU_FREQ;
+const SAMPLE_PERIOD_DEN: u32 = SAMPLE_RATE;
+
 /// Result of an APU tick.
 pub struct ApuOutput {
     pub nr52: u8,
@@ -400,6 +412,13 @@ pub struct ApuPeripheral {
     /// Raw register bytes for NR10–NR51 (indices 0–21), stored as written.
     /// Read-back ORs these with `READ_MASKS` to expose write-only bits as 1.
     regs: [u8; 23], // NR10 (0xFF10) through NR52 (0xFF26)
+
+    /// Downsampling accumulator. Incremented by SAMPLE_PERIOD_DEN each T-cycle;
+    /// when it reaches SAMPLE_PERIOD_NUM a stereo sample is emitted and the
+    /// remainder is kept to avoid pitch drift.
+    sample_acc: u32,
+    /// Interleaved stereo PCM output buffer: [L, R, L, R, ...], f32 in [-1, 1].
+    sample_buffer: alloc::vec::Vec<f32>,
 }
 
 impl ApuPeripheral {
@@ -415,7 +434,15 @@ impl ApuPeripheral {
             channel3: WaveChannel::default(),
             channel4: NoiseChannel::default(),
             regs: [0u8; 23],
+            sample_acc: 0,
+            sample_buffer: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Drain and return accumulated PCM samples since the last call.
+    /// Returns interleaved stereo f32 samples: [L, R, L, R, ...] in [-1.0, 1.0].
+    pub fn drain_samples(&mut self) -> alloc::vec::Vec<f32> {
+        core::mem::take(&mut self.sample_buffer)
     }
 
     /// Read a register with OR masks applied.
@@ -524,6 +551,15 @@ impl ApuPeripheral {
                 self.channel3.clock_frequency();
             }
             self.channel4.clock_frequency();
+
+            // Downsample: emit one stereo sample every ~87.38 T-cycles.
+            self.sample_acc += SAMPLE_PERIOD_DEN;
+            if self.sample_acc >= SAMPLE_PERIOD_NUM {
+                self.sample_acc -= SAMPLE_PERIOD_NUM;
+                let (left, right) = self.mix_sample();
+                self.sample_buffer.push(left);
+                self.sample_buffer.push(right);
+            }
         }
 
         ApuOutput { nr52: self.build_nr52() }
@@ -553,6 +589,66 @@ impl ApuPeripheral {
         self.channel2.clock_length();
         self.channel3.clock_length();
         self.channel4.clock_length();
+    }
+
+    /// Mix all four channels into a stereo sample pair using NR50/NR51.
+    /// Returns (left, right) in [-1.0, 1.0].
+    fn mix_sample(&self) -> (f32, f32) {
+        // Channel digital outputs (0–15).
+        let ch1 = if self.channel1.enabled {
+            let high = DUTY_TABLE[self.channel1.duty as usize][self.channel1.duty_position as usize];
+            if high != 0 { self.channel1.volume } else { 0 }
+        } else { 0 };
+
+        let ch2 = if self.channel2.enabled {
+            let high = DUTY_TABLE[self.channel2.duty as usize][self.channel2.duty_position as usize];
+            if high != 0 { self.channel2.volume } else { 0 }
+        } else { 0 };
+
+        let ch3 = if self.channel3.enabled {
+            let nibble = if self.channel3.position & 1 == 0 {
+                self.channel3.sample_buffer >> 4
+            } else {
+                self.channel3.sample_buffer & 0x0F
+            };
+            match self.channel3.volume_code {
+                0 => 0,
+                1 => nibble,
+                2 => nibble >> 1,
+                3 => nibble >> 2,
+                _ => 0,
+            }
+        } else { 0 };
+
+        let ch4 = if self.channel4.enabled {
+            // LFSR bit 0 = 0 means high output.
+            if self.channel4.lfsr & 1 == 0 { self.channel4.volume } else { 0 }
+        } else { 0 };
+
+        // NR51 (regs[21]): panning. Bits 7-4 = ch4-ch1 left, bits 3-0 = ch4-ch1 right.
+        let nr51 = self.regs[21];
+        let left_mix =
+            if nr51 & 0x10 != 0 { ch1 as f32 } else { 0.0 }
+            + if nr51 & 0x20 != 0 { ch2 as f32 } else { 0.0 }
+            + if nr51 & 0x40 != 0 { ch3 as f32 } else { 0.0 }
+            + if nr51 & 0x80 != 0 { ch4 as f32 } else { 0.0 };
+        let right_mix =
+            if nr51 & 0x01 != 0 { ch1 as f32 } else { 0.0 }
+            + if nr51 & 0x02 != 0 { ch2 as f32 } else { 0.0 }
+            + if nr51 & 0x04 != 0 { ch3 as f32 } else { 0.0 }
+            + if nr51 & 0x08 != 0 { ch4 as f32 } else { 0.0 };
+
+        // NR50 (regs[20]): master volume. Bits 6-4 = left vol (0-7), bits 2-0 = right vol (0-7).
+        let nr50 = self.regs[20];
+        let left_vol  = ((nr50 >> 4) & 0x07) as f32 + 1.0; // 1–8
+        let right_vol = ( nr50       & 0x07) as f32 + 1.0; // 1–8
+
+        // Normalize: max possible mix = 4 channels × 15 volume × 8 master = 480
+        const NORM: f32 = 4.0 * 15.0 * 8.0;
+        let left  = (left_mix  * left_vol)  / NORM;
+        let right = (right_mix * right_vol) / NORM;
+
+        (left, right)
     }
 
     fn build_nr52(&self) -> u8 {
@@ -1092,5 +1188,31 @@ mod tests {
         // Write NR11 (mask=0x3F, only duty bits 6-7 readable)
         apu.write_register(0xFF11, 0xC0); // duty=3
         assert_eq!(apu.read_register(0xFF11), 0xC0 | 0x3F); // 0xFF
+    }
+
+    #[test]
+    fn test_sample_generation() {
+        let mut apu = ApuPeripheral::new();
+        // Seed DMG post-boot state
+        apu.write_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
+        apu.write_register(0xFF25, 0xF3); // NR51: panning
+        apu.write_register(0xFF24, 0x77); // NR50: max volume
+        // Trigger ch1 with audible settings
+        apu.write_register(0xFF12, 0xF3); // NR12: volume=15, envelope up, period=3
+        apu.write_register(0xFF11, 0x80); // NR11: duty=2 (50%), length=0
+        apu.write_register(0xFF13, 0x00); // NR13: freq lo
+        apu.write_register(0xFF14, 0x87); // NR14: trigger, freq hi=7
+
+        let mut div: u16 = 0;
+        for _ in 0..70224u32 {
+            div = div.wrapping_add(1);
+            apu.tick(1, div);
+        }
+        let samples = apu.drain_samples();
+        assert!(samples.len() > 0, "no samples generated");
+        let nonzero = samples.iter().any(|&s| s != 0.0);
+        let max = samples.iter().cloned().fold(0.0f32, f32::max);
+        assert!(nonzero, "all samples zero: max={} nr50={:#04x} nr51={:#04x}",
+            max, apu.regs[20], apu.regs[21]);
     }
 }

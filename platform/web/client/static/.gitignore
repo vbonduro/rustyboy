@@ -1,0 +1,6 @@
+# Ignore wasm-pack build output (generated at build time)
+rustyboy_web_client.js
+rustyboy_web_client.d.ts
+rustyboy_web_client_bg.wasm
+rustyboy_web_client_bg.wasm.d.ts
+package.json
