@@ -13,14 +13,12 @@
   <div class="scene">
     <div class="gameboy">
 
-      <!-- Top rail: power switch -->
+      <!-- Top rail: reset button -->
       <div class="top-rail">
-        <div class="power-switch" id="powerBtn" aria-label="Power / Menu">
-          <div class="power-switch-track">
-            <span class="power-switch-label left">◁OFF</span>
-            <div class="power-switch-knob"></div>
-            <span class="power-switch-label right">ON▷</span>
-          </div>
+        <div class="reset-wrap">
+          <div class="reset-led" id="resetLed"></div>
+          <button class="reset-btn" id="powerBtn" aria-label="Reset"></button>
+          <span class="reset-label">RESET</span>
         </div>
         <div class="top-rail-indent"></div>
       </div>
