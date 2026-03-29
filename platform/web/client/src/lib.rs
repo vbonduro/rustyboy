@@ -108,6 +108,28 @@ impl EmulatorHandle {
         )
     }
 
+    /// Serialize the full emulator state to a byte blob (save state).
+    pub fn save_state(&self) -> Vec<u8> {
+        self.cpu.save_state()
+    }
+
+    /// Restore emulator state from a blob produced by `save_state`.
+    pub fn load_state(&mut self, data: Vec<u8>) -> Result<(), JsValue> {
+        self.cpu.load_state(&data).map_err(|e| JsValue::from_str(e))
+    }
+
+    /// Returns the cartridge external RAM (battery save) as bytes, or an empty Vec
+    /// if this cartridge has no external RAM.
+    pub fn get_battery_save(&self) -> Vec<u8> {
+        self.cpu.external_ram().map(|s| s.to_vec()).unwrap_or_default()
+    }
+
+    /// Writes battery save data into the cartridge external RAM.
+    /// No-op if this cartridge has no external RAM.
+    pub fn set_battery_save(&mut self, data: Vec<u8>) {
+        self.cpu.set_external_ram(&data);
+    }
+
     /// button: 0=Right 1=Left 2=Up 3=Down 4=A 5=B 6=Select 7=Start
     pub fn set_button(&mut self, button: u8, pressed: bool) {
         let btn = match button {

@@ -125,6 +125,23 @@ impl PpuPeripheral {
         &self.framebuffer
     }
 
+    pub fn dot(&self) -> u16 { self.dot }
+    pub fn ly(&self) -> u8 { self.ly }
+    pub fn mode(&self) -> u8 { self.mode as u8 }
+    pub fn window_line_counter(&self) -> u8 { self.window_line_counter }
+
+    pub fn set_dot(&mut self, v: u16) { self.dot = v; }
+    pub fn set_ly(&mut self, v: u8) { self.ly = v; }
+    pub fn set_mode(&mut self, v: u8) {
+        self.mode = match v {
+            0 => PpuMode::HBlank,
+            1 => PpuMode::VBlank,
+            2 => PpuMode::OamScan,
+            _ => PpuMode::PixelTransfer,
+        };
+    }
+    pub fn set_window_line_counter(&mut self, v: u8) { self.window_line_counter = v; }
+
     /// Advance the PPU by `cycles` T-cycles.
     pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
         let lcdc = Lcdc(input.lcdc);

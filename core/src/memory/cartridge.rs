@@ -18,6 +18,10 @@ pub trait Cartridge {
     /// Advance the cartridge clock by `cycles` T-cycles (4 MHz). Only meaningful for
     /// MBC3 carts with an RTC; other implementations ignore this.
     fn tick_rtc(&mut self, _cycles: u32) {}
+    /// Returns the full external RAM contents, or `None` if this cart has no battery-backed RAM.
+    fn external_ram(&self) -> Option<&[u8]> { None }
+    /// Overwrites the full external RAM from the given bytes. No-op if cart has no external RAM.
+    fn set_external_ram(&mut self, _data: &[u8]) {}
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -228,6 +232,13 @@ impl Mbc1 {
 }
 
 impl Cartridge for Mbc1 {
+    fn external_ram(&self) -> Option<&[u8]> {
+        if self.ram.is_empty() { None } else { Some(&self.ram) }
+    }
+    fn set_external_ram(&mut self, data: &[u8]) {
+        let len = self.ram.len().min(data.len());
+        self.ram[..len].copy_from_slice(&data[..len]);
+    }
     fn current_rom_bank(&self) -> usize { self.rom_bank() }
 
     fn read_rom(&self, addr: u16) -> u8 {
@@ -352,6 +363,13 @@ impl Mbc1Multicart {
 }
 
 impl Cartridge for Mbc1Multicart {
+    fn external_ram(&self) -> Option<&[u8]> {
+        if self.ram.is_empty() { None } else { Some(&self.ram) }
+    }
+    fn set_external_ram(&mut self, data: &[u8]) {
+        let len = self.ram.len().min(data.len());
+        self.ram[..len].copy_from_slice(&data[..len]);
+    }
     fn read_rom(&self, addr: u16) -> u8 {
         let physical = match addr {
             0x0000..=0x3FFF => self.rom_bank0() * 0x4000 + addr as usize,
@@ -542,6 +560,13 @@ impl Mbc3 {
 }
 
 impl Cartridge for Mbc3 {
+    fn external_ram(&self) -> Option<&[u8]> {
+        if self.ram.is_empty() { None } else { Some(&self.ram) }
+    }
+    fn set_external_ram(&mut self, data: &[u8]) {
+        let len = self.ram.len().min(data.len());
+        self.ram[..len].copy_from_slice(&data[..len]);
+    }
     fn current_rom_bank(&self) -> usize { self.rom_bank as usize }
 
     fn tick_rtc(&mut self, cycles: u32) {

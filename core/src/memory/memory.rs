@@ -153,6 +153,60 @@ impl GameBoyMemory {
         self.oam.as_slice()
     }
 
+    pub fn wram(&self) -> &[u8] {
+        self.wram.as_slice()
+    }
+
+    pub fn hram(&self) -> &[u8] {
+        self.hram.as_slice()
+    }
+
+    pub fn ie(&self) -> u8 {
+        self.ie
+    }
+
+    pub fn set_wram(&mut self, data: &[u8]) {
+        let len = data.len().min(self.wram.as_slice().len());
+        for i in 0..len {
+            let _ = self.wram.write(i as u16, data[i]);
+        }
+    }
+
+    pub fn set_hram(&mut self, data: &[u8]) {
+        let len = data.len().min(self.hram.as_slice().len());
+        for i in 0..len {
+            let _ = self.hram.write(i as u16, data[i]);
+        }
+    }
+
+    pub fn set_vram(&mut self, data: &[u8]) {
+        let len = data.len().min(self.vram.as_slice().len());
+        for i in 0..len {
+            let _ = self.vram.write(i as u16, data[i]);
+        }
+    }
+
+    pub fn set_oam(&mut self, data: &[u8]) {
+        let len = data.len().min(self.oam.as_slice().len());
+        for i in 0..len {
+            let _ = self.oam.write(i as u16, data[i]);
+        }
+    }
+
+    pub fn set_ie(&mut self, value: u8) {
+        self.ie = value;
+    }
+
+    /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
+    pub fn external_ram(&self) -> Option<&[u8]> {
+        self.cartridge.external_ram()
+    }
+
+    /// Overwrites the cartridge external RAM. No-op if cart has no external RAM.
+    pub fn set_external_ram(&mut self, data: &[u8]) {
+        self.cartridge.set_external_ram(data);
+    }
+
     /// Direct read of an IO register. No bus events.
     /// Handles 0xFF00-0xFF7F from io array, 0xFFFF from ie field.
     pub fn read_io(&self, address: u16) -> u8 {
