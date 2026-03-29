@@ -213,6 +213,156 @@ impl Sm83 {
         self.apu.drain_samples()
     }
 
+    /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
+    pub fn external_ram(&self) -> Option<&[u8]> {
+        self.memory.external_ram()
+    }
+
+    /// Overwrites the cartridge external RAM with the provided data.
+    pub fn set_external_ram(&mut self, data: &[u8]) {
+        self.memory.set_external_ram(data);
+    }
+
+    /// Serialize the full emulator state to a byte blob.
+    ///
+    /// Format:
+    ///   [0..4]   magic "RBSS"
+    ///   [4..6]   version u16 LE (= 1)
+    ///   [6]      A
+    ///   [7]      B
+    ///   [8]      C
+    ///   [9]      D
+    ///   [10]     E
+    ///   [11]     H
+    ///   [12]     L
+    ///   [13]     F (flags byte)
+    ///   [14..16] SP u16 LE
+    ///   [16..18] PC u16 LE
+    ///   [18]     IME (0=disabled, 1=pending, 2=enabled)
+    ///   [19]     halted (0/1)
+    ///   [20..28] cycle_counter u64 LE
+    ///   [28..30] timer internal_counter u16 LE
+    ///   [30..32] PPU dot u16 LE
+    ///   [32]     PPU ly
+    ///   [33]     PPU mode
+    ///   [34]     PPU window_line_counter
+    ///   [35..163]  IO registers (0xFF00–0xFF7F, 0x80 bytes)
+    ///   [163]    IE register
+    ///   [164..8356]   WRAM (0x2000 bytes)
+    ///   [8356..8483]  HRAM (0x7F bytes)
+    ///   [8483..16675] VRAM (0x2000 bytes)
+    ///   [16675..16835] OAM (0xA0 bytes)
+    pub fn save_state(&self) -> alloc::vec::Vec<u8> {
+        let mut out = alloc::vec::Vec::with_capacity(16835);
+        // Magic + version
+        out.extend_from_slice(b"RBSS");
+        out.extend_from_slice(&1u16.to_le_bytes());
+        // CPU registers
+        out.push(self.registers.a);
+        out.push(self.registers.b);
+        out.push(self.registers.c);
+        out.push(self.registers.d);
+        out.push(self.registers.e);
+        out.push(self.registers.h);
+        out.push(self.registers.l);
+        out.push(self.registers.f.bits());
+        out.extend_from_slice(&self.registers.sp.to_le_bytes());
+        out.extend_from_slice(&self.registers.pc.to_le_bytes());
+        // IME + halted
+        out.push(match self.ime {
+            ImeState::Disabled => 0,
+            ImeState::Pending  => 1,
+            ImeState::Enabled  => 2,
+        });
+        out.push(self.halted as u8);
+        // cycle_counter
+        out.extend_from_slice(&self.cycle_counter.to_le_bytes());
+        // Timer internal counter
+        out.extend_from_slice(&self.timer.internal_counter().to_le_bytes());
+        // PPU internal state
+        out.extend_from_slice(&self.ppu.dot().to_le_bytes());
+        out.push(self.ppu.ly());
+        out.push(self.ppu.mode());
+        out.push(self.ppu.window_line_counter());
+        // IO registers (0xFF00–0xFF7F)
+        for i in 0..0x80u16 {
+            out.push(self.memory.read_io(0xFF00 + i));
+        }
+        // IE
+        out.push(self.memory.ie());
+        // WRAM
+        out.extend_from_slice(self.memory.wram());
+        // HRAM
+        out.extend_from_slice(self.memory.hram());
+        // VRAM
+        out.extend_from_slice(self.memory.vram());
+        // OAM
+        out.extend_from_slice(self.memory.oam());
+        out
+    }
+
+    /// Restore emulator state from a blob produced by `save_state`.
+    /// Returns `Err` with a description if the blob is invalid.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        if data.len() < 16835 {
+            return Err("save state blob too short");
+        }
+        if &data[0..4] != b"RBSS" {
+            return Err("invalid save state magic");
+        }
+        let version = u16::from_le_bytes([data[4], data[5]]);
+        if version != 1 {
+            return Err("unsupported save state version");
+        }
+        // CPU registers
+        self.registers.a  = data[6];
+        self.registers.b  = data[7];
+        self.registers.c  = data[8];
+        self.registers.d  = data[9];
+        self.registers.e  = data[10];
+        self.registers.h  = data[11];
+        self.registers.l  = data[12];
+        self.registers.f  = Flags::from_bits_truncate(data[13]);
+        self.registers.sp = u16::from_le_bytes([data[14], data[15]]);
+        self.registers.pc = u16::from_le_bytes([data[16], data[17]]);
+        // IME + halted
+        self.ime = match data[18] {
+            1 => ImeState::Pending,
+            2 => ImeState::Enabled,
+            _ => ImeState::Disabled,
+        };
+        self.halted = data[19] != 0;
+        // cycle_counter
+        self.cycle_counter = u64::from_le_bytes([
+            data[20], data[21], data[22], data[23],
+            data[24], data[25], data[26], data[27],
+        ]);
+        // Timer
+        let timer_counter = u16::from_le_bytes([data[28], data[29]]);
+        self.timer.set_internal_counter(timer_counter);
+        // PPU
+        let ppu_dot = u16::from_le_bytes([data[30], data[31]]);
+        self.ppu.set_dot(ppu_dot);
+        self.ppu.set_ly(data[32]);
+        self.ppu.set_mode(data[33]);
+        self.ppu.set_window_line_counter(data[34]);
+        // IO registers
+        for i in 0..0x80u16 {
+            self.memory.write_io(0xFF00 + i, data[35 + i as usize]);
+        }
+        // IE
+        self.memory.set_ie(data[163]);
+        // WRAM
+        self.memory.set_wram(&data[164..164 + 0x2000]);
+        // HRAM
+        self.memory.set_hram(&data[8356..8356 + 0x7F]);
+        // VRAM
+        self.memory.set_vram(&data[8483..8483 + 0x2000]);
+        // OAM
+        self.memory.set_oam(&data[16675..16675 + 0xA0]);
+        Ok(())
+    }
+
     /// Builder method to set initial register state. Used to skip the boot ROM
     /// by setting PC to 0x0100 and SP to 0xFFFE.
     pub fn with_registers(mut self, registers: Registers) -> Self {
