@@ -458,6 +458,13 @@ impl RtcRegisters {
 ///   0x2000–0x3FFF  ROM bank number (7-bit, 0→1)
 ///   0x4000–0x5FFF  RAM bank (0x00–0x03) or RTC register select (0x08–0x0C)
 ///   0x6000–0x7FFF  Latch clock: write 0x00 then 0x01 to latch RTC
+
+/// Increments `val` by 1. Resets to 0 and returns `true` (carry) if it reaches `limit`.
+fn inc_with_carry(val: &mut u8, limit: u8) -> bool {
+    *val += 1;
+    if *val >= limit { *val = 0; true } else { false }
+}
+
 pub struct Mbc3 {
     rom: Vec<u8>,
     ram: Vec<u8>,
@@ -512,25 +519,19 @@ impl Mbc3 {
         self.rtc_cycles %= RTC_CYCLES_PER_SEC;
 
         for _ in 0..secs_elapsed {
-            self.rtc.sec += 1;
-            if self.rtc.sec < 60 { continue; }
-            self.rtc.sec = 0;
-            self.rtc.min += 1;
-            if self.rtc.min < 60 { continue; }
-            self.rtc.min = 0;
-            self.rtc.hour += 1;
-            if self.rtc.hour < 24 { continue; }
-            self.rtc.hour = 0;
-            // Increment 9-bit day counter
-            let day = ((self.rtc.day_hi & 0x01) as u16) << 8 | self.rtc.day_lo as u16;
-            let day = day + 1;
-            self.rtc.day_lo = day as u8;
-            self.rtc.day_hi = (self.rtc.day_hi & 0xFE) | ((day >> 8) as u8 & 0x01);
-            if day >= 0x200 {
-                // Day counter overflow: set carry flag, reset counter
-                self.rtc.day_hi |= 0x80;
-                self.rtc.day_lo = 0;
-                self.rtc.day_hi &= !0x01;
+            if inc_with_carry(&mut self.rtc.sec, 60)
+                && inc_with_carry(&mut self.rtc.min, 60)
+                && inc_with_carry(&mut self.rtc.hour, 24)
+            {
+                let day = ((self.rtc.day_hi & 0x01) as u16) << 8 | self.rtc.day_lo as u16;
+                let day = day + 1;
+                self.rtc.day_lo = day as u8;
+                self.rtc.day_hi = (self.rtc.day_hi & 0xFE) | ((day >> 8) as u8 & 0x01);
+                if day >= 0x200 {
+                    // Day counter overflow: set carry flag, reset counter
+                    self.rtc.day_hi = (self.rtc.day_hi | 0x80) & !0x01;
+                    self.rtc.day_lo = 0;
+                }
             }
         }
     }
