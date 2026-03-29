@@ -1,3 +1,5 @@
+mod db;
+
 use axum::{
     Router,
     extract::{Path, State},
@@ -14,6 +16,7 @@ use tower_http::services::ServeDir;
 struct AppState {
     roms_dir: PathBuf,
     static_dir: PathBuf,
+    db: db::Database,
 }
 
 #[tokio::main]
@@ -26,10 +29,16 @@ async fn main() {
     let static_dir = PathBuf::from(
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "/static".to_string()),
     );
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "/data/rustyboy.db".to_string());
+
+    let db = db::Database::connect(&db_path)
+        .await
+        .expect("Failed to connect to database");
 
     let state = Arc::new(AppState {
         roms_dir,
         static_dir: static_dir.clone(),
+        db,
     });
 
     let app = Router::new()
