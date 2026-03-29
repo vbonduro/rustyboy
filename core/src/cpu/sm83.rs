@@ -34,7 +34,7 @@ use super::peripheral::apu::{
     ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
 };
 use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
-use super::peripheral::serial::SerialPort;
+use super::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
 use super::peripheral::ppu::{
     PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
     LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
@@ -312,6 +312,21 @@ impl Sm83 {
             self.advance_timer_apu(1);
         }
         self.memory.tick_rtc(cycles as u32);
+        self.advance_serial(cycles);
+    }
+
+    fn advance_serial(&mut self, cycles: u16) {
+        let output = self.serial.tick(cycles);
+        if output.interrupt {
+            if let Some(sb) = output.sb {
+                self.memory.write_io(SB_ADDR, sb);
+            }
+            if let Some(sc) = output.sc {
+                self.memory.write_io(SC_ADDR, sc);
+            }
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << SERIAL_INTERRUPT_BIT));
+        }
     }
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
