@@ -130,6 +130,11 @@ impl GameBoyMemory {
         self.cartridge.current_rom_bank()
     }
 
+    /// Advance the cartridge RTC by `cycles` T-cycles. No-op for non-RTC carts.
+    pub fn tick_rtc(&mut self, cycles: u32) {
+        self.cartridge.tick_rtc(cycles);
+    }
+
     /// Perform OAM DMA: copy 160 bytes from the source page to OAM.
     /// Source address = page * 0x100. Reads go through normal memory mapping.
     pub fn dma_to_oam(&mut self, page: u8) {
