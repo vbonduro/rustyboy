@@ -13,6 +13,8 @@ pub trait Cartridge {
     fn read_rom(&self, addr: u16) -> u8;
     fn read_ram(&self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, value: u8);
+    /// Returns the currently mapped ROM bank number for the switchable window (0x4000–0x7FFF).
+    fn current_rom_bank(&self) -> usize { 1 }
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -218,6 +220,8 @@ impl Mbc1 {
 }
 
 impl Cartridge for Mbc1 {
+    fn current_rom_bank(&self) -> usize { self.rom_bank() }
+
     fn read_rom(&self, addr: u16) -> u8 {
         let physical = match addr {
             0x0000..=0x3FFF => self.rom_bank0() * 0x4000 + addr as usize,
