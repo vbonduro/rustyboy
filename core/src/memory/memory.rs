@@ -125,6 +125,11 @@ impl GameBoyMemory {
         }
     }
 
+    /// Returns the currently mapped ROM bank number for the switchable window.
+    pub fn current_rom_bank(&self) -> usize {
+        self.cartridge.current_rom_bank()
+    }
+
     /// Perform OAM DMA: copy 160 bytes from the source page to OAM.
     /// Source address = page * 0x100. Reads go through normal memory mapping.
     pub fn dma_to_oam(&mut self, page: u8) {

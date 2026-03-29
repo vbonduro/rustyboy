@@ -63,6 +63,7 @@ const state = {
   rafId:        null,
   audioCtx:     null,   // AudioContext | null
   audioNode:    null,   // AudioWorkletNode | null
+  debugOverlay: false,  // toggle with D key
 };
 
 // ── Audio ───────────────────────────────────────────────────────────────────
@@ -137,6 +138,8 @@ const resetLed    = document.getElementById('resetLed');
 const screenInner = canvas.parentElement;
 const screenBezel = screenInner.parentElement;
 
+// Debug overlay toggle — wired in boot() after DOM confirmed ready
+
 // ── Boot ───────────────────────────────────────────────────────────────────
 
 async function boot() {
@@ -152,6 +155,28 @@ async function boot() {
   await loadRomList();
   bindButtons();
   bindKeyboard();
+  // Only wire debug overlay if compiled in (debug-overlay feature)
+  if (typeof EmulatorHandle.prototype.debug_state === 'function') {
+    bindDebugButton();
+  }
+}
+
+function bindDebugButton() {
+  // Inject DBG button only when the debug-overlay feature is compiled in
+  const housing = document.querySelector('.screen-housing');
+  if (!housing) return;
+  const btn = document.createElement('button');
+  btn.id = 'debugBtn';
+  btn.textContent = 'DBG';
+  btn.style.cssText = 'position:absolute;top:4px;right:8px;background:rgba(0,0,0,0.7);color:#9BBC0F;font:8px monospace;border:1px solid #9BBC0F;border-radius:2px;padding:3px 6px;z-index:50;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;';
+  housing.appendChild(btn);
+  btn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    state.debugOverlay = !state.debugOverlay;
+    btn.style.background = state.debugOverlay ? '#9BBC0F' : 'rgba(0,0,0,0.7)';
+    btn.style.color = state.debugOverlay ? '#000' : '#9BBC0F';
+  });
 }
 
 // ── ROM list ───────────────────────────────────────────────────────────────
@@ -334,6 +359,26 @@ function drawFrame() {
   const rgba = state.emulator.framebuffer_rgba();
   imageData.data.set(rgba);
   ctx.putImageData(imageData, 0, 0);
+
+  if (state.debugOverlay && typeof state.emulator.debug_state === 'function') {
+    const lines = state.emulator.debug_state().split('\n');
+    // Draw at a size that fills most of the canvas width when scaled up
+    const fontSize = 10;
+    const lineH = fontSize + 3;
+    const pad = 3;
+    ctx.font = `bold ${fontSize}px monospace`;
+    ctx.textBaseline = 'top';
+    let maxW = 0;
+    lines.forEach(l => { const m = ctx.measureText(l).width; if (m > maxW) maxW = m; });
+    const boxW = Math.min(maxW + pad * 2, 160);
+    const boxH = lines.length * lineH + pad * 2;
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, boxW, boxH);
+    ctx.fillStyle = '#9BBC0F';
+    lines.forEach((line, i) => {
+      ctx.fillText(line, pad, pad + lineH * i);
+    });
+  }
 }
 
 // ── Button handling ────────────────────────────────────────────────────────
@@ -425,6 +470,12 @@ function bindKeyboard() {
   document.addEventListener('keydown', (e) => {
     if (heldKeys.has(e.key)) return;
     heldKeys.add(e.key);
+
+    // Toggle debug overlay with backtick/apostrophe (only if compiled in)
+    if ((e.key === "'" || e.key === '`') && typeof EmulatorHandle.prototype.debug_state === 'function') {
+      state.debugOverlay = !state.debugOverlay;
+      return;
+    }
 
     const idx = KEY_MAP[e.key];
     if (idx === undefined) return;

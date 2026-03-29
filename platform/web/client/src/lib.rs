@@ -77,6 +77,37 @@ impl EmulatorHandle {
         self.cpu.drain_audio_samples()
     }
 
+    /// Returns a debug string with key PPU/interrupt state for on-screen display.
+    /// Only available when compiled with the `debug-overlay` feature.
+    #[cfg(feature = "debug-overlay")]
+    pub fn debug_state(&self) -> String {
+        let read = |a: u16| self.cpu.read_memory(a).unwrap_or(0);
+        let lcdc = read(0xFF40);
+        let stat = read(0xFF41);
+        let ly   = read(0xFF44);
+        let lyc  = read(0xFF45);
+        let scx  = read(0xFF43);
+        let scy  = read(0xFF42);
+        let if_  = read(0xFF0F);
+        let ie   = read(0xFFFF);
+        let bgp  = read(0xFF47);
+        let obp0 = read(0xFF48);
+        let ffeb = read(0xFFEB);
+        let ffe6 = read(0xFFE6);
+        let ime  = if self.cpu.ime() { "1" } else { "0" };
+        let bank = self.cpu.current_rom_bank();
+        let pc = self.cpu.registers().pc;
+        format!(
+            "PC={:04X} ROM={:02}\nLY={:3} LYC={:3} SCX={:3} SCY={:3}\nLCDC={:02X} OBJ={} WIN={} BG={}\nSTAT={:02X} IF={:02X} IE={:02X} IME={}\nBGP={:02X} OBP0={:02X}\nFFEB={:02X} FFE6={:02X}",
+            pc, bank,
+            ly, lyc, scx, scy,
+            lcdc, (lcdc >> 1) & 1, (lcdc >> 5) & 1, lcdc & 1,
+            stat, if_, ie, ime,
+            bgp, obp0,
+            ffeb, ffe6
+        )
+    }
+
     /// button: 0=Right 1=Left 2=Up 3=Down 4=A 5=B 6=Select 7=Start
     pub fn set_button(&mut self, button: u8, pressed: bool) {
         let btn = match button {

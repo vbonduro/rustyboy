@@ -1,5 +1,12 @@
+# ── Build args ─────────────────────────────────────────────────────────────
+# Pass --build-arg DEBUG_OVERLAY=1 to enable the on-screen debug overlay.
+# Default is off (production build).
+ARG DEBUG_OVERLAY=0
+
 # ── Stage 1: Build WASM client ─────────────────────────────────────────────
 FROM rust:1.82-slim AS wasm-builder
+
+ARG DEBUG_OVERLAY
 
 RUN apt-get update && apt-get install -y \
     curl \
@@ -20,10 +27,19 @@ COPY platform/web/server/Cargo.toml ./platform/web/server/Cargo.toml
 RUN mkdir -p platform/web/server/src && echo "fn main() {}" > platform/web/server/src/main.rs
 
 # Build WASM with wasm-pack (--target web = native ES module, no bundler)
-RUN wasm-pack build platform/web/client \
-    --target web \
-    --out-dir /build/platform/web/client/pkg \
-    --release
+# Pass --features debug-overlay when DEBUG_OVERLAY=1
+RUN if [ "$DEBUG_OVERLAY" = "1" ]; then \
+      wasm-pack build platform/web/client \
+        --target web \
+        --out-dir /build/platform/web/client/pkg \
+        --release \
+        --features debug-overlay; \
+    else \
+      wasm-pack build platform/web/client \
+        --target web \
+        --out-dir /build/platform/web/client/pkg \
+        --release; \
+    fi
 
 # ── Stage 2: Build the Axum server ─────────────────────────────────────────
 FROM rust:1.82-slim AS server-builder

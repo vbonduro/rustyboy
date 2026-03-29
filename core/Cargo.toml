@@ -3,6 +3,11 @@ name = "rustyboy-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enables per-instruction trace hooks on Sm83. Zero cost when disabled.
+# Usage: cargo test --features trace
+trace = []
+
 [dependencies]
 bitflags = "2.5.0"
 

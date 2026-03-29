@@ -68,6 +68,18 @@ const IE_ADDR: u16 = 0xFFFF;
 const SB_ADDR: u16 = 0xFF01;
 const SC_ADDR: u16 = 0xFF02;
 
+/// Snapshot of CPU and key hardware state passed to trace hooks.
+#[cfg(feature = "trace")]
+pub struct TraceEvent<'a> {
+    pub pc: u16,
+    pub registers: &'a Registers,
+    pub ime: bool,
+    pub ly: u8,
+    pub if_: u8,
+    pub ie: u8,
+    pub lcdc: u8,
+}
+
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
@@ -84,6 +96,9 @@ pub struct Sm83 {
     /// Pending OAM DMA transfer. When Some, holds the source page and number of
     /// bytes already copied. Each M-cycle advances the transfer by one byte.
     dma: Option<DmaState>,
+    /// Per-instruction trace hook, enabled by the `trace` feature.
+    #[cfg(feature = "trace")]
+    trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
 }
 
 /// State for an in-progress OAM DMA transfer.
@@ -110,6 +125,8 @@ impl Sm83 {
             halted: false,
             cycle_counter: 0,
             dma: None,
+            #[cfg(feature = "trace")]
+            trace_hook: None,
         };
         // Seed JOYP with no buttons pressed (all lines high).
         sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
@@ -161,9 +178,24 @@ impl Sm83 {
         self.halted
     }
 
+    /// Install a per-instruction trace hook (only available with `--features trace`).
+    /// The hook is called after every instruction with a snapshot of CPU and hardware state.
+    #[cfg(feature = "trace")]
+    pub fn set_trace_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut(TraceEvent<'_>) + 'static,
+    {
+        self.trace_hook = Some(Box::new(hook));
+    }
+
     /// Read a byte from the memory bus (for test/debug access).
     pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
         self.memory.read(address)
+    }
+
+    /// Returns the currently mapped ROM bank for the switchable window (0x4000–0x7FFF).
+    pub fn current_rom_bank(&self) -> usize {
+        self.memory.current_rom_bank()
     }
 
     /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
@@ -579,6 +611,16 @@ impl Cpu for Sm83 {
             self.tick_cycle(); // 1 M-cycle while halted
             if self.has_pending_interrupt() {
                 self.halted = false;
+                // When IME=1, the interrupt is dispatched before resuming execution
+                // (the ISR runs; after RETI, execution continues at the instruction
+                // after HALT). This must happen before advance_ime so the EI delay
+                // does not interfere.
+                if self.ime == ImeState::Enabled {
+                    if let Some(bit) = self.take_pending_interrupt() {
+                        self.dispatch_interrupt(bit)?;
+                    }
+                    return Ok((self.cycle_counter - start_cycles) as u8);
+                }
             } else {
                 return Ok((self.cycle_counter - start_cycles) as u8);
             }
@@ -602,6 +644,19 @@ impl Cpu for Sm83 {
             if let Some(bit) = self.take_pending_interrupt() {
                 self.dispatch_interrupt(bit)?;
             }
+        }
+
+        #[cfg(feature = "trace")]
+        if let Some(ref mut hook) = self.trace_hook {
+            hook(TraceEvent {
+                pc: self.registers.pc,
+                registers: &self.registers,
+                ime: self.ime == ImeState::Enabled,
+                ly:   self.memory.read_io(LY_ADDR),
+                if_:  self.memory.read_io(IF_ADDR),
+                ie:   self.memory.read_io(IE_ADDR),
+                lcdc: self.memory.read_io(LCDC_ADDR),
+            });
         }
 
         Ok((self.cycle_counter - start_cycles) as u8)
