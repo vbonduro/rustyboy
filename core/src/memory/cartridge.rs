@@ -15,6 +15,9 @@ pub trait Cartridge {
     fn write(&mut self, addr: u16, value: u8);
     /// Returns the currently mapped ROM bank number for the switchable window (0x4000–0x7FFF).
     fn current_rom_bank(&self) -> usize { 1 }
+    /// Advance the cartridge clock by `cycles` T-cycles (4 MHz). Only meaningful for
+    /// MBC3 carts with an RTC; other implementations ignore this.
+    fn tick_rtc(&mut self, _cycles: u32) {}
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -59,8 +62,8 @@ fn is_mbc1_multicart(data: &[u8], rom_bank_count: usize) -> bool {
 /// Construct the appropriate `Cartridge` impl from a ROM image.
 ///
 /// Reads the cartridge type, ROM size, and RAM size from the header and
-/// returns a `NoMbc`, `Mbc1`, or `Mbc1Multicart` accordingly. Panics on
-/// unsupported types.
+/// returns a `NoMbc`, `Mbc1`, `Mbc1Multicart`, or `Mbc3` accordingly.
+/// Panics on unsupported types.
 ///
 /// MBC1 multicart mode is detected heuristically: a 64-bank MBC1 ROM with
 /// the Nintendo logo present in banks 0x10, 0x20, and 0x30.
@@ -81,6 +84,11 @@ pub fn from_rom(data: Vec<u8>) -> Box<dyn Cartridge> {
             } else {
                 Box::new(Mbc1::new(data, ram_bytes))
             }
+        }
+        // MBC3+TIMER+BATTERY, MBC3+TIMER+RAM+BATTERY, MBC3, MBC3+RAM, MBC3+RAM+BATTERY
+        0x0F | 0x10 | 0x11 | 0x12 | 0x13 => {
+            let has_timer = matches!(cart_type, 0x0F | 0x10);
+            Box::new(Mbc3::new(data, ram_bytes, has_timer))
         }
         other => panic!("Unsupported cartridge type: 0x{:02X}", other),
     }
@@ -392,6 +400,225 @@ impl Cartridge for Mbc1Multicart {
     }
 }
 
+// ── MBC3 ─────────────────────────────────────────────────────────────────────
+
+/// MBC3 real-time clock registers, latched on command.
+///
+/// Register map (selected via 0x4000–0x5FFF write of 0x08–0x0C):
+///   0x08  RTC S   — seconds  (0–59)
+///   0x09  RTC M   — minutes  (0–59)
+///   0x0A  RTC H   — hours    (0–23)
+///   0x0B  RTC DL  — day counter low byte
+///   0x0C  RTC DH  — day counter high bit + halt flag + day carry flag
+///
+/// The latch register works by writing 0x00 then 0x01 to 0x6000–0x7FFF.
+/// On the second write the current RTC time is copied into the latched
+/// registers, which are what the game actually reads.
+///
+/// Pan Docs reference: <https://gbdev.io/pandocs/MBC3.html>
+#[derive(Clone, Default)]
+struct RtcRegisters {
+    sec: u8,
+    min: u8,
+    hour: u8,
+    day_lo: u8,
+    /// Bit 0: day counter bit 8.  Bit 6: halt.  Bit 7: day carry.
+    day_hi: u8,
+}
+
+impl RtcRegisters {
+    fn read(&self, reg: u8) -> u8 {
+        match reg {
+            0x08 => self.sec,
+            0x09 => self.min,
+            0x0A => self.hour,
+            0x0B => self.day_lo,
+            0x0C => self.day_hi,
+            _ => 0xFF,
+        }
+    }
+
+    fn write(&mut self, reg: u8, value: u8) {
+        match reg {
+            0x08 => self.sec  = value & 0x3F,
+            0x09 => self.min  = value & 0x3F,
+            0x0A => self.hour = value & 0x1F,
+            0x0B => self.day_lo = value,
+            0x0C => self.day_hi = value & 0xC1, // bits 0, 6, 7 only
+            _ => {}
+        }
+    }
+
+}
+
+/// MBC3 memory bank controller with optional real-time clock.
+///
+/// Register map (writes to ROM space):
+///   0x0000–0x1FFF  RAM/timer enable: 0x0A enables, anything else disables
+///   0x2000–0x3FFF  ROM bank number (7-bit, 0→1)
+///   0x4000–0x5FFF  RAM bank (0x00–0x03) or RTC register select (0x08–0x0C)
+///   0x6000–0x7FFF  Latch clock: write 0x00 then 0x01 to latch RTC
+pub struct Mbc3 {
+    rom: Vec<u8>,
+    ram: Vec<u8>,
+    /// Currently selected ROM bank (1–127).
+    rom_bank: u8,
+    /// RAM bank (0–3) or RTC register index (0x08–0x0C).
+    bank_or_rtc: u8,
+    ram_rtc_enabled: bool,
+    /// Whether the RTC peripheral is present.
+    has_timer: bool,
+    /// Current (running) RTC time.
+    rtc: RtcRegisters,
+    /// Snapshot of RTC captured on latch.
+    rtc_latched: RtcRegisters,
+    /// Tracks the latch sequence: waiting for 0x01 after seeing 0x00.
+    latch_armed: bool,
+    /// Sub-second cycle accumulator (4 MHz ticks).
+    rtc_cycles: u32,
+}
+
+const RTC_CYCLES_PER_SEC: u32 = 4_194_304;
+
+impl Mbc3 {
+    pub fn new(data: Vec<u8>, ram_bytes: usize, has_timer: bool) -> Self {
+        Self {
+            rom: data,
+            ram: vec![0u8; ram_bytes.max(if ram_bytes > 0 { ram_bytes } else { 0 })],
+            rom_bank: 1,
+            bank_or_rtc: 0,
+            ram_rtc_enabled: false,
+            has_timer,
+            rtc: RtcRegisters::default(),
+            rtc_latched: RtcRegisters::default(),
+            latch_armed: false,
+            rtc_cycles: 0,
+        }
+    }
+
+    /// Advance the RTC clock by `cycles` CPU cycles.
+    ///
+    /// Call this once per emulator step with the number of cycles elapsed.
+    /// No-op if the cart has no timer or the RTC halt flag is set.
+    pub fn tick(&mut self, cycles: u32) {
+        if !self.has_timer || self.rtc.day_hi & 0x40 != 0 {
+            return;
+        }
+        self.rtc_cycles += cycles;
+        if self.rtc_cycles < RTC_CYCLES_PER_SEC {
+            return;
+        }
+        let secs_elapsed = self.rtc_cycles / RTC_CYCLES_PER_SEC;
+        self.rtc_cycles %= RTC_CYCLES_PER_SEC;
+
+        for _ in 0..secs_elapsed {
+            self.rtc.sec += 1;
+            if self.rtc.sec < 60 { continue; }
+            self.rtc.sec = 0;
+            self.rtc.min += 1;
+            if self.rtc.min < 60 { continue; }
+            self.rtc.min = 0;
+            self.rtc.hour += 1;
+            if self.rtc.hour < 24 { continue; }
+            self.rtc.hour = 0;
+            // Increment 9-bit day counter
+            let day = ((self.rtc.day_hi & 0x01) as u16) << 8 | self.rtc.day_lo as u16;
+            let day = day + 1;
+            self.rtc.day_lo = day as u8;
+            self.rtc.day_hi = (self.rtc.day_hi & 0xFE) | ((day >> 8) as u8 & 0x01);
+            if day >= 0x200 {
+                // Day counter overflow: set carry flag, reset counter
+                self.rtc.day_hi |= 0x80;
+                self.rtc.day_lo = 0;
+                self.rtc.day_hi &= !0x01;
+            }
+        }
+    }
+
+    fn is_rtc_reg(bank_or_rtc: u8) -> bool {
+        matches!(bank_or_rtc, 0x08..=0x0C)
+    }
+}
+
+impl Cartridge for Mbc3 {
+    fn current_rom_bank(&self) -> usize { self.rom_bank as usize }
+
+    fn tick_rtc(&mut self, cycles: u32) {
+        self.tick(cycles);
+    }
+
+    fn read_rom(&self, addr: u16) -> u8 {
+        let physical = match addr {
+            0x0000..=0x3FFF => addr as usize,
+            0x4000..=0x7FFF => self.rom_bank as usize * 0x4000 + (addr as usize - 0x4000),
+            _ => return 0xFF,
+        };
+        self.rom.get(physical).copied().unwrap_or(0xFF)
+    }
+
+    fn read_ram(&self, addr: u16) -> u8 {
+        if !self.ram_rtc_enabled {
+            return 0xFF;
+        }
+        if Self::is_rtc_reg(self.bank_or_rtc) {
+            return if self.has_timer { self.rtc_latched.read(self.bank_or_rtc) } else { 0xFF };
+        }
+        if self.ram.is_empty() {
+            return 0xFF;
+        }
+        let offset = self.bank_or_rtc as usize * 0x2000 + addr as usize;
+        self.ram.get(offset).copied().unwrap_or(0xFF)
+    }
+
+    fn write(&mut self, addr: u16, value: u8) {
+        match addr {
+            // RAM/timer enable
+            0x0000..=0x1FFF => {
+                self.ram_rtc_enabled = value & 0x0F == 0x0A;
+            }
+            // ROM bank number (7-bit, 0→1)
+            0x2000..=0x3FFF => {
+                self.rom_bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
+            }
+            // RAM bank / RTC register select
+            0x4000..=0x5FFF => {
+                self.bank_or_rtc = value;
+            }
+            // Latch clock data: 0x00 arms, 0x01 latches
+            0x6000..=0x7FFF => {
+                if value == 0x00 {
+                    self.latch_armed = true;
+                } else if value == 0x01 && self.latch_armed {
+                    self.rtc_latched = self.rtc.clone();
+                    self.latch_armed = false;
+                } else {
+                    self.latch_armed = false;
+                }
+            }
+            // External RAM write
+            0xA000..=0xBFFF => {
+                if !self.ram_rtc_enabled {
+                    return;
+                }
+                if Self::is_rtc_reg(self.bank_or_rtc) {
+                    if self.has_timer {
+                        self.rtc.write(self.bank_or_rtc, value);
+                    }
+                    return;
+                }
+                if self.ram.is_empty() {
+                    return;
+                }
+                let offset = self.bank_or_rtc as usize * 0x2000 + (addr - 0xA000) as usize;
+                if let Some(b) = self.ram.get_mut(offset) {
+                    *b = value;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -664,5 +891,168 @@ mod tests {
         cart.write(0x2000, 0x01);
         // Normal MBC1: bank = (1<<5)|1 = 33, masked to 32 banks → 33 % 32 = 1.
         assert_eq!(cart.read_rom(0x4000), 1);
+    }
+
+    // ── MBC3 ─────────────────────────────────────────────────────────────────
+
+    fn make_mbc3_rom(size_kb: usize, cart_type: u8) -> Vec<u8> {
+        let size = size_kb * 1024;
+        let mut data = vec![0u8; size];
+        for bank in 0..(size / 0x4000) {
+            for byte in &mut data[bank * 0x4000..(bank + 1) * 0x4000] {
+                *byte = bank as u8;
+            }
+        }
+        data[CART_TYPE_ADDR] = cart_type;
+        let code = (size / (32 * 1024)).trailing_zeros() as u8;
+        data[ROM_SIZE_ADDR] = code;
+        data
+    }
+
+    #[test]
+    fn mbc3_default_reads_bank0_and_bank1() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let cart = Mbc3::new(data, 0, false);
+        assert_eq!(cart.read_rom(0x0000), 0x00); // fixed bank 0
+        assert_eq!(cart.read_rom(0x4000), 0x01); // switchable bank 1 (default)
+    }
+
+    #[test]
+    fn mbc3_switches_rom_bank() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 0, false);
+        cart.write(0x2000, 0x05);
+        assert_eq!(cart.read_rom(0x4000), 0x05);
+    }
+
+    #[test]
+    fn mbc3_bank_0_write_selects_bank1() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 0, false);
+        cart.write(0x2000, 0x00);
+        assert_eq!(cart.read_rom(0x4000), 0x01);
+    }
+
+    #[test]
+    fn mbc3_full_7bit_bank_range() {
+        let data = make_mbc3_rom(8192, 0x13); // 256 banks (more than 7-bit, but test 0x7F)
+        let mut cart = Mbc3::new(data, 0, false);
+        cart.write(0x2000, 0x7F);
+        assert_eq!(cart.read_rom(0x4000), 0x7F);
+    }
+
+    #[test]
+    fn mbc3_ram_disabled_returns_0xff() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let cart = Mbc3::new(data, 32 * 1024, false);
+        assert_eq!(cart.read_ram(0x0000), 0xFF);
+    }
+
+    #[test]
+    fn mbc3_ram_enable_and_write() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 32 * 1024, false);
+        cart.write(0x0000, 0x0A); // enable
+        cart.write(0x4000, 0x00); // select RAM bank 0
+        cart.write(0xA000, 0x42);
+        assert_eq!(cart.read_ram(0x0000), 0x42);
+    }
+
+    #[test]
+    fn mbc3_ram_banking() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 32 * 1024, false);
+        cart.write(0x0000, 0x0A); // enable
+        cart.write(0x4000, 0x01); // bank 1
+        cart.write(0xA000, 0xBB);
+        cart.write(0x4000, 0x00); // bank 0
+        assert_eq!(cart.read_ram(0x0000), 0x00); // bank 0 untouched
+        cart.write(0x4000, 0x01);
+        assert_eq!(cart.read_ram(0x0000), 0xBB);
+    }
+
+    #[test]
+    fn mbc3_rtc_latch_and_read() {
+        let data = make_mbc3_rom(1024, 0x0F); // MBC3+TIMER+BATTERY
+        let mut cart = Mbc3::new(data, 0, true);
+        // Advance 2 seconds worth of cycles
+        cart.tick(RTC_CYCLES_PER_SEC * 2);
+        // Latch the time
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+        // Select RTC seconds register
+        cart.write(0x4000, 0x08);
+        cart.write(0x0000, 0x0A); // enable RAM/RTC
+        assert_eq!(cart.read_ram(0x0000), 2);
+    }
+
+    #[test]
+    fn mbc3_rtc_latch_freezes_time() {
+        let data = make_mbc3_rom(1024, 0x0F);
+        let mut cart = Mbc3::new(data, 0, true);
+        cart.tick(RTC_CYCLES_PER_SEC * 3);
+        // Latch at 3 seconds
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+        // Advance more — latched value should not change
+        cart.tick(RTC_CYCLES_PER_SEC * 5);
+        cart.write(0x4000, 0x08);
+        cart.write(0x0000, 0x0A);
+        assert_eq!(cart.read_ram(0x0000), 3); // still reads 3
+    }
+
+    #[test]
+    fn mbc3_rtc_minute_rollover() {
+        let data = make_mbc3_rom(1024, 0x0F);
+        let mut cart = Mbc3::new(data, 0, true);
+        cart.tick(RTC_CYCLES_PER_SEC * 60);
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x08); // seconds
+        assert_eq!(cart.read_ram(0x0000), 0); // rolled over
+        cart.write(0x4000, 0x09); // minutes
+        assert_eq!(cart.read_ram(0x0000), 1);
+    }
+
+    #[test]
+    fn mbc3_rtc_halt_stops_time() {
+        let data = make_mbc3_rom(1024, 0x0F);
+        let mut cart = Mbc3::new(data, 0, true);
+        cart.tick(RTC_CYCLES_PER_SEC); // 1 second
+        // Halt: write 0x40 to DH register (0x0C)
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x0C);
+        cart.write(0xA000, 0x40); // set halt flag
+        // Advance time — should not change
+        cart.tick(RTC_CYCLES_PER_SEC * 10);
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+        cart.write(0x4000, 0x08);
+        assert_eq!(cart.read_ram(0x0000), 1); // still 1 second
+    }
+
+    #[test]
+    fn mbc3_no_timer_ignores_rtc_writes() {
+        let data = make_mbc3_rom(1024, 0x13); // MBC3+RAM+BATTERY (no timer)
+        let mut cart = Mbc3::new(data, 0, false);
+        cart.tick(RTC_CYCLES_PER_SEC * 5);
+        cart.write(0x6000, 0x00);
+        cart.write(0x6000, 0x01);
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x08);
+        // No timer → reads 0xFF (RTC disabled, ram_rtc_enabled but no rtc reg)
+        assert_eq!(cart.read_ram(0x0000), 0xFF);
+    }
+
+    #[test]
+    fn from_rom_dispatches_mbc3_types() {
+        for &cart_type in &[0x0Fu8, 0x10, 0x11, 0x12, 0x13] {
+            let data = make_mbc3_rom(1024, cart_type);
+            let mut cart = from_rom(data);
+            // Basic sanity: bank switching works
+            cart.write(0x2000, 0x02);
+            assert_eq!(cart.read_rom(0x4000), 0x02);
+        }
     }
 }

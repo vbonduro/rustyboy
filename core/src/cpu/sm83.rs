@@ -311,6 +311,7 @@ impl Sm83 {
         for _ in 0..cycles {
             self.advance_timer_apu(1);
         }
+        self.memory.tick_rtc(cycles as u32);
     }
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
