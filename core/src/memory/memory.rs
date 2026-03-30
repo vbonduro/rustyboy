@@ -197,6 +197,37 @@ impl GameBoyMemory {
         self.ie = value;
     }
 
+    /// Serialize memory state into `out`.
+    /// IO registers (0x80 bytes) + IE (1 byte) + WRAM + HRAM + VRAM + OAM.
+    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
+        for i in 0..0x80u16 {
+            out.push(self.read_io(0xFF00 + i));
+        }
+        out.push(self.ie);
+        out.extend_from_slice(self.wram());
+        out.extend_from_slice(self.hram());
+        out.extend_from_slice(self.vram());
+        out.extend_from_slice(self.oam());
+    }
+
+    /// Deserialize memory state from `data` at `offset`. Advances offset past all regions.
+    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
+        for i in 0..0x80u16 {
+            self.write_io(0xFF00 + i, data[*offset + i as usize]);
+        }
+        *offset += 0x80;
+        self.ie = data[*offset];
+        *offset += 1;
+        self.set_wram(&data[*offset..*offset + 0x2000]);
+        *offset += 0x2000;
+        self.set_hram(&data[*offset..*offset + 0x7F]);
+        *offset += 0x7F;
+        self.set_vram(&data[*offset..*offset + 0x2000]);
+        *offset += 0x2000;
+        self.set_oam(&data[*offset..*offset + 0xA0]);
+        *offset += 0xA0;
+    }
+
     /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
     pub fn external_ram(&self) -> Option<&[u8]> {
         self.cartridge.external_ram()

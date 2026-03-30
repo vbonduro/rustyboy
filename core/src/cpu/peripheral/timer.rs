@@ -58,6 +58,17 @@ impl TimerPeripheral {
         self.internal_counter = v;
     }
 
+    /// Serialize timer state into `out`. 2 bytes: internal_counter LE.
+    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
+        out.extend_from_slice(&self.internal_counter.to_le_bytes());
+    }
+
+    /// Deserialize timer state from `data` at `offset`. Advances offset by 2.
+    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
+        self.internal_counter = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
+        *offset += 2;
+    }
+
     /// Advance the timer by `cycles` T-cycles.
     ///
     /// Pure transform: reads register state from `input`, returns new state

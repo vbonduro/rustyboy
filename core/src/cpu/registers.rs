@@ -98,6 +98,35 @@ impl Registers {
         self.a = (af >> 8) as u8;
         self.f = Flags::from_bits_truncate((af & 0xF0) as u8);
     }
+
+    /// Serialize registers into `out`. 10 bytes: A B C D E H L F SP(LE) PC(LE).
+    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
+        out.push(self.a);
+        out.push(self.b);
+        out.push(self.c);
+        out.push(self.d);
+        out.push(self.e);
+        out.push(self.h);
+        out.push(self.l);
+        out.push(self.f.bits());
+        out.extend_from_slice(&self.sp.to_le_bytes());
+        out.extend_from_slice(&self.pc.to_le_bytes());
+    }
+
+    /// Deserialize registers from `data` starting at `offset`. Advances offset by 10.
+    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
+        self.a  = data[*offset];
+        self.b  = data[*offset + 1];
+        self.c  = data[*offset + 2];
+        self.d  = data[*offset + 3];
+        self.e  = data[*offset + 4];
+        self.h  = data[*offset + 5];
+        self.l  = data[*offset + 6];
+        self.f  = Flags::from_bits_truncate(data[*offset + 7]);
+        self.sp = u16::from_le_bytes([data[*offset + 8], data[*offset + 9]]);
+        self.pc = u16::from_le_bytes([data[*offset + 10], data[*offset + 11]]);
+        *offset += 12;
+    }
 }
 
 #[cfg(test)]
