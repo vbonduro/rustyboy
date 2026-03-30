@@ -54,10 +54,6 @@ impl TimerPeripheral {
         self.internal_counter = 0;
     }
 
-    pub fn set_internal_counter(&mut self, v: u16) {
-        self.internal_counter = v;
-    }
-
     /// Serialize timer state into `out`. 2 bytes: internal_counter LE.
     pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(&self.internal_counter.to_le_bytes());
