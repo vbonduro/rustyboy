@@ -286,7 +286,7 @@ impl Sm83 {
             return Err("unsupported save state version");
         }
         let mut offset = 6;
-        self.registers.load_state(data, &mut offset);
+        offset += self.registers.load_state(data, offset);
         self.ime = match data[offset] {
             1 => ImeState::Pending,
             2 => ImeState::Enabled,
@@ -300,9 +300,9 @@ impl Sm83 {
             data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
         ]);
         offset += 8;
-        self.timer.load_state(data, &mut offset);
-        self.ppu.load_state(data, &mut offset);
-        self.memory.load_state(data, &mut offset);
+        offset += self.timer.load_state(data, offset);
+        offset += self.ppu.load_state(data, offset);
+        self.memory.load_state(data, offset);
         Ok(())
     }
 
