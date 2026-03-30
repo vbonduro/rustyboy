@@ -1,7 +1,8 @@
 pub mod auth;
+pub mod config;
 pub mod db;
 
-use auth::{AuthUser, JwtSecretExt};
+use auth::{AuthUser, DbExt, JwtSecretExt};
 use axum::{
     Router,
     extract::{Path, Request, State},
@@ -42,22 +43,24 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .nest_service("/static", ServeDir::new(&static_dir))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            inject_jwt_secret,
+            inject_auth_extensions,
         ))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
-/// Middleware: injects the JWT secret as a request extension so that
-/// the `AuthUser` extractor can verify session cookies without holding
-/// a reference to `AppState` directly.
-async fn inject_jwt_secret(
+/// Middleware: injects the JWT secret and DB handle as request extensions so
+/// that the `AuthUser` extractor can verify and check revocation of session
+/// cookies without holding a reference to `AppState` directly.
+async fn inject_auth_extensions(
     State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
     req.extensions_mut()
         .insert(JwtSecretExt(state.oauth.jwt_secret.clone()));
+    req.extensions_mut()
+        .insert(DbExt(state.db.clone()));
     next.run(req).await
 }
 

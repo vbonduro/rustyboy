@@ -328,6 +328,30 @@ impl Database {
         })
     }
 
+    // --- Revoked tokens ---
+
+    pub async fn revoke_token(&self, jti: &str, expires_at: i64) -> Result<(), sqlx::Error> {
+        // Also purge expired tokens lazily to keep the table small
+        sqlx::query("DELETE FROM revoked_tokens WHERE expires_at < ?")
+            .bind(now_secs())
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("INSERT OR IGNORE INTO revoked_tokens (jti, expires_at) VALUES (?, ?)")
+            .bind(jti)
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_token_revoked(&self, jti: &str) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query("SELECT 1 FROM revoked_tokens WHERE jti = ?")
+            .bind(jti)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn get_battery_save(
         &self,
         user_id: &str,

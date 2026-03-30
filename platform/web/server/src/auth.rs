@@ -54,7 +54,14 @@ impl OAuthConfig {
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
+    jti: String, // JWT ID — used for revocation
     exp: u64,
+}
+
+pub struct JwtPayload {
+    pub user_id: String,
+    pub jti: String,
+    pub exp: u64,
 }
 
 pub fn create_jwt(user_id: &str, secret: &str) -> String {
@@ -66,6 +73,7 @@ pub fn create_jwt(user_id: &str, secret: &str) -> String {
 
     let claims = Claims {
         sub: user_id.to_string(),
+        jti: uuid::Uuid::new_v4().to_string(),
         exp,
     };
 
@@ -77,7 +85,7 @@ pub fn create_jwt(user_id: &str, secret: &str) -> String {
     .unwrap_or_default()
 }
 
-pub fn verify_jwt(token: &str, secret: &str) -> Result<String, ()> {
+pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtPayload, ()> {
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
 
@@ -86,7 +94,11 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<String, ()> {
         &DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     )
-    .map(|data| data.claims.sub)
+    .map(|data| JwtPayload {
+        user_id: data.claims.sub,
+        jti: data.claims.jti,
+        exp: data.claims.exp,
+    })
     .map_err(|_| ())
 }
 
@@ -98,14 +110,14 @@ const COOKIE_NAME: &str = "rb_session";
 
 pub fn session_cookie(token: &str) -> String {
     format!(
-        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000",
+        "{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
         COOKIE_NAME, token
     )
 }
 
 pub fn clear_session_cookie() -> String {
     format!(
-        "{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
+        "{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
         COOKIE_NAME
     )
 }
@@ -116,11 +128,17 @@ pub fn clear_session_cookie() -> String {
 
 pub struct AuthUser {
     pub user_id: String,
+    pub jti: String,
+    pub exp: u64,
 }
 
 /// Extension type used to ferry the JWT secret into FromRequestParts.
 #[derive(Clone)]
 pub struct JwtSecretExt(pub String);
+
+/// Extension type used to ferry the DB handle into FromRequestParts.
+#[derive(Clone)]
+pub struct DbExt(pub crate::db::Database);
 
 #[async_trait]
 impl<S> FromRequestParts<S> for AuthUser
@@ -130,6 +148,14 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let unauthed = || {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "unauthorized"})),
+            )
+                .into_response()
+        };
+
         // Read the Cookie header
         let cookie_header = parts
             .headers
@@ -139,37 +165,44 @@ where
 
         // Find rb_session=<value>
         let prefix = format!("{}=", COOKIE_NAME);
-        let token = cookie_header
+        let token = match cookie_header
             .split(';')
             .map(|s| s.trim())
-            .find_map(|part| part.strip_prefix(prefix.as_str()));
-
-        let token = match token {
+            .find_map(|part| part.strip_prefix(prefix.as_str()))
+        {
             Some(t) => t.to_string(),
-            None => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": "unauthorized"})),
-                )
-                    .into_response())
-            }
+            None => return Err(unauthed()),
         };
 
-        // Retrieve the JWT secret from the extension we insert in the middleware.
+        // Retrieve the JWT secret from request extensions.
         let secret = parts
             .extensions
             .get::<JwtSecretExt>()
             .map(|e| e.0.clone())
             .unwrap_or_default();
 
-        match verify_jwt(&token, &secret) {
-            Ok(user_id) => Ok(AuthUser { user_id }),
-            Err(_) => Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "unauthorized"})),
-            )
-                .into_response()),
+        let payload = match verify_jwt(&token, &secret) {
+            Ok(p) => p,
+            Err(_) => return Err(unauthed()),
+        };
+
+        // Check revocation list
+        if let Some(db_ext) = parts.extensions.get::<DbExt>() {
+            match db_ext.0.is_token_revoked(&payload.jti).await {
+                Ok(true) => return Err(unauthed()),
+                Err(e) => {
+                    tracing::error!("revocation check failed: {e}");
+                    return Err(unauthed());
+                }
+                Ok(false) => {}
+            }
         }
+
+        Ok(AuthUser {
+            user_id: payload.user_id,
+            jti: payload.jti,
+            exp: payload.exp,
+        })
     }
 }
 
@@ -370,7 +403,41 @@ pub async fn google_callback(
     redirect_response("/", Some(session_cookie(&token)))
 }
 
-pub async fn logout() -> Response {
+/// Check that the Origin header, if present, matches the request Host.
+/// Returns Err(403) for cross-origin requests.
+pub fn check_origin(headers: &axum::http::HeaderMap) -> Result<(), Response> {
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) => o,
+        None => return Ok(()), // no Origin header — same-origin curl/fetch, allow
+    };
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    // Strip scheme from origin to compare just host:port
+    let origin_host = origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+
+    if origin_host == host {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "cross-origin request rejected").into_response())
+    }
+}
+
+pub async fn logout(
+    auth: AuthUser,
+    State(state): State<Arc<crate::AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Err(e) = check_origin(&headers) {
+        return e;
+    }
+    if let Err(e) = state.db.revoke_token(&auth.jti, auth.exp as i64).await {
+        tracing::error!("failed to revoke token on logout: {e}");
+    }
     redirect_response("/", Some(clear_session_cookie()))
 }
 

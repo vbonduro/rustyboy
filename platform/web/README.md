@@ -146,57 +146,30 @@ Use a pinned semver tag for production so a bad push never disrupts your server.
 
 ## Managing secrets
 
-Never pass secrets directly on the command line — they appear in shell history and `docker inspect` output.
+Never pass secrets directly on the command line — they appear in shell history and `docker inspect` output. Instead use a single secrets file mounted into the container.
 
-### Recommended: secret files
-
-For each secret, write the value to a file and pass the path via a `_FILE` env var. The server reads the file at startup. Secret values never appear in `docker inspect` or process listings.
+### Setup
 
 ```sh
-# Create a secrets directory
-mkdir -p /path/to/secrets
-chmod 700 /path/to/secrets
-
-# Write each secret to its own file
-echo -n 'your-long-random-jwt-secret'   > /path/to/secrets/jwt_secret
-echo -n 'your-google-client-id'         > /path/to/secrets/google_client_id
-echo -n 'your-google-client-secret'     > /path/to/secrets/google_client_secret
-chmod 600 /path/to/secrets/*
-```
-
-```sh
-docker run \
-  -v /path/to/secrets:/secrets:ro \
-  -e JWT_SECRET_FILE=/secrets/jwt_secret \
-  -e GOOGLE_CLIENT_ID_FILE=/secrets/google_client_id \
-  -e GOOGLE_CLIENT_SECRET_FILE=/secrets/google_client_secret \
-  -e OAUTH_REDIRECT_URI=https://yoursite.com/auth/google/callback \
-  -p 8080:8080 \
-  -v /path/to/roms:/roms \
-  ghcr.io/vbonduro/rustyboy:1.x.x
-```
-
-Every secret variable supports both forms — `VAR=value` and `VAR_FILE=/path/to/file`. The `_FILE` form takes precedence when both are set.
-
-### Alternative: env file
-
-If secret files aren't practical, use `--env-file` to at least keep secrets out of shell history:
-
-```sh
-cat > /path/to/rustyboy.env <<EOF
+mkdir -p /path/to/appdata/rustyboy
+cat > /path/to/appdata/rustyboy/secrets.env <<EOF
 JWT_SECRET=<long random string>
 GOOGLE_CLIENT_ID=<from Google Console>
 GOOGLE_CLIENT_SECRET=<from Google Console>
 EOF
-chmod 600 /path/to/rustyboy.env
+chmod 600 /path/to/appdata/rustyboy/secrets.env
+```
 
-docker run --env-file /path/to/rustyboy.env \
+```sh
+docker run \
+  -v /path/to/appdata/rustyboy:/appdata:ro \
+  -e SECRETS_FILE=/appdata/secrets.env \
   -p 8080:8080 \
   -v /path/to/roms:/roms \
   ghcr.io/vbonduro/rustyboy:1.x.x
 ```
 
-Keep the env file off version control. `DEV_MODE` should never be set in production.
+The file uses standard `KEY=VALUE` format. Lines starting with `#` are ignored. `DEV_MODE` should never appear in a production secrets file.
 
 ## Deploying on Unraid
 
@@ -223,7 +196,7 @@ Keep the env file off version control. `DEV_MODE` should never be set in product
    /mnt/user/Games/GameBoy
    ```
 
-4. Set your environment variables (see Authentication section above).
+4. Create your secrets file and set `SECRETS_FILE=/appdata/secrets.env` (see Managing secrets above).
 
 5. Click **Apply**. The container pulls `ghcr.io/vbonduro/rustyboy:latest` and starts automatically.
 
