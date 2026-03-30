@@ -6,7 +6,27 @@
 
 import init, { EmulatorHandle } from '/static/rustyboy_web_client.js';
 
-function dbg(msg) { console.debug('[rustyboy]', msg); }
+class Logger {
+  #tag;
+  #seq = 0;
+
+  constructor(tag) { this.#tag = tag; }
+
+  debug(msg) { console.debug(`[${this.#tag}]`, msg); }
+  warn(msg)  { console.warn(`[${this.#tag}]`, msg); }
+  error(msg) { console.error(`[${this.#tag}]`, msg); }
+
+  /** Log a named app-state transition with sequence number, then POST to /dev/log. */
+  event(label) {
+    const seq = ++this.#seq;
+    const activeMenu = state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none';
+    const msg = `#${seq} ${label} | activeMenu=${activeMenu} | emulator=${!!state.emulator}`;
+    console.debug(`[${this.#tag}] ${msg}`);
+    fetch('/dev/log', { method: 'POST', body: msg }).catch(() => {});
+  }
+}
+
+const log = new Logger('rustyboy');
 
 // ── Boot jingle ────────────────────────────────────────────────────────────
 // Plays the classic "Vintendo" power-on ding via Web Audio API.
@@ -103,10 +123,9 @@ async function initAudio() {
     };
     node.connect(state.audioCtx.destination);
     state.audioNode = node;
-    dbg(`audio init: ctx=${state.audioCtx.state} rate=${state.audioCtx.sampleRate}`);
+    log.debug(`audio init: ctx=${state.audioCtx.state} rate=${state.audioCtx.sampleRate}`);
   } catch (e) {
-    console.warn('Audio init failed:', e);
-    dbg(`audio init failed: ${e}`);
+    log.warn(`Audio init failed: ${e}`);
   }
 }
 
@@ -149,7 +168,7 @@ async function boot() {
     state.wasm = await init();
   } catch (err) {
     showError('WASM LOAD FAILED');
-    console.error(err);
+    log.error(err);
     return;
   }
 
@@ -243,7 +262,7 @@ function bindMenuToButtons(menu) {
 }
 
 function showLoginScreen() {
-  logState('showLoginScreen');
+  log.event('showLoginScreen');
   const menu = new window.MenuRenderer(canvas);
   menuOverlay.classList.add('hidden');
   state.activeMenu = menu;
@@ -275,7 +294,7 @@ async function showLoginError() {
 // ── Main menu / ROM list ───────────────────────────────────────────────────
 
 function showMainMenu() {
-  logState('showMainMenu');
+  log.event('showMainMenu');
   menuOverlay.classList.add('hidden');
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
@@ -307,13 +326,13 @@ async function loadRomList() {
     if (!res.ok) throw new Error(res.statusText);
     state.roms = await res.json();
   } catch (err) {
-    console.error(err);
+    log.error(err);
     state.roms = [];
   }
 }
 
 function showRomList() {
-  logState('showRomList');
+  log.event('showRomList');
   if (state.roms.length === 0) {
     showCanvasError('NO ROMS FOUND');
     return;
@@ -369,7 +388,7 @@ async function launchRom(name) {
     bytes = new Uint8Array(buf);
   } catch (err) {
     showError('LOAD ERROR');
-    console.error(err);
+    log.error(err);
     return;
   }
 
@@ -381,7 +400,7 @@ async function launchRom(name) {
     state.emulator = new EmulatorHandle(bytes);
   } catch (err) {
     showError('ROM ERROR');
-    console.error(err);
+    log.error(err);
     return;
   }
 
@@ -448,7 +467,7 @@ function startLoop() {
       try {
         for (let i = 0; i < framesToRun; i++) state.emulator.run_frame();
       } catch(e) {
-        console.error('run_frame error:', e);
+        log.error(`run_frame error: ${e}`);
         return;
       }
 
@@ -494,7 +513,7 @@ function drawFrame() {
 // ── Button handling ────────────────────────────────────────────────────────
 
 function sendButton(idx, pressed) {
-  logState(`sendButton idx=${idx} pressed=${pressed}`);
+  log.event(`sendButton idx=${idx} pressed=${pressed}`);
   if (state.emulator) {
     state.emulator.set_button(idx, pressed);
   } else if (!pressed) {
@@ -502,7 +521,7 @@ function sendButton(idx, pressed) {
     if (state.activeMenu && state.activeMenu.isActive()) {
       const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape' };
       const key = keyMap[idx];
-      console.debug(`[rustyboy:input] sendButton → menu key=${key}`);
+      log.debug(`sendButton → menu key=${key}`);
       if (key) { state.activeMenu.handleInput(key); return; }
     }
     // Menu navigation on button release
@@ -570,22 +589,15 @@ const heldKeys = new Set();
 
 function clearHeldKeys() { heldKeys.clear(); }
 
-let _logSeq = 0;
-function logState(label) {
-  const seq = ++_logSeq;
-  const msg = `#${seq} ${label} | activeMenu=${state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none'} | emulator=${!!state.emulator}`;
-  console.debug(`[rustyboy:input] ${msg}`);
-  fetch('/dev/log', { method: 'POST', body: msg }).catch(() => {});
-}
-
 function bindKeyboard() {
   document.addEventListener('keydown', (e) => {
     if (heldKeys.has(e.key)) {
-      console.debug(`[rustyboy:input] keydown IGNORED (held) key=${e.key} heldKeys=[${[...heldKeys].join(',')}]`);
+      log.debug(`keydown IGNORED (held) key=${e.key} heldKeys=[${[...heldKeys].join(',')}]`);
       return;
     }
     heldKeys.add(e.key);
-    console.debug(`[rustyboy:input] keydown key=${e.key} heldKeys=[${[...heldKeys].join(',')}] activeMenu=${state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none'}`);
+    const activeMenu = state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none';
+    log.debug(`keydown key=${e.key} heldKeys=[${[...heldKeys].join(',')}] activeMenu=${activeMenu}`);
 
     // Forward to canvas menu if active.
     // Navigation keys (arrows, w/s) and Enter/Escape are handled directly.
@@ -616,7 +628,7 @@ function bindKeyboard() {
   });
 
   document.addEventListener('keyup', (e) => {
-    console.debug(`[rustyboy:input] keyup key=${e.key}`);
+    log.debug(`keyup key=${e.key}`);
     heldKeys.delete(e.key);
     const idx = KEY_MAP[e.key];
     if (idx === undefined || idx === -1) return;
