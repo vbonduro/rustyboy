@@ -351,3 +351,210 @@ impl Database {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn new_db() -> Database {
+        Database::connect(":memory:").await.expect("in-memory db failed")
+    }
+
+    #[tokio::test]
+    async fn test_upsert_and_get_user_by_google_sub() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub123", "alice@example.com", "Alice", Some("https://avatar.example.com/alice"))
+            .await
+            .unwrap();
+        assert_eq!(user.google_sub, "sub123");
+        assert_eq!(user.email, "alice@example.com");
+        assert_eq!(user.display_name, "Alice");
+        assert_eq!(user.avatar_url.as_deref(), Some("https://avatar.example.com/alice"));
+
+        let fetched = db.get_user_by_google_sub("sub123").await.unwrap().unwrap();
+        assert_eq!(fetched.id, user.id);
+        assert_eq!(fetched.google_sub, user.google_sub);
+        assert_eq!(fetched.email, user.email);
+        assert_eq!(fetched.display_name, user.display_name);
+        assert_eq!(fetched.avatar_url, user.avatar_url);
+        assert_eq!(fetched.created_at, user.created_at);
+    }
+
+    #[tokio::test]
+    async fn test_upsert_user_updates_existing() {
+        let db = new_db().await;
+        db.upsert_user("sub_update", "old@example.com", "OldName", None)
+            .await
+            .unwrap();
+        let updated = db
+            .upsert_user("sub_update", "new@example.com", "NewName", Some("https://avatar.example.com/new"))
+            .await
+            .unwrap();
+        assert_eq!(updated.email, "new@example.com");
+        assert_eq!(updated.display_name, "NewName");
+        assert_eq!(updated.avatar_url.as_deref(), Some("https://avatar.example.com/new"));
+
+        // Only one row should exist
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE google_sub = 'sub_update'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_id() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_by_id", "byid@example.com", "ById", None)
+            .await
+            .unwrap();
+        let fetched = db.get_user_by_id(&user.id).await.unwrap().unwrap();
+        assert_eq!(fetched.id, user.id);
+        assert_eq!(fetched.email, user.email);
+        assert_eq!(fetched.display_name, user.display_name);
+    }
+
+    #[tokio::test]
+    async fn test_get_user_missing() {
+        let db = new_db().await;
+        let result = db
+            .get_user_by_id("00000000-0000-0000-0000-000000000000")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_save_state_creates_new() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_ss_new", "ss@example.com", "SSUser", None)
+            .await
+            .unwrap();
+        let data = vec![1u8, 2, 3, 4, 5];
+        let ss = db
+            .upsert_save_state(&user.id, "tetris.gb", "slot1", data.clone())
+            .await
+            .unwrap();
+        assert_eq!(ss.user_id, user.id);
+        assert_eq!(ss.rom_name, "tetris.gb");
+        assert_eq!(ss.slot_name, "slot1");
+        assert_eq!(ss.data, data);
+        assert!(!ss.id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_save_state_updates_existing() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_ss_upd", "ssupd@example.com", "SSUpd", None)
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "tetris.gb", "slot1", vec![1, 2, 3])
+            .await
+            .unwrap();
+        let new_data = vec![9u8, 8, 7];
+        let updated = db
+            .upsert_save_state(&user.id, "tetris.gb", "slot1", new_data.clone())
+            .await
+            .unwrap();
+        assert_eq!(updated.data, new_data);
+
+        // Only one row should exist
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM save_states WHERE user_id = ? AND rom_name = 'tetris.gb' AND slot_name = 'slot1'",
+        )
+        .bind(&user.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_save_states() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_ss_list", "sslist@example.com", "SSList", None)
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot1", vec![1]).await.unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot2", vec![2]).await.unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot3", vec![3]).await.unwrap();
+        let states = db.list_save_states(&user.id, "zelda.gb").await.unwrap();
+        assert_eq!(states.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_save_states_empty() {
+        let db = new_db().await;
+        let states = db
+            .list_save_states("00000000-0000-0000-0000-000000000000", "none.gb")
+            .await
+            .unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_save_state_by_id() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_ss_get", "ssget@example.com", "SSGet", None)
+            .await
+            .unwrap();
+        let data = vec![42u8, 43, 44];
+        let ss = db
+            .upsert_save_state(&user.id, "mario.gb", "slot1", data.clone())
+            .await
+            .unwrap();
+        let fetched = db.get_save_state(&ss.id).await.unwrap().unwrap();
+        assert_eq!(fetched.id, ss.id);
+        assert_eq!(fetched.data, data);
+        assert_eq!(fetched.rom_name, "mario.gb");
+    }
+
+    #[tokio::test]
+    async fn test_upsert_battery_save_creates_and_updates() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_bat", "bat@example.com", "BatUser", None)
+            .await
+            .unwrap();
+        let first_data = vec![10u8, 20, 30];
+        let bs1 = db
+            .upsert_battery_save(&user.id, "pokemon.gb", first_data.clone())
+            .await
+            .unwrap();
+        assert_eq!(bs1.data, first_data);
+
+        let second_data = vec![99u8, 88, 77];
+        let bs2 = db
+            .upsert_battery_save(&user.id, "pokemon.gb", second_data.clone())
+            .await
+            .unwrap();
+        assert_eq!(bs2.id, bs1.id);
+        assert_eq!(bs2.data, second_data);
+
+        // Only one row
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM battery_saves WHERE user_id = ? AND rom_name = 'pokemon.gb'",
+        )
+        .bind(&user.id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_battery_save_missing() {
+        let db = new_db().await;
+        let result = db
+            .get_battery_save("00000000-0000-0000-0000-000000000000", "none.gb")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+}

@@ -64,6 +64,8 @@ const state = {
   audioCtx:     null,   // AudioContext | null
   audioNode:    null,   // AudioWorkletNode | null
   debugOverlay: false,  // toggle with D key
+  user:         null,   // logged-in user object | null
+  activeMenu:   null,   // MenuRenderer | null (canvas-based menu)
 };
 
 // ── Audio ───────────────────────────────────────────────────────────────────
@@ -152,9 +154,17 @@ async function boot() {
   }
 
   setLed('menu');
-  await loadRomList();
+
+  const authed = await checkAuth();
   bindButtons();
   bindKeyboard();
+  if (!authed) {
+    showLoginScreen();
+    return;
+  }
+
+  await loadRomList();
+  showMainMenu();
   // Only wire debug overlay if compiled in (debug-overlay feature)
   if (typeof EmulatorHandle.prototype.debug_state === 'function') {
     bindDebugButton();
@@ -179,7 +189,117 @@ function bindDebugButton() {
   });
 }
 
-// ── ROM list ───────────────────────────────────────────────────────────────
+// ── Auth ───────────────────────────────────────────────────────────────────
+
+async function checkAuth() {
+  const params = new URLSearchParams(window.location.search);
+
+  if (params.has('auth_error')) {
+    await showLoginError();
+    return false;
+  }
+
+  // Already have a valid session?
+  try {
+    const res = await fetch('/api/me');
+    if (res.ok) {
+      state.user = await res.json();
+      if (params.has('logged_in')) {
+        history.replaceState({}, '', '/');
+      }
+      return true;
+    }
+  } catch (e) {
+    // network error — treat as not authed
+  }
+
+  // Not authed — check which auth method the server wants
+  try {
+    const res = await fetch('/api/auth-method');
+    if (res.ok) {
+      const { method } = await res.json();
+      if (method === 'cf') {
+        // Cloudflare Access: redirect to our CF handler which reads the
+        // injected header and sets a session cookie, then sends us back to /.
+        window.location.href = '/auth/cf-access';
+        return false; // navigation in flight
+      }
+    }
+  } catch (e) {
+    // ignore — will fall through to login screen
+  }
+
+  return false; // show login screen
+}
+
+function bindMenuToButtons(menu) {
+  // Store reference so keyboard handler can forward to it
+  state.activeMenu = menu;
+
+  // Button releases forward to the canvas menu
+  // We patch sendButton so that while a canvas menu is active, button releases
+  // route to the menu instead of handleMenuInput.
+  // The patch is applied by overriding sendButton's menu path via activeMenu.
+}
+
+function showLoginScreen() {
+  logState('showLoginScreen');
+  const menu = new window.MenuRenderer(canvas);
+  menuOverlay.classList.add('hidden');
+  state.activeMenu = menu;
+  menu.show({
+    title: 'RUSTYBOY',
+    items: [{ label: 'SIGN IN WITH GOOGLE', value: 'login' }],
+    footer: '\u25b2\u25bc MOVE  A SELECT',
+    onSelect: () => {
+      window.location.href = '/auth/google';
+    },
+    onBack: () => { showLoginScreen(); }, // B on login → stay on login
+  });
+}
+
+async function showLoginError() {
+  return new Promise(() => {
+    const menu = new window.MenuRenderer(canvas);
+    menuOverlay.classList.add('hidden');
+    state.activeMenu = menu;
+    menu.show({
+      title: 'AUTH FAILED',
+      items: [{ label: 'TRY AGAIN', value: 'retry' }],
+      onSelect: () => { window.location.href = '/auth/google'; },
+    });
+  });
+  // Intentionally never resolves — user must click TRY AGAIN
+}
+
+// ── Main menu / ROM list ───────────────────────────────────────────────────
+
+function showMainMenu() {
+  logState('showMainMenu');
+  menuOverlay.classList.add('hidden');
+  const menu = new window.MenuRenderer(canvas);
+  state.activeMenu = menu;
+  const name = state.user && (state.user.display_name || state.user.email) || '';
+  menu.show({
+    title: 'RUSTYBOY',
+    items: [
+      { label: 'PLAY',   value: 'play' },
+      { label: 'LOGOUT', value: 'logout' },
+    ],
+    footer: name ? ('HELLO, ' + name.toUpperCase()) : '\u25b2\u25bc MOVE  A SELECT',
+    onSelect: (item) => {
+      state.activeMenu = null;
+      if (item.value === 'play') {
+        showRomList();
+      } else if (item.value === 'logout') {
+        fetch('/auth/logout', { method: 'POST' }).finally(() => {
+          window.location.href = '/';
+        });
+      }
+    },
+    onBack: () => { showMainMenu(); }, // B on main menu → stay on main menu
+  });
+}
 
 async function loadRomList() {
   try {
@@ -187,50 +307,35 @@ async function loadRomList() {
     if (!res.ok) throw new Error(res.statusText);
     state.roms = await res.json();
   } catch (err) {
-    showError('NO ROMS FOUND');
     console.error(err);
-    return;
+    state.roms = [];
   }
+}
 
+function showRomList() {
+  logState('showRomList');
   if (state.roms.length === 0) {
-    showError('NO ROMS FOUND');
+    showCanvasError('NO ROMS FOUND');
     return;
   }
 
-  // Restore last selection
   const lastIdx = state.roms.indexOf(state.lastRomName);
   state.selectedIdx = lastIdx >= 0 ? lastIdx : 0;
 
-  renderMenu();
-}
-
-function renderMenu() {
-  const maxVisible = 12;
-  const total      = state.roms.length;
-  const sel        = state.selectedIdx;
-
-  // Scroll window so selected is visible
-  const start = Math.max(0, Math.min(sel - 2, total - maxVisible));
-  const end   = Math.min(start + maxVisible, total);
-  const slice = state.roms.slice(start, end);
-
-  romList.innerHTML = '';
-  slice.forEach((name, i) => {
-    const realIdx = start + i;
-    const el = document.createElement('div');
-    el.className = 'menu-item' + (realIdx === sel ? ' selected' : '');
-    el.textContent = stripExtension(name);
-    el.dataset.idx = realIdx;
-    el.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      if (realIdx === sel) {
-        launchRom(state.roms[realIdx]);
-      } else {
-        state.selectedIdx = realIdx;
-        renderMenu();
-      }
-    });
-    romList.appendChild(el);
+  const menu = new window.MenuRenderer(canvas);
+  state.activeMenu = menu;
+  menu.show({
+    title: 'SELECT GAME',
+    items: state.roms.map(name => ({ label: stripExtension(name), value: name })),
+    footer: '\u25b2\u25bc MOVE  A SELECT  B BACK',
+    onSelect: (item) => {
+      state.activeMenu = null;
+      launchRom(item.value);
+    },
+    onBack: () => {
+      state.activeMenu = null;
+      showMainMenu();
+    },
   });
 }
 
@@ -238,8 +343,18 @@ function stripExtension(name) {
   return name.replace(/\.(gb|gbc)$/i, '');
 }
 
-function showError(msg) {
-  romList.innerHTML = `<div class="menu-loading">${msg}</div>`;
+function showCanvasError(msg) {
+  const menu = new window.MenuRenderer(canvas);
+  state.activeMenu = menu;
+  menu.show({
+    title: 'ERROR',
+    items: [{ label: msg, value: 'error' }],
+    footer: 'B BACK',
+    onBack: () => {
+      state.activeMenu = null;
+      showMainMenu();
+    },
+  });
 }
 
 // ── Launch / stop ──────────────────────────────────────────────────────────
@@ -308,12 +423,7 @@ function stopEmulation() {
 function returnToMenu() {
   stopEmulation();
   setLed('menu');
-  menuOverlay.classList.remove('hidden');
-
-  // Reset selection to last ROM
-  const lastIdx = state.roms.indexOf(state.lastRomName);
-  state.selectedIdx = lastIdx >= 0 ? lastIdx : 0;
-  renderMenu();
+  showMainMenu();
 }
 
 // ── Emulation loop ─────────────────────────────────────────────────────────
@@ -384,32 +494,24 @@ function drawFrame() {
 // ── Button handling ────────────────────────────────────────────────────────
 
 function sendButton(idx, pressed) {
+  logState(`sendButton idx=${idx} pressed=${pressed}`);
   if (state.emulator) {
     state.emulator.set_button(idx, pressed);
   } else if (!pressed) {
+    // If a canvas menu is active, forward to it
+    if (state.activeMenu && state.activeMenu.isActive()) {
+      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape' };
+      const key = keyMap[idx];
+      console.debug(`[rustyboy:input] sendButton → menu key=${key}`);
+      if (key) { state.activeMenu.handleInput(key); return; }
+    }
     // Menu navigation on button release
     handleMenuInput(idx);
   }
 }
 
-function handleMenuInput(idx) {
-  if (state.roms.length === 0) return;
-  const total = state.roms.length;
-
-  switch (idx) {
-    case 2: // Up
-      state.selectedIdx = (state.selectedIdx - 1 + total) % total;
-      renderMenu();
-      break;
-    case 3: // Down
-      state.selectedIdx = (state.selectedIdx + 1) % total;
-      renderMenu();
-      break;
-    case 4: // A
-    case 7: // Start
-      launchRom(state.roms[state.selectedIdx]);
-      break;
-  }
+function handleMenuInput(_idx) {
+  // No-op: all menu navigation is handled by MenuRenderer via sendButton → activeMenu
 }
 
 function bindButtons() {
@@ -466,10 +568,35 @@ const KEY_MAP = {
 
 const heldKeys = new Set();
 
+function clearHeldKeys() { heldKeys.clear(); }
+
+let _logSeq = 0;
+function logState(label) {
+  const seq = ++_logSeq;
+  const msg = `#${seq} ${label} | activeMenu=${state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none'} | emulator=${!!state.emulator}`;
+  console.debug(`[rustyboy:input] ${msg}`);
+  fetch('/dev/log', { method: 'POST', body: msg }).catch(() => {});
+}
+
 function bindKeyboard() {
   document.addEventListener('keydown', (e) => {
-    if (heldKeys.has(e.key)) return;
+    if (heldKeys.has(e.key)) {
+      console.debug(`[rustyboy:input] keydown IGNORED (held) key=${e.key} heldKeys=[${[...heldKeys].join(',')}]`);
+      return;
+    }
     heldKeys.add(e.key);
+    console.debug(`[rustyboy:input] keydown key=${e.key} heldKeys=[${[...heldKeys].join(',')}] activeMenu=${state.activeMenu?.isActive() ? state.activeMenu._opts?.title : 'none'}`);
+
+    // Forward to canvas menu if active.
+    // Navigation keys (arrows, w/s) and Enter/Escape are handled directly.
+    // z/x (A/B buttons) are intentionally NOT intercepted here — they route
+    // through sendButton on keyup, which maps them to Enter/Escape for the menu.
+    const MENU_NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 's', 'Enter', 'Escape', 'a', 'b']);
+    if (state.activeMenu && state.activeMenu.isActive() && MENU_NAV_KEYS.has(e.key)) {
+      e.preventDefault();
+      state.activeMenu.handleInput(e.key);
+      return;
+    }
 
     // Toggle debug overlay with backtick/apostrophe (only if compiled in)
     if ((e.key === "'" || e.key === '`') && typeof EmulatorHandle.prototype.debug_state === 'function') {
@@ -489,6 +616,7 @@ function bindKeyboard() {
   });
 
   document.addEventListener('keyup', (e) => {
+    console.debug(`[rustyboy:input] keyup key=${e.key}`);
     heldKeys.delete(e.key);
     const idx = KEY_MAP[e.key];
     if (idx === undefined || idx === -1) return;
@@ -516,4 +644,5 @@ function flashResetLed() {
 
 // ── Start ──────────────────────────────────────────────────────────────────
 
+window.__appState = state;
 boot();

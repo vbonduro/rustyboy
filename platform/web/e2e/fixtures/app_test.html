@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+</head>
+<body>
+  <!-- Minimal DOM matching structure expected by app.js -->
+  <div id="screenBezel">
+    <div id="screenInner">
+      <canvas id="gameCanvas" width="160" height="144"></canvas>
+    </div>
+  </div>
+  <div id="menuOverlay">
+    <div id="romList"></div>
+  </div>
+  <button id="powerBtn"></button>
+  <div class="power-led" id="powerLed"></div>
+  <div class="reset-led" id="resetLed"></div>
+  <!-- D-pad and action buttons matching index.html data-btn indices -->
+  <button data-btn="2" id="btn-up">Up</button>
+  <button data-btn="3" id="btn-down">Down</button>
+  <button data-btn="4" id="btn-a">A</button>
+  <button data-btn="5" id="btn-b">B</button>
+
+  <script src="/static/menu.js"></script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
