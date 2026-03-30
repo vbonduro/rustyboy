@@ -1,22 +1,17 @@
-mod db;
-
-use axum::{
-    Router,
-    extract::{Path, State},
-    http::{HeaderValue, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Json, Response},
-    routing::get,
-    extract::Request,
-};
+use rustyboy_web_server::{AppState, auth::OAuthConfig, build_router, db_connect};
 use std::{path::PathBuf, sync::Arc};
-use tower_http::services::ServeDir;
 
-#[derive(Clone)]
-struct AppState {
-    roms_dir: PathBuf,
-    static_dir: PathBuf,
-    db: db::Database,
+/// Read a secret from `{key}_FILE` (path to a file) falling back to `key`
+/// (raw value).  Trims whitespace so files with a trailing newline work fine.
+fn get_secret(key: &str) -> String {
+    let file_key = format!("{}_FILE", key);
+    if let Ok(path) = std::env::var(&file_key) {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => return s.trim().to_string(),
+            Err(e) => tracing::error!("failed to read secret file {path}: {e}"),
+        }
+    }
+    std::env::var(key).unwrap_or_default()
 }
 
 #[tokio::main]
@@ -31,89 +26,39 @@ async fn main() {
     );
     let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "/data/rustyboy.db".to_string());
 
-    let db = db::Database::connect(&db_path)
+    let db = db_connect(&db_path)
         .await
         .expect("Failed to connect to database");
 
+    let team_domain = std::env::var("CF_TEAM_DOMAIN").unwrap_or_default();
+    let cf_certs_url = if team_domain.is_empty() {
+        String::new()
+    } else {
+        format!("https://{}.cloudflareaccess.com/cdn-cgi/access/certs", team_domain)
+    };
+
+    let oauth = OAuthConfig {
+        client_id:     get_secret("GOOGLE_CLIENT_ID"),
+        client_secret: get_secret("GOOGLE_CLIENT_SECRET"),
+        redirect_uri:  String::new(), // derived from request Host header at runtime
+        jwt_secret:    get_secret("JWT_SECRET"),
+        cf_access_aud: get_secret("CF_ACCESS_AUD"),
+        cf_certs_url,
+    };
+    let http_client = reqwest::Client::new();
+
     let state = Arc::new(AppState {
         roms_dir,
-        static_dir: static_dir.clone(),
+        static_dir,
         db,
+        oauth,
+        http_client,
     });
 
-    let app = Router::new()
-        .route("/", get(serve_index))
-        .route("/api/roms", get(list_roms))
-        .route("/roms/:name", get(serve_rom))
-        .nest_service("/static", ServeDir::new(&static_dir))
-        .layer(middleware::from_fn(security_headers))
-        .with_state(state);
+    let app = build_router(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-    tracing::info!("Listening on http://0.0.0.0:8080");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
+    tracing::info!("Listening on http://0.0.0.0:{}", port);
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn security_headers(req: Request, next: Next) -> Response {
-    let mut res = next.run(req).await;
-    let h = res.headers_mut();
-    h.insert("cache-control",              HeaderValue::from_static("no-store"));
-    h.insert("x-content-type-options",     HeaderValue::from_static("nosniff"));
-    h.insert("x-frame-options",            HeaderValue::from_static("DENY"));
-    h.insert("cross-origin-embedder-policy",  HeaderValue::from_static("require-corp"));
-    h.insert("cross-origin-opener-policy",    HeaderValue::from_static("same-origin"));
-    h.insert("cross-origin-resource-policy",  HeaderValue::from_static("same-origin"));
-    h.insert("permissions-policy",            HeaderValue::from_static("camera=(), microphone=(), geolocation=()"));
-    h.insert("content-security-policy",       HeaderValue::from_static(
-        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"
-    ));
-    res
-}
-
-async fn serve_index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let path = state.static_dir.join("index.html");
-    match tokio::fs::read(path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "text/html; charset=utf-8")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-async fn list_roms(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut names: Vec<String> = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(&state.roms_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let s = name.to_string_lossy().into_owned();
-            if s.ends_with(".gb") || s.ends_with(".gbc") {
-                names.push(s);
-            }
-        }
-    }
-    names.sort();
-    Json(names)
-}
-
-async fn serve_rom(
-    Path(name): Path<String>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    // Reject path traversal attempts
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let path = state.roms_dir.join(&name);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }

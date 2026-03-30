@@ -1,6 +1,6 @@
 # rustyboy — web platform
 
-A browser-based Game Boy emulator that looks and feels like a real DMG. The emulator core compiles to WASM and runs entirely client-side; the server is stateless and just serves static files and ROM downloads.
+A browser-based Game Boy emulator that looks and feels like a real DMG. The emulator core compiles to WASM and runs entirely client-side; the Axum server handles authentication, ROM serving, and static files.
 
 ## How it works
 
@@ -9,8 +9,14 @@ Browser                          Server (Axum)
 ───────                          ─────────────
 GET /                      →     serves index.html
 GET /api/roms              →     lists .gb/.gbc files in ROMS_DIR
-GET /roms/:name            →     streams ROM bytes
+GET /api/me                →     returns current user info (requires session)
+GET /api/auth-method       →     returns active auth mode: "google" | "cf" | "dev"
+GET /roms/:name            →     streams ROM bytes (requires session)
 GET /static/*              →     serves WASM + JS + CSS
+GET /auth/google           →     begins Google OAuth flow
+GET /auth/google/callback  →     completes Google OAuth, sets session cookie
+GET /auth/cf-access        →     validates Cloudflare Access JWT, sets session cookie
+POST /auth/logout          →     clears session cookie
 
 JS loads rustyboy_web_client.wasm
   → new EmulatorHandle(romBytes)   (Rust/WASM)
@@ -50,15 +56,27 @@ wasm-pack build platform/web/client \
   --target web \
   --out-dir platform/web/client/static
 
-# 2. Build and run the server
+# 2. Build and run the server (DEV_MODE skips auth for local testing)
 ROMS_DIR=/path/to/your/roms \
 STATIC_DIR=platform/web/client/static \
+JWT_SECRET=local-dev-secret \
+DEV_MODE=1 \
 cargo run -p rustyboy-web-server
 
 # 3. Open http://localhost:8080
 ```
 
 ROMs must be `.gb` or `.gbc` files. The server lists whatever is in `ROMS_DIR`.
+
+For local Docker testing with auth bypassed:
+
+```sh
+docker run -p 8080:8080 \
+  -v /path/to/your/roms:/roms \
+  -e JWT_SECRET=local-dev-secret \
+  -e DEV_MODE=1 \
+  ghcr.io/vbonduro/rustyboy:dev
+```
 
 ## Docker
 
@@ -76,11 +94,109 @@ Open `http://localhost:8080` in a browser.
 
 ### Environment variables
 
+#### Core
+
 | Variable | Default | Description |
 |---|---|---|
 | `ROMS_DIR` | `/roms` | Directory scanned for `.gb`/`.gbc` ROM files |
 | `STATIC_DIR` | `/static` | Directory serving the built frontend assets |
+| `PORT` | `8080` | Port the server listens on |
+| `DB_PATH` | `/data/rustyboy.db` | SQLite database path (user accounts) |
+| `JWT_SECRET` | _(required)_ | Secret used to sign session cookies — set to a long random string |
 | `RUST_LOG` | _(unset)_ | Log level, e.g. `info` |
+
+#### Authentication
+
+Three auth modes are supported. Only one should be active at a time.
+
+**Mode 1 — Google OAuth** (default, no extra flags needed)
+
+| Variable | Description |
+|---|---|
+| `GOOGLE_CLIENT_ID` | OAuth 2.0 client ID from Google Cloud Console |
+| `GOOGLE_CLIENT_SECRET` | OAuth 2.0 client secret |
+
+The redirect URI is auto-detected from the request's `Host` header — no configuration needed. Register `https://yoursite.com/auth/google/callback` in Google Console (replacing `yoursite.com` with your actual domain).
+
+**Mode 2 — Cloudflare Access** (recommended for Cloudflare Tunnel deployments)
+
+Users authenticate at the Cloudflare edge; the server validates the injected JWT. No Google credentials needed on the server.
+
+| Variable | Description |
+|---|---|
+| `CF_ACCESS_AUD` | Application Audience tag from your Cloudflare Access application settings |
+| `CF_TEAM_DOMAIN` | Your Cloudflare team name, e.g. `mycompany` → `mycompany.cloudflareaccess.com` |
+
+**Mode 3 — Dev mode** (local development only, bypasses all auth)
+
+| Variable | Description |
+|---|---|
+| `DEV_MODE` | Set to any value to skip authentication and auto-login as `dev@localhost` |
+
+## Docker images
+
+Two images are published to the GitHub Container Registry:
+
+| Image | Published on | Use for |
+|---|---|---|
+| `ghcr.io/vbonduro/rustyboy:1.x.x` | GitHub release | Production — pinned, stable |
+| `ghcr.io/vbonduro/rustyboy:dev` | Every push to `main` | Development / testing — always latest |
+
+Use a pinned semver tag for production so a bad push never disrupts your server.
+
+## Managing secrets
+
+Never pass secrets directly on the command line — they appear in shell history and `docker inspect` output.
+
+### Recommended: secret files
+
+For each secret, write the value to a file and pass the path via a `_FILE` env var. The server reads the file at startup. Secret values never appear in `docker inspect` or process listings.
+
+```sh
+# Create a secrets directory
+mkdir -p /path/to/secrets
+chmod 700 /path/to/secrets
+
+# Write each secret to its own file
+echo -n 'your-long-random-jwt-secret'   > /path/to/secrets/jwt_secret
+echo -n 'your-google-client-id'         > /path/to/secrets/google_client_id
+echo -n 'your-google-client-secret'     > /path/to/secrets/google_client_secret
+chmod 600 /path/to/secrets/*
+```
+
+```sh
+docker run \
+  -v /path/to/secrets:/secrets:ro \
+  -e JWT_SECRET_FILE=/secrets/jwt_secret \
+  -e GOOGLE_CLIENT_ID_FILE=/secrets/google_client_id \
+  -e GOOGLE_CLIENT_SECRET_FILE=/secrets/google_client_secret \
+  -e OAUTH_REDIRECT_URI=https://yoursite.com/auth/google/callback \
+  -p 8080:8080 \
+  -v /path/to/roms:/roms \
+  ghcr.io/vbonduro/rustyboy:1.x.x
+```
+
+Every secret variable supports both forms — `VAR=value` and `VAR_FILE=/path/to/file`. The `_FILE` form takes precedence when both are set.
+
+### Alternative: env file
+
+If secret files aren't practical, use `--env-file` to at least keep secrets out of shell history:
+
+```sh
+cat > /path/to/rustyboy.env <<EOF
+JWT_SECRET=<long random string>
+GOOGLE_CLIENT_ID=<from Google Console>
+GOOGLE_CLIENT_SECRET=<from Google Console>
+EOF
+chmod 600 /path/to/rustyboy.env
+
+docker run --env-file /path/to/rustyboy.env \
+  -p 8080:8080 \
+  -v /path/to/roms:/roms \
+  ghcr.io/vbonduro/rustyboy:1.x.x
+```
+
+Keep the env file off version control. `DEV_MODE` should never be set in production.
 
 ## Deploying on Unraid
 
@@ -107,17 +223,15 @@ Open `http://localhost:8080` in a browser.
    /mnt/user/Games/GameBoy
    ```
 
-4. Click **Apply**. The container pulls `ghcr.io/vbonduro/rustyboy:latest` and starts automatically.
+4. Set your environment variables (see Authentication section above).
 
-5. Open `http://<unraid-ip>:8080` in a browser — your ROMs appear in the menu.
+5. Click **Apply**. The container pulls `ghcr.io/vbonduro/rustyboy:latest` and starts automatically.
+
+6. Open `http://<unraid-ip>:8080` in a browser — your ROMs appear in the menu.
 
 ### Updating
 
 In the Unraid Docker tab, click the rustyboy container icon and choose **Update**. Or enable **Auto Update** via Unraid's settings.
-
-### Network access
-
-The server binds on port 8080. If you want to play from other devices on your LAN, make sure nothing is blocking that port on the Unraid host. No authentication is built in — keep it on your local network or behind a VPN.
 
 ## Directory layout
 
@@ -130,8 +244,18 @@ platform/web/
 │   └── static/
 │       ├── index.html      # DMG Game Boy shell
 │       ├── style.css       # Pixel-accurate DMG styling
-│       └── app.js          # ROM menu, emulation loop, input handling
+│       ├── app.js          # ROM menu, emulation loop, input handling, auth flow
+│       └── menu.js         # MenuRenderer — GB-palette canvas menus
+├── e2e/
+│   ├── playwright.config.js
+│   ├── server.cjs          # Mock server for E2E tests
+│   └── tests/
+│       └── traversal.spec.js  # Menu traversal + mobile interaction tests
 └── server/
     ├── Cargo.toml
-    └── src/main.rs         # Axum: GET /, /api/roms, /roms/:name, /static/*
+    └── src/
+        ├── main.rs         # Entrypoint, env config
+        ├── lib.rs          # Axum router, middleware, route handlers
+        ├── auth.rs         # Google OAuth, Cloudflare Access, session JWT
+        └── db.rs           # SQLite user store (sqlx)
 ```

@@ -87,8 +87,9 @@
         case 'a':
           if (items.length > 0 && this._opts.onSelect) {
             const item = items[this._selIdx];
+            const cb = this._opts.onSelect;
             this.hide();
-            this._opts.onSelect(item);
+            cb(item);
           }
           break;
 
@@ -118,8 +119,9 @@
 
       if (this._opts.onSelect) {
         const item = items[itemIdx];
+        const cb = this._opts.onSelect;
         this.hide();
-        this._opts.onSelect(item);
+        cb(item);
       }
     }
 
@@ -233,6 +235,18 @@
       const t   = e.changedTouches[0];
       const dy  = t.clientY - (this._touchStartY || t.clientY);
       this._touchStartY = null;
+
+      // Ignore touches that ended outside the canvas bounds — this prevents
+      // d-pad button presses (which share touch coordinates with the canvas
+      // area on mobile) from accidentally triggering menu taps.
+      const rect = this._canvas.getBoundingClientRect();
+      const outside = t.clientX < rect.left || t.clientX > rect.right ||
+                      t.clientY < rect.top  || t.clientY > rect.bottom;
+      const msg = `MenuRenderer._onTouchEnd dy=${dy.toFixed(1)} outside=${outside} title=${this._opts?.title}`;
+      console.debug('[rustyboy:menu]', msg);
+      fetch('/dev/log', { method: 'POST', body: msg }).catch(() => {});
+      if (outside) return;
+
       const items = (this._opts && this._opts.items) || [];
 
       if (Math.abs(dy) > 12) {
