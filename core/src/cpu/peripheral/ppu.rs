@@ -142,6 +142,23 @@ impl PpuPeripheral {
     }
     pub fn set_window_line_counter(&mut self, v: u8) { self.window_line_counter = v; }
 
+    /// Serialize PPU state into `out`. 5 bytes: dot(LE u16) ly mode window_line_counter.
+    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
+        out.extend_from_slice(&self.dot.to_le_bytes());
+        out.push(self.ly);
+        out.push(self.mode as u8);
+        out.push(self.window_line_counter);
+    }
+
+    /// Deserialize PPU state from `data` at `offset`. Advances offset by 5.
+    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
+        self.dot = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
+        self.set_ly(data[*offset + 2]);
+        self.set_mode(data[*offset + 3]);
+        self.window_line_counter = data[*offset + 4];
+        *offset += 5;
+    }
+
     /// Advance the PPU by `cycles` T-cycles.
     pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
         let lcdc = Lcdc(input.lcdc);

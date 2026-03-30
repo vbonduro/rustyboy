@@ -254,50 +254,21 @@ impl Sm83 {
     ///   [16675..16835] OAM (0xA0 bytes)
     pub fn save_state(&self) -> alloc::vec::Vec<u8> {
         let mut out = alloc::vec::Vec::with_capacity(16835);
-        // Magic + version
+        // Header
         out.extend_from_slice(b"RBSS");
         out.extend_from_slice(&1u16.to_le_bytes());
-        // CPU registers
-        out.push(self.registers.a);
-        out.push(self.registers.b);
-        out.push(self.registers.c);
-        out.push(self.registers.d);
-        out.push(self.registers.e);
-        out.push(self.registers.h);
-        out.push(self.registers.l);
-        out.push(self.registers.f.bits());
-        out.extend_from_slice(&self.registers.sp.to_le_bytes());
-        out.extend_from_slice(&self.registers.pc.to_le_bytes());
-        // IME + halted
+        // Components
+        self.registers.save_state(&mut out);
         out.push(match self.ime {
             ImeState::Disabled => 0,
             ImeState::Pending  => 1,
             ImeState::Enabled  => 2,
         });
         out.push(self.halted as u8);
-        // cycle_counter
         out.extend_from_slice(&self.cycle_counter.to_le_bytes());
-        // Timer internal counter
-        out.extend_from_slice(&self.timer.internal_counter().to_le_bytes());
-        // PPU internal state
-        out.extend_from_slice(&self.ppu.dot().to_le_bytes());
-        out.push(self.ppu.ly());
-        out.push(self.ppu.mode());
-        out.push(self.ppu.window_line_counter());
-        // IO registers (0xFF00–0xFF7F)
-        for i in 0..0x80u16 {
-            out.push(self.memory.read_io(0xFF00 + i));
-        }
-        // IE
-        out.push(self.memory.ie());
-        // WRAM
-        out.extend_from_slice(self.memory.wram());
-        // HRAM
-        out.extend_from_slice(self.memory.hram());
-        // VRAM
-        out.extend_from_slice(self.memory.vram());
-        // OAM
-        out.extend_from_slice(self.memory.oam());
+        self.timer.save_state(&mut out);
+        self.ppu.save_state(&mut out);
+        self.memory.save_state(&mut out);
         out
     }
 
@@ -314,52 +285,24 @@ impl Sm83 {
         if version != 1 {
             return Err("unsupported save state version");
         }
-        // CPU registers
-        self.registers.a  = data[6];
-        self.registers.b  = data[7];
-        self.registers.c  = data[8];
-        self.registers.d  = data[9];
-        self.registers.e  = data[10];
-        self.registers.h  = data[11];
-        self.registers.l  = data[12];
-        self.registers.f  = Flags::from_bits_truncate(data[13]);
-        self.registers.sp = u16::from_le_bytes([data[14], data[15]]);
-        self.registers.pc = u16::from_le_bytes([data[16], data[17]]);
-        // IME + halted
-        self.ime = match data[18] {
+        let mut offset = 6;
+        self.registers.load_state(data, &mut offset);
+        self.ime = match data[offset] {
             1 => ImeState::Pending,
             2 => ImeState::Enabled,
             _ => ImeState::Disabled,
         };
-        self.halted = data[19] != 0;
-        // cycle_counter
+        offset += 1;
+        self.halted = data[offset] != 0;
+        offset += 1;
         self.cycle_counter = u64::from_le_bytes([
-            data[20], data[21], data[22], data[23],
-            data[24], data[25], data[26], data[27],
+            data[offset],     data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
         ]);
-        // Timer
-        let timer_counter = u16::from_le_bytes([data[28], data[29]]);
-        self.timer.set_internal_counter(timer_counter);
-        // PPU
-        let ppu_dot = u16::from_le_bytes([data[30], data[31]]);
-        self.ppu.set_dot(ppu_dot);
-        self.ppu.set_ly(data[32]);
-        self.ppu.set_mode(data[33]);
-        self.ppu.set_window_line_counter(data[34]);
-        // IO registers
-        for i in 0..0x80u16 {
-            self.memory.write_io(0xFF00 + i, data[35 + i as usize]);
-        }
-        // IE
-        self.memory.set_ie(data[163]);
-        // WRAM
-        self.memory.set_wram(&data[164..164 + 0x2000]);
-        // HRAM
-        self.memory.set_hram(&data[8356..8356 + 0x7F]);
-        // VRAM
-        self.memory.set_vram(&data[8483..8483 + 0x2000]);
-        // OAM
-        self.memory.set_oam(&data[16675..16675 + 0xA0]);
+        offset += 8;
+        self.timer.load_state(data, &mut offset);
+        self.ppu.load_state(data, &mut offset);
+        self.memory.load_state(data, &mut offset);
         Ok(())
     }
 
