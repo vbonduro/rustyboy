@@ -59,10 +59,12 @@ impl TimerPeripheral {
         out.extend_from_slice(&self.internal_counter.to_le_bytes());
     }
 
-    /// Deserialize timer state from `data` at `offset`. Advances offset by 2.
-    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
-        self.internal_counter = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
-        *offset += 2;
+    /// Deserialize timer state from `data` at byte `offset`. Returns the number of bytes consumed.
+    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        let start = offset;
+        let mut cur = offset;
+        self.internal_counter = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
+        cur - start
     }
 
     /// Advance the timer by `cycles` T-cycles.

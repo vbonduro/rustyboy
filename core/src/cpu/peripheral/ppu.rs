@@ -133,18 +133,20 @@ impl PpuPeripheral {
         out.push(self.window_line_counter);
     }
 
-    /// Deserialize PPU state from `data` at `offset`. Advances offset by 5.
-    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
-        self.dot = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
-        self.ly = data[*offset + 2];
-        self.mode = match data[*offset + 3] {
+    /// Deserialize PPU state from `data` at byte `offset`. Returns the number of bytes consumed.
+    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        let start = offset;
+        let mut cur = offset;
+        self.dot = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
+        self.ly = data[cur]; cur += 1;
+        self.mode = match data[cur] {
             0 => PpuMode::HBlank,
             1 => PpuMode::VBlank,
             2 => PpuMode::OamScan,
             _ => PpuMode::PixelTransfer,
-        };
-        self.window_line_counter = data[*offset + 4];
-        *offset += 5;
+        }; cur += 1;
+        self.window_line_counter = data[cur]; cur += 1;
+        cur - start
     }
 
     /// Advance the PPU by `cycles` T-cycles.

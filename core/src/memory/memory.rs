@@ -211,21 +211,24 @@ impl GameBoyMemory {
     }
 
     /// Deserialize memory state from `data` at `offset`. Advances offset past all regions.
-    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
+    /// Deserialize memory state from `data` at byte `offset`. Returns the number of bytes consumed.
+    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        let mut cur = offset;
         for i in 0..0x80u16 {
-            self.write_io(0xFF00 + i, data[*offset + i as usize]);
+            self.write_io(0xFF00 + i, data[cur + i as usize]);
         }
-        *offset += 0x80;
-        self.ie = data[*offset];
-        *offset += 1;
-        self.set_wram(&data[*offset..*offset + 0x2000]);
-        *offset += 0x2000;
-        self.set_hram(&data[*offset..*offset + 0x7F]);
-        *offset += 0x7F;
-        self.set_vram(&data[*offset..*offset + 0x2000]);
-        *offset += 0x2000;
-        self.set_oam(&data[*offset..*offset + 0xA0]);
-        *offset += 0xA0;
+        cur += 0x80;
+        self.ie = data[cur];
+        cur += 1;
+        self.set_wram(&data[cur..cur + 0x2000]);
+        cur += 0x2000;
+        self.set_hram(&data[cur..cur + 0x7F]);
+        cur += 0x7F;
+        self.set_vram(&data[cur..cur + 0x2000]);
+        cur += 0x2000;
+        self.set_oam(&data[cur..cur + 0xA0]);
+        cur += 0xA0;
+        cur - offset
     }
 
     /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.

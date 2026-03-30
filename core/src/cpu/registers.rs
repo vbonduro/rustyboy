@@ -113,19 +113,21 @@ impl Registers {
         out.extend_from_slice(&self.pc.to_le_bytes());
     }
 
-    /// Deserialize registers from `data` starting at `offset`. Advances offset by 10.
-    pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
-        self.a  = data[*offset];
-        self.b  = data[*offset + 1];
-        self.c  = data[*offset + 2];
-        self.d  = data[*offset + 3];
-        self.e  = data[*offset + 4];
-        self.h  = data[*offset + 5];
-        self.l  = data[*offset + 6];
-        self.f  = Flags::from_bits_truncate(data[*offset + 7]);
-        self.sp = u16::from_le_bytes([data[*offset + 8], data[*offset + 9]]);
-        self.pc = u16::from_le_bytes([data[*offset + 10], data[*offset + 11]]);
-        *offset += 12;
+    /// Deserialize registers from `data` at byte `offset`. Returns the number of bytes consumed.
+    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        let start = offset;
+        let mut cur = offset;
+        self.a  = data[cur]; cur += 1;
+        self.b  = data[cur]; cur += 1;
+        self.c  = data[cur]; cur += 1;
+        self.d  = data[cur]; cur += 1;
+        self.e  = data[cur]; cur += 1;
+        self.h  = data[cur]; cur += 1;
+        self.l  = data[cur]; cur += 1;
+        self.f  = Flags::from_bits_truncate(data[cur]); cur += 1;
+        self.sp = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
+        self.pc = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
+        cur - start
     }
 }
 
