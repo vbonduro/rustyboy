@@ -125,23 +125,6 @@ impl PpuPeripheral {
         &self.framebuffer
     }
 
-    pub fn dot(&self) -> u16 { self.dot }
-    pub fn ly(&self) -> u8 { self.ly }
-    pub fn mode(&self) -> u8 { self.mode as u8 }
-    pub fn window_line_counter(&self) -> u8 { self.window_line_counter }
-
-    pub fn set_dot(&mut self, v: u16) { self.dot = v; }
-    pub fn set_ly(&mut self, v: u8) { self.ly = v; }
-    pub fn set_mode(&mut self, v: u8) {
-        self.mode = match v {
-            0 => PpuMode::HBlank,
-            1 => PpuMode::VBlank,
-            2 => PpuMode::OamScan,
-            _ => PpuMode::PixelTransfer,
-        };
-    }
-    pub fn set_window_line_counter(&mut self, v: u8) { self.window_line_counter = v; }
-
     /// Serialize PPU state into `out`. 5 bytes: dot(LE u16) ly mode window_line_counter.
     pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
         out.extend_from_slice(&self.dot.to_le_bytes());
@@ -153,8 +136,13 @@ impl PpuPeripheral {
     /// Deserialize PPU state from `data` at `offset`. Advances offset by 5.
     pub fn load_state(&mut self, data: &[u8], offset: &mut usize) {
         self.dot = u16::from_le_bytes([data[*offset], data[*offset + 1]]);
-        self.set_ly(data[*offset + 2]);
-        self.set_mode(data[*offset + 3]);
+        self.ly = data[*offset + 2];
+        self.mode = match data[*offset + 3] {
+            0 => PpuMode::HBlank,
+            1 => PpuMode::VBlank,
+            2 => PpuMode::OamScan,
+            _ => PpuMode::PixelTransfer,
+        };
         self.window_line_counter = data[*offset + 4];
         *offset += 5;
     }
