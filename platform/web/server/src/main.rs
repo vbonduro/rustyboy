@@ -1,21 +1,11 @@
-use rustyboy_web_server::{AppState, auth::OAuthConfig, build_router, db_connect};
+use rustyboy_web_server::{AppState, auth::OAuthConfig, build_router, config, db_connect};
 use std::{path::PathBuf, sync::Arc};
-
-/// Read a secret from `{key}_FILE` (path to a file) falling back to `key`
-/// (raw value).  Trims whitespace so files with a trailing newline work fine.
-fn get_secret(key: &str) -> String {
-    let file_key = format!("{}_FILE", key);
-    if let Ok(path) = std::env::var(&file_key) {
-        match std::fs::read_to_string(&path) {
-            Ok(s) => return s.trim().to_string(),
-            Err(e) => tracing::error!("failed to read secret file {path}: {e}"),
-        }
-    }
-    std::env::var(key).unwrap_or_default()
-}
 
 #[tokio::main]
 async fn main() {
+    // Load bundled secrets file before anything else reads env vars
+    config::load_secrets_file();
+
     tracing_subscriber::fmt::init();
 
     let roms_dir = PathBuf::from(
@@ -38,11 +28,11 @@ async fn main() {
     };
 
     let oauth = OAuthConfig {
-        client_id:     get_secret("GOOGLE_CLIENT_ID"),
-        client_secret: get_secret("GOOGLE_CLIENT_SECRET"),
+        client_id:     config::get_secret("GOOGLE_CLIENT_ID"),
+        client_secret: config::get_secret("GOOGLE_CLIENT_SECRET"),
         redirect_uri:  String::new(), // derived from request Host header at runtime
-        jwt_secret:    get_secret("JWT_SECRET"),
-        cf_access_aud: get_secret("CF_ACCESS_AUD"),
+        jwt_secret:    config::get_secret("JWT_SECRET"),
+        cf_access_aud: config::get_secret("CF_ACCESS_AUD"),
         cf_certs_url,
     };
     let http_client = reqwest::Client::new();
