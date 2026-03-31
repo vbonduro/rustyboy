@@ -107,25 +107,34 @@ Open `http://localhost:8080` in a browser.
 
 #### Authentication
 
-Three auth modes are supported. Only one should be active at a time.
+All secrets go in `secrets.env` (see [Managing secrets](#managing-secrets) below). Three auth modes are supported; Google OAuth and Cloudflare Access can be active simultaneously.
 
-**Mode 1 — Google OAuth** (default, no extra flags needed)
+**Mode 1 — Google OAuth**
 
-| Variable | Description |
+1. Go to [Google Cloud Console](https://console.cloud.google.com) → APIs & Services → Credentials → **Create OAuth 2.0 Client ID** (type: Web application)
+2. Under **Authorized JavaScript origins** add: `https://yoursite.com`
+3. Under **Authorized redirect URIs** add: `https://yoursite.com/auth/google/callback`
+4. Copy the Client ID and Client Secret into `secrets.env`
+
+The redirect URI is auto-detected from the request's `Host` header — no server-side config needed.
+
+| Variable | Where to find it |
 |---|---|
-| `GOOGLE_CLIENT_ID` | OAuth 2.0 client ID from Google Cloud Console |
-| `GOOGLE_CLIENT_SECRET` | OAuth 2.0 client secret |
-
-The redirect URI is auto-detected from the request's `Host` header — no configuration needed. Register `https://yoursite.com/auth/google/callback` in Google Console (replacing `yoursite.com` with your actual domain).
+| `GOOGLE_CLIENT_ID` | Google Cloud Console → Credentials → your OAuth client → Client ID (ends in `.apps.googleusercontent.com`) |
+| `GOOGLE_CLIENT_SECRET` | Same page → Client Secret (starts with `GOCSPX-`) |
 
 **Mode 2 — Cloudflare Access** (recommended for Cloudflare Tunnel deployments)
 
-Users authenticate at the Cloudflare edge; the server validates the injected JWT. No Google credentials needed on the server.
+Users authenticate at the Cloudflare edge; the server validates the injected JWT. Can be used alongside Google OAuth.
 
-| Variable | Description |
+1. In the Cloudflare dashboard create a Tunnel pointing to `http://<server-ip>:8080`
+2. Create an Access Application protecting that tunnel
+3. Copy the Audience tag and team name into `secrets.env`
+
+| Variable | Where to find it |
 |---|---|
-| `CF_ACCESS_AUD` | Application Audience tag from your Cloudflare Access application settings |
-| `CF_TEAM_DOMAIN` | Your Cloudflare team name, e.g. `mycompany` → `mycompany.cloudflareaccess.com` |
+| `CF_ACCESS_AUD` | Cloudflare dashboard → Access → Applications → your app → **Audience tag** |
+| `CF_TEAM_DOMAIN` | Your Cloudflare team name — if your team URL is `mycompany.cloudflareaccess.com` use `mycompany` |
 
 **Mode 3 — Dev mode** (local development only, bypasses all auth)
 
@@ -146,18 +155,31 @@ Use a pinned semver tag for production so a bad push never disrupts your server.
 
 ## Managing secrets
 
-Never pass secrets directly on the command line — they appear in shell history and `docker inspect` output. Instead use a single secrets file mounted into the container.
+Never pass secrets directly on the command line — they appear in shell history and `docker inspect` output. Instead put all secrets in a single file mounted into the container via `SECRETS_FILE`.
 
 ### Setup
 
 ```sh
 mkdir -p /path/to/appdata/rustyboy
-cat > /path/to/appdata/rustyboy/secrets.env <<EOF
-JWT_SECRET=<long random string>
-GOOGLE_CLIENT_ID=<from Google Console>
-GOOGLE_CLIENT_SECRET=<from Google Console>
-EOF
 chmod 600 /path/to/appdata/rustyboy/secrets.env
+```
+
+Edit `/path/to/appdata/rustyboy/secrets.env`:
+
+```sh
+# Required — generate with: openssl rand -hex 32
+JWT_SECRET=<long random string>
+
+# Google OAuth
+# Find at: console.cloud.google.com → APIs & Services → Credentials → your OAuth client
+GOOGLE_CLIENT_ID=<ends in .apps.googleusercontent.com>
+GOOGLE_CLIENT_SECRET=<starts with GOCSPX->
+
+# Cloudflare Access
+# CF_ACCESS_AUD: Cloudflare dashboard → Access → Applications → your app → Audience tag
+# CF_TEAM_DOMAIN: your team name — if your URL is mycompany.cloudflareaccess.com use "mycompany"
+CF_ACCESS_AUD=<audience tag>
+CF_TEAM_DOMAIN=<team name>
 ```
 
 ```sh
@@ -169,7 +191,7 @@ docker run \
   ghcr.io/vbonduro/rustyboy:1.x.x
 ```
 
-The file uses standard `KEY=VALUE` format. Lines starting with `#` are ignored. `DEV_MODE` should never appear in a production secrets file.
+The file uses standard `KEY=VALUE` format. Lines starting with `#` are ignored. Only include the variables for the auth modes you are using — unused variables are safely ignored. `DEV_MODE` should never appear in a production secrets file.
 
 ## Deploying on Unraid
 
