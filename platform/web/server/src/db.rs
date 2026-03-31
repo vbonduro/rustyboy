@@ -131,6 +131,25 @@ impl Database {
         }))
     }
 
+    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, google_sub, email, display_name, avatar_url, created_at
+             FROM users WHERE email = ?",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| User {
+            id: r.get("id"),
+            google_sub: r.get("google_sub"),
+            email: r.get("email"),
+            display_name: r.get("display_name"),
+            avatar_url: r.get("avatar_url"),
+            created_at: r.get("created_at"),
+        }))
+    }
+
     pub async fn get_user_by_id(&self, id: &str) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, google_sub, email, display_name, avatar_url, created_at

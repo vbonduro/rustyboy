@@ -247,12 +247,16 @@ async function checkAuth() {
         // Try Cloudflare Access silently — only works when the CF JWT header
         // is present (i.e. accessed via the Cloudflare tunnel).
         // Falls through to login screen on failure (local/direct access).
-        const cfRes = await fetch('/auth/cf-access');
-        if (cfRes.ok || cfRes.redirected) {
-          // CF set a session cookie — reload to pick it up.
-          window.location.href = '/';
-          return false;
-        }
+        await fetch('/auth/cf-access');
+        // Confirm a session was actually established (not just a redirect to /?auth_error).
+        try {
+          const meRes = await fetch('/api/me');
+          if (meRes.ok) {
+            state.user = await meRes.json();
+            window.location.href = '/';
+            return false;
+          }
+        } catch (_) { /* fall through */ }
         // CF failed (no header present) — fall through to login screen.
       }
     }
