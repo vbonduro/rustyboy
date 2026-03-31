@@ -151,7 +151,7 @@
       ctx.fillStyle = C1;
       ctx.fillRect(0, footerY, W, FOOTER_H);
       ctx.fillStyle = C3;
-      ctx.font      = '7px monospace';
+      ctx.font      = 'bold 7px monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       const footer = this._opts.footer || '\u25b2\u25bc MOVE  A SELECT  B BACK';
