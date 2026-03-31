@@ -125,14 +125,20 @@ async fn api_me(
 }
 
 async fn api_auth_method(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let method = if std::env::var("DEV_MODE").is_ok() {
-        "dev"
-    } else if !state.oauth.cf_access_aud.is_empty() {
-        "cf"
-    } else {
-        "google"
-    };
-    Json(serde_json::json!({ "method": method }))
+    if std::env::var("DEV_MODE").is_ok() {
+        return Json(serde_json::json!({ "methods": ["dev"] }));
+    }
+    let mut methods = Vec::new();
+    if !state.oauth.cf_access_aud.is_empty() {
+        methods.push("cf");
+    }
+    if !state.oauth.client_id.is_empty() {
+        methods.push("google");
+    }
+    if methods.is_empty() {
+        methods.push("google"); // fallback
+    }
+    Json(serde_json::json!({ "methods": methods }))
 }
 
 async fn dev_log(body: String) -> StatusCode {
