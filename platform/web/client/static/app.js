@@ -232,20 +232,32 @@ async function checkAuth() {
     // network error — treat as not authed
   }
 
-  // Not authed — check which auth method the server wants
+  // After an explicit logout, skip silent CF attempt and show login screen.
+  if (params.has('logged_out')) {
+    history.replaceState({}, '', '/');
+    return false;
+  }
+
+  // Not authed — check available auth methods.
   try {
     const res = await fetch('/api/auth-method');
     if (res.ok) {
-      const { method } = await res.json();
-      if (method === 'cf') {
-        // Cloudflare Access: redirect to our CF handler which reads the
-        // injected header and sets a session cookie, then sends us back to /.
-        window.location.href = '/auth/cf-access';
-        return false; // navigation in flight
+      const { methods } = await res.json();
+      if (methods.includes('cf')) {
+        // Try Cloudflare Access silently — only works when the CF JWT header
+        // is present (i.e. accessed via the Cloudflare tunnel).
+        // Falls through to login screen on failure (local/direct access).
+        const cfRes = await fetch('/auth/cf-access');
+        if (cfRes.ok || cfRes.redirected) {
+          // CF set a session cookie — reload to pick it up.
+          window.location.href = '/';
+          return false;
+        }
+        // CF failed (no header present) — fall through to login screen.
       }
     }
   } catch (e) {
-    // ignore — will fall through to login screen
+    // ignore — fall through to login screen
   }
 
   return false; // show login screen
@@ -285,7 +297,9 @@ async function showLoginError() {
     menu.show({
       title: 'AUTH FAILED',
       items: [{ label: 'TRY AGAIN', value: 'retry' }],
+      footer: 'A SELECT  B BACK',
       onSelect: () => { window.location.href = '/auth/google'; },
+      onBack: () => { showLoginScreen(); },
     });
   });
   // Intentionally never resolves — user must click TRY AGAIN
@@ -298,7 +312,8 @@ function showMainMenu() {
   menuOverlay.classList.add('hidden');
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
-  const name = state.user && (state.user.display_name || state.user.email) || '';
+  const rawName = state.user && (state.user.display_name || state.user.email) || '';
+  const name = rawName.length > 12 ? rawName.slice(0, 12) + '...' : rawName;
   menu.show({
     title: 'RUSTYBOY',
     items: [
@@ -312,7 +327,7 @@ function showMainMenu() {
         showRomList();
       } else if (item.value === 'logout') {
         fetch('/auth/logout', { method: 'POST' }).finally(() => {
-          window.location.href = '/';
+          window.location.href = '/?logged_out=1';
         });
       }
     },
