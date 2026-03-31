@@ -313,7 +313,7 @@ function showMainMenu() {
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
   const rawName = state.user && (state.user.display_name || state.user.email) || '';
-  const name = rawName.length > 12 ? rawName.slice(0, 12) + '...' : rawName;
+  const name = rawName.replace(/@[^@]+$/, '');
   menu.show({
     title: 'RUSTYBOY',
     items: [
