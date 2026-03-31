@@ -265,13 +265,17 @@ fn redirect_response(location: &str, cookie: Option<String>) -> Response {
 /// falling back to the configured `redirect_uri` if the header is absent.
 fn redirect_uri_from_request(headers: &axum::http::HeaderMap, configured: &str) -> String {
     if let Some(host) = headers.get("host").and_then(|v| v.to_str().ok()) {
-        // Infer scheme: assume https unless host is localhost or a bare IP
-        let scheme = if host.starts_with("localhost") || host.starts_with("127.") {
-            "http"
-        } else {
-            "https"
-        };
-        return format!("{}://{}/auth/google/callback", scheme, host);
+        // Strip optional port to check just the hostname
+        let hostname = host.split(':').next().unwrap_or(host);
+
+        // Only build a dynamic URI for named hosts (tunnel domains, localhost).
+        // Reject bare IPs — Google OAuth won't accept them as redirect URIs,
+        // and the configured OAUTH_REDIRECT_URI is the correct value to use.
+        let is_ip = hostname.parse::<std::net::IpAddr>().is_ok();
+        if !is_ip {
+            let scheme = if hostname == "localhost" { "http" } else { "https" };
+            return format!("{}://{}/auth/google/callback", scheme, host);
+        }
     }
     configured.to_string()
 }
@@ -526,11 +530,19 @@ pub async fn cf_access_login(
         }
     };
 
-    let user = match state.db.upsert_user(&claims.sub, &claims.email, &claims.email, None).await {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::error!("CF Access: upsert_user failed: {e}");
-            return redirect_response("/?auth_error=1", None);
+    // Prefer an existing user matched by email (e.g. previously logged in via Google)
+    // so that CF Access and Google OAuth resolve to the same account.
+    let user = if let Ok(Some(existing)) = state.db.get_user_by_email(&claims.email).await {
+        existing
+    } else {
+        // No existing user — create one using the email local-part as display name.
+        let display_name = claims.email.split('@').next().unwrap_or(&claims.email);
+        match state.db.upsert_user(&claims.sub, &claims.email, display_name, None).await {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!("CF Access: upsert_user failed: {e}");
+                return redirect_response("/?auth_error=1", None);
+            }
         }
     };
 
