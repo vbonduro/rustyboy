@@ -34,6 +34,7 @@ async fn main() {
         jwt_secret:    config::get_secret("JWT_SECRET"),
         cf_access_aud: config::get_secret("CF_ACCESS_AUD"),
         cf_certs_url,
+        dev_mode:      false, // never enabled in production
     };
     let http_client = reqwest::Client::new();
 

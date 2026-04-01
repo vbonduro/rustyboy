@@ -125,7 +125,7 @@ async fn api_me(
 }
 
 async fn api_auth_method(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if std::env::var("DEV_MODE").is_ok() {
+    if state.oauth.dev_mode {
         return Json(serde_json::json!({ "methods": ["dev"] }));
     }
     let mut methods = Vec::new();
