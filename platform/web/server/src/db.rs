@@ -600,4 +600,65 @@ mod tests {
             .unwrap();
         assert!(result.is_none());
     }
+
+    #[tokio::test]
+    async fn test_get_user_by_email_found() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_email", "vincent@example.com", "Vincent", None)
+            .await
+            .unwrap();
+        let fetched = db.get_user_by_email("vincent@example.com").await.unwrap().unwrap();
+        assert_eq!(fetched.id, user.id);
+        assert_eq!(fetched.email, "vincent@example.com");
+        assert_eq!(fetched.display_name, "Vincent");
+    }
+
+    #[tokio::test]
+    async fn test_get_user_by_email_missing() {
+        let db = new_db().await;
+        let result = db.get_user_by_email("nobody@example.com").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cf_login_reuses_existing_email_user() {
+        // Simulates: user logs in via Google first, then via CF Access with same email.
+        // CF login should resolve to the same user record (same id, same display_name).
+        let db = new_db().await;
+
+        // Google login creates user with full display name
+        let google_user = db
+            .upsert_user("google-sub-abc", "vincent@example.com", "Vincent Bonduro", None)
+            .await
+            .unwrap();
+
+        // CF login: look up by email first (as cf_access_login does)
+        let cf_user = if let Some(existing) = db.get_user_by_email("vincent@example.com").await.unwrap() {
+            existing
+        } else {
+            let display_name = "vincent@example.com".split('@').next().unwrap_or("vincent@example.com");
+            db.upsert_user("cf-sub-xyz", "vincent@example.com", display_name, None)
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(cf_user.id, google_user.id, "CF login should reuse the Google user record");
+        assert_eq!(cf_user.display_name, "Vincent Bonduro", "display_name should be preserved from Google login");
+    }
+
+    #[tokio::test]
+    async fn test_cf_login_creates_user_with_email_local_part() {
+        // When no existing user exists, CF login creates one using the email local-part.
+        let db = new_db().await;
+
+        let display_name = "vbonduro@example.com".split('@').next().unwrap_or("vbonduro@example.com");
+        let user = db
+            .upsert_user("cf-sub-new", "vbonduro@example.com", display_name, None)
+            .await
+            .unwrap();
+
+        assert_eq!(user.display_name, "vbonduro");
+        assert_eq!(user.email, "vbonduro@example.com");
+    }
 }

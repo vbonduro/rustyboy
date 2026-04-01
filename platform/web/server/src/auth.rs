@@ -549,3 +549,256 @@ pub async fn cf_access_login(
     let token = create_jwt(&user.id, &cfg.jwt_secret);
     redirect_response("/", Some(session_cookie(&token)))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use std::sync::Arc;
+
+    // ── redirect_uri_from_request ──────────────────────────────────────────
+
+    fn headers_with_host(host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("host", host.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn redirect_uri_uses_host_for_named_domain() {
+        let h = headers_with_host("rustyboy.example.com");
+        let uri = redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
+        assert_eq!(uri, "https://rustyboy.example.com/auth/google/callback");
+    }
+
+    #[test]
+    fn redirect_uri_uses_http_for_localhost() {
+        let h = headers_with_host("localhost:8080");
+        let uri = redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
+        assert_eq!(uri, "http://localhost:8080/auth/google/callback");
+    }
+
+    #[test]
+    fn redirect_uri_falls_back_for_ipv4() {
+        // Private IPs are rejected by Google OAuth; must use the configured URI.
+        let h = headers_with_host("192.168.2.254:9002");
+        let configured = "https://rustyboy.example.com/auth/google/callback";
+        let uri = redirect_uri_from_request(&h, configured);
+        assert_eq!(uri, configured);
+    }
+
+    #[test]
+    fn redirect_uri_falls_back_for_loopback_ip() {
+        let h = headers_with_host("127.0.0.1:8080");
+        let configured = "https://rustyboy.example.com/auth/google/callback";
+        let uri = redirect_uri_from_request(&h, configured);
+        assert_eq!(uri, configured);
+    }
+
+    #[test]
+    fn redirect_uri_uses_configured_when_no_host_header() {
+        let h = HeaderMap::new();
+        let configured = "https://rustyboy.example.com/auth/google/callback";
+        let uri = redirect_uri_from_request(&h, configured);
+        assert_eq!(uri, configured);
+    }
+
+    // ── CF Access handler ──────────────────────────────────────────────────
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    async fn test_app(oauth: OAuthConfig) -> axum::Router {
+        let db = crate::db::Database::connect(":memory:").await.unwrap();
+        let state = Arc::new(crate::AppState {
+            roms_dir: std::path::PathBuf::from("/tmp"),
+            static_dir: std::path::PathBuf::from("/tmp"),
+            db,
+            oauth,
+            http_client: reqwest::Client::new(),
+        });
+        crate::build_router(state)
+    }
+
+    fn make_cf_jwt(private_key: &RsaPrivateKey, aud: &str, sub: &str, email: &str) -> String {
+        #[derive(serde::Serialize)]
+        struct Claims<'a> {
+            sub: &'a str,
+            email: &'a str,
+            aud: &'a str,
+            exp: u64,
+        }
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let claims = Claims { sub, email, aud, exp };
+        let pem = rsa::pkcs1::EncodeRsaPrivateKey::to_pkcs1_pem(private_key, rsa::pkcs1::LineEnding::LF)
+            .unwrap();
+        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        encode(&header, &claims, &encoding_key).unwrap()
+    }
+
+    fn jwks_json(private_key: &RsaPrivateKey) -> serde_json::Value {
+        let pub_key = private_key.to_public_key();
+        let n = URL_SAFE_NO_PAD.encode(pub_key.n().to_bytes_be());
+        let e = URL_SAFE_NO_PAD.encode(pub_key.e().to_bytes_be());
+        json!({ "keys": [{ "kid": "test-key-1", "kty": "RSA", "n": n, "e": e }] })
+    }
+
+    /// Spawn a tiny HTTP server that returns `body` for every GET, return its base URL.
+    async fn mock_jwks_server(body: serde_json::Value) -> String {
+        use std::convert::Infallible;
+        use axum::response::Json as AxumJson;
+
+        let app = axum::Router::new().route(
+            "/certs",
+            axum::routing::get(move || {
+                let b = body.clone();
+                async move { Result::<AxumJson<serde_json::Value>, Infallible>::Ok(AxumJson(b)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}/certs", addr)
+    }
+
+    #[tokio::test]
+    async fn cf_access_login_no_jwt_header_redirects_auth_error() {
+        let app = test_app(OAuthConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            jwt_secret: "secret".to_string(),
+            cf_access_aud: "test-aud".to_string(),
+            cf_certs_url: "http://localhost:1/certs".to_string(), // unreachable — shouldn't be called
+        })
+        .await;
+
+        let res = app
+            .oneshot(Request::get("/auth/cf-access").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::FOUND);
+        let location = res.headers().get("location").unwrap().to_str().unwrap();
+        assert!(location.contains("auth_error"), "expected auth_error redirect, got: {location}");
+    }
+
+    #[tokio::test]
+    async fn cf_access_login_valid_jwt_sets_session_cookie() {
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let aud = "test-aud";
+        let jwt = make_cf_jwt(&private_key, aud, "cf-sub-1", "user@example.com");
+        let jwks_url = mock_jwks_server(jwks_json(&private_key)).await;
+
+        let app = test_app(OAuthConfig {
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: String::new(),
+            jwt_secret: "secret".to_string(),
+            cf_access_aud: aud.to_string(),
+            cf_certs_url: jwks_url,
+        })
+        .await;
+
+        let res = app
+            .oneshot(
+                Request::get("/auth/cf-access")
+                    .header("Cf-Access-Jwt-Assertion", jwt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::FOUND);
+        let location = res.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "/", "should redirect to / on success");
+        let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("rb_session="), "should set session cookie");
+    }
+
+    #[tokio::test]
+    async fn cf_access_login_reuses_existing_google_user() {
+        // Pre-create a user via Google (different sub, same email).
+        // CF login should issue a session for that same user record.
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let aud = "test-aud";
+        let email = "shared@example.com";
+        let jwt = make_cf_jwt(&private_key, aud, "cf-sub-shared", email);
+        let jwks_url = mock_jwks_server(jwks_json(&private_key)).await;
+
+        let db = crate::db::Database::connect(":memory:").await.unwrap();
+        // Simulate prior Google login
+        let google_user = db
+            .upsert_user("google-sub-shared", email, "Shared User", None)
+            .await
+            .unwrap();
+
+        let state = Arc::new(crate::AppState {
+            roms_dir: std::path::PathBuf::from("/tmp"),
+            static_dir: std::path::PathBuf::from("/tmp"),
+            db: db.clone(),
+            oauth: OAuthConfig {
+                client_id: String::new(),
+                client_secret: String::new(),
+                redirect_uri: String::new(),
+                jwt_secret: "secret".to_string(),
+                cf_access_aud: aud.to_string(),
+                cf_certs_url: jwks_url,
+            },
+            http_client: reqwest::Client::new(),
+        });
+        let app = crate::build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::get("/auth/cf-access")
+                    .header("Cf-Access-Jwt-Assertion", jwt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::FOUND);
+        let cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("rb_session="));
+
+        // Extract the JWT from the cookie and verify it resolves to the Google user
+        let token = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .trim_start_matches("rb_session=");
+        let payload = verify_jwt(token, "secret").unwrap();
+        assert_eq!(
+            payload.user_id, google_user.id,
+            "CF login should reuse the existing Google user id"
+        );
+
+        // Only one user record should exist for this email
+        let by_email = db.get_user_by_email(email).await.unwrap().unwrap();
+        assert_eq!(by_email.id, google_user.id);
+        assert_eq!(by_email.display_name, "Shared User");
+    }
+}
