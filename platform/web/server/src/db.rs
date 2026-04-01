@@ -70,8 +70,12 @@ impl Database {
     ) -> Result<User, sqlx::Error> {
         let now = now_secs();
 
-        // Try to update existing user first
-        let existing = self.get_user_by_google_sub(google_sub).await?;
+        // Look up by sub first, then fall back to email — this merges accounts
+        // that were created via different auth paths (CF Access vs Google OAuth).
+        let existing = match self.get_user_by_google_sub(google_sub).await? {
+            Some(u) => Some(u),
+            None => self.get_user_by_email(email).await?,
+        };
         if let Some(mut user) = existing {
             sqlx::query(
                 "UPDATE users SET email = ?, display_name = ?, avatar_url = ? WHERE id = ?",
@@ -622,29 +626,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cf_login_reuses_existing_email_user() {
-        // Simulates: user logs in via Google first, then via CF Access with same email.
-        // CF login should resolve to the same user record (same id, same display_name).
+    async fn test_google_then_cf_same_account() {
+        // Google login first → CF login second: same record, same display name.
         let db = new_db().await;
 
-        // Google login creates user with full display name
         let google_user = db
-            .upsert_user("google-sub-abc", "vincent@example.com", "Vincent Bonduro", None)
+            .upsert_user("google-sub-abc", "vincent@example.com", "vincent", None)
             .await
             .unwrap();
 
-        // CF login: look up by email first (as cf_access_login does)
-        let cf_user = if let Some(existing) = db.get_user_by_email("vincent@example.com").await.unwrap() {
-            existing
-        } else {
-            let display_name = "vincent@example.com".split('@').next().unwrap_or("vincent@example.com");
-            db.upsert_user("cf-sub-xyz", "vincent@example.com", display_name, None)
-                .await
-                .unwrap()
-        };
+        let cf_user = db
+            .upsert_user("cf-sub-xyz", "vincent@example.com", "vincent", None)
+            .await
+            .unwrap();
 
-        assert_eq!(cf_user.id, google_user.id, "CF login should reuse the Google user record");
-        assert_eq!(cf_user.display_name, "Vincent Bonduro", "display_name should be preserved from Google login");
+        assert_eq!(cf_user.id, google_user.id);
+        assert_eq!(cf_user.display_name, "vincent");
+    }
+
+    #[tokio::test]
+    async fn test_cf_then_google_same_account() {
+        // CF login first → Google login second: same record, same display name.
+        let db = new_db().await;
+
+        let cf_user = db
+            .upsert_user("cf-sub-xyz", "vincent@example.com", "vincent", None)
+            .await
+            .unwrap();
+
+        let google_user = db
+            .upsert_user("google-sub-abc", "vincent@example.com", "vincent", None)
+            .await
+            .unwrap();
+
+        assert_eq!(google_user.id, cf_user.id);
+        assert_eq!(google_user.display_name, "vincent");
     }
 
     #[tokio::test]

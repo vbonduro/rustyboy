@@ -385,13 +385,16 @@ pub async fn google_callback(
         }
     };
 
+    // Use email local-part as display name for consistency with CF Access login.
+    let display_name = userinfo.email.split('@').next().unwrap_or(&userinfo.email);
+
     // Upsert user in DB
     let user = match state
         .db
         .upsert_user(
             &userinfo.sub,
             &userinfo.email,
-            &userinfo.name,
+            display_name,
             userinfo.picture.as_deref(),
         )
         .await
@@ -530,19 +533,14 @@ pub async fn cf_access_login(
         }
     };
 
-    // Prefer an existing user matched by email (e.g. previously logged in via Google)
-    // so that CF Access and Google OAuth resolve to the same account.
-    let user = if let Ok(Some(existing)) = state.db.get_user_by_email(&claims.email).await {
-        existing
-    } else {
-        // No existing user — create one using the email local-part as display name.
-        let display_name = claims.email.split('@').next().unwrap_or(&claims.email);
-        match state.db.upsert_user(&claims.sub, &claims.email, display_name, None).await {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::error!("CF Access: upsert_user failed: {e}");
-                return redirect_response("/?auth_error=1", None);
-            }
+    // Use the email local-part as display name when creating a new CF user.
+    // upsert_user will merge with an existing email-matched record (e.g. from Google OAuth).
+    let display_name = claims.email.split('@').next().unwrap_or(&claims.email);
+    let user = match state.db.upsert_user(&claims.sub, &claims.email, display_name, None).await {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::error!("CF Access: upsert_user failed: {e}");
+            return redirect_response("/?auth_error=1", None);
         }
     };
 
@@ -748,9 +746,9 @@ mod tests {
         let jwks_url = mock_jwks_server(jwks_json(&private_key)).await;
 
         let db = crate::db::Database::connect(":memory:").await.unwrap();
-        // Simulate prior Google login
+        // Simulate prior Google login (both paths now use email local-part)
         let google_user = db
-            .upsert_user("google-sub-shared", email, "Shared User", None)
+            .upsert_user("google-sub-shared", email, "shared", None)
             .await
             .unwrap();
 
@@ -799,6 +797,6 @@ mod tests {
         // Only one user record should exist for this email
         let by_email = db.get_user_by_email(email).await.unwrap().unwrap();
         assert_eq!(by_email.id, google_user.id);
-        assert_eq!(by_email.display_name, "Shared User");
+        assert_eq!(by_email.display_name, "shared");
     }
 }
