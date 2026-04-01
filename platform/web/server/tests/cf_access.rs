@@ -128,6 +128,7 @@ async fn make_app(cf_aud: Option<&str>, certs_base_url: Option<&str>) -> (axum::
             jwt_secret:    "test-secret".to_string(),
             cf_access_aud: cf_aud.unwrap_or("").to_string(),
             cf_certs_url:  certs_url.unwrap_or_default(),
+            dev_mode:      false,
         },
         http_client: reqwest::Client::new(),
     });

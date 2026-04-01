@@ -28,17 +28,15 @@ async fn authed_app() -> (axum::Router, String, TempDir, TempDir) {
             jwt_secret:    "test-secret".to_string(),
             cf_access_aud: String::new(),
             cf_certs_url:  String::new(),
+            dev_mode:      true,
         },
         http_client: reqwest::Client::new(),
     });
 
-    // Login via DEV_MODE on the same state so the DB is shared
-    unsafe { std::env::set_var("DEV_MODE", "1"); }
     let login_res = build_router(state.clone())
         .oneshot(Request::builder().uri("/auth/google").body(Body::empty()).unwrap())
         .await
         .unwrap();
-    unsafe { std::env::remove_var("DEV_MODE"); }
 
     let cookie = login_res
         .headers()
@@ -82,14 +80,13 @@ async fn session_cookie_is_samesite_strict() {
             client_id: String::new(), client_secret: String::new(),
             redirect_uri: String::new(), jwt_secret: "s".to_string(),
             cf_access_aud: String::new(), cf_certs_url: String::new(),
+            dev_mode: true,
         },
         http_client: reqwest::Client::new(),
     });
-    unsafe { std::env::set_var("DEV_MODE", "1"); }
     let res = build_router(state)
         .oneshot(Request::builder().uri("/auth/google").body(Body::empty()).unwrap())
         .await.unwrap();
-    unsafe { std::env::remove_var("DEV_MODE"); }
 
     let cookie = cookie_header_value(&res, "rb_session").expect("no rb_session cookie");
     assert!(cookie.contains("SameSite=Strict"), "expected SameSite=Strict, got: {cookie}");

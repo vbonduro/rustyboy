@@ -26,6 +26,10 @@ pub struct OAuthConfig {
     /// URL of the Cloudflare Access public-key endpoint.
     /// Defaults to the standard CF endpoint; overrideable for tests.
     pub cf_certs_url: String,
+    /// Skip real OAuth and create a local dev user immediately.
+    /// Set via the DEV_MODE env var in production; set directly in tests
+    /// to avoid process-global env var races.
+    pub dev_mode: bool,
 }
 
 impl OAuthConfig {
@@ -43,6 +47,7 @@ impl OAuthConfig {
             jwt_secret:    std::env::var("JWT_SECRET").unwrap_or_default(),
             cf_access_aud: std::env::var("CF_ACCESS_AUD").unwrap_or_default(),
             cf_certs_url,
+            dev_mode:      false,
         }
     }
 }
@@ -285,7 +290,7 @@ pub async fn google_login(
     headers: axum::http::HeaderMap,
 ) -> Response {
     // DEV_MODE: skip real OAuth, create a local dev user immediately
-    if std::env::var("DEV_MODE").is_ok() {
+    if state.oauth.dev_mode {
         let user = match state
             .db
             .upsert_user("dev-user", "dev@localhost", "Dev User", None)
@@ -686,6 +691,7 @@ mod tests {
             jwt_secret: "secret".to_string(),
             cf_access_aud: "test-aud".to_string(),
             cf_certs_url: "http://localhost:1/certs".to_string(), // unreachable — shouldn't be called
+            dev_mode: false,
         })
         .await;
 
@@ -714,6 +720,7 @@ mod tests {
             jwt_secret: "secret".to_string(),
             cf_access_aud: aud.to_string(),
             cf_certs_url: jwks_url,
+            dev_mode: false,
         })
         .await;
 
@@ -763,6 +770,7 @@ mod tests {
                 jwt_secret: "secret".to_string(),
                 cf_access_aud: aud.to_string(),
                 cf_certs_url: jwks_url,
+                dev_mode: false,
             },
             http_client: reqwest::Client::new(),
         });
