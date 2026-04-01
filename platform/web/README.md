@@ -116,12 +116,23 @@ All secrets go in `secrets.env` (see [Managing secrets](#managing-secrets) below
 3. Under **Authorized redirect URIs** add: `https://yoursite.com/auth/google/callback`
 4. Copy the Client ID and Client Secret into `secrets.env`
 
-The redirect URI is auto-detected from the request's `Host` header — no server-side config needed.
+When you click "Sign in with Google", the server builds the OAuth redirect URI from the incoming request's `Host` header (e.g. `https://rustyboy.yourdomain.com/auth/google/callback`). This works automatically when accessed through a named domain like a Cloudflare tunnel.
+
+**Accessing via local IP alongside a Cloudflare tunnel**
+
+Google does not allow private IP addresses as OAuth redirect URIs, so initiating the OAuth flow from `http://192.168.x.x:8080` will fail with a `redirect_uri` error. Set `OAUTH_REDIRECT_URI` to your tunnel's callback URL to fix this:
+
+```sh
+OAUTH_REDIRECT_URI=https://rustyboy.yourdomain.com/auth/google/callback
+```
+
+When this is set and a request arrives from a bare IP, the server sends the configured URI to Google instead of building one from the IP. Google then redirects the browser back to your tunnel URL to complete the auth — which proxies to your server and sets the session cookie as normal. The end result is the same regardless of whether you initiated the flow from the tunnel or the local IP.
 
 | Variable | Where to find it |
 |---|---|
 | `GOOGLE_CLIENT_ID` | Google Cloud Console → Credentials → your OAuth client → Client ID (ends in `.apps.googleusercontent.com`) |
 | `GOOGLE_CLIENT_SECRET` | Same page → Client Secret (starts with `GOCSPX-`) |
+| `OAUTH_REDIRECT_URI` | Your tunnel callback URL — only needed when you also access the server via local IP. Set to `https://yoursite.com/auth/google/callback` |
 
 **Mode 2 — Cloudflare Access** (recommended for Cloudflare Tunnel deployments)
 
@@ -174,6 +185,9 @@ JWT_SECRET=<long random string>
 # Find at: console.cloud.google.com → APIs & Services → Credentials → your OAuth client
 GOOGLE_CLIENT_ID=<ends in .apps.googleusercontent.com>
 GOOGLE_CLIENT_SECRET=<starts with GOCSPX->
+# Only needed if you access the server via local IP as well as a tunnel/domain.
+# Set to your tunnel's callback URL so Google has a valid redirect target.
+OAUTH_REDIRECT_URI=https://yoursite.com/auth/google/callback
 
 # Cloudflare Access
 # CF_ACCESS_AUD: Cloudflare dashboard → Access → Applications → your app → Audience tag
