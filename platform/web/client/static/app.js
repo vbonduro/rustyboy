@@ -86,6 +86,8 @@ const state = {
   debugOverlay: false,  // toggle with D key
   user:         null,   // logged-in user object | null
   activeMenu:   null,   // MenuRenderer | null (canvas-based menu)
+  currentRomName: null, // name of the currently loaded ROM
+  batterySaveTimer: null, // setInterval id for periodic battery save upload
 };
 
 // ── Audio ───────────────────────────────────────────────────────────────────
@@ -145,6 +147,51 @@ function stopAudio() {
   if (state.audioNode) { state.audioNode.disconnect(); state.audioNode = null; }
   if (state.audioCtx)  { state.audioCtx.close(); state.audioCtx = null; }
   state._ring = null; state._ringSize = 0;
+}
+
+// ── Battery saves ──────────────────────────────────────────────────────────
+
+async function loadBatterySave(romName) {
+  try {
+    const res = await fetch(`/api/battery-saves/${encodeURIComponent(romName)}`);
+    if (res.ok) {
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > 0) {
+        state.emulator.set_battery_save(new Uint8Array(buf));
+        log.debug(`battery save loaded: ${buf.byteLength} bytes`);
+      }
+    }
+  } catch (e) {
+    log.warn(`battery save load failed: ${e}`);
+  }
+}
+
+async function uploadBatterySave(romName) {
+  if (!state.emulator) return;
+  const data = state.emulator.get_battery_save();
+  if (!data || data.length === 0) return;
+  try {
+    await fetch(`/api/battery-saves/${encodeURIComponent(romName)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: data,
+    });
+    log.debug(`battery save uploaded: ${data.length} bytes`);
+  } catch (e) {
+    log.warn(`battery save upload failed: ${e}`);
+  }
+}
+
+function startBatterySaveTimer(romName) {
+  stopBatterySaveTimer();
+  state.batterySaveTimer = setInterval(() => uploadBatterySave(romName), 30_000);
+}
+
+function stopBatterySaveTimer() {
+  if (state.batterySaveTimer) {
+    clearInterval(state.batterySaveTimer);
+    state.batterySaveTimer = null;
+  }
 }
 
 // ── DOM refs ───────────────────────────────────────────────────────────────
@@ -412,7 +459,7 @@ async function launchRom(name) {
   }
 
   // Tear down previous
-  stopEmulation();
+  await stopEmulation();
 
   // Create emulator
   try {
@@ -424,8 +471,12 @@ async function launchRom(name) {
   }
 
   state.lastRomName = name;
+  state.currentRomName = name;
   localStorage.setItem('lastRom', name);
   state.running = true;
+
+  await loadBatterySave(name);
+  startBatterySaveTimer(name);
 
   initAudio();
   playBootJingle();
@@ -443,23 +494,28 @@ async function launchRom(name) {
   startLoop();
 }
 
-function stopEmulation() {
+async function stopEmulation() {
   if (state.rafId) {
     cancelAnimationFrame(state.rafId);
     state.rafId = null;
+  }
+  stopBatterySaveTimer();
+  if (state.emulator && state.currentRomName) {
+    await uploadBatterySave(state.currentRomName);
   }
   if (state.emulator) {
     state.emulator.free?.();
     state.emulator = null;
   }
+  state.currentRomName = null;
   state.running = false;
   stopAudio();
   screenInner.classList.remove('running', 'booting');
   screenBezel.classList.remove('running');
 }
 
-function returnToMenu() {
-  stopEmulation();
+async function returnToMenu() {
+  await stopEmulation();
   setLed('menu');
   showMainMenu();
 }
