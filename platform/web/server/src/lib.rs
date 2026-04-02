@@ -5,6 +5,7 @@ pub mod db;
 use auth::{AuthUser, DbExt, JwtSecretExt};
 use axum::{
     Router,
+    body::Bytes,
     extract::{Path, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -33,6 +34,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(serve_index))
         .route("/api/roms", get(list_roms))
         .route("/api/me", get(api_me))
+        .route("/api/battery-saves/:rom_name", get(get_battery_save).put(put_battery_save))
         .route("/api/auth-method", get(api_auth_method))
         .route("/roms/:name", get(serve_rom))
         .route("/auth/google", get(auth::google_login))
@@ -139,6 +141,38 @@ async fn api_auth_method(State(state): State<Arc<AppState>>) -> impl IntoRespons
         methods.push("google"); // fallback
     }
     Json(serde_json::json!({ "methods": methods }))
+}
+
+async fn get_battery_save(
+    auth: AuthUser,
+    Path(rom_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.get_battery_save(&auth.user_id, &rom_name).await {
+        Ok(Some(bs)) => (
+            StatusCode::OK,
+            [("content-type", "application/octet-stream")],
+            bs.data,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn put_battery_save(
+    auth: AuthUser,
+    Path(rom_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if body.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match state.db.upsert_battery_save(&auth.user_id, &rom_name, body.to_vec()).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn dev_log(body: String) -> StatusCode {
