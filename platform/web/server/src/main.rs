@@ -30,12 +30,21 @@ async fn main() {
     let oauth = OAuthConfig {
         client_id:     config::get_secret("GOOGLE_CLIENT_ID"),
         client_secret: config::get_secret("GOOGLE_CLIENT_SECRET"),
-        redirect_uri:  String::new(), // derived from request Host header at runtime
+        redirect_uri:  config::get_secret("OAUTH_REDIRECT_URI"),
         jwt_secret:    config::get_secret("JWT_SECRET"),
         cf_access_aud: config::get_secret("CF_ACCESS_AUD"),
         cf_certs_url,
         dev_mode:      std::env::var("DEV_MODE").is_ok(),
     };
+
+    tracing::info!(
+        "auth config: dev_mode={} google_client_id={} redirect_uri={:?} cf_access_aud={} cf_certs_url={}",
+        oauth.dev_mode,
+        if oauth.client_id.is_empty() { "(not set)" } else { "(set)" },
+        if oauth.redirect_uri.is_empty() { "(not set — will derive from Host header)" } else { &oauth.redirect_uri },
+        if oauth.cf_access_aud.is_empty() { "(not set)" } else { "(set)" },
+        if oauth.cf_certs_url.is_empty() { "(not set)" } else { "(set)" },
+    );
     let http_client = reqwest::Client::new();
 
     let state = Arc::new(AppState {

@@ -308,6 +308,12 @@ pub async fn google_login(
 
     let cfg = &state.oauth;
     let redirect_uri = redirect_uri_from_request(&headers, &cfg.redirect_uri);
+    tracing::debug!(
+        "google_login: host={:?} configured_redirect_uri={:?} resolved_redirect_uri={:?}",
+        headers.get("host").and_then(|v| v.to_str().ok()),
+        if cfg.redirect_uri.is_empty() { "(not set)" } else { &cfg.redirect_uri },
+        redirect_uri,
+    );
     let url = format!(
         "https://accounts.google.com/o/oauth2/v2/auth\
          ?client_id={}\
@@ -339,6 +345,11 @@ pub async fn google_callback(
 
     let cfg = &state.oauth;
     let redirect_uri = redirect_uri_from_request(&headers, &cfg.redirect_uri);
+    tracing::debug!(
+        "google_callback: host={:?} resolved_redirect_uri={:?}",
+        headers.get("host").and_then(|v| v.to_str().ok()),
+        redirect_uri,
+    );
 
     // Exchange code for tokens
     let token_res = state
