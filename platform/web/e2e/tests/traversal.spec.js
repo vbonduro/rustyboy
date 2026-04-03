@@ -205,12 +205,12 @@ test('T4: login Enter triggers auth and lands on main menu', async ({ page, requ
   await page.waitForFunction(
     () => window.__appState && window.__appState.activeMenu && window.__appState.activeMenu._opts &&
           window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+          window.__appState.activeMenu._opts.items.some(i => i.value === 'games'),
     { timeout: 5000 }
   );
 
   expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
-  expect(await activeMenuItems(page)).toContain('play');
+  expect(await activeMenuItems(page)).toContain('games');
 });
 
 // T5: Login screen tap on item triggers login
@@ -230,11 +230,11 @@ test('T5: login screen tap on first item triggers navigation to /auth/google', a
     () => window.__appState && window.__appState.activeMenu &&
           window.__appState.activeMenu._opts &&
           window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+          window.__appState.activeMenu._opts.items.some(i => i.value === 'games'),
     { timeout: 5000 }
   );
 
-  expect(await activeMenuItems(page)).toContain('play');
+  expect(await activeMenuItems(page)).toContain('games');
 });
 
 // T6: Authenticated load → main menu
@@ -246,12 +246,12 @@ test('T6: authenticated load shows main menu', async ({ page, request }) => {
   expect(title).toBe('RUSTYBOY');
 
   const items = await activeMenuItems(page);
-  expect(items).toContain('play');
+  expect(items).toContain('games');
   expect(items).toContain('logout');
 });
 
-// T7: Main menu default selection is PLAY (idx 0)
-test('T7: main menu default selection is PLAY', async ({ page, request }) => {
+// T7: Main menu default selection is GAMES (idx 0)
+test('T7: main menu default selection is GAMES', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
 
@@ -259,7 +259,7 @@ test('T7: main menu default selection is PLAY', async ({ page, request }) => {
   expect(idx).toBe(0);
 
   const items = await activeMenuItems(page);
-  expect(items[0]).toBe('play');
+  expect(items[0]).toBe('games');
 });
 
 // T8: Main menu ArrowDown moves to LOGOUT
@@ -440,12 +440,12 @@ test('T17: ROM list Escape returns to main menu', async ({ page, request }) => {
     () => window.__appState && window.__appState.activeMenu &&
           window.__appState.activeMenu._opts &&
           window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+          window.__appState.activeMenu._opts.items.some(i => i.value === 'games'),
     { timeout: 3000 }
   );
 
   expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
-  expect(await activeMenuItems(page)).toContain('play');
+  expect(await activeMenuItems(page)).toContain('games');
 });
 
 // T18: ROM list Enter launches selected ROM (menu dismissed, emulator running)
@@ -499,72 +499,63 @@ test('T19: ROM list tap on item launches emulator', async ({ page, request }) =>
   expect(await isRunning(page)).toBe(true);
 });
 
-// T20: Power button during game → main menu
-test('T20: power button while running returns to main menu', async ({ page, request }) => {
+// T20: Power button during game → in-game pause menu (still running, paused)
+test('T20: power button while running shows in-game pause menu', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
 
-  // Navigate to ROM list and launch
-  await menuKey(page, 'Enter');
+  await menuKey(page, 'Enter'); // GAMES
   await page.waitForFunction(
-    () => window.__appState && window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.title === 'SELECT GAME',
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME',
     { timeout: 3000 }
   );
-  await menuKey(page, 'Enter');
+  await menuKey(page, 'Enter'); // launch
   await page.waitForFunction(
-    () => window.__appState && window.__appState.running === true,
+    () => window.__appState?.running === true,
     { timeout: 5000 }
   );
 
-  // Click power button
   await page.click('#powerBtn');
 
   await page.waitForFunction(
-    () => window.__appState && window.__appState.running === false &&
-          window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+    () => window.__appState?.paused === true &&
+          window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'resume'),
     { timeout: 3000 }
   );
 
-  expect(await isRunning(page)).toBe(false);
-  expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
+  expect(await isRunning(page)).toBe(true);
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(true);
+  expect(await activeMenuItems(page)).toContain('resume');
+  expect(await activeMenuItems(page)).toContain('quit');
 });
 
-// T21: Backspace key during game → main menu
-test('T21: Backspace key while running returns to main menu', async ({ page, request }) => {
+// T21: Backspace key during game → in-game pause menu
+test('T21: Backspace key while running shows in-game pause menu', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
 
-  await menuKey(page, 'Enter');
+  await menuKey(page, 'Enter'); // GAMES
   await page.waitForFunction(
-    () => window.__appState && window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.title === 'SELECT GAME',
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME',
     { timeout: 3000 }
   );
-  await menuKey(page, 'Enter');
+  await menuKey(page, 'Enter'); // launch
   await page.waitForFunction(
-    () => window.__appState && window.__appState.running === true,
+    () => window.__appState?.running === true,
     { timeout: 5000 }
   );
 
   await page.keyboard.press('Backspace');
 
   await page.waitForFunction(
-    () => window.__appState && window.__appState.running === false &&
-          window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+    () => window.__appState?.paused === true &&
+          window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'resume'),
     { timeout: 3000 }
   );
 
-  expect(await isRunning(page)).toBe(false);
-  expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
+  expect(await isRunning(page)).toBe(true);
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(true);
+  expect(await activeMenuItems(page)).toContain('resume');
 });
 
 // T22: Zero ROMs → error screen
@@ -603,7 +594,7 @@ test('T23: error screen Escape returns to main menu', async ({ page, request }) 
     () => window.__appState && window.__appState.activeMenu &&
           window.__appState.activeMenu._opts &&
           window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'play'),
+          window.__appState.activeMenu._opts.items.some(i => i.value === 'games'),
     { timeout: 3000 }
   );
 
@@ -614,7 +605,7 @@ test('T23: error screen Escape returns to main menu', async ({ page, request }) 
 
 async function cyclePlayBack(page) {
   await page.waitForFunction(
-    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'play'),
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
     { timeout: 3000 }
   );
   await page.evaluate(() => { if (window.__appState?.activeMenu) window.__appState.activeMenu._selIdx = 0; });
@@ -625,7 +616,7 @@ async function cyclePlayBack(page) {
   );
   await menuKey(page, 'Escape');
   await page.waitForFunction(
-    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'play'),
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
     { timeout: 3000 }
   );
 }
@@ -644,7 +635,7 @@ async function cycleLogin(page) {
   await menuKey(page, 'Enter');
   await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 5000 });
   await page.waitForFunction(
-    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'play'),
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
     { timeout: 5000 }
   );
 }
@@ -710,7 +701,7 @@ test('T25: two login→play→back→logout cycles — menu stays navigable thro
       page.waitForNavigation({ waitUntil: 'networkidle', timeout: 5000 }),
       select(page),
     ]);
-    await waitForItems('play');
+    await waitForItems('games');
 
     // Main menu: d-pad works
     expect(await activeMenuSelIdx(page)).toBe(0);
@@ -733,7 +724,7 @@ test('T25: two login→play→back→logout cycles — menu stays navigable thro
 
     // B → back to main menu
     await back(page);
-    await waitForItems('play');
+    await waitForItems('games');
 
     // Main menu still navigable after returning (the bug this test catches)
     expect(await activeMenuSelIdx(page)).toBe(0);
@@ -814,7 +805,7 @@ test('T26: mobile tap on login item navigates to main menu', async ({ page, requ
     tapCanvas(page, 80, 23),
   ]);
 
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
   expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
 });
 
@@ -822,7 +813,7 @@ test('T26: mobile tap on login item navigates to main menu', async ({ page, requ
 test('T27: mobile d-pad down moves main menu selection', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   expect(await activeMenuSelIdx(page)).toBe(0);
   await tapButton(page, '[data-btn="3"]'); // Down
@@ -835,7 +826,7 @@ test('T27: mobile d-pad down moves main menu selection', async ({ page, request 
 test('T28: mobile A button on PLAY opens ROM list', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   await tapButton(page, '[data-btn="4"]'); // A
   await waitForMenuTitle(page, 'SELECT GAME');
@@ -845,13 +836,13 @@ test('T28: mobile A button on PLAY opens ROM list', async ({ page, request }) =>
 test('T29: mobile B button on ROM list returns to main menu', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   await tapButton(page, '[data-btn="4"]'); // A → ROM list
   await waitForMenuTitle(page, 'SELECT GAME');
 
   await tapButton(page, '[data-btn="5"]'); // B → back
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 });
 
 // T30: mobile — d-pad still works on main menu after returning from ROM list via B
@@ -859,13 +850,13 @@ test('T29: mobile B button on ROM list returns to main menu', async ({ page, req
 test('T30: mobile d-pad navigable on main menu after B back from ROM list', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   // Go into ROM list and back
   await tapButton(page, '[data-btn="4"]'); // A → ROM list
   await waitForMenuTitle(page, 'SELECT GAME');
   await tapButton(page, '[data-btn="5"]'); // B → main menu
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   // D-pad must still work — this is what froze on mobile
   expect(await activeMenuSelIdx(page)).toBe(0);
@@ -888,7 +879,7 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
       page.waitForNavigation({ waitUntil: 'networkidle', timeout: 5000 }),
       tapCanvas(page, 80, 23),
     ]);
-    await waitForMenuItems(page, 'play');
+    await waitForMenuItems(page, 'games');
 
     // D-pad works on main menu
     expect(await activeMenuSelIdx(page)).toBe(0);
@@ -909,7 +900,7 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
 
     // B → back to main menu
     await tapButton(page, '[data-btn="5"]');
-    await waitForMenuItems(page, 'play');
+    await waitForMenuItems(page, 'games');
 
     // D-pad still works after returning — the bug
     expect(await activeMenuSelIdx(page)).toBe(0);
@@ -932,7 +923,7 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
 test('T32: canvas tap fires touch+pointer — d-pad still works after', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   // A → ROM list via canvas tap (fires both touch and pointer events like real mobile)
   await page.evaluate(() => {
@@ -956,7 +947,7 @@ test('T32: canvas tap fires touch+pointer — d-pad still works after', async ({
 
   // B → back
   await tapButton(page, '[data-btn="5"]');
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   // D-pad must work
   expect(await activeMenuSelIdx(page)).toBe(0);
@@ -969,7 +960,7 @@ test('T32: canvas tap fires touch+pointer — d-pad still works after', async ({
 test('T33: touch ending outside canvas bounds does not trigger menu selection', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   // Touch starts on canvas (inside), ends at a position outside canvas bounds
   const triggered = await page.evaluate(() => {
@@ -1007,7 +998,7 @@ test('T33: touch ending outside canvas bounds does not trigger menu selection', 
 test('T34: B button on main menu does not hide menu', async ({ page, request }) => {
   await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'play');
+  await waitForMenuItems(page, 'games');
 
   await tapButton(page, '[data-btn="5"]'); // B on main menu
 
@@ -1028,4 +1019,357 @@ test('T35: B button on login screen does not hide menu', async ({ page, request 
 
   expect(await hasActiveMenu(page)).toBe(true);
   expect(await activeMenuItems(page)).toContain('login');
+});
+
+// ── Pause menu bug regression tests ──────────────────────────────────────────
+
+/** Helper: launch a game and wait until running. */
+async function launchGame(page, request) {
+  await setServerState(request, { authed: true, roms: ['Tetris.gb'], saveStates: [] });
+  await loadApp(page);
+  await waitForMenuItems(page, 'games');
+  await menuKey(page, 'Enter'); // GAMES → ROM list
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME',
+    { timeout: 3000 }
+  );
+  await menuKey(page, 'Enter'); // launch Tetris
+  await page.waitForFunction(
+    () => window.__appState?.running === true,
+    { timeout: 5000 }
+  );
+}
+
+// T36: Face buttons (A/B) work in the in-game pause menu
+// Regression: sendButton routed to emulator while paused, ignoring the menu.
+test('T36: A button selects item in in-game pause menu', async ({ page, request }) => {
+  await launchGame(page, request);
+
+  // Open in-game menu
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true &&
+          window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'resume'),
+    { timeout: 3000 }
+  );
+
+  // Press A (data-btn="4") — should select RESUME and unpause
+  await tapButton(page, '[data-btn="4"]');
+
+  await page.waitForFunction(
+    () => window.__appState?.paused === false && window.__appState?.running === true,
+    { timeout: 3000 }
+  );
+
+  expect(await isRunning(page)).toBe(true);
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(false);
+});
+
+// T37: B button in in-game pause menu resumes the game
+// Regression: same routing bug — B press went to emulator, not menu onBack.
+test('T37: B button in in-game pause menu resumes game', async ({ page, request }) => {
+  await launchGame(page, request);
+
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true &&
+          window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+
+  // Press B (data-btn="5") — should call onBack → resumeEmulation
+  await tapButton(page, '[data-btn="5"]');
+
+  await page.waitForFunction(
+    () => window.__appState?.paused === false && window.__appState?.running === true,
+    { timeout: 3000 }
+  );
+
+  expect(await isRunning(page)).toBe(true);
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(false);
+});
+
+// T42: Hammering POWER many times then QUIT leaves clean main-menu state
+// Regression: concurrent showInGameMenu invocations fought over canvas; stale menu showed after quit.
+test('T42: hammer power button many times then quit leaves clean state', async ({ page, request }) => {
+  await launchGame(page, request);
+
+  // Hammer the power button 5 times rapidly (odd = should end paused)
+  for (let i = 0; i < 5; i++) {
+    await page.click('#powerBtn');
+  }
+
+  // Wait for a stable paused state with an active menu
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 5000 }
+  );
+
+  // Navigate to QUIT and select it
+  const items = await activeMenuItems(page);
+  const quitIdx = items.indexOf('quit');
+  for (let i = 0; i < quitIdx; i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter');
+
+  await page.waitForFunction(
+    () => window.__appState?.running === false &&
+          window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
+    { timeout: 3000 }
+  );
+
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(false);
+  expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
+  expect(await activeMenuItems(page)).not.toContain('resume');
+});
+
+// T39: Rapid POWER toggle then QUIT leaves app in clean main-menu state (no stale pause menu)
+// Regression: async showInGameMenu fetch resolved after quit, stamping pause menu over main menu.
+test('T39: rapid open/close then quit leaves clean main menu state', async ({ page, request }) => {
+  await launchGame(page, request);
+
+  // Open pause menu
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+
+  // Immediately resume before the fetch could have resolved cleanly
+  await tapButton(page, '[data-btn="5"]'); // B → resume
+  await page.waitForFunction(
+    () => window.__appState?.paused === false && window.__appState?.running === true,
+    { timeout: 3000 }
+  );
+
+  // Open again and quit
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+
+  // Navigate down to QUIT and select it
+  const items = await activeMenuItems(page);
+  const quitIdx = items.indexOf('quit');
+  for (let i = 0; i < quitIdx; i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter'); // QUIT
+
+  await page.waitForFunction(
+    () => window.__appState?.running === false &&
+          window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
+    { timeout: 3000 }
+  );
+
+  // State must be clean: not paused, main menu showing, no stale pause menu
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(false);
+  expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
+  expect(await activeMenuItems(page)).not.toContain('resume');
+  expect(await activeMenuItems(page)).toContain('games');
+});
+
+// T38: Opening and closing the pause menu multiple times keeps it functional
+// Regression: stale RAF loop generation caused menu to stop opening after several cycles.
+test('T38: pause menu opens correctly after multiple open/close cycles', async ({ page, request }) => {
+  await launchGame(page, request);
+
+  for (let i = 0; i < 4; i++) {
+    // Open menu
+    await page.click('#powerBtn');
+    await page.waitForFunction(
+      () => window.__appState?.paused === true &&
+            window.__appState?.activeMenu?.isActive(),
+      { timeout: 3000 }
+    );
+
+    // Close via B (resume)
+    await tapButton(page, '[data-btn="5"]');
+    await page.waitForFunction(
+      () => window.__appState?.paused === false && window.__appState?.running === true,
+      { timeout: 3000 }
+    );
+  }
+
+  // After 4 cycles, menu must still open
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true &&
+          window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+
+  expect(await page.evaluate(() => window.__appState.paused)).toBe(true);
+  expect(await hasActiveMenu(page)).toBe(true);
+  expect(await activeMenuItems(page)).toContain('resume');
+});
+
+// T40: B button on LOAD STATE screen deletes the selected save slot
+// After deletion the slot is removed from the list; if list becomes empty, go back.
+test('T40: B on load state screen deletes selected save slot', async ({ page, request }) => {
+  await setServerState(request, {
+    authed: true,
+    roms: ['Tetris.gb'],
+    saveStates: [
+      { id: 'ss-1', rom_name: 'Tetris.gb', slot_name: '1000', updated_at: 1000 },
+      { id: 'ss-2', rom_name: 'Tetris.gb', slot_name: '2000', updated_at: 2000 },
+    ],
+  });
+  await loadApp(page);
+  await waitForMenuItems(page, 'games');
+
+  // Navigate to GAMES (may not be index 0 if CONTINUE is present)
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
+    { timeout: 3000 }
+  );
+  const mainItems = await activeMenuItems(page);
+  for (let i = 0; i < mainItems.indexOf('games'); i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter'); // GAMES
+
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME', { timeout: 3000 }
+  );
+  await menuKey(page, 'Enter'); // launch Tetris
+  await page.waitForFunction(() => window.__appState?.running === true, { timeout: 5000 });
+
+  // Open pause menu → LOAD
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+  const pauseItems = await activeMenuItems(page);
+  const loadIdx = pauseItems.indexOf('load');
+  for (let i = 0; i < loadIdx; i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter'); // select LOAD
+
+  // Load state list should be showing with 2 items
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'LOAD STATE', { timeout: 3000 }
+  );
+  const slotsBefore = await activeMenuItems(page);
+  expect(slotsBefore.length).toBe(2);
+
+  // Press B to delete the selected (top = most recent = ss-2)
+  await menuKey(page, 'Escape'); // B key
+
+  // List should now have 1 item
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'LOAD STATE' &&
+          window.__appState?.activeMenu?._opts?.items?.length === 1,
+    { timeout: 3000 }
+  );
+  const slotsAfter = await activeMenuItems(page);
+  expect(slotsAfter.length).toBe(1);
+  expect(slotsAfter).not.toContain('ss-2');
+});
+
+// T43: Marquee RAF loop stops when pause menu is dismissed via power button resume
+// Regression: power-button resume set state.activeMenu=null BEFORE calling resumeEmulation(),
+// so resumeEmulation()'s hide() guard found null and never called hide(), leaving the
+// marquee RAF loop running and continuously overpainting the canvas with the old title.
+test('T43: marquee RAF loop stops after power-button resume on marquee-title game', async ({ page, request }) => {
+  // Use a long ROM name that will overflow the 160px header and trigger marquee.
+  const longRomName = 'A Very Long Game Title That Will Overflow The Header Area.gb';
+  await setServerState(request, {
+    authed: true,
+    roms: [longRomName],
+    saveStates: [],
+  });
+  await loadApp(page);
+  await waitForMenuItems(page, 'games');
+
+  // Navigate to GAMES → select the long-named ROM
+  const mainItems = await activeMenuItems(page);
+  for (let i = 0; i < mainItems.indexOf('games'); i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter');
+
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME', { timeout: 3000 }
+  );
+  await menuKey(page, 'Enter');
+  await page.waitForFunction(() => window.__appState?.running === true, { timeout: 5000 });
+
+  // Open pause menu via power button (shows long ROM title → triggers marquee)
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+
+  // Capture the paused menu renderer instance reference
+  await page.evaluate(() => {
+    window._pauseMenuRef = window.__appState.activeMenu;
+  });
+
+  // Verify marquee RAF is running (long title should have started it)
+  const rafRunningBefore = await page.evaluate(
+    () => window._pauseMenuRef._marqueeRafId !== null
+  );
+  expect(rafRunningBefore).toBe(true);
+
+  // Resume via power button (the bug: this used to null activeMenu before resumeEmulation,
+  // so hide() was never called and the marquee RAF kept running)
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === false && window.__appState?.running === true,
+    { timeout: 3000 }
+  );
+
+  // The OLD menu renderer's RAF loop must now be stopped
+  const rafRunningAfter = await page.evaluate(
+    () => window._pauseMenuRef._marqueeRafId !== null
+  );
+  expect(rafRunningAfter).toBe(false);
+});
+
+// T41: Deleting the last save slot on the LOAD STATE screen goes back to pause menu
+test('T41: deleting last save slot returns to pause menu', async ({ page, request }) => {
+  await setServerState(request, {
+    authed: true,
+    roms: ['Tetris.gb'],
+    saveStates: [
+      { id: 'ss-only', rom_name: 'Tetris.gb', slot_name: '1000', updated_at: 1000 },
+    ],
+  });
+  await loadApp(page);
+  await waitForMenuItems(page, 'games');
+
+  // Navigate to GAMES
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'games'),
+    { timeout: 3000 }
+  );
+  const mainItems = await activeMenuItems(page);
+  for (let i = 0; i < mainItems.indexOf('games'); i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter'); // GAMES
+
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME', { timeout: 3000 }
+  );
+  await menuKey(page, 'Enter');
+  await page.waitForFunction(() => window.__appState?.running === true, { timeout: 5000 });
+
+  await page.click('#powerBtn');
+  await page.waitForFunction(
+    () => window.__appState?.paused === true && window.__appState?.activeMenu?.isActive(),
+    { timeout: 3000 }
+  );
+  const pauseItems = await activeMenuItems(page);
+  const loadIdx = pauseItems.indexOf('load');
+  for (let i = 0; i < loadIdx; i++) await menuKey(page, 'ArrowDown');
+  await menuKey(page, 'Enter');
+
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.title === 'LOAD STATE', { timeout: 3000 }
+  );
+
+  // Delete the only slot
+  await menuKey(page, 'Escape'); // B = delete
+
+  // Should be back at pause menu (no more saves → onBack called)
+  await page.waitForFunction(
+    () => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === 'resume'),
+    { timeout: 3000 }
+  );
+  expect(await activeMenuItems(page)).toContain('resume');
 });

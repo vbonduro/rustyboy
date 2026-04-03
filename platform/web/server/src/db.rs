@@ -292,6 +292,52 @@ impl Database {
         }))
     }
 
+    /// Returns the most recent save state for a given user+rom, without the blob data.
+    pub async fn get_latest_save_state(&self, user_id: &str, rom_name: &str) -> Result<Option<SaveState>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT id, user_id, rom_name, slot_name, created_at, updated_at, data
+             FROM save_states WHERE user_id = ? AND rom_name = ?
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(rom_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| SaveState {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            rom_name: r.get("rom_name"),
+            slot_name: r.get("slot_name"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+            data: r.get("data"),
+        }))
+    }
+
+    pub async fn delete_save_state(&self, id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM save_states WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Returns one row per rom_name the user has saves for, with the most recent updated_at.
+    pub async fn list_roms_with_saves(&self, user_id: &str) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT rom_name, MAX(updated_at) as last_saved
+             FROM save_states WHERE user_id = ?
+             GROUP BY rom_name
+             ORDER BY last_saved DESC",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.get("rom_name"), r.get("last_saved"))).collect())
+    }
+
     // --- Battery Saves ---
 
     pub async fn upsert_battery_save(
@@ -676,5 +722,85 @@ mod tests {
 
         assert_eq!(user.display_name, "vbonduro");
         assert_eq!(user.email, "vbonduro@example.com");
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_save_state_returns_most_recent() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_latest", "latest@example.com", "Latest", None)
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "link.gb", "slot1", vec![1]).await.unwrap();
+        db.upsert_save_state(&user.id, "link.gb", "slot2", vec![2]).await.unwrap();
+        // Force slot2 to have a clearly later updated_at so ORDER BY is deterministic
+        sqlx::query("UPDATE save_states SET updated_at = updated_at + 10 WHERE slot_name = 'slot2'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let latest = db.get_latest_save_state(&user.id, "link.gb").await.unwrap().unwrap();
+        assert_eq!(latest.slot_name, "slot2");
+        assert_eq!(latest.data, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_save_state_missing() {
+        let db = new_db().await;
+        let result = db
+            .get_latest_save_state("00000000-0000-0000-0000-000000000000", "none.gb")
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_roms_with_saves_returns_distinct_roms() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_roms", "roms@example.com", "Roms", None)
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "tetris.gb", "slot1", vec![1]).await.unwrap();
+        db.upsert_save_state(&user.id, "tetris.gb", "slot2", vec![2]).await.unwrap();
+        db.upsert_save_state(&user.id, "mario.gb",  "slot1", vec![3]).await.unwrap();
+
+        let roms = db.list_roms_with_saves(&user.id).await.unwrap();
+        assert_eq!(roms.len(), 2);
+        let names: Vec<&str> = roms.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"tetris.gb"));
+        assert!(names.contains(&"mario.gb"));
+    }
+
+    #[tokio::test]
+    async fn test_list_roms_with_saves_empty() {
+        let db = new_db().await;
+        let roms = db
+            .list_roms_with_saves("00000000-0000-0000-0000-000000000000")
+            .await
+            .unwrap();
+        assert!(roms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_save_state() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_del", "del@example.com", "Del", None)
+            .await
+            .unwrap();
+        let ss = db
+            .upsert_save_state(&user.id, "wario.gb", "slot1", vec![7, 8, 9])
+            .await
+            .unwrap();
+
+        // Verify it exists
+        assert!(db.get_save_state(&ss.id).await.unwrap().is_some());
+
+        // Delete it
+        db.delete_save_state(&ss.id).await.unwrap();
+
+        // Verify it's gone
+        assert!(db.get_save_state(&ss.id).await.unwrap().is_none());
     }
 }

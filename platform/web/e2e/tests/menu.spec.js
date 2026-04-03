@@ -219,6 +219,74 @@ test('tap on item calls onSelect', async ({ page }) => {
   expect(tapped.value).toBe('tetris');
 });
 
+// Marquee tests — title scrolling behavior
+
+test('short title has zero marquee offset', async ({ page }) => {
+  await loadMenuPage(page);
+  await showMenu(page, {
+    title: 'HI',
+    items: [{ label: 'x', value: 'x' }],
+  });
+
+  // Short title fits — marquee offset should stay 0
+  await page.waitForTimeout(200);
+  const offset = await page.evaluate(() => window._testMenu._marqueeOffset);
+  expect(offset).toBe(0);
+});
+
+test('long title starts at zero offset then scrolls after 1s pause', async ({ page }) => {
+  await loadMenuPage(page);
+  // Title long enough to overflow the 160px header at 8px monospace
+  await showMenu(page, {
+    title: 'SUPER LONG GAME TITLE THAT WILL NOT FIT',
+    items: [{ label: 'x', value: 'x' }],
+  });
+
+  // Immediately after show, offset should be 0 (in the pause phase)
+  const offsetAtStart = await page.evaluate(() => window._testMenu._marqueeOffset);
+  expect(offsetAtStart).toBe(0);
+
+  // After >1s the scroll should have begun (offset > 0)
+  await page.waitForTimeout(1400);
+  const offsetAfterPause = await page.evaluate(() => window._testMenu._marqueeOffset);
+  expect(offsetAfterPause).toBeGreaterThan(0);
+});
+
+test('marquee resets to zero after title scrolls fully off screen', async ({ page }) => {
+  await loadMenuPage(page);
+  await showMenu(page, {
+    title: 'SUPER LONG GAME TITLE THAT WILL NOT FIT',
+    items: [{ label: 'x', value: 'x' }],
+  });
+
+  // _marqueeScrollMax is the total px to scroll before reset (TEXT_PAD + titleWidth)
+  // Fast-forward: force scroll phase with phaseAt far in the past so elapsed > scrollMax
+  await page.evaluate(() => {
+    const menu = window._testMenu;
+    menu._marqueePhase   = 'scroll';
+    menu._marqueePhaseAt = performance.now() - 100000; // 100s ago → way past any title width
+  });
+
+  // Give one RAF tick to process
+  await page.waitForTimeout(100);
+
+  const offset = await page.evaluate(() => window._testMenu._marqueeOffset);
+  expect(offset).toBe(0);
+});
+
+test('marquee RAF loop stops when hide() is called', async ({ page }) => {
+  await loadMenuPage(page);
+  await showMenu(page, {
+    title: 'SUPER LONG GAME TITLE THAT WILL NOT FIT',
+    items: [{ label: 'x', value: 'x' }],
+  });
+
+  await page.evaluate(() => window._testMenu.hide());
+
+  const rafActive = await page.evaluate(() => window._testMenu._marqueeRafId !== null);
+  expect(rafActive).toBe(false);
+});
+
 test('menu hides when hide() is called', async ({ page }) => {
   await loadMenuPage(page);
   await showMenu(page, {

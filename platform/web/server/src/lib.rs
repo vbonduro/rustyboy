@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use std::{path::PathBuf, sync::Arc};
 use tower_http::services::ServeDir;
@@ -35,6 +35,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/roms", get(list_roms))
         .route("/api/me", get(api_me))
         .route("/api/battery-saves/:rom_name", get(get_battery_save).put(put_battery_save))
+        .route("/api/save-states", get(list_roms_with_saves))
+        .route("/api/save-states/:rom_name", get(list_save_states).post(post_save_state))
+        .route("/api/save-states/:rom_name/latest", get(get_latest_save_state))
+        .route("/api/save-states/by-id/:id/data", get(get_save_state_data))
+        .route("/api/save-states/by-id/:id", delete(delete_save_state))
         .route("/api/auth-method", get(api_auth_method))
         .route("/roms/:name", get(serve_rom))
         .route("/auth/google", get(auth::google_login))
@@ -173,6 +178,139 @@ async fn put_battery_save(
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+// ── Save state handlers ────────────────────────────────────────────────────
+
+/// GET /api/save-states — list roms the user has saves for
+async fn list_roms_with_saves(
+    auth: AuthUser,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.list_roms_with_saves(&auth.user_id).await {
+        Ok(rows) => {
+            let items: Vec<_> = rows
+                .into_iter()
+                .map(|(rom_name, last_saved)| serde_json::json!({ "rom_name": rom_name, "last_saved": last_saved }))
+                .collect();
+            Json(items).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// GET /api/save-states/:rom_name — list save slots for a game
+async fn list_save_states(
+    auth: AuthUser,
+    Path(rom_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.list_save_states(&auth.user_id, &rom_name).await {
+        Ok(saves) => {
+            let items: Vec<_> = saves
+                .into_iter()
+                .map(|s| serde_json::json!({
+                    "id": s.id,
+                    "slot_name": s.slot_name,
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
+                }))
+                .collect();
+            Json(items).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// GET /api/save-states/:rom_name/latest — get metadata for most recent save
+async fn get_latest_save_state(
+    auth: AuthUser,
+    Path(rom_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.get_latest_save_state(&auth.user_id, &rom_name).await {
+        Ok(Some(s)) => Json(serde_json::json!({
+            "id": s.id,
+            "slot_name": s.slot_name,
+            "created_at": s.created_at,
+            "updated_at": s.updated_at,
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// POST /api/save-states/:rom_name — upload a new save state blob
+async fn post_save_state(
+    auth: AuthUser,
+    Path(rom_name): Path<String>,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if body.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Auto-generate slot name from current unix timestamp
+    let slot_name = now_unix_secs().to_string();
+    match state.db.upsert_save_state(&auth.user_id, &rom_name, &slot_name, body.to_vec()).await {
+        Ok(s) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "id": s.id,
+                "slot_name": s.slot_name,
+                "created_at": s.created_at,
+                "updated_at": s.updated_at,
+            })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// GET /api/save-states/by-id/:id/data — download save state blob
+async fn get_save_state_data(
+    auth: AuthUser,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.get_save_state(&id).await {
+        Ok(Some(s)) if s.user_id == auth.user_id => (
+            StatusCode::OK,
+            [("content-type", "application/octet-stream")],
+            s.data,
+        )
+            .into_response(),
+        Ok(Some(_)) => StatusCode::FORBIDDEN.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// DELETE /api/save-states/by-id/:id — delete a save state
+async fn delete_save_state(
+    auth: AuthUser,
+    Path(id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.db.get_save_state(&id).await {
+        Ok(Some(s)) if s.user_id == auth.user_id => {
+            match state.db.delete_save_state(&id).await {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+        Ok(Some(_)) => StatusCode::FORBIDDEN.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 async fn dev_log(body: String) -> StatusCode {

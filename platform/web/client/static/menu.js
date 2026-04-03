@@ -41,23 +41,41 @@
       this._selIdx  = 0;
       this._scrollY = 0;       // index of first visible item
       this._touchStartY = null;
+      // Marquee state
+      this._marqueeOffset  = 0;      // px scrolled left so far
+      this._marqueePhase   = 'pause'; // 'pause' | 'scroll'
+      this._marqueePhaseAt = 0;      // timestamp when current phase started
+      this._marqueeRafId    = null;
+      this._marqueeOverflow = 0;     // how many px the title overflows the header
+      this._marqueeScrollMax = 0;    // total px to scroll before reset (title fully off-screen)
     }
 
     // ── Public API ──────────────────────────────────────────────────────────
 
     show(options) {
-      this._opts    = options;
-      this._selIdx  = 0;
-      this._scrollY = 0;
-      this._active  = true;
+      this._opts           = options;
+      this._selIdx         = 0;
+      this._scrollY        = 0;
+      this._marqueeOffset  = 0;
+      this._marqueePhase   = 'pause';
+      this._marqueePhaseAt = performance.now();
+      this._active         = true;
+      // Measure title overflow (needs font set first)
+      this._ctx.font = 'bold 8px monospace';
+      const titleW = this._ctx.measureText(options.title || '').width;
+      const available = W - TEXT_PAD * 2;
+      this._marqueeOverflow  = Math.max(0, Math.ceil(titleW - available));
+      this._marqueeScrollMax = Math.ceil(TEXT_PAD + titleW); // scroll until fully off-screen
       this.render();
       this._attachTouchListeners();
+      if (this._marqueeOverflow > 0) this._startMarquee();
     }
 
     hide() {
       this._active = false;
       this._opts   = null;
       this._detachTouchListeners();
+      this._stopMarquee();
     }
 
     isActive() {
@@ -96,9 +114,10 @@
         case 'Escape':
         case 'b':
           if (this._opts.onBack) {
+            const selIdx = this._selIdx;
             const cb = this._opts.onBack;
             this.hide();
-            cb();
+            cb(selIdx);
           } else {
             this.hide();
           }
@@ -142,9 +161,20 @@
       ctx.fillRect(0, 0, W, HEADER_H);
       ctx.fillStyle = C3;
       ctx.font      = 'bold 8px monospace';
-      ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(this._opts.title || '', W / 2, HEADER_H / 2);
+      const title = this._opts.title || '';
+      if (this._marqueeOverflow > 0) {
+        // Scrolling title: clip to header, draw left-aligned minus scroll offset
+        ctx.save();
+        ctx.rect(TEXT_PAD, 0, W - TEXT_PAD * 2, HEADER_H);
+        ctx.clip();
+        ctx.textAlign = 'left';
+        ctx.fillText(title, TEXT_PAD - this._marqueeOffset, HEADER_H / 2);
+        ctx.restore();
+      } else {
+        ctx.textAlign = 'center';
+        ctx.fillText(title, W / 2, HEADER_H / 2);
+      }
 
       // ── Footer ────────────────────────────────────────────────────────────
       const footerY = H - FOOTER_H;
@@ -200,6 +230,46 @@
     }
 
     // ── Private ─────────────────────────────────────────────────────────────
+
+    _startMarquee() {
+      if (this._marqueeRafId !== null) return;
+      const tick = (now) => {
+        if (!this._active) { this._marqueeRafId = null; return; }
+        this._tickMarquee(now);
+        this.render();
+        this._marqueeRafId = requestAnimationFrame(tick);
+      };
+      this._marqueeRafId = requestAnimationFrame(tick);
+    }
+
+    _stopMarquee() {
+      if (this._marqueeRafId !== null) {
+        cancelAnimationFrame(this._marqueeRafId);
+        this._marqueeRafId = null;
+      }
+    }
+
+    _tickMarquee(now) {
+      const PAUSE_MS  = 1000;
+      const SCROLL_PX_PER_MS = 0.03; // ~30px/s
+
+      const elapsed = now - this._marqueePhaseAt;
+
+      if (this._marqueePhase === 'pause') {
+        if (elapsed >= PAUSE_MS) {
+          this._marqueePhase   = 'scroll';
+          this._marqueePhaseAt = now;
+        }
+      } else {
+        this._marqueeOffset = elapsed * SCROLL_PX_PER_MS;
+        if (this._marqueeOffset >= this._marqueeScrollMax) {
+          // Title fully off-screen — reset and pause again
+          this._marqueeOffset  = 0;
+          this._marqueePhase   = 'pause';
+          this._marqueePhaseAt = now;
+        }
+      }
+    }
 
     _clampScroll() {
       const items = (this._opts && this._opts.items) || [];
