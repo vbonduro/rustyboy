@@ -88,6 +88,9 @@ const state = {
   activeMenu:   null,   // MenuRenderer | null (canvas-based menu)
   currentRomName: null, // name of the currently loaded ROM
   batterySaveTimer: null, // setInterval id for periodic battery save upload
+  paused:       false,  // true when emulation loop is suspended for in-game menu
+  menuPending:  false,  // true while showInGameMenu fetch is in-flight; blocks re-entry
+  menuGen:      0,      // incremented on every pause/resume; stale async callbacks self-cancel
 };
 
 // ── Audio ───────────────────────────────────────────────────────────────────
@@ -358,23 +361,40 @@ async function showLoginError() {
 
 // ── Main menu / ROM list ───────────────────────────────────────────────────
 
-function showMainMenu() {
+async function showMainMenu() {
   log.event('showMainMenu');
   menuOverlay.classList.add('hidden');
+
+  // Check if user has any saves to show CONTINUE
+  let hasSaves = false;
+  if (state.user) {
+    try {
+      const res = await fetch('/api/save-states');
+      if (res.ok) {
+        const roms = await res.json();
+        hasSaves = roms.length > 0;
+      }
+    } catch (_) {}
+  }
+
+  const items = [];
+  if (hasSaves) items.push({ label: 'CONTINUE', value: 'continue' });
+  items.push({ label: 'GAMES',  value: 'games' });
+  items.push({ label: 'LOGOUT', value: 'logout' });
+
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
   const rawName = state.user && (state.user.display_name || state.user.email) || '';
   const name = rawName.replace(/@[^@]+$/, '');
   menu.show({
     title: 'RUSTYBOY',
-    items: [
-      { label: 'PLAY',   value: 'play' },
-      { label: 'LOGOUT', value: 'logout' },
-    ],
+    items,
     footer: name ? ('HELLO, ' + name.toUpperCase()) : '\u25b2\u25bc MOVE  A SELECT',
-    onSelect: (item) => {
+    onSelect: async (item) => {
       state.activeMenu = null;
-      if (item.value === 'play') {
+      if (item.value === 'continue') {
+        await continueLatestSave();
+      } else if (item.value === 'games') {
         showRomList();
       } else if (item.value === 'logout') {
         fetch('/auth/logout', { method: 'POST' }).finally(() => {
@@ -384,6 +404,24 @@ function showMainMenu() {
     },
     onBack: () => { showMainMenu(); }, // B on main menu → stay on main menu
   });
+}
+
+/** CONTINUE: find the most recently saved game across all ROMs and resume it. */
+async function continueLatestSave() {
+  try {
+    const res = await fetch('/api/save-states');
+    if (!res.ok) { showMainMenu(); return; }
+    const roms = await res.json(); // [{rom_name, last_saved}, ...] sorted newest first
+    if (roms.length === 0) { showMainMenu(); return; }
+    const romName = roms[0].rom_name;
+    // Get the latest save state for that ROM
+    const latestRes = await fetch(`/api/save-states/${encodeURIComponent(romName)}/latest`);
+    if (!latestRes.ok) { showMainMenu(); return; }
+    const latestMeta = await latestRes.json();
+    await launchRomWithSaveState(romName, latestMeta.id);
+  } catch (_) {
+    showMainMenu();
+  }
 }
 
 async function loadRomList() {
@@ -445,7 +483,21 @@ function showCanvasError(msg) {
 // ── Launch / stop ──────────────────────────────────────────────────────────
 
 async function launchRom(name) {
-  // Fetch bytes
+  // Check for a latest save state to auto-load
+  let saveStateId = null;
+  try {
+    const res = await fetch(`/api/save-states/${encodeURIComponent(name)}/latest`);
+    if (res.ok) {
+      const meta = await res.json();
+      saveStateId = meta.id;
+    }
+  } catch (_) {}
+
+  await launchRomWithSaveState(name, saveStateId);
+}
+
+async function launchRomWithSaveState(name, saveStateId) {
+  // Fetch ROM bytes
   let bytes;
   try {
     const res = await fetch(`/roms/${encodeURIComponent(name)}`);
@@ -453,7 +505,7 @@ async function launchRom(name) {
     const buf = await res.arrayBuffer();
     bytes = new Uint8Array(buf);
   } catch (err) {
-    showError('LOAD ERROR');
+    showCanvasError('LOAD ERROR');
     log.error(err);
     return;
   }
@@ -465,7 +517,7 @@ async function launchRom(name) {
   try {
     state.emulator = new EmulatorHandle(bytes);
   } catch (err) {
-    showError('ROM ERROR');
+    showCanvasError('ROM ERROR');
     log.error(err);
     return;
   }
@@ -474,8 +526,23 @@ async function launchRom(name) {
   state.currentRomName = name;
   localStorage.setItem('lastRom', name);
   state.running = true;
+  state.paused = false;
 
-  await loadBatterySave(name);
+  // Load save state if available, otherwise load battery save
+  if (saveStateId) {
+    try {
+      const res = await fetch(`/api/save-states/by-id/${encodeURIComponent(saveStateId)}/data`);
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        state.emulator.load_state(new Uint8Array(buf));
+        log.debug(`save state loaded: ${buf.byteLength} bytes`);
+      }
+    } catch (e) {
+      log.warn(`save state load failed: ${e}`);
+    }
+  } else {
+    await loadBatterySave(name);
+  }
   startBatterySaveTimer(name);
 
   initAudio();
@@ -509,9 +576,35 @@ async function stopEmulation() {
   }
   state.currentRomName = null;
   state.running = false;
+  state.paused = false;
+  state.menuPending = false;
+  state.menuGen++; // invalidate any in-flight showInGameMenu calls
   stopAudio();
   screenInner.classList.remove('running', 'booting');
   screenBezel.classList.remove('running');
+}
+
+function pauseEmulation() {
+  if (!state.running || state.paused) return;
+  state.paused = true;
+  state.menuGen++;
+  if (state.rafId) {
+    cancelAnimationFrame(state.rafId);
+    state.rafId = null;
+  }
+  // Flush ring buffer so audio stops immediately without a pop
+  if (state._ring) { state._ringHead = 0; state._ringTail = 0; state._ringSize = 0; }
+}
+
+function resumeEmulation() {
+  if (!state.running || !state.paused) return;
+  state.paused = false;
+  state.menuGen++;
+  if (state.activeMenu) {
+    state.activeMenu.hide();
+    state.activeMenu = null;
+  }
+  startLoop();
 }
 
 async function returnToMenu() {
@@ -520,9 +613,172 @@ async function returnToMenu() {
   showMainMenu();
 }
 
+// ── In-game pause menu ─────────────────────────────────────────────────────
+
+function showPauseMenu(hasSaves) {
+  const items = [
+    { label: 'RESUME', value: 'resume' },
+    { label: 'SAVE',   value: 'save' },
+  ];
+  if (hasSaves) items.push({ label: 'LOAD', value: 'load' });
+  items.push({ label: 'RESET', value: 'reset' });
+  items.push({ label: 'QUIT',  value: 'quit' });
+
+  const menu = new window.MenuRenderer(canvas);
+  state.activeMenu = menu;
+  menu.show({
+    title: state.currentRomName ? stripExtension(state.currentRomName).toUpperCase() : 'PAUSED',
+    items,
+    footer: '\u25b2\u25bc MOVE  A SELECT  B RESUME',
+    onSelect: async (item) => {
+      state.activeMenu = null;
+      if (item.value === 'resume') {
+        resumeEmulation();
+      } else if (item.value === 'save') {
+        await saveCurrentState();
+        resumeEmulation();
+      } else if (item.value === 'load') {
+        // When returning from load screen (e.g. deleted all slots), re-show pause menu without saves
+        showSaveStateSlots(state.currentRomName, () => showPauseMenu(false));
+      } else if (item.value === 'reset') {
+        const romName = state.currentRomName;
+        await stopEmulation();
+        await launchRomWithSaveState(romName, null); // fresh start
+      } else if (item.value === 'quit') {
+        await returnToMenu();
+      }
+    },
+    onBack: () => {
+      resumeEmulation();
+    },
+  });
+}
+
+async function showInGameMenu() {
+  if (!state.running || state.menuPending) return;
+  // If already paused (menu visible or fetch in-flight), ignore
+  if (state.paused) return;
+  pauseEmulation();
+  state.menuPending = true;
+  log.event('showInGameMenu');
+  const gen = state.menuGen; // snapshot before async gap
+
+  // Check if saves exist for current game
+  let hasSaves = false;
+  try {
+    const res = await fetch(`/api/save-states/${encodeURIComponent(state.currentRomName)}`);
+    if (res.ok) {
+      const saves = await res.json();
+      hasSaves = saves.length > 0;
+    }
+  } catch (_) {}
+
+  state.menuPending = false;
+
+  // If state changed while we were fetching (resumed, quit, new game), abort
+  if (state.menuGen !== gen || !state.paused || !state.running) return;
+
+  showPauseMenu(hasSaves);
+}
+
+async function saveCurrentState() {
+  if (!state.emulator || !state.currentRomName) return;
+  try {
+    const blob = state.emulator.save_state();
+    await fetch(`/api/save-states/${encodeURIComponent(state.currentRomName)}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: blob,
+    });
+    showSavedOverlay();
+    log.debug(`save state uploaded: ${blob.length} bytes`);
+  } catch (e) {
+    log.warn(`save state upload failed: ${e}`);
+  }
+}
+
+function showSavedOverlay() {
+  const c = canvas.getContext('2d');
+  c.save();
+  c.fillStyle = 'rgba(15,56,15,0.85)';
+  c.fillRect(0, 60, 160, 24);
+  c.fillStyle = '#9BBC0F';
+  c.font = 'bold 10px monospace';
+  c.textAlign = 'center';
+  c.textBaseline = 'middle';
+  c.fillText('\u2713 SAVED', 80, 72);
+  c.restore();
+  setTimeout(() => { if (state.running && !state.paused) drawFrame(); }, 1500);
+}
+
+async function showSaveStateSlots(romName, onBack) {
+  let saves = [];
+  try {
+    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}`);
+    if (res.ok) saves = await res.json();
+  } catch (_) {}
+
+  if (saves.length === 0) {
+    if (onBack) onBack();
+    return;
+  }
+
+  const items = saves.map(s => ({
+    label: formatSaveSlotLabel(s.updated_at),
+    value: s.id,
+  }));
+
+  const menu = new window.MenuRenderer(canvas);
+  state.activeMenu = menu;
+  menu.show({
+    title: 'LOAD STATE',
+    items,
+    footer: '\u25b2\u25bc MOVE  A LOAD  B DEL',
+    onSelect: async (item) => {
+      state.activeMenu = null;
+      try {
+        const res = await fetch(`/api/save-states/by-id/${encodeURIComponent(item.value)}/data`);
+        if (res.ok) {
+          const buf = await res.arrayBuffer();
+          state.emulator.load_state(new Uint8Array(buf));
+          log.debug(`save state loaded: ${buf.byteLength} bytes`);
+        }
+      } catch (e) {
+        log.warn(`save state load failed: ${e}`);
+      }
+      resumeEmulation();
+    },
+    onBack: async (selIdx) => {
+      // B = delete the currently selected slot
+      const id = items[selIdx]?.value;
+      if (!id) { state.activeMenu = null; if (onBack) onBack(); return; }
+      try {
+        await fetch(`/api/save-states/by-id/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        log.debug(`save state deleted: ${id}`);
+      } catch (e) {
+        log.warn(`save state delete failed: ${e}`);
+      }
+      state.activeMenu = null;
+      // Re-open the slot list (minus the deleted slot); if empty, go back
+      await showSaveStateSlots(romName, onBack);
+    },
+  });
+}
+
+function formatSaveSlotLabel(unixSecs) {
+  const d = new Date(unixSecs * 1000);
+  const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const mon = months[d.getMonth()];
+  const day = String(d.getDate()).padStart(2, '0');
+  const h   = String(d.getHours()).padStart(2, '0');
+  const m   = String(d.getMinutes()).padStart(2, '0');
+  return `${mon} ${day} ${h}:${m}`;
+}
+
 // ── Emulation loop ─────────────────────────────────────────────────────────
 
 let imageData = null;
+let loopGeneration = 0; // incremented each time startLoop() is called; stale RAF callbacks self-cancel
 
 // DMG runs at 4194304 Hz / 70224 cycles per frame = 59.7275 fps
 const FRAME_DURATION_MS = 1000 / 59.7275;
@@ -530,9 +786,10 @@ const FRAME_DURATION_MS = 1000 / 59.7275;
 function startLoop() {
   imageData = ctx.createImageData(160, 144);
   let lastFrameTime = performance.now();
+  const myGen = ++loopGeneration;
 
   function frame(now) {
-    if (!state.running || !state.emulator) return;
+    if (!state.running || !state.emulator || loopGeneration !== myGen) return;
 
     const elapsed = now - lastFrameTime;
     if (elapsed >= FRAME_DURATION_MS) {
@@ -589,6 +846,16 @@ function drawFrame() {
 
 function sendButton(idx, pressed) {
   log.event(`sendButton idx=${idx} pressed=${pressed}`);
+  // While paused, route button releases to the canvas menu (not the emulator)
+  if (state.paused) {
+    if (!pressed && state.activeMenu && state.activeMenu.isActive()) {
+      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape' };
+      const key = keyMap[idx];
+      log.debug(`sendButton (paused) → menu key=${key}`);
+      if (key) { state.activeMenu.handleInput(key); }
+    }
+    return;
+  }
   if (state.emulator) {
     state.emulator.set_button(idx, pressed);
   } else if (!pressed) {
@@ -638,13 +905,25 @@ function bindButtons() {
     });
   });
 
-  // Reset button — animate press, flash LED, then return to menu
+  // Power button — if running, pause and show in-game menu; otherwise go to main menu
   powerBtn.addEventListener('pointerdown', (e) => {
     e.preventDefault();
     powerBtn.classList.add('pressed');
     flashResetLed();
   });
-  powerBtn.addEventListener('pointerup',     () => { powerBtn.classList.remove('pressed'); returnToMenu(); });
+  powerBtn.addEventListener('pointerup', () => {
+    powerBtn.classList.remove('pressed');
+    if (state.menuPending) return; // fetch in-flight — ignore
+    if (state.running && !state.paused) {
+      showInGameMenu();
+    } else if (state.paused && state.activeMenu) {
+      // Power pressed while in-game menu is open → resume (resumeEmulation hides the menu)
+      resumeEmulation();
+    } else if (!state.running) {
+      returnToMenu();
+    }
+    // state.paused && !state.activeMenu: menu just closed, ignore
+  });
   powerBtn.addEventListener('pointerleave',  () => { powerBtn.classList.remove('pressed'); });
   powerBtn.addEventListener('pointercancel', () => { powerBtn.classList.remove('pressed'); });
 }
@@ -696,7 +975,12 @@ function bindKeyboard() {
     e.preventDefault();
 
     if (idx === -1) {
-      returnToMenu();
+      if (state.menuPending) return;
+      if (state.running && !state.paused) {
+        showInGameMenu();
+      } else if (!state.running) {
+        returnToMenu();
+      }
     } else {
       sendButton(idx, true);
     }
