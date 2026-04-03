@@ -122,6 +122,15 @@
             this.hide();
           }
           break;
+
+        case 'Select':
+          if (this._opts.onSelectBtn) {
+            const selIdx = this._selIdx;
+            const cb = this._opts.onSelectBtn;
+            this.hide();
+            cb(selIdx);
+          }
+          break;
       }
     }
 

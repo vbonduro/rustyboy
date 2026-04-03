@@ -275,6 +275,8 @@ impl Sm83 {
     /// Restore emulator state from a blob produced by `save_state`.
     /// Returns `Err` with a description if the blob is invalid.
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        // Minimum size covers header + CPU + timer + PPU + memory (without MBC state).
+        // MBC state is appended after and may be absent in older saves.
         if data.len() < 16835 {
             return Err("save state blob too short");
         }
