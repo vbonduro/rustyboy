@@ -22,6 +22,12 @@ pub trait Cartridge {
     fn external_ram(&self) -> Option<&[u8]> { None }
     /// Overwrites the full external RAM from the given bytes. No-op if cart has no external RAM.
     fn set_external_ram(&mut self, _data: &[u8]) {}
+    /// Serialize MBC register state (bank numbers, mode bits, etc.) into `out`.
+    /// Does NOT include ROM or RAM contents — those are saved separately.
+    fn save_mbc_state(&self, _out: &mut Vec<u8>) {}
+    /// Restore MBC register state from `data` starting at `offset`.
+    /// Returns number of bytes consumed. Default: 0 (no state).
+    fn load_mbc_state(&mut self, _data: &[u8], _offset: usize) -> usize { 0 }
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -292,6 +298,22 @@ impl Cartridge for Mbc1 {
             _ => {}
         }
     }
+
+    fn save_mbc_state(&self, out: &mut Vec<u8>) {
+        out.push(self.rom_bank_lo);
+        out.push(self.upper_bits);
+        out.push(self.ram_mode as u8);
+        out.push(self.ram_enabled as u8);
+    }
+
+    fn load_mbc_state(&mut self, data: &[u8], offset: usize) -> usize {
+        if data.len() < offset + 4 { return 0; }
+        self.rom_bank_lo = data[offset].max(1); // 0→1 quirk
+        self.upper_bits  = data[offset + 1] & 0x03;
+        self.ram_mode    = data[offset + 2] != 0;
+        self.ram_enabled = data[offset + 3] != 0;
+        4
+    }
 }
 
 // ── MBC1 Multicart ───────────────────────────────────────────────────────────
@@ -415,6 +437,22 @@ impl Cartridge for Mbc1Multicart {
             }
             _ => {}
         }
+    }
+
+    fn save_mbc_state(&self, out: &mut Vec<u8>) {
+        out.push(self.rom_bank_lo);
+        out.push(self.upper_bits);
+        out.push(self.ram_mode as u8);
+        out.push(self.ram_enabled as u8);
+    }
+
+    fn load_mbc_state(&mut self, data: &[u8], offset: usize) -> usize {
+        if data.len() < offset + 4 { return 0; }
+        self.rom_bank_lo = data[offset].max(1);
+        self.upper_bits  = data[offset + 1] & 0x03;
+        self.ram_mode    = data[offset + 2] != 0;
+        self.ram_enabled = data[offset + 3] != 0;
+        4
     }
 }
 
@@ -642,6 +680,48 @@ impl Cartridge for Mbc3 {
             }
             _ => {}
         }
+    }
+
+    fn save_mbc_state(&self, out: &mut Vec<u8>) {
+        out.push(self.rom_bank);
+        out.push(self.bank_or_rtc);
+        out.push(self.ram_rtc_enabled as u8);
+        out.push(self.latch_armed as u8);
+        // RTC running state
+        out.push(self.rtc.sec);
+        out.push(self.rtc.min);
+        out.push(self.rtc.hour);
+        out.push(self.rtc.day_lo);
+        out.push(self.rtc.day_hi);
+        // RTC latched state
+        out.push(self.rtc_latched.sec);
+        out.push(self.rtc_latched.min);
+        out.push(self.rtc_latched.hour);
+        out.push(self.rtc_latched.day_lo);
+        out.push(self.rtc_latched.day_hi);
+        out.extend_from_slice(&self.rtc_cycles.to_le_bytes());
+    }
+
+    fn load_mbc_state(&mut self, data: &[u8], offset: usize) -> usize {
+        const SIZE: usize = 18; // 4 + 5 + 5 + 4
+        if data.len() < offset + SIZE { return 0; }
+        let d = &data[offset..];
+        self.rom_bank        = d[0].max(1);
+        self.bank_or_rtc     = d[1];
+        self.ram_rtc_enabled = d[2] != 0;
+        self.latch_armed     = d[3] != 0;
+        self.rtc.sec         = d[4];
+        self.rtc.min         = d[5];
+        self.rtc.hour        = d[6];
+        self.rtc.day_lo      = d[7];
+        self.rtc.day_hi      = d[8];
+        self.rtc_latched.sec    = d[9];
+        self.rtc_latched.min    = d[10];
+        self.rtc_latched.hour   = d[11];
+        self.rtc_latched.day_lo = d[12];
+        self.rtc_latched.day_hi = d[13];
+        self.rtc_cycles = u32::from_le_bytes([d[14], d[15], d[16], d[17]]);
+        SIZE
     }
 }
 

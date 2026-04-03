@@ -1202,9 +1202,9 @@ test('T38: pause menu opens correctly after multiple open/close cycles', async (
   expect(await activeMenuItems(page)).toContain('resume');
 });
 
-// T40: B button on LOAD STATE screen deletes the selected save slot
+// T40: Select button on LOAD STATE screen deletes the selected save slot
 // After deletion the slot is removed from the list; if list becomes empty, go back.
-test('T40: B on load state screen deletes selected save slot', async ({ page, request }) => {
+test('T40: Select on load state screen deletes selected save slot', async ({ page, request }) => {
   await setServerState(request, {
     authed: true,
     roms: ['Tetris.gb'],
@@ -1249,8 +1249,8 @@ test('T40: B on load state screen deletes selected save slot', async ({ page, re
   const slotsBefore = await activeMenuItems(page);
   expect(slotsBefore.length).toBe(2);
 
-  // Press B to delete the selected (top = most recent = ss-2)
-  await menuKey(page, 'Escape'); // B key
+  // Press Select to delete the selected (top = most recent = ss-2)
+  await menuKey(page, 'Select');
 
   // List should now have 1 item
   await page.waitForFunction(
@@ -1363,8 +1363,8 @@ test('T41: deleting last save slot returns to pause menu', async ({ page, reques
     () => window.__appState?.activeMenu?._opts?.title === 'LOAD STATE', { timeout: 3000 }
   );
 
-  // Delete the only slot
-  await menuKey(page, 'Escape'); // B = delete
+  // Delete the only slot using Select button
+  await menuKey(page, 'Select');
 
   // Should be back at pause menu (no more saves → onBack called)
   await page.waitForFunction(

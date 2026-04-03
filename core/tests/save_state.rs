@@ -151,6 +151,56 @@ fn test_save_state_too_short() {
     assert!(result.is_err(), "expected Err for too-short blob, got Ok");
 }
 
+// ── MBC bank state preserved ──────────────────────────────────────────────────
+
+#[test]
+fn test_save_state_mbc1_bank_preserved() {
+    // Build a 128-bank MBC1 ROM (cart_type=0x01, rom_size_code=6 → 128 banks)
+    let mut rom = vec![0u8; 128 * 0x4000];
+    rom[0x0147] = 0x01; // MBC1
+    rom[0x0148] = 0x06; // 128 banks
+    rom[0x0149] = 0x00; // no RAM
+
+    // Put a sentinel byte at the start of bank 7's switchable window
+    rom[7 * 0x4000] = 0xAB;
+
+    // ROM program at 0x0100:
+    //   LD HL, 0x2000   ; point HL at MBC1 bank register
+    //   LD (HL), 7      ; select bank 7
+    //   NOP / JR -2     ; spin
+    rom[0x0100] = 0x21; // LD HL, nn
+    rom[0x0101] = 0x00;
+    rom[0x0102] = 0x20; // 0x2000
+    rom[0x0103] = 0x36; // LD (HL), n
+    rom[0x0104] = 0x07; // 7
+    rom[0x0105] = 0x00; // NOP
+    rom[0x0106] = 0x18; // JR -2
+    rom[0x0107] = 0xFE;
+
+    let mut cpu = make_emulator(rom.clone());
+
+    // Run enough ticks to execute LD HL + LD (HL) = ~16 ticks total
+    for _ in 0..30 {
+        cpu.tick().unwrap();
+    }
+
+    // Bank 7 should now be mapped
+    assert_eq!(cpu.current_rom_bank(), 7, "bank 7 should be active");
+    assert_eq!(cpu.read_memory(0x4000).unwrap(), 0xAB, "sentinel should be readable in bank 7");
+
+    let state = cpu.save_state();
+
+    // Fresh emulator starts at bank 1 — sentinel not visible
+    let mut cpu2 = make_emulator(rom);
+    assert_eq!(cpu2.current_rom_bank(), 1, "fresh emulator starts at bank 1");
+
+    cpu2.load_state(&state).expect("load_state failed");
+
+    // After restoring, bank 7 should be remapped
+    assert_eq!(cpu2.current_rom_bank(), 7, "MBC bank not restored across save/load");
+    assert_eq!(cpu2.read_memory(0x4000).unwrap(), 0xAB, "sentinel should be readable after load_state");
+}
+
 // ── Cycle counter preserved ───────────────────────────────────────────────────
 
 #[test]

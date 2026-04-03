@@ -208,6 +208,7 @@ impl GameBoyMemory {
         out.extend_from_slice(self.hram());
         out.extend_from_slice(self.vram());
         out.extend_from_slice(self.oam());
+        self.cartridge.save_mbc_state(out);
     }
 
     /// Deserialize memory state from `data` at `offset`. Advances offset past all regions.
@@ -228,6 +229,7 @@ impl GameBoyMemory {
         cur += 0x2000;
         self.set_oam(&data[cur..cur + 0xA0]);
         cur += 0xA0;
+        cur += self.cartridge.load_mbc_state(data, cur);
         cur - offset
     }
 

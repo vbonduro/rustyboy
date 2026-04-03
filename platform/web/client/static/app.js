@@ -361,21 +361,26 @@ async function showLoginError() {
 
 // ── Main menu / ROM list ───────────────────────────────────────────────────
 
+/** Returns true if any save states exist. Pass a romName to scope to that ROM. */
+async function fetchHasSaves(romName) {
+  try {
+    const url = romName
+      ? `/api/save-states/${encodeURIComponent(romName)}`
+      : '/api/save-states';
+    const res = await fetch(url);
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data.length > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function showMainMenu() {
   log.event('showMainMenu');
   menuOverlay.classList.add('hidden');
 
-  // Check if user has any saves to show CONTINUE
-  let hasSaves = false;
-  if (state.user) {
-    try {
-      const res = await fetch('/api/save-states');
-      if (res.ok) {
-        const roms = await res.json();
-        hasSaves = roms.length > 0;
-      }
-    } catch (_) {}
-  }
+  const hasSaves = state.user ? await fetchHasSaves() : false;
 
   const items = [];
   if (hasSaves) items.push({ label: 'CONTINUE', value: 'continue' });
@@ -663,15 +668,7 @@ async function showInGameMenu() {
   log.event('showInGameMenu');
   const gen = state.menuGen; // snapshot before async gap
 
-  // Check if saves exist for current game
-  let hasSaves = false;
-  try {
-    const res = await fetch(`/api/save-states/${encodeURIComponent(state.currentRomName)}`);
-    if (res.ok) {
-      const saves = await res.json();
-      hasSaves = saves.length > 0;
-    }
-  } catch (_) {}
+  const hasSaves = await fetchHasSaves(state.currentRomName);
 
   state.menuPending = false;
 
@@ -733,7 +730,7 @@ async function showSaveStateSlots(romName, onBack) {
   menu.show({
     title: 'LOAD STATE',
     items,
-    footer: '\u25b2\u25bc MOVE  A LOAD  B DEL',
+    footer: '\u25b2\u25bc MOVE  A LOAD  SEL DEL  B BACK',
     onSelect: async (item) => {
       state.activeMenu = null;
       try {
@@ -748,17 +745,20 @@ async function showSaveStateSlots(romName, onBack) {
       }
       resumeEmulation();
     },
-    onBack: async (selIdx) => {
-      // B = delete the currently selected slot
+    onBack: () => {
+      // B = back to pause menu
+      if (onBack) onBack();
+    },
+    onSelectBtn: async (selIdx) => {
+      // Select = delete the currently selected slot
       const id = items[selIdx]?.value;
-      if (!id) { state.activeMenu = null; if (onBack) onBack(); return; }
+      if (!id) return;
       try {
         await fetch(`/api/save-states/by-id/${encodeURIComponent(id)}`, { method: 'DELETE' });
         log.debug(`save state deleted: ${id}`);
       } catch (e) {
         log.warn(`save state delete failed: ${e}`);
       }
-      state.activeMenu = null;
       // Re-open the slot list (minus the deleted slot); if empty, go back
       await showSaveStateSlots(romName, onBack);
     },
@@ -849,7 +849,7 @@ function sendButton(idx, pressed) {
   // While paused, route button releases to the canvas menu (not the emulator)
   if (state.paused) {
     if (!pressed && state.activeMenu && state.activeMenu.isActive()) {
-      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape' };
+      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape', 6: 'Select' };
       const key = keyMap[idx];
       log.debug(`sendButton (paused) → menu key=${key}`);
       if (key) { state.activeMenu.handleInput(key); }
@@ -861,7 +861,7 @@ function sendButton(idx, pressed) {
   } else if (!pressed) {
     // If a canvas menu is active, forward to it
     if (state.activeMenu && state.activeMenu.isActive()) {
-      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape' };
+      const keyMap = { 2: 'ArrowUp', 3: 'ArrowDown', 4: 'Enter', 5: 'Escape', 6: 'Select' };
       const key = keyMap[idx];
       log.debug(`sendButton → menu key=${key}`);
       if (key) { state.activeMenu.handleInput(key); return; }
@@ -957,10 +957,12 @@ function bindKeyboard() {
     // Navigation keys (arrows, w/s) and Enter/Escape are handled directly.
     // z/x (A/B buttons) are intentionally NOT intercepted here — they route
     // through sendButton on keyup, which maps them to Enter/Escape for the menu.
-    const MENU_NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 's', 'Enter', 'Escape', 'a', 'b']);
+    const MENU_NAV_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'w', 's', 'Enter', 'Escape', 'a', 'b', 'Shift']);
     if (state.activeMenu && state.activeMenu.isActive() && MENU_NAV_KEYS.has(e.key)) {
       e.preventDefault();
-      state.activeMenu.handleInput(e.key);
+      // Shift key = Select button in menu context
+      const menuKey = e.key === 'Shift' ? 'Select' : e.key;
+      state.activeMenu.handleInput(menuKey);
       return;
     }
 
