@@ -96,6 +96,9 @@ pub struct Sm83 {
     /// Pending OAM DMA transfer. When Some, holds the source page and number of
     /// bytes already copied. Each M-cycle advances the transfer by one byte.
     dma: Option<DmaState>,
+    /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
+    /// read a fully-rendered frame rather than one mid-render.
+    front_buffer: [u8; FRAMEBUFFER_SIZE],
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
@@ -125,6 +128,7 @@ impl Sm83 {
             halted: false,
             cycle_counter: 0,
             dma: None,
+            front_buffer: [0u8; FRAMEBUFFER_SIZE],
             #[cfg(feature = "trace")]
             trace_hook: None,
         };
@@ -204,7 +208,7 @@ impl Sm83 {
     }
 
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
-        self.ppu.framebuffer()
+        &self.front_buffer
     }
 
     /// Drain accumulated PCM audio samples since the last call.
@@ -527,6 +531,9 @@ impl Sm83 {
         self.memory.write_io(LY_ADDR, output.ly);
         self.memory.write_io(STAT_ADDR, output.stat);
         if output.vblank_interrupt {
+            // Snapshot the completed frame into the front buffer before the PPU
+            // starts overwriting scanlines for the next frame.
+            self.front_buffer.copy_from_slice(self.ppu.framebuffer());
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << VBLANK_INTERRUPT_BIT));
         }

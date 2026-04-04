@@ -51,27 +51,14 @@
       this._marqueeScrollMax = 0;    // total px to scroll before reset (title fully off-screen)
     }
 
-    // Scale canvas buffer to physical pixels for crisp rendering.
-    // Saves original dimensions so hide() can restore them for the emulator.
+    // Compute the scale factor from the canvas's current physical buffer size.
+    // The canvas buffer is kept at physical resolution by a ResizeObserver in app.js,
+    // so we just read the current width rather than mutating canvas dimensions.
     _scaleCanvas() {
-      const dpr  = window.devicePixelRatio || 1;
-      const rect = this._canvas.getBoundingClientRect();
-      const physW = Math.round(rect.width  * dpr);
-      const physH = Math.round(rect.height * dpr);
-      this._savedCanvasW = this._canvas.width;
-      this._savedCanvasH = this._canvas.height;
-      this._canvas.width  = physW;
-      this._canvas.height = physH;
-      this._scale = physW / W;
+      this._scale = this._canvas.width / W;
     }
 
     _restoreCanvas() {
-      if (this._savedCanvasW !== undefined) {
-        this._canvas.width  = this._savedCanvasW;
-        this._canvas.height = this._savedCanvasH;
-        this._savedCanvasW  = undefined;
-        this._savedCanvasH  = undefined;
-      }
       this._scale = 1;
     }
 
