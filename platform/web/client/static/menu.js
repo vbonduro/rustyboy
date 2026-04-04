@@ -41,6 +41,7 @@
       this._selIdx  = 0;
       this._scrollY = 0;       // index of first visible item
       this._touchStartY = null;
+      this._scale   = 1;       // physical-to-logical scale factor
       // Marquee state
       this._marqueeOffset  = 0;      // px scrolled left so far
       this._marqueePhase   = 'pause'; // 'pause' | 'scroll'
@@ -48,6 +49,30 @@
       this._marqueeRafId    = null;
       this._marqueeOverflow = 0;     // how many px the title overflows the header
       this._marqueeScrollMax = 0;    // total px to scroll before reset (title fully off-screen)
+    }
+
+    // Scale canvas buffer to physical pixels for crisp rendering.
+    // Saves original dimensions so hide() can restore them for the emulator.
+    _scaleCanvas() {
+      const dpr  = window.devicePixelRatio || 1;
+      const rect = this._canvas.getBoundingClientRect();
+      const physW = Math.round(rect.width  * dpr);
+      const physH = Math.round(rect.height * dpr);
+      this._savedCanvasW = this._canvas.width;
+      this._savedCanvasH = this._canvas.height;
+      this._canvas.width  = physW;
+      this._canvas.height = physH;
+      this._scale = physW / W;
+    }
+
+    _restoreCanvas() {
+      if (this._savedCanvasW !== undefined) {
+        this._canvas.width  = this._savedCanvasW;
+        this._canvas.height = this._savedCanvasH;
+        this._savedCanvasW  = undefined;
+        this._savedCanvasH  = undefined;
+      }
+      this._scale = 1;
     }
 
     // ── Public API ──────────────────────────────────────────────────────────
@@ -60,9 +85,13 @@
       this._marqueePhase   = 'pause';
       this._marqueePhaseAt = performance.now();
       this._active         = true;
-      // Measure title overflow (needs font set first)
+      this._scaleCanvas();
+      // Measure title overflow (needs font set first, using logical scale)
+      this._ctx.save();
+      this._ctx.scale(this._scale, this._scale);
       this._ctx.font = 'bold 8px monospace';
       const titleW = this._ctx.measureText(options.title || '').width;
+      this._ctx.restore();
       const available = W - TEXT_PAD * 2;
       this._marqueeOverflow  = Math.max(0, Math.ceil(titleW - available));
       this._marqueeScrollMax = Math.ceil(TEXT_PAD + titleW); // scroll until fully off-screen
@@ -76,6 +105,7 @@
       this._opts   = null;
       this._detachTouchListeners();
       this._stopMarquee();
+      this._restoreCanvas();
     }
 
     isActive() {
@@ -160,6 +190,7 @@
 
       ctx.imageSmoothingEnabled = false;
       ctx.save();
+      ctx.scale(this._scale, this._scale);
 
       // ── Background ────────────────────────────────────────────────────────
       ctx.fillStyle = C0;
