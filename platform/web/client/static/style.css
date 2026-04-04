@@ -41,7 +41,7 @@
   --btn-mid-hi:      #B4B2AC;
   --btn-mid-shadow:  #6A6860;
 
-  --gb-w: min(370px, 92vw);
+  --gb-w: min(370px, 92vw, 54vh);
   --pixel: 'Press Start 2P', monospace;
 }
 
@@ -482,8 +482,8 @@ body {
 .dpad-wrap { flex: 0 0 auto; }
 
 .dpad {
-  width: clamp(88px, 24vw, 104px);
-  height: clamp(88px, 24vw, 104px);
+  width: clamp(96px, 26vw, 120px);
+  height: clamp(96px, 26vw, 120px);
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   grid-template-rows: 1fr 1fr 1fr;
@@ -522,8 +522,8 @@ body {
 
 .ab-cluster {
   position: relative;
-  width: clamp(88px, 24vw, 108px);
-  height: clamp(68px, 19vw, 82px);
+  width: clamp(96px, 26vw, 120px);
+  height: clamp(76px, 21vw, 94px);
 }
 
 .ab-btn-wrap {
@@ -539,8 +539,8 @@ body {
 .btn-b-wrap { bottom: 0; left: 0;  }
 
 .action-btn {
-  width: clamp(36px, 10vw, 44px);
-  height: clamp(36px, 10vw, 44px);
+  width: clamp(42px, 11vw, 52px);
+  height: clamp(42px, 11vw, 52px);
   border-radius: 50%;
   border: none;
   cursor: pointer;
@@ -586,8 +586,8 @@ body {
 }
 
 .mid-btn {
-  width: clamp(36px, 10vw, 44px);
-  height: clamp(10px, 2.6vw, 13px);
+  width: clamp(44px, 12vw, 56px);
+  height: clamp(18px, 4.5vw, 22px);
   background: var(--btn-mid);
   border: none;
   border-radius: 20px;
@@ -666,10 +666,10 @@ button:focus-visible {
 
 /* ── Responsive ───────────────────────────────────────── */
 @media (min-width: 430px) {
-  :root { --gb-w: min(400px, 88vw); }
+  :root { --gb-w: min(420px, 88vw, 56vh); }
 }
 @media (min-width: 600px) {
-  :root { --gb-w: 360px; }
+  :root { --gb-w: min(420px, 60vh); }
   .scene { padding: 20px 0; }
 }
 
