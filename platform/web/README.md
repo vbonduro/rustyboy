@@ -28,7 +28,17 @@ JS loads rustyboy_web_client.wasm
       handle.set_button(idx, pressed)
 ```
 
-Multiple users can run simultaneously — each browser tab has its own independent WASM instance. There are no server-side save states.
+Multiple users can run simultaneously — each browser tab has its own independent WASM instance.
+
+## Save States & Battery Saves
+
+Both save types are stored server-side in SQLite, scoped per user and ROM.
+
+**Save states** are stored in a `save_states` table (keyed by user, ROM name, and slot name) and loaded automatically when a ROM starts.
+
+**Battery saves** (cartridge RAM — e.g. Pokémon) are stored in a `battery_saves` table. They are uploaded to the server every 30 seconds while a ROM is running and on ROM unload, then reloaded from the server on next launch.
+
+`localStorage` is only used to remember which ROM was last played.
 
 ## Controls
 
