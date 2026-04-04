@@ -1161,4 +1161,155 @@ mod tests {
             assert_eq!(cart.read_rom(0x4000), 0x02);
         }
     }
+
+    // ── external_ram / set_external_ram ──────────────────────────────────────
+
+    #[test]
+    fn no_mbc_has_no_external_ram() {
+        let cart = NoMbc::new(vec![0u8; 0x8000]);
+        assert!(cart.external_ram().is_none());
+    }
+
+    #[test]
+    fn mbc1_external_ram_roundtrips() {
+        let data = make_rom(64, 0x03);
+        let mut cart = Mbc1::new(data, 8 * 1024);
+        let payload: Vec<u8> = (0u8..=127).collect();
+        cart.set_external_ram(&payload);
+        let ram = cart.external_ram().expect("mbc1 should have external ram");
+        assert_eq!(&ram[..payload.len()], &payload[..]);
+    }
+
+    #[test]
+    fn mbc3_external_ram_roundtrips() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 8 * 1024, false);
+        let payload = vec![0xAB; 64];
+        cart.set_external_ram(&payload);
+        let ram = cart.external_ram().expect("mbc3 should have external ram");
+        assert_eq!(&ram[..payload.len()], &payload[..]);
+    }
+
+    #[test]
+    fn mbc3_no_ram_external_ram_is_none() {
+        let data = make_mbc3_rom(1024, 0x11); // MBC3, no RAM
+        let cart = Mbc3::new(data, 0, false);
+        assert!(cart.external_ram().is_none());
+    }
+
+    // ── save_mbc_state / load_mbc_state ──────────────────────────────────────
+
+    #[test]
+    fn mbc1_save_load_mbc_state_roundtrip() {
+        let data = make_rom(1024, 0x03); // 64 banks, 4 RAM banks
+        let mut cart = Mbc1::new(data.clone(), 32 * 1024);
+        // Set a non-default state: bank 5, upper=1, RAM mode, RAM enabled
+        cart.write(0x2000, 0x05);
+        cart.write(0x4000, 0x01);
+        cart.write(0x6000, 0x01); // RAM mode
+        cart.write(0x0000, 0x0A); // enable RAM
+
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+        assert_eq!(blob.len(), 4);
+
+        let mut cart2 = Mbc1::new(data, 32 * 1024);
+        let consumed = cart2.load_mbc_state(&blob, 0);
+        assert_eq!(consumed, 4);
+
+        // Verify ROM bank restored
+        assert_eq!(cart2.read_rom(0x4000), cart.read_rom(0x4000));
+        // Verify RAM mode restored (upper bits select RAM bank 1 in RAM mode)
+        assert_eq!(cart2.read_rom(0x0000), cart.read_rom(0x0000));
+    }
+
+    #[test]
+    fn mbc1_load_mbc_state_with_offset() {
+        let data = make_rom(64, 0x01);
+        let mut cart = Mbc1::new(data.clone(), 0);
+        cart.write(0x2000, 0x03);
+
+        let mut blob = vec![0xFFu8; 10]; // 10 bytes padding
+        cart.save_mbc_state(&mut blob);
+
+        let mut cart2 = Mbc1::new(data, 0);
+        let consumed = cart2.load_mbc_state(&blob, 10); // read from offset 10
+        assert_eq!(consumed, 4);
+        assert_eq!(cart2.read_rom(0x4000), 3);
+    }
+
+    #[test]
+    fn mbc1_load_mbc_state_too_short_returns_zero() {
+        let data = make_rom(64, 0x01);
+        let mut cart = Mbc1::new(data, 0);
+        let consumed = cart.load_mbc_state(&[0u8; 2], 0); // only 2 bytes, need 4
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn mbc3_save_load_mbc_state_roundtrip() {
+        let data = make_mbc3_rom(1024, 0x0F); // with timer
+        let mut cart = Mbc3::new(data.clone(), 32 * 1024, true);
+        cart.write(0x2000, 0x0A);        // ROM bank 10
+        cart.write(0x4000, 0x02);        // RAM bank 2
+        cart.write(0x0000, 0x0A);        // enable
+        cart.tick(RTC_CYCLES_PER_SEC * 7); // advance 7 seconds
+
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+        assert_eq!(blob.len(), 18);
+
+        let mut cart2 = Mbc3::new(data, 32 * 1024, true);
+        let consumed = cart2.load_mbc_state(&blob, 0);
+        assert_eq!(consumed, 18);
+
+        // ROM bank restored
+        assert_eq!(cart2.read_rom(0x4000), cart.read_rom(0x4000));
+    }
+
+    #[test]
+    fn mbc3_load_mbc_state_too_short_returns_zero() {
+        let data = make_mbc3_rom(1024, 0x13);
+        let mut cart = Mbc3::new(data, 0, false);
+        let consumed = cart.load_mbc_state(&[0u8; 10], 0); // need 18
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn no_mbc_save_load_mbc_state_is_noop() {
+        let mut cart = NoMbc::new(vec![0u8; 0x8000]);
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+        assert_eq!(blob.len(), 0);
+        let consumed = cart.load_mbc_state(&[1, 2, 3], 0);
+        assert_eq!(consumed, 0);
+    }
+
+    // ── Multicart save/load state ─────────────────────────────────────────────
+
+    #[test]
+    fn mbc1_multicart_save_load_mbc_state_roundtrip() {
+        let data = make_multicart_rom();
+        let mut cart = from_rom(data.clone());
+        // Select sub-game 1 (upper=1) bank 3 (lower=3) → bank (1<<4)|3 = 19
+        cart.write(0x4000, 0x01);
+        cart.write(0x2000, 0x03);
+        assert_eq!(cart.read_rom(0x4000), 19);
+
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+
+        let mut cart2 = from_rom(data);
+        cart2.load_mbc_state(&blob, 0);
+        assert_eq!(cart2.read_rom(0x4000), 19);
+    }
+
+    // ── NoMbc set_external_ram is no-op ──────────────────────────────────────
+
+    #[test]
+    fn no_mbc_set_external_ram_is_noop() {
+        let mut cart = NoMbc::new(vec![0u8; 0x8000]);
+        cart.set_external_ram(&[0xAB; 16]); // should not panic
+        assert!(cart.external_ram().is_none());
+    }
 }
