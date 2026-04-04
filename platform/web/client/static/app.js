@@ -201,6 +201,22 @@ function stopBatterySaveTimer() {
 
 const canvas      = document.getElementById('gameCanvas');
 const ctx         = canvas.getContext('2d');
+
+// Keep the canvas buffer at device-pixel resolution so upscaling is done by
+// canvas drawImage (with imageSmoothingEnabled=false) rather than CSS, which
+// guarantees crisp nearest-neighbor scaling on all browsers/zoom levels.
+new ResizeObserver(entries => {
+  for (const entry of entries) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = Math.round(entry.contentRect.width * dpr);
+    const h = Math.round(entry.contentRect.height * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width  = w;
+      canvas.height = h;
+    }
+  }
+}).observe(canvas);
+
 const menuOverlay = document.getElementById('menuOverlay');
 const romList     = document.getElementById('romList');
 const powerBtn    = document.getElementById('powerBtn');
@@ -697,6 +713,8 @@ async function saveCurrentState() {
 function showSavedOverlay() {
   const c = canvas.getContext('2d');
   c.save();
+  const s = canvas.width / 160;
+  c.scale(s, s);
   c.fillStyle = 'rgba(15,56,15,0.85)';
   c.fillRect(0, 60, 160, 24);
   c.fillStyle = '#9BBC0F';
@@ -778,37 +796,33 @@ function formatSaveSlotLabel(unixSecs) {
 // ── Emulation loop ─────────────────────────────────────────────────────────
 
 let imageData = null;
+let offscreenCanvas = null;
+let offscreenCtx = null;
 let loopGeneration = 0; // incremented each time startLoop() is called; stale RAF callbacks self-cancel
 
-// DMG runs at 4194304 Hz / 70224 cycles per frame = 59.7275 fps
-const FRAME_DURATION_MS = 1000 / 59.7275;
-
 function startLoop() {
-  imageData = ctx.createImageData(160, 144);
-  let lastFrameTime = performance.now();
+  offscreenCanvas = document.createElement('canvas');
+  offscreenCanvas.width = 160;
+  offscreenCanvas.height = 144;
+  offscreenCtx = offscreenCanvas.getContext('2d');
+  imageData = offscreenCtx.createImageData(160, 144);
   const myGen = ++loopGeneration;
 
   function frame(now) {
     if (!state.running || !state.emulator || loopGeneration !== myGen) return;
 
-    const elapsed = now - lastFrameTime;
-    if (elapsed >= FRAME_DURATION_MS) {
-      const framesToRun = Math.min(2, Math.floor(elapsed / FRAME_DURATION_MS));
-      lastFrameTime = now - (elapsed % FRAME_DURATION_MS);
-
-      try {
-        for (let i = 0; i < framesToRun; i++) state.emulator.run_frame();
-      } catch(e) {
-        log.error(`run_frame error: ${e}`);
-        return;
-      }
-
-      if (state.audioCtx) {
-        pushAudioSamples(state.emulator.drain_audio_samples());
-      }
-
-      drawFrame();
+    try {
+      state.emulator.run_frame();
+    } catch(e) {
+      log.error(`run_frame error: ${e}`);
+      return;
     }
+
+    if (state.audioCtx) {
+      pushAudioSamples(state.emulator.drain_audio_samples());
+    }
+
+    drawFrame();
 
     state.rafId = requestAnimationFrame(frame);
   }
@@ -819,14 +833,18 @@ function startLoop() {
 function drawFrame() {
   const rgba = state.emulator.framebuffer_rgba();
   imageData.data.set(rgba);
-  ctx.putImageData(imageData, 0, 0);
+  offscreenCtx.putImageData(imageData, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offscreenCanvas, 0, 0, canvas.width, canvas.height);
 
   if (state.debugOverlay && typeof state.emulator.debug_state === 'function') {
     const lines = state.emulator.debug_state().split('\n');
-    // Draw at a size that fills most of the canvas width when scaled up
+    const s = canvas.width / 160;
     const fontSize = 10;
     const lineH = fontSize + 3;
     const pad = 3;
+    ctx.save();
+    ctx.scale(s, s);
     ctx.font = `bold ${fontSize}px monospace`;
     ctx.textBaseline = 'top';
     let maxW = 0;
@@ -839,6 +857,7 @@ function drawFrame() {
     lines.forEach((line, i) => {
       ctx.fillText(line, pad, pad + lineH * i);
     });
+    ctx.restore();
   }
 }
 
