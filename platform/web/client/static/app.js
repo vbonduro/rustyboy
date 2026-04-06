@@ -901,6 +901,7 @@ function bindButtons() {
 
     el.addEventListener('pointerdown', (e) => {
       e.preventDefault();
+      el.setPointerCapture(e.pointerId);
       el.classList.add('pressed');
       sendButton(idx, true);
     });
@@ -909,13 +910,6 @@ function bindButtons() {
       e.preventDefault();
       el.classList.remove('pressed');
       sendButton(idx, false);
-    });
-
-    el.addEventListener('pointerleave', (e) => {
-      if (el.classList.contains('pressed')) {
-        el.classList.remove('pressed');
-        sendButton(idx, false);
-      }
     });
 
     el.addEventListener('pointercancel', () => {

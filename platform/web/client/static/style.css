@@ -147,7 +147,7 @@ body {
   border-radius: 50%;
   border: none;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
   background: #C8294A;
   box-shadow:
     inset 0 2px 0 rgba(255,255,255,0.25),
@@ -482,8 +482,8 @@ body {
 .dpad-wrap { flex: 0 0 auto; }
 
 .dpad {
-  width: clamp(96px, 26vw, 120px);
-  height: clamp(96px, 26vw, 120px);
+  width: clamp(110px, 30vw, 140px);
+  height: clamp(110px, 30vw, 140px);
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   grid-template-rows: 1fr 1fr 1fr;
@@ -494,7 +494,7 @@ body {
   background: var(--btn-dpad);
   border: none;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
   -webkit-tap-highlight-color: transparent;
   transition: background 0.06s;
 }
@@ -522,8 +522,8 @@ body {
 
 .ab-cluster {
   position: relative;
-  width: clamp(96px, 26vw, 120px);
-  height: clamp(76px, 21vw, 94px);
+  width: clamp(110px, 30vw, 140px);
+  height: clamp(88px, 24vw, 110px);
 }
 
 .ab-btn-wrap {
@@ -539,12 +539,12 @@ body {
 .btn-b-wrap { bottom: 0; left: 0;  }
 
 .action-btn {
-  width: clamp(42px, 11vw, 52px);
-  height: clamp(42px, 11vw, 52px);
+  width: clamp(50px, 13vw, 62px);
+  height: clamp(50px, 13vw, 62px);
   border-radius: 50%;
   border: none;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
   background: var(--btn-ab);
   box-shadow:
     inset 0 3px 0 var(--btn-ab-hi),
@@ -592,7 +592,7 @@ body {
   border: none;
   border-radius: 20px;
   cursor: pointer;
-  touch-action: manipulation;
+  touch-action: none;
   box-shadow:
     inset 0 2px 0 var(--btn-mid-hi),
     inset 0 -3px 0 var(--btn-mid-shadow),
