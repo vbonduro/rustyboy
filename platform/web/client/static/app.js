@@ -620,6 +620,10 @@ async function stopEmulation() {
 
 function pauseEmulation() {
   if (!state.running || state.paused) return;
+  // Release all buttons before pausing so none stay stuck in the emulator
+  if (state.emulator) {
+    for (let i = 0; i < 8; i++) state.emulator.set_button(i, false);
+  }
   state.paused = true;
   state.menuGen++;
   if (state.rafId) {
@@ -937,23 +941,32 @@ function bindButtons() {
   // All game / dpad buttons
   document.querySelectorAll('[data-btn]').forEach(el => {
     const idx = parseInt(el.dataset.btn, 10);
+    let held = false;
 
     el.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       el.setPointerCapture(e.pointerId);
       el.classList.add('pressed');
+      held = true;
       sendButton(idx, true);
     });
 
     el.addEventListener('pointerup', (e) => {
       e.preventDefault();
       el.classList.remove('pressed');
-      sendButton(idx, false);
+      if (held) { held = false; sendButton(idx, false); }
     });
 
     el.addEventListener('pointercancel', () => {
       el.classList.remove('pressed');
-      sendButton(idx, false);
+      if (held) { held = false; sendButton(idx, false); }
+    });
+
+    // Fires after pointerup/pointercancel AND when capture is dropped mid-slide.
+    // The held guard ensures we only send a release if pointerup/cancel hasn't already.
+    el.addEventListener('lostpointercapture', () => {
+      el.classList.remove('pressed');
+      if (held) { held = false; sendButton(idx, false); }
     });
   });
 
