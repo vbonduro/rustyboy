@@ -690,7 +690,13 @@ function showPauseMenu(hasSaves, latestSaveId) {
         resumeEmulation();
       } else if (item.value === 'load') {
         // When returning from load screen (e.g. deleted all slots), re-show pause menu without saves
-        showSaveStateSlots(state.currentRomName, () => showPauseMenu(false));
+        showSaveStateSlots(state.currentRomName, async () => {
+          const [hasSaves, latestSave] = await Promise.all([
+            fetchHasSaves(state.currentRomName),
+            fetchLatestSaveId(state.currentRomName),
+          ]);
+          showPauseMenu(hasSaves, latestSave);
+        });
       } else if (item.value === 'reset') {
         const romName = state.currentRomName;
         await stopEmulation();
