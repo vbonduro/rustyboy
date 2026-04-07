@@ -254,16 +254,20 @@ async fn post_save_state(
     // Auto-generate slot name from current unix timestamp
     let slot_name = now_unix_secs().to_string();
     match state.db.upsert_save_state(&auth.user_id, &rom_name, &slot_name, body.to_vec()).await {
-        Ok(s) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "id": s.id,
-                "slot_name": s.slot_name,
-                "created_at": s.created_at,
-                "updated_at": s.updated_at,
-            })),
-        )
-            .into_response(),
+        Ok(s) => {
+            // Keep only the 5 most recent saves per user+rom; silently ignore prune errors
+            let _ = state.db.prune_save_states(&auth.user_id, &rom_name, 5).await;
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "id": s.id,
+                    "slot_name": s.slot_name,
+                    "created_at": s.created_at,
+                    "updated_at": s.updated_at,
+                })),
+            )
+                .into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

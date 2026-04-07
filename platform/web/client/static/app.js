@@ -377,6 +377,19 @@ async function showLoginError() {
 
 // ── Main menu / ROM list ───────────────────────────────────────────────────
 
+/** Returns the ID of the most recent save state for a ROM, or null if none. */
+async function fetchLatestSaveId(romName) {
+  if (!romName) return null;
+  try {
+    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}/latest`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /** Returns true if any save states exist. Pass a romName to scope to that ROM. */
 async function fetchHasSaves(romName) {
   try {
@@ -636,12 +649,15 @@ async function returnToMenu() {
 
 // ── In-game pause menu ─────────────────────────────────────────────────────
 
-function showPauseMenu(hasSaves) {
+function showPauseMenu(hasSaves, latestSaveId) {
   const items = [
-    { label: 'RESUME', value: 'resume' },
-    { label: 'SAVE',   value: 'save' },
+    { label: 'RESUME',     value: 'resume' },
+    { label: 'SAVE',       value: 'save' },
   ];
-  if (hasSaves) items.push({ label: 'LOAD', value: 'load' });
+  if (hasSaves) {
+    items.push({ label: 'QUICK LOAD', value: 'quickload' });
+    items.push({ label: 'LOAD',       value: 'load' });
+  }
   items.push({ label: 'RESET', value: 'reset' });
   items.push({ label: 'QUIT',  value: 'quit' });
 
@@ -657,6 +673,20 @@ function showPauseMenu(hasSaves) {
         resumeEmulation();
       } else if (item.value === 'save') {
         await saveCurrentState();
+        resumeEmulation();
+      } else if (item.value === 'quickload') {
+        if (latestSaveId) {
+          try {
+            const res = await fetch(`/api/save-states/by-id/${encodeURIComponent(latestSaveId)}/data`);
+            if (res.ok) {
+              const buf = await res.arrayBuffer();
+              state.emulator.load_state(new Uint8Array(buf));
+              log.debug(`quick load: ${buf.byteLength} bytes`);
+            }
+          } catch (e) {
+            log.warn(`quick load failed: ${e}`);
+          }
+        }
         resumeEmulation();
       } else if (item.value === 'load') {
         // When returning from load screen (e.g. deleted all slots), re-show pause menu without saves
@@ -684,14 +714,17 @@ async function showInGameMenu() {
   log.event('showInGameMenu');
   const gen = state.menuGen; // snapshot before async gap
 
-  const hasSaves = await fetchHasSaves(state.currentRomName);
+  const [hasSaves, latestSave] = await Promise.all([
+    fetchHasSaves(state.currentRomName),
+    fetchLatestSaveId(state.currentRomName),
+  ]);
 
   state.menuPending = false;
 
   // If state changed while we were fetching (resumed, quit, new game), abort
   if (state.menuGen !== gen || !state.paused || !state.running) return;
 
-  showPauseMenu(hasSaves);
+  showPauseMenu(hasSaves, latestSave);
 }
 
 async function saveCurrentState() {

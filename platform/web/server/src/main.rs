@@ -14,7 +14,7 @@ async fn main() {
     let static_dir = PathBuf::from(
         std::env::var("STATIC_DIR").unwrap_or_else(|_| "/static".to_string()),
     );
-    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "/data/rustyboy.db".to_string());
+    let db_path = std::env::var("DB_PATH").unwrap_or_else(|_| "/appdata/rustyboy.db".to_string());
 
     let db = db_connect(&db_path)
         .await

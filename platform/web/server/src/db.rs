@@ -323,6 +323,28 @@ impl Database {
         Ok(())
     }
 
+    /// Delete the oldest save states for a user+rom beyond `keep` most recent.
+    pub async fn prune_save_states(&self, user_id: &str, rom_name: &str, keep: usize) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "DELETE FROM save_states
+             WHERE user_id = ? AND rom_name = ?
+               AND id NOT IN (
+                 SELECT id FROM save_states
+                 WHERE user_id = ? AND rom_name = ?
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+               )",
+        )
+        .bind(user_id)
+        .bind(rom_name)
+        .bind(user_id)
+        .bind(rom_name)
+        .bind(keep as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Returns one row per rom_name the user has saves for, with the most recent updated_at.
     pub async fn list_roms_with_saves(&self, user_id: &str) -> Result<Vec<(String, i64)>, sqlx::Error> {
         let rows = sqlx::query(
@@ -780,6 +802,58 @@ mod tests {
             .await
             .unwrap();
         assert!(roms.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_prune_save_states_removes_oldest() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_prune", "prune@example.com", "Prune", None)
+            .await
+            .unwrap();
+
+        // Insert 7 saves with staggered timestamps
+        for i in 0..7u64 {
+            db.upsert_save_state(&user.id, "zelda.gb", &i.to_string(), vec![i as u8])
+                .await
+                .unwrap();
+            // Force distinct updated_at values
+            sqlx::query("UPDATE save_states SET updated_at = ? WHERE slot_name = ?")
+                .bind(i as i64)
+                .bind(i.to_string())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        db.prune_save_states(&user.id, "zelda.gb", 5).await.unwrap();
+
+        let remaining = db.list_save_states(&user.id, "zelda.gb").await.unwrap();
+        assert_eq!(remaining.len(), 5);
+        // The 5 most recent (slots 2-6, updated_at 2-6) should remain
+        let slots: Vec<String> = remaining.iter().map(|s| s.slot_name.clone()).collect();
+        assert!(!slots.contains(&"0".to_string()));
+        assert!(!slots.contains(&"1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_prune_save_states_noop_when_under_limit() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_prune2", "prune2@example.com", "Prune2", None)
+            .await
+            .unwrap();
+
+        for i in 0..3u64 {
+            db.upsert_save_state(&user.id, "mario.gb", &i.to_string(), vec![i as u8])
+                .await
+                .unwrap();
+        }
+
+        db.prune_save_states(&user.id, "mario.gb", 5).await.unwrap();
+
+        let remaining = db.list_save_states(&user.id, "mario.gb").await.unwrap();
+        assert_eq!(remaining.len(), 3);
     }
 
     #[tokio::test]

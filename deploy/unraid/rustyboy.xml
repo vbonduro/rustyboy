@@ -16,7 +16,11 @@
 
   <Config Name="Web UI Port" Target="8080" Default="8080" Mode="tcp" Description="Port to access the rustyboy web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
 
+  <Config Name="AppData" Target="/appdata" Default="/mnt/user/appdata/rustyboy" Mode="rw" Description="Persistent data directory. Stores the SQLite database (save states, battery saves, user accounts) and your secrets.env file." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/rustyboy</Config>
+
   <Config Name="ROMs" Target="/roms" Default="/mnt/user/appdata/rustyboy/roms" Mode="ro" Description="Directory containing your .gb and .gbc ROM files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/rustyboy/roms</Config>
+
+  <Config Name="Secrets File" Target="SECRETS_FILE" Default="/appdata/secrets.env" Mode="" Description="Path inside the container to your secrets file containing JWT_SECRET and auth credentials." Type="Variable" Display="always" Required="false" Mask="false">/appdata/secrets.env</Config>
 
   <Config Name="ROMS_DIR" Target="ROMS_DIR" Default="/roms" Mode="" Description="Path inside the container where ROMs are mounted. Change only if you customised the ROMs path above." Type="Variable" Display="advanced" Required="false" Mask="false">/roms</Config>
 
