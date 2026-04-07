@@ -63,8 +63,6 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /data
-
 # Copy server binary
 COPY --from=server-builder \
     /build/target/release/rustyboy-server \
@@ -78,7 +76,7 @@ COPY --from=wasm-builder /build/platform/web/client/pkg /static
 EXPOSE 8080
 ENV ROMS_DIR=/roms
 ENV STATIC_DIR=/static
-ENV DB_PATH=/data/rustyboy.db
+ENV DB_PATH=/appdata/rustyboy.db
 
 # ROMs are mounted at runtime: docker run -v /path/to/roms:/roms
 ENTRYPOINT ["/usr/local/bin/rustyboy-server"]

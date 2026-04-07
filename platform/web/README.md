@@ -111,7 +111,7 @@ Open `http://localhost:8080` in a browser.
 | `ROMS_DIR` | `/roms` | Directory scanned for `.gb`/`.gbc` ROM files |
 | `STATIC_DIR` | `/static` | Directory serving the built frontend assets |
 | `PORT` | `8080` | Port the server listens on |
-| `DB_PATH` | `/data/rustyboy.db` | SQLite database path (user accounts) |
+| `DB_PATH` | `/appdata/rustyboy.db` | SQLite database path (user accounts) |
 | `JWT_SECRET` | _(required)_ | Secret used to sign session cookies — set to a long random string |
 | `RUST_LOG` | _(unset)_ | Log level, e.g. `info` |
 
@@ -208,7 +208,7 @@ CF_TEAM_DOMAIN=<team name>
 
 ```sh
 docker run \
-  -v /path/to/appdata/rustyboy:/appdata:ro \
+  -v /path/to/appdata/rustyboy:/appdata \
   -e SECRETS_FILE=/appdata/secrets.env \
   -p 8080:8080 \
   -v /path/to/roms:/roms \
