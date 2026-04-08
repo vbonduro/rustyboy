@@ -209,6 +209,17 @@ impl GameBoyMemory {
         out.extend_from_slice(self.vram());
         out.extend_from_slice(self.oam());
         self.cartridge.save_mbc_state(out);
+        // External RAM (cart SRAM): prefix with u16 LE length so load_state
+        // can handle carts with no RAM (len=0) and varying RAM sizes.
+        match self.cartridge.external_ram() {
+            Some(ram) => {
+                out.extend_from_slice(&(ram.len() as u16).to_le_bytes());
+                out.extend_from_slice(ram);
+            }
+            None => {
+                out.extend_from_slice(&0u16.to_le_bytes());
+            }
+        }
     }
 
     /// Deserialize memory state from `data` at `offset`. Advances offset past all regions.
@@ -230,6 +241,15 @@ impl GameBoyMemory {
         self.set_oam(&data[cur..cur + 0xA0]);
         cur += 0xA0;
         cur += self.cartridge.load_mbc_state(data, cur);
+        // External RAM: read u16 LE length, then restore that many bytes.
+        if cur + 2 <= data.len() {
+            let ram_len = u16::from_le_bytes([data[cur], data[cur + 1]]) as usize;
+            cur += 2;
+            if ram_len > 0 && cur + ram_len <= data.len() {
+                self.cartridge.set_external_ram(&data[cur..cur + ram_len]);
+                cur += ram_len;
+            }
+        }
         cur - offset
     }
 
