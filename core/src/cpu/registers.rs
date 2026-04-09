@@ -129,6 +129,11 @@ impl Registers {
         self.pc = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
         cur - start
     }
+
+    /// Apply register state from a parsed [`CpuState`].
+    pub fn apply_state(&mut self, state: crate::cpu::save_state::CpuState) {
+        *self = state.to_registers();
+    }
 }
 
 #[cfg(test)]

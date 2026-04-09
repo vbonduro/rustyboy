@@ -284,17 +284,12 @@ impl Sm83 {
     /// well-formed `SaveState`. Returns `Ok(())` always; kept as `Result` for
     /// call-site symmetry and future extensibility.
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
-        self.registers = state.cpu().to_registers();
-        self.ime = state.ime;
-        self.halted = state.halted;
-        self.cycle_counter = state.cycle_counter;
-        self.timer.set_internal_counter(state.timer_internal_counter);
-        self.ppu.apply_fields(
-            state.ppu.dot,
-            state.ppu.ly,
-            state.ppu.mode,
-            state.ppu.window_line_counter,
-        );
+        self.ime           = state.cpu.ime;
+        self.halted        = state.cpu.halted;
+        self.cycle_counter = state.cpu.cycle_counter;
+        self.registers.apply_state(state.cpu);
+        self.timer.load_state(state.timer);
+        self.ppu.load_state(state.ppu);
         self.memory.load_from_save_state(&state);
         Ok(())
     }

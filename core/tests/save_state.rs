@@ -269,8 +269,8 @@ fn test_save_state_struct_inspect_then_apply() {
     let state = SaveState::from_blob(blob).expect("SaveState::from_blob failed");
 
     // Inspect fields before touching any emulator state
-    assert_eq!(state.cpu().pc, pc_before, "SaveState pc field mismatch");
-    assert_eq!(state.cycle_counter(), cycles_before, "SaveState cycle_counter field mismatch");
+    assert_eq!(state.cpu.pc, pc_before, "SaveState pc field mismatch");
+    assert_eq!(state.cpu.cycle_counter, cycles_before, "SaveState cycle_counter field mismatch");
 
     // Apply into a fresh emulator and verify
     let mut cpu2 = make_emulator(rom);
