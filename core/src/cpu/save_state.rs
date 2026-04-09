@@ -16,6 +16,7 @@ use core::ops::Range;
 use crate::cpu::peripheral::ppu::PpuMode;
 use crate::cpu::registers::{Flags, Registers};
 use crate::cpu::sm83::ImeState;
+use crate::memory::memory::GameBoyMemory;
 
 // ── Format constants ──────────────────────────────────────────────────────────
 
@@ -198,6 +199,41 @@ pub struct SaveState {
 }
 
 impl SaveState {
+    /// Serialize emulator state into an RBSS v1 blob.
+    ///
+    /// Called by `Sm83::save_state` which constructs the typed state structs
+    /// from its own fields and passes them here. This function owns the format.
+    pub fn serialize(cpu: CpuState, timer: TimerState, ppu: PpuState, memory: &GameBoyMemory) -> Vec<u8> {
+        let mut out = Vec::with_capacity(MIN_BLOB_SIZE);
+        // Header
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        // CPU registers
+        out.push(cpu.a); out.push(cpu.b); out.push(cpu.c); out.push(cpu.d);
+        out.push(cpu.e); out.push(cpu.h); out.push(cpu.l);
+        out.push(cpu.f.bits());
+        out.extend_from_slice(&cpu.sp.to_le_bytes());
+        out.extend_from_slice(&cpu.pc.to_le_bytes());
+        // IME + halted + cycle counter
+        out.push(match cpu.ime {
+            ImeState::Disabled => 0,
+            ImeState::Pending  => 1,
+            ImeState::Enabled  => 2,
+        });
+        out.push(cpu.halted as u8);
+        out.extend_from_slice(&cpu.cycle_counter.to_le_bytes());
+        // Timer
+        out.extend_from_slice(&timer.internal_counter.to_le_bytes());
+        // PPU
+        out.extend_from_slice(&ppu.dot.to_le_bytes());
+        out.push(ppu.ly);
+        out.push(ppu.mode as u8);
+        out.push(ppu.window_line_counter);
+        // Memory regions (IO regs, WRAM, HRAM, VRAM, OAM, MBC state, cart RAM)
+        memory.save_state(&mut out);
+        out
+    }
+
     /// Parse and validate a raw RBSS v1 blob.
     ///
     /// Returns `Err` if the blob is too short, has a bad magic, or has an

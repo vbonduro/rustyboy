@@ -54,9 +54,9 @@ impl TimerPeripheral {
         self.internal_counter = 0;
     }
 
-    /// Serialize timer state into `out`. 2 bytes: internal_counter LE.
-    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
-        out.extend_from_slice(&self.internal_counter.to_le_bytes());
+    /// Extract timer state into a [`TimerState`] for serialization.
+    pub fn to_save_state(&self) -> crate::cpu::save_state::TimerState {
+        crate::cpu::save_state::TimerState { internal_counter: self.internal_counter }
     }
 
     /// Apply timer state from a parsed [`TimerState`].
