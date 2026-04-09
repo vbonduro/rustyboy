@@ -223,39 +223,8 @@ impl GameBoyMemory {
         }
     }
 
-    /// Deserialize memory state from `data` at `offset`. Advances offset past all regions.
-    /// Deserialize memory state from `data` at byte `offset`. Returns the number of bytes consumed.
-    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
-        let mut cur = offset;
-        for i in 0..0x80u16 {
-            self.write_io(0xFF00 + i, data[cur + i as usize]);
-        }
-        cur += 0x80;
-        self.ie = data[cur];
-        cur += 1;
-        self.set_wram(&data[cur..cur + 0x2000]);
-        cur += 0x2000;
-        self.set_hram(&data[cur..cur + 0x7F]);
-        cur += 0x7F;
-        self.set_vram(&data[cur..cur + 0x2000]);
-        cur += 0x2000;
-        self.set_oam(&data[cur..cur + 0xA0]);
-        cur += 0xA0;
-        cur += self.cartridge.load_mbc_state(data, cur);
-        // External RAM: read u16 LE length, then restore that many bytes.
-        if cur + 2 <= data.len() {
-            let ram_len = u16::from_le_bytes([data[cur], data[cur + 1]]) as usize;
-            cur += 2;
-            if ram_len > 0 && cur + ram_len <= data.len() {
-                self.cartridge.set_external_ram(&data[cur..cur + ram_len]);
-                cur += ram_len;
-            }
-        }
-        cur - offset
-    }
-
     /// Apply memory state from a parsed [`SaveState`]. Zero-copy for large regions.
-    pub fn load_from_save_state(&mut self, state: &SaveState) {
+    pub fn load_state(&mut self, state: &SaveState) {
         let io = state.io_registers();
         for i in 0..0x80u16 {
             self.write_io(0xFF00 + i, io[i as usize]);
