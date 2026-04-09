@@ -44,7 +44,7 @@ use super::peripheral::timer::{
     TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
 };
 use super::registers::{Flags, Registers};
-use super::save_state::SaveState;
+use super::save_state::{CpuState, SaveState};
 
 use crate::memory::memory::{Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
 
@@ -228,53 +228,16 @@ impl Sm83 {
         self.memory.set_external_ram(data);
     }
 
-    /// Serialize the full emulator state to a byte blob.
-    ///
-    /// Format:
-    ///   [0..4]   magic "RBSS"
-    ///   [4..6]   version u16 LE (= 1)
-    ///   [6]      A
-    ///   [7]      B
-    ///   [8]      C
-    ///   [9]      D
-    ///   [10]     E
-    ///   [11]     H
-    ///   [12]     L
-    ///   [13]     F (flags byte)
-    ///   [14..16] SP u16 LE
-    ///   [16..18] PC u16 LE
-    ///   [18]     IME (0=disabled, 1=pending, 2=enabled)
-    ///   [19]     halted (0/1)
-    ///   [20..28] cycle_counter u64 LE
-    ///   [28..30] timer internal_counter u16 LE
-    ///   [30..32] PPU dot u16 LE
-    ///   [32]     PPU ly
-    ///   [33]     PPU mode
-    ///   [34]     PPU window_line_counter
-    ///   [35..163]  IO registers (0xFF00–0xFF7F, 0x80 bytes)
-    ///   [163]    IE register
-    ///   [164..8356]   WRAM (0x2000 bytes)
-    ///   [8356..8483]  HRAM (0x7F bytes)
-    ///   [8483..16675] VRAM (0x2000 bytes)
-    ///   [16675..16835] OAM (0xA0 bytes)
+    /// Serialize the full emulator state to an RBSS v1 blob.
     pub fn save_state(&self) -> alloc::vec::Vec<u8> {
-        let mut out = alloc::vec::Vec::with_capacity(16835);
-        // Header
-        out.extend_from_slice(b"RBSS");
-        out.extend_from_slice(&1u16.to_le_bytes());
-        // Components
-        self.registers.save_state(&mut out);
-        out.push(match self.ime {
-            ImeState::Disabled => 0,
-            ImeState::Pending  => 1,
-            ImeState::Enabled  => 2,
-        });
-        out.push(self.halted as u8);
-        out.extend_from_slice(&self.cycle_counter.to_le_bytes());
-        self.timer.save_state(&mut out);
-        self.ppu.save_state(&mut out);
-        self.memory.save_state(&mut out);
-        out
+        let cpu = CpuState {
+            a: self.registers.a, b: self.registers.b, c: self.registers.c,
+            d: self.registers.d, e: self.registers.e, h: self.registers.h,
+            l: self.registers.l, f: self.registers.f,
+            sp: self.registers.sp, pc: self.registers.pc,
+            ime: self.ime, halted: self.halted, cycle_counter: self.cycle_counter,
+        };
+        SaveState::serialize(cpu, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
     }
 
     /// Restore emulator state from a parsed [`SaveState`].

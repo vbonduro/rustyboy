@@ -99,36 +99,6 @@ impl Registers {
         self.f = Flags::from_bits_truncate((af & 0xF0) as u8);
     }
 
-    /// Serialize registers into `out`. 10 bytes: A B C D E H L F SP(LE) PC(LE).
-    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
-        out.push(self.a);
-        out.push(self.b);
-        out.push(self.c);
-        out.push(self.d);
-        out.push(self.e);
-        out.push(self.h);
-        out.push(self.l);
-        out.push(self.f.bits());
-        out.extend_from_slice(&self.sp.to_le_bytes());
-        out.extend_from_slice(&self.pc.to_le_bytes());
-    }
-
-    /// Deserialize registers from `data` at byte `offset`. Returns the number of bytes consumed.
-    pub fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
-        let start = offset;
-        let mut cur = offset;
-        self.a  = data[cur]; cur += 1;
-        self.b  = data[cur]; cur += 1;
-        self.c  = data[cur]; cur += 1;
-        self.d  = data[cur]; cur += 1;
-        self.e  = data[cur]; cur += 1;
-        self.h  = data[cur]; cur += 1;
-        self.l  = data[cur]; cur += 1;
-        self.f  = Flags::from_bits_truncate(data[cur]); cur += 1;
-        self.sp = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
-        self.pc = u16::from_le_bytes([data[cur], data[cur + 1]]); cur += 2;
-        cur - start
-    }
 
 }
 

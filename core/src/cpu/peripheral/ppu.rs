@@ -125,12 +125,14 @@ impl PpuPeripheral {
         &self.framebuffer
     }
 
-    /// Serialize PPU state into `out`. 5 bytes: dot(LE u16) ly mode window_line_counter.
-    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
-        out.extend_from_slice(&self.dot.to_le_bytes());
-        out.push(self.ly);
-        out.push(self.mode as u8);
-        out.push(self.window_line_counter);
+    /// Extract PPU state into a [`PpuState`] for serialization.
+    pub fn to_save_state(&self) -> crate::cpu::save_state::PpuState {
+        crate::cpu::save_state::PpuState {
+            dot: self.dot,
+            ly: self.ly,
+            mode: self.mode,
+            window_line_counter: self.window_line_counter,
+        }
     }
 
     /// Apply PPU state from a parsed [`PpuState`].
