@@ -130,10 +130,6 @@ impl Registers {
         cur - start
     }
 
-    /// Apply register state from a parsed [`CpuState`].
-    pub fn apply_state(&mut self, state: crate::cpu::save_state::CpuState) {
-        *self = state.to_registers();
-    }
 }
 
 #[cfg(test)]
