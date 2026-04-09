@@ -6,6 +6,7 @@ use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
+use rustyboy_core::cpu::save_state::SaveState;
 use rustyboy_core::memory::memory::GameBoyMemory;
 
 /// Build a minimal in-memory ROM with a NOP + JR -2 loop at 0x0100.
@@ -58,7 +59,7 @@ fn test_save_state_roundtrip_basic() {
 
     // Restore into a fresh emulator from the same ROM
     let mut cpu2 = make_emulator(rom);
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     let regs_after = cpu2.registers();
     assert_eq!(regs_before.a, regs_after.a, "register A mismatch");
@@ -89,7 +90,7 @@ fn test_save_state_pc_preserved() {
     let state = cpu.save_state();
 
     let mut cpu2 = make_emulator(rom);
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     assert_eq!(pc_before, cpu2.registers().pc, "PC not preserved across save/load");
 }
@@ -111,7 +112,7 @@ fn test_save_state_wram_preserved() {
 
     // Load the patched state into a fresh emulator
     let mut cpu2 = make_emulator(rom);
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     // Read back WRAM via the memory bus (0xC000 maps to WRAM base)
     for (i, &expected) in pattern.iter().enumerate() {
@@ -125,30 +126,21 @@ fn test_save_state_wram_preserved() {
 
 #[test]
 fn test_save_state_invalid_magic() {
-    let rom = make_rom(0x00, 0, 0);
-    let mut cpu = make_emulator(rom);
-
-    // Build a blob of the right length but with wrong magic
     let mut garbage = vec![0xFFu8; 16835];
     garbage[0] = b'X';
     garbage[1] = b'X';
     garbage[2] = b'X';
     garbage[3] = b'X';
 
-    let result = cpu.load_state(&garbage);
-    assert!(result.is_err(), "expected Err for invalid magic, got Ok");
+    assert!(SaveState::from_blob(garbage).is_err(), "expected Err for invalid magic, got Ok");
 }
 
 // ── Too short ─────────────────────────────────────────────────────────────────
 
 #[test]
 fn test_save_state_too_short() {
-    let rom = make_rom(0x00, 0, 0);
-    let mut cpu = make_emulator(rom);
-
-    let short_blob = [0u8; 10];
-    let result = cpu.load_state(&short_blob);
-    assert!(result.is_err(), "expected Err for too-short blob, got Ok");
+    let short_blob = vec![0u8; 10];
+    assert!(SaveState::from_blob(short_blob).is_err(), "expected Err for too-short blob, got Ok");
 }
 
 // ── MBC bank state preserved ──────────────────────────────────────────────────
@@ -194,7 +186,7 @@ fn test_save_state_mbc1_bank_preserved() {
     let mut cpu2 = make_emulator(rom);
     assert_eq!(cpu2.current_rom_bank(), 1, "fresh emulator starts at bank 1");
 
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     // After restoring, bank 7 should be remapped
     assert_eq!(cpu2.current_rom_bank(), 7, "MBC bank not restored across save/load");
@@ -248,7 +240,7 @@ fn test_save_state_mbc1_cart_ram_preserved() {
 
     // Fresh emulator — cart RAM is zeroed
     let mut cpu2 = make_emulator(rom);
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     // Cart RAM must survive the round-trip
     for (i, &expected) in pattern.iter().enumerate() {
@@ -256,6 +248,51 @@ fn test_save_state_mbc1_cart_ram_preserved() {
         assert_eq!(actual, expected,
             "cart RAM byte {i} lost across save/load: got {actual:#04x}, want {expected:#04x}");
     }
+}
+
+// ── SaveState: parse blob, inspect fields, then apply ────────────────────────
+
+#[test]
+fn test_save_state_struct_inspect_then_apply() {
+    let rom = make_rom(0x00, 0, 0);
+    let mut cpu = make_emulator(rom.clone());
+
+    for _ in 0..1000 {
+        cpu.tick().unwrap();
+    }
+
+    let pc_before = cpu.registers().pc;
+    let cycles_before = cpu.cycle_counter();
+
+    // Serialize to blob, then parse into SaveState
+    let blob = cpu.save_state();
+    let state = SaveState::from_blob(blob).expect("SaveState::from_blob failed");
+
+    // Inspect fields before touching any emulator state
+    assert_eq!(state.cpu().pc, pc_before, "SaveState pc field mismatch");
+    assert_eq!(state.cycle_counter(), cycles_before, "SaveState cycle_counter field mismatch");
+
+    // Apply into a fresh emulator and verify
+    let mut cpu2 = make_emulator(rom);
+    cpu2.load_state(state).expect("load_state failed");
+
+    assert_eq!(cpu2.registers().pc, pc_before, "PC not preserved after apply");
+    assert_eq!(cpu2.cycle_counter(), cycles_before, "cycle_counter not preserved after apply");
+}
+
+// ── SaveState: from_blob rejects invalid input ────────────────────────────────
+
+#[test]
+fn test_save_state_from_blob_rejects_bad_magic() {
+    let mut blob = vec![0u8; 16835];
+    blob[0..4].copy_from_slice(b"XXXX");
+    assert!(SaveState::from_blob(blob).is_err());
+}
+
+#[test]
+fn test_save_state_from_blob_rejects_too_short() {
+    let blob = vec![0u8; 10];
+    assert!(SaveState::from_blob(blob).is_err());
 }
 
 // ── Cycle counter preserved ───────────────────────────────────────────────────
@@ -276,7 +313,7 @@ fn test_save_state_roundtrip_preserves_cycle_counter() {
     let state = cpu.save_state();
 
     let mut cpu2 = make_emulator(rom);
-    cpu2.load_state(&state).expect("load_state failed");
+    cpu2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
 
     assert_eq!(cycles_before, cpu2.cycle_counter(), "cycle_counter not preserved across save/load");
 }

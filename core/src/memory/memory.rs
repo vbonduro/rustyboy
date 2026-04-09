@@ -5,6 +5,7 @@ use core::fmt;
 
 use super::cartridge::{self, Cartridge, NoMbc};
 use super::rom::Ram;
+use crate::cpu::save_state::SaveState;
 
 /// An event produced when a write occurs to an I/O or IE register address.
 #[derive(Debug, PartialEq, Clone)]
@@ -251,6 +252,28 @@ impl GameBoyMemory {
             }
         }
         cur - offset
+    }
+
+    /// Apply memory state from a parsed [`SaveState`]. Zero-copy for large regions.
+    pub fn load_from_save_state(&mut self, state: &SaveState) {
+        let io = state.io_registers();
+        for i in 0..0x80u16 {
+            self.write_io(0xFF00 + i, io[i as usize]);
+        }
+        self.ie = state.ie();
+        self.set_wram(state.wram());
+        self.set_hram(state.hram());
+        self.set_vram(state.vram());
+        self.set_oam(state.oam());
+        if let Some(mbc) = state.mbc() {
+            // Reconstruct MBC register state via the existing load path.
+            // We build a minimal 4-byte buffer and reuse load_mbc_state.
+            let buf = [mbc.rom_bank_lo, mbc.upper_bits, mbc.ram_mode as u8, mbc.ram_enabled as u8];
+            self.cartridge.load_mbc_state(&buf, 0);
+        }
+        if let Some(ram) = state.cart_ram() {
+            self.cartridge.set_external_ram(ram);
+        }
     }
 
     /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.

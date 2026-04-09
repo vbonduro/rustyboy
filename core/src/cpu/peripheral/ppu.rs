@@ -149,6 +149,13 @@ impl PpuPeripheral {
         cur - start
     }
 
+    pub fn apply_fields(&mut self, dot: u16, ly: u8, mode: PpuMode, window_line_counter: u8) {
+        self.dot = dot;
+        self.ly = ly;
+        self.mode = mode;
+        self.window_line_counter = window_line_counter;
+    }
+
     /// Advance the PPU by `cycles` T-cycles.
     pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
         let lcdc = Lcdc(input.lcdc);

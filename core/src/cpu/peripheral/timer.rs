@@ -67,6 +67,10 @@ impl TimerPeripheral {
         cur - start
     }
 
+    pub fn set_internal_counter(&mut self, value: u16) {
+        self.internal_counter = value;
+    }
+
     /// Advance the timer by `cycles` T-cycles.
     ///
     /// Pure transform: reads register state from `input`, returns new state
