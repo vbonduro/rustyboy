@@ -77,6 +77,21 @@ pub struct CpuState {
 }
 
 impl CpuState {
+    pub fn serialize(&self, out: &mut Vec<u8>) {
+        out.push(self.a); out.push(self.b); out.push(self.c); out.push(self.d);
+        out.push(self.e); out.push(self.h); out.push(self.l);
+        out.push(self.f.bits());
+        out.extend_from_slice(&self.sp.to_le_bytes());
+        out.extend_from_slice(&self.pc.to_le_bytes());
+        out.push(match self.ime {
+            ImeState::Disabled => 0,
+            ImeState::Pending  => 1,
+            ImeState::Enabled  => 2,
+        });
+        out.push(self.halted as u8);
+        out.extend_from_slice(&self.cycle_counter.to_le_bytes());
+    }
+
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
         let b = &blob[offset..];
         let ime = match b[CPU_REGS_SIZE] {
@@ -117,6 +132,10 @@ pub struct TimerState {
 }
 
 impl TimerState {
+    pub fn serialize(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.internal_counter.to_le_bytes());
+    }
+
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
         let state = TimerState {
             internal_counter: u16::from_le_bytes([blob[offset], blob[offset + 1]]),
@@ -135,6 +154,13 @@ pub struct PpuState {
 }
 
 impl PpuState {
+    pub fn serialize(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.dot.to_le_bytes());
+        out.push(self.ly);
+        out.push(self.mode as u8);
+        out.push(self.window_line_counter);
+    }
+
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
         let b = &blob[offset..];
         let state = PpuState {
@@ -205,31 +231,11 @@ impl SaveState {
     /// from its own fields and passes them here. This function owns the format.
     pub fn serialize(cpu: CpuState, timer: TimerState, ppu: PpuState, memory: &GameBoyMemory) -> Vec<u8> {
         let mut out = Vec::with_capacity(MIN_BLOB_SIZE);
-        // Header
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        // CPU registers
-        out.push(cpu.a); out.push(cpu.b); out.push(cpu.c); out.push(cpu.d);
-        out.push(cpu.e); out.push(cpu.h); out.push(cpu.l);
-        out.push(cpu.f.bits());
-        out.extend_from_slice(&cpu.sp.to_le_bytes());
-        out.extend_from_slice(&cpu.pc.to_le_bytes());
-        // IME + halted + cycle counter
-        out.push(match cpu.ime {
-            ImeState::Disabled => 0,
-            ImeState::Pending  => 1,
-            ImeState::Enabled  => 2,
-        });
-        out.push(cpu.halted as u8);
-        out.extend_from_slice(&cpu.cycle_counter.to_le_bytes());
-        // Timer
-        out.extend_from_slice(&timer.internal_counter.to_le_bytes());
-        // PPU
-        out.extend_from_slice(&ppu.dot.to_le_bytes());
-        out.push(ppu.ly);
-        out.push(ppu.mode as u8);
-        out.push(ppu.window_line_counter);
-        // Memory regions (IO regs, WRAM, HRAM, VRAM, OAM, MBC state, cart RAM)
+        cpu.serialize(&mut out);
+        timer.serialize(&mut out);
+        ppu.serialize(&mut out);
         memory.save_state(&mut out);
         out
     }
