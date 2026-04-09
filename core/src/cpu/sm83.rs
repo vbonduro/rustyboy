@@ -44,6 +44,7 @@ use super::peripheral::timer::{
     TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
 };
 use super::registers::{Flags, Registers};
+use super::save_state::SaveState;
 
 use crate::memory::memory::{Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
 
@@ -55,7 +56,7 @@ impl From<MemoryError> for InstructionError {
 
 /// Interrupt Master Enable state. EI has a 1-instruction delay before IME becomes active.
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum ImeState {
+pub enum ImeState {
     Disabled,
     /// EI was just executed — IME activates after the next instruction.
     Pending,
@@ -276,39 +277,25 @@ impl Sm83 {
         out
     }
 
-    /// Restore emulator state from a blob produced by `save_state`.
-    /// Returns `Err` with a description if the blob is invalid.
-    pub fn load_state(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        // Minimum size covers header + CPU + timer + PPU + memory (without MBC state).
-        // MBC state is appended after and may be absent in older saves.
-        if data.len() < 16835 {
-            return Err("save state blob too short");
-        }
-        if &data[0..4] != b"RBSS" {
-            return Err("invalid save state magic");
-        }
-        let version = u16::from_le_bytes([data[4], data[5]]);
-        if version != 1 {
-            return Err("unsupported save state version");
-        }
-        let mut offset = 6;
-        offset += self.registers.load_state(data, offset);
-        self.ime = match data[offset] {
-            1 => ImeState::Pending,
-            2 => ImeState::Enabled,
-            _ => ImeState::Disabled,
-        };
-        offset += 1;
-        self.halted = data[offset] != 0;
-        offset += 1;
-        self.cycle_counter = u64::from_le_bytes([
-            data[offset],     data[offset + 1], data[offset + 2], data[offset + 3],
-            data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
-        ]);
-        offset += 8;
-        offset += self.timer.load_state(data, offset);
-        offset += self.ppu.load_state(data, offset);
-        self.memory.load_state(data, offset);
+    /// Restore emulator state from a parsed [`SaveState`].
+    ///
+    /// The blob is fully validated before this is called (via
+    /// [`SaveState::from_blob`]), so applying here is infallible given a
+    /// well-formed `SaveState`. Returns `Ok(())` always; kept as `Result` for
+    /// call-site symmetry and future extensibility.
+    pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
+        self.registers = state.cpu().to_registers();
+        self.ime = state.ime;
+        self.halted = state.halted;
+        self.cycle_counter = state.cycle_counter;
+        self.timer.set_internal_counter(state.timer_internal_counter);
+        self.ppu.apply_fields(
+            state.ppu.dot,
+            state.ppu.ly,
+            state.ppu.mode,
+            state.ppu.window_line_counter,
+        );
+        self.memory.load_from_save_state(&state);
         Ok(())
     }
 

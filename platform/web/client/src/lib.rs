@@ -6,6 +6,7 @@ use rustyboy_core::{
         instructions::opcodes::OpCodeDecoder,
         peripheral::joypad::Button,
         registers::{Flags, Registers},
+        save_state::SaveState,
         sm83::Sm83,
     },
     memory::GameBoyMemory,
@@ -115,7 +116,8 @@ impl EmulatorHandle {
 
     /// Restore emulator state from a blob produced by `save_state`.
     pub fn load_state(&mut self, data: Vec<u8>) -> Result<(), JsValue> {
-        self.cpu.load_state(&data).map_err(|e| JsValue::from_str(e))
+        let state = SaveState::from_blob(data).map_err(|e| JsValue::from_str(e))?;
+        self.cpu.load_state(state).map_err(|e| JsValue::from_str(e))
     }
 
     /// Returns the cartridge external RAM (battery save) as bytes, or an empty Vec
