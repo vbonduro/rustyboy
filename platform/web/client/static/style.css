@@ -482,8 +482,8 @@ body {
 .dpad-wrap { flex: 0 0 auto; }
 
 .dpad {
-  width: clamp(110px, 30vw, 140px);
-  height: clamp(110px, 30vw, 140px);
+  width: clamp(120px, 33vw, 152px);
+  height: clamp(120px, 33vw, 152px);
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
   grid-template-rows: 1fr 1fr 1fr;
@@ -522,8 +522,8 @@ body {
 
 .ab-cluster {
   position: relative;
-  width: clamp(110px, 30vw, 140px);
-  height: clamp(88px, 24vw, 110px);
+  width: clamp(120px, 33vw, 152px);
+  height: clamp(96px, 26vw, 120px);
 }
 
 .ab-btn-wrap {
@@ -539,8 +539,8 @@ body {
 .btn-b-wrap { bottom: 0; left: 0;  }
 
 .action-btn {
-  width: clamp(50px, 13vw, 62px);
-  height: clamp(50px, 13vw, 62px);
+  width: clamp(56px, 14.5vw, 68px);
+  height: clamp(56px, 14.5vw, 68px);
   border-radius: 50%;
   border: none;
   cursor: pointer;
@@ -586,8 +586,8 @@ body {
 }
 
 .mid-btn {
-  width: clamp(44px, 12vw, 56px);
-  height: clamp(18px, 4.5vw, 22px);
+  width: clamp(50px, 13.5vw, 63px);
+  height: clamp(22px, 5.5vw, 27px);
   background: var(--btn-mid);
   border: none;
   border-radius: 20px;
