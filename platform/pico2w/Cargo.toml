@@ -1,0 +1,55 @@
+[package]
+name = "rustyboy-pico2w"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rustyboy-pico2w"
+path = "src/main.rs"
+
+[dependencies]
+# Embassy async runtime and RP2350 HAL.
+# rp235xa = ARM Cortex-M33 variant of the RP2350 (used on Pico 2 / Pico 2W).
+# time-driver = enables embassy-time integration.
+embassy-rp = { git = "https://github.com/embassy-rs/embassy", features = [
+    "rp235xa",
+    "time-driver",
+    "defmt",
+    # Provides the critical-section implementation for the RP2350.
+    # Must NOT also enable cortex-m's critical-section-single-core.
+    "critical-section-impl",
+    # Embeds IMAGE_DEF / binary-info block required by the RP2350 bootrom.
+    "binary-info",
+] }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = [
+    "platform-cortex-m",
+    "executor-thread",
+    "defmt",
+] }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+
+# Cortex-M runtime. inline-asm required for critical section on bare metal.
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+# Logging over RTT (Real-Time Transfer) — no UART required.
+# defmt 1.x is required by embassy (breaking change from 0.3).
+defmt = "1"
+defmt-rtt = "1"
+
+# Panic handler: prints defmt log then halts. probe-rs will surface the message.
+panic-probe = { version = "1", features = ["print-defmt"] }
+
+[profile.dev]
+# Optimize enough to avoid stack overflows in async state machines.
+opt-level = 1
+debug = 2
+
+[profile.release]
+opt-level = "z"    # Minimise flash usage
+lto = true
+codegen-units = 1
+debug = 2          # Keep debug info for probe-rs backtraces even in release
