@@ -33,10 +33,14 @@ A cycle-accurate Game Boy (DMG) emulator written in Rust.
 rustyboy/
 ├── core/               # no_std emulator core (CPU, PPU, APU, memory)
 ├── platform/
-│   └── web/            # Browser platform (Axum server + WASM client)
-│       ├── client/     # wasm-bindgen crate compiled to WASM
-│       ├── server/     # Axum HTTP server serving ROMs and static files
-│       └── Dockerfile  # Multi-stage Docker build
+│   ├── web/            # Browser platform (Axum server + WASM client)
+│   │   ├── client/     # wasm-bindgen crate compiled to WASM
+│   │   ├── server/     # Axum HTTP server serving ROMs and static files
+│   │   └── Dockerfile  # Multi-stage Docker build
+│   └── pico2w/         # Raspberry Pi Pico 2W embedded platform
+│       ├── src/        # Embassy async firmware
+│       ├── memory.x    # RP2350A flash/RAM layout
+│       └── README.md   # Setup, wiring, and flash instructions
 └── Cargo.toml          # Workspace root
 ```
 
@@ -45,6 +49,7 @@ rustyboy/
 | Platform | Description |
 |---|---|
 | [web](platform/web/README.md) | Docker-hosted browser emulator with DMG Game Boy UI |
+| [pico2w](platform/pico2w/README.md) | Portable handheld on Raspberry Pi Pico 2W (RP2350A) |
 
 ## Building
 
@@ -54,4 +59,9 @@ cargo test -p rustyboy-core
 
 # Build the web platform (requires wasm-pack)
 # See platform/web/README.md for full instructions
+
+# Build the Pico 2W firmware (requires cross-compilation target)
+# See platform/pico2w/README.md for full instructions
+cd platform/pico2w
+cargo build --release
 ```
