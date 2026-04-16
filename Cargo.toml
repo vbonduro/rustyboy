@@ -3,5 +3,13 @@ members = [
     "core",
     "platform/web/server",
     "platform/web/client",
+    "platform/pico2w",
+]
+# Exclude embedded target from default workspace builds.
+# Build pico2w from within platform/pico2w/ to pick up its .cargo/config.toml.
+default-members = [
+    "core",
+    "platform/web/server",
+    "platform/web/client",
 ]
 resolver = "2"

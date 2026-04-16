@@ -1,0 +1,20 @@
+[target.thumbv8m.main-none-eabihf]
+# probe-rs flash + run via SWD/JTAG debug probe.
+# For picotool (BOOTSEL / drag-and-drop), see CLAUDE.md.
+runner = "probe-rs run --chip RP235x"
+
+rustflags = [
+    # Link against the memory layout defined in memory.x.
+    "-C", "link-arg=-Tlink.x",
+    # Include defmt symbol table (required for defmt RTT decoding).
+    "-C", "link-arg=-Tdefmt.x",
+    # Disable the default linker relaxation pass — required for RP235x.
+    "-C", "link-arg=--nmagic",
+]
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[env]
+# Default log level. Override with DEFMT_LOG=trace cargo run etc.
+DEFMT_LOG = "debug"
