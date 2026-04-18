@@ -43,6 +43,13 @@ defmt-rtt = "1"
 # Panic handler: prints defmt log then halts. probe-rs will surface the message.
 panic-probe = { version = "1", features = ["print-defmt"] }
 
+# Display driver (ILI9341 via mipidsi) + embedded-graphics for splash text.
+mipidsi = "0.8"
+display-interface-spi = "0.5"
+embedded-graphics = "0.8"
+# ExclusiveDevice wraps SpiBus + CS pin into a SpiDevice for mipidsi.
+embedded-hal-bus = "0.1"
+
 [profile.dev]
 # Optimize enough to avoid stack overflows in async state machines.
 opt-level = 1
