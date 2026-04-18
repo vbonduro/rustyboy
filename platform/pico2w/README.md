@@ -25,8 +25,8 @@ A portable Game Boy emulator running on the Raspberry Pi Pico 2W (RP2350A), usin
 |---|---|---|
 | GP8 | Display DC | 2 |
 | GP9 | Display CS | 2 |
-| GP10 | SPI0 CLK (display) | 2 |
-| GP11 | SPI0 MOSI (display) | 2 |
+| GP10 | SPI1 CLK (display) | 2 |
+| GP11 | SPI1 MOSI (display) | 2 |
 | GP12 | Display RST | 2 |
 | GP14 | I2S BCLK (MAX98357A) | 5 |
 | GP15 | Dev blinky LED / I2S LRCLK | 1/5 |
@@ -193,7 +193,7 @@ syslog_port = 514               # optional, default 514
 | Bead | Feature | Status |
 |---|---|---|
 | 1 | Scaffold, build system, blinky | ✅ Done |
-| 2 | ILI9341 display driver + framebuffer | 🔲 Pending |
+| 2 | ILI9341 display driver + framebuffer | ✅ Done |
 | 3 | Input (8 buttons, debounce) | 🔲 Pending |
 | 4 | SD card ROM storage + StreamingCartridge | 🔲 Pending |
 | 5 | Core integration + game loop + I2S audio | 🔲 Pending |
