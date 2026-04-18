@@ -43,6 +43,12 @@ defmt-rtt = "1"
 # Panic handler: prints defmt log then halts. probe-rs will surface the message.
 panic-probe = { version = "1", features = ["print-defmt"] }
 
+# Emulator core (no_std).
+rustyboy-core = { path = "../../core" }
+
+# Global allocator for no_std — required because rustyboy-core uses `alloc`.
+embedded-alloc = "0.5"
+
 # Display driver (ILI9341 via mipidsi) + embedded-graphics for splash text.
 mipidsi = "0.8"
 display-interface-spi = "0.5"
