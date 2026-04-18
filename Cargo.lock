@@ -607,6 +607,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "display-viewer"
+version = "0.1.0"
+dependencies = [
+ "rustyboy-pico2w",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2710,6 +2717,7 @@ dependencies = [
  "embedded-hal-bus",
  "mipidsi",
  "panic-probe",
+ "png",
  "rustyboy-core",
 ]
 

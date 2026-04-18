@@ -4,6 +4,7 @@ members = [
     "platform/web/server",
     "platform/web/client",
     "platform/pico2w",
+    "platform/display-viewer",
 ]
 # Exclude embedded target from default workspace builds.
 # Build pico2w from within platform/pico2w/ to pick up its .cargo/config.toml.
