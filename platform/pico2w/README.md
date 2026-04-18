@@ -23,30 +23,31 @@ A portable Game Boy emulator running on the Raspberry Pi Pico 2W (RP2350A), usin
 
 | GPIO | Function | Bead |
 |---|---|---|
-| GP8 | Display DC | 2 |
-| GP9 | Display CS | 2 |
-| GP10 | SPI1 CLK (display) | 2 |
-| GP11 | SPI1 MOSI (display) | 2 |
-| GP12 | Display RST | 2 |
-| GP14 | I2S BCLK (MAX98357A) | 5 |
-| GP15 | Dev blinky LED / I2S LRCLK | 1/5 |
-| GP16 | SPI1 MISO (SD card) | 4 |
-| GP17 | SPI1 CS (SD card) | 4 |
-| GP18 | SPI1 CLK (SD card) | 4 |
-| GP19 | SPI1 MOSI (SD card) | 4 |
-| GP20 | I2S DIN (MAX98357A) | 5 |
-| GP21 | Button: D-pad Up | 3 |
-| GP22 | Button: D-pad Down | 3 |
-| GP26 | Button: D-pad Left | 3 |
-| GP27 | Button: D-pad Right | 3 |
 | GP0 | Button: A | 3 |
 | GP1 | Button: B | 3 |
 | GP2 | Button: Start | 3 |
 | GP3 | Button: Select | 3 |
 | GP4 | MAX98357A SD_MODE | 5 |
 | GP5 | Brown-out detect | 9 |
+| GP8 | Display DC | 2 |
+| GP9 | Display CS | 2 |
+| GP10 | SPI1 CLK (display) | 2 |
+| GP11 | SPI1 MOSI (display) | 2 |
+| GP12 | Display RST | 2 |
+| GP13 | Display backlight | 2 |
+| GP14 | I2S BCLK (MAX98357A) | 5 |
+| GP15 | Dev blinky LED / I2S LRCLK | 1/5 |
+| GP16 | SPI0 MISO (SD card) | 4 |
+| GP17 | SPI0 CS (SD card) | 4 |
+| GP18 | SPI0 CLK (SD card) | 4 |
+| GP19 | SPI0 MOSI (SD card) | 4 |
+| GP20 | I2S DIN (MAX98357A) | 5 |
+| GP21 | Button: D-pad Up | 3 |
+| GP22 | Button: D-pad Down | 3 |
+| GP26 | Button: D-pad Left | 3 |
+| GP27 | Button: D-pad Right | 3 |
 
-> Pin assignments are finalized in Bead 2–5. The table above reflects the planned allocation.
+> Display uses SPI1; SD card uses SPI0. These are separate peripherals and can run concurrently.
 
 ## Toolchain setup
 
@@ -65,10 +66,29 @@ cargo install probe-rs-tools --locked
 ```sh
 cd platform/pico2w
 
+# Firmware (embedded, ARM)
 cargo build --release
+
+# Host unit tests (no hardware required)
+cargo test-host
 ```
 
 Running `cargo build` from the workspace root targets the host architecture and will fail — this is by design.
+
+### Host display viewer
+
+The `display-viewer` tool renders display output to PNG files on the host, useful for iterating on the splash animation and framebuffer rendering without flashing hardware.
+
+```sh
+# Final splash frame → /tmp/splash_final.png
+cargo run -p display-viewer -- splash --last
+
+# All splash frames → /tmp/splash_000.png … splash_final.png
+cargo run -p display-viewer -- splash
+
+# DMG palette test frame → /tmp/frame.png
+cargo run -p display-viewer -- frame
+```
 
 ## Flashing
 
@@ -87,13 +107,7 @@ cd platform/pico2w
 cargo run --release
 ```
 
-`probe-rs` flashes the binary and immediately begins streaming defmt RTT logs to the terminal. You will see output like:
-
-```
-INFO  rustyboy-pico2w v0.1.0 starting
-INFO  heartbeat tick=1
-INFO  heartbeat tick=2
-```
+`probe-rs` flashes the binary and immediately begins streaming defmt RTT logs to the terminal.
 
 ### Via BOOTSEL / picotool — no debug probe required
 
@@ -111,17 +125,30 @@ INFO  heartbeat tick=2
 
 RTT logs are not available without a debug probe. After Bead 7, syslog over WiFi provides equivalent visibility.
 
-## Blinky smoke test (Bead 1)
+## Current firmware behaviour
 
-The current firmware blinks an LED on **GP15** at 1Hz and logs a heartbeat every second over defmt RTT. This proves:
+On boot the firmware:
 
-- Embassy async runtime boots correctly on RP2350A
-- defmt RTT logging works
-- Watchdog is running (5s timeout, fed every loop iteration)
+1. Plays the **VINTENDO** splash animation on the ILI9341 display (~640ms slide-in + 2s hold)
+2. Enters a **~60 Hz main loop** that polls all 8 buttons with 10ms software debounce
+3. Logs button press/release events over defmt RTT
+4. Detects a **Start+Select hold (1s)** and logs a menu-combo event
+5. Blinks the dev LED on GP15 at 1Hz as a heartbeat
 
-**Wiring:** LED anode → GP15, LED cathode → 330Ω resistor → GND.
+Example RTT output:
 
-The Pico 2W's onboard LED is routed through the CYW43 WiFi chip and requires the cyw43 driver (added in Bead 6). GP15 is used for bare-PCB development.
+```
+INFO  rustyboy-pico2w v0.1.0 starting
+INFO  display: ILI9341 initialised
+INFO  entering main loop
+INFO  btn press:   A
+INFO  btn release: A
+INFO  btn press:   Start
+INFO  btn press:   Select
+WARN  menu combo triggered
+INFO  btn release: Start
+INFO  btn release: Select
+```
 
 ## Logging
 
@@ -194,7 +221,7 @@ syslog_port = 514               # optional, default 514
 |---|---|---|
 | 1 | Scaffold, build system, blinky | ✅ Done |
 | 2 | ILI9341 display driver + framebuffer | ✅ Done |
-| 3 | Input (8 buttons, debounce) | 🔲 Pending |
+| 3 | Input (8 buttons, debounce, menu combo) | ✅ Done |
 | 4 | SD card ROM storage + StreamingCartridge | 🔲 Pending |
 | 5 | Core integration + game loop + I2S audio | 🔲 Pending |
 | 6 | WiFi + captive portal setup | 🔲 Pending |
