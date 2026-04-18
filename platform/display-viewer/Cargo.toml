@@ -1,0 +1,11 @@
+[package]
+name = "display-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "display-viewer"
+path = "src/main.rs"
+
+[dependencies]
+rustyboy-pico2w = { path = "../pico2w", features = ["std"] }
