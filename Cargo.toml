@@ -14,3 +14,12 @@ default-members = [
     "platform/web/client",
 ]
 resolver = "2"
+
+[profile.dev]
+opt-level = 1
+debug = 2
+
+[profile.release]
+opt-level = "z"
+lto = true
+debug = 2

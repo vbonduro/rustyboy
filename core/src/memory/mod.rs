@@ -3,8 +3,10 @@ pub mod cartridge;
 pub mod fake;
 pub mod memory;
 pub mod rom;
+pub mod streaming;
 
 #[cfg(test)]
 pub use fake::FakeMemory;
 pub use memory::{GameBoyMemory, Memory};
 pub use rom::{ROMVec, Ram, ReadOnlyMemory};
+pub use streaming::{RomReader, StreamingCartridge, StreamingError};

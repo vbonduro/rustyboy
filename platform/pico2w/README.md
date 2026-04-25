@@ -27,8 +27,10 @@ A portable Game Boy emulator running on the Raspberry Pi Pico 2W (RP2350A), usin
 | GP1 | Button: B | 3 |
 | GP2 | Button: Start | 3 |
 | GP3 | Button: Select | 3 |
-| GP4 | MAX98357A SD_MODE | 5 |
-| GP5 | Brown-out detect | 9 |
+| GP4 | SPI0 MISO (SD card) | 4 |
+| GP5 | SPI0 CS (SD card) | 4 |
+| GP6 | SPI0 CLK (SD card) | 4 |
+| GP7 | SPI0 MOSI (SD card) | 4 |
 | GP8 | Display DC | 2 |
 | GP9 | Display CS | 2 |
 | GP10 | SPI1 CLK (display) | 2 |
@@ -37,11 +39,10 @@ A portable Game Boy emulator running on the Raspberry Pi Pico 2W (RP2350A), usin
 | GP13 | Display backlight | 2 |
 | GP14 | I2S BCLK (MAX98357A) | 5 |
 | GP15 | Dev blinky LED / I2S LRCLK | 1/5 |
-| GP16 | SPI0 MISO (SD card) | 4 |
-| GP17 | SPI0 CS (SD card) | 4 |
-| GP18 | SPI0 CLK (SD card) | 4 |
-| GP19 | SPI0 MOSI (SD card) | 4 |
-| GP20 | I2S DIN (MAX98357A) | 5 |
+| GP16 | I2S DIN (MAX98357A) | 5 |
+| GP17 | MAX98357A SD_MODE | 5 |
+| GP18 | Brown-out detect | 9 |
+| GP20 | SD module power enable | 4 |
 | GP21 | Button: D-pad Up | 3 |
 | GP22 | Button: D-pad Down | 3 |
 | GP26 | Button: D-pad Left | 3 |
