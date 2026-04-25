@@ -10,20 +10,41 @@ static HEAP: Heap = Heap::empty();
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
+use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::spi::{self, Spi};
 use embassy_rp::watchdog::Watchdog;
+use embassy_rp::{bind_interrupts, dma};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{SdCard, VolumeManager};
 use {defmt_rtt as _, panic_probe as _};
 
+use rustyboy_core::cpu::cpu::Cpu;
+use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
+use rustyboy_core::cpu::registers::{Flags, Registers};
+use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::memory::{GameBoyMemory, StreamingCartridge};
 use rustyboy_pico2w::display::hw::HwDisplay;
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CYCLES_PER_FRAME: u64 = 70_224;
+const SAMPLE_RATE: u32 = 48_000;
+// One GB frame generates ~804 stereo samples; 1024 gives comfortable headroom.
+const AUDIO_BUF_SIZE: usize = 1024;
+
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => PioIrqHandler<PIO0>;
+    DMA_IRQ_0  => dma::InterruptHandler<DMA_CH0>;
+});
+
+// Double-buffer for I2S DMA: two back-to-back static arrays in .bss.
+static mut AUDIO_BUF_A: [u32; AUDIO_BUF_SIZE] = [0u32; AUDIO_BUF_SIZE];
+static mut AUDIO_BUF_B: [u32; AUDIO_BUF_SIZE] = [0u32; AUDIO_BUF_SIZE];
 
 #[unsafe(link_section = ".bi_entries")]
 #[used]
@@ -49,8 +70,6 @@ async fn main(_spawner: Spawner) {
 
     info!("rustyboy-pico2w v{} starting", FIRMWARE_VERSION);
 
-    let mut led = Output::new(p.PIN_15, Level::Low);
-
     // GP8=DC  GP9=CS  GP10=CLK  GP11=MOSI  GP12=RST  GP13=BL
     let mut hw_disp = HwDisplay::new(
         p.SPI1, p.PIN_10, p.PIN_11, p.PIN_9, p.PIN_8, p.PIN_12, p.PIN_13,
@@ -64,7 +83,7 @@ async fn main(_spawner: Spawner) {
         p.PIN_0,  p.PIN_1,  p.PIN_2,  p.PIN_3,
     );
 
-    // SD card: power-cycle via GP20, then init SPI0 on GP4-GP7.
+    // SD card: power-cycle via GP20, then init SPI0 on GP4–GP7.
     let mut sd_power = Output::new(p.PIN_20, Level::Low);
     Timer::after(Duration::from_millis(200)).await;
     sd_power.set_high();
@@ -93,21 +112,83 @@ async fn main(_spawner: Spawner) {
             loop { Timer::after(Duration::from_millis(2_000)).await; }
         }
     };
-    let _memory = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
-    info!("ROM loaded, entering main loop");
 
-    // TODO: run core + I2S audio (Bead 5)
+    let memory  = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
+    let decoder = alloc::boxed::Box::new(OpCodeDecoder::new());
+    let mut cpu = Sm83::new(alloc::boxed::Box::new(memory), decoder)
+        .with_registers(Registers {
+            a: 0x01, f: Flags::from_bits_truncate(0xB0),
+            b: 0x00, c: 0x13,
+            d: 0x00, e: 0xD8,
+            h: 0x01, l: 0x4D,
+            pc: 0x0100,
+            sp: 0xFFFE,
+        })
+        .with_dmg_state();
+    info!("ROM loaded, entering game loop");
+
+    // I2S audio: GP14=BCLK  GP15=LRCLK  GP16=DIN  GP17=SD_MODE (MAX98357A).
+    // Drive SD_MODE high to enable the amplifier.
+    let _sd_mode = Output::new(p.PIN_17, Level::High);
+    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let i2s_prog = PioI2sOutProgram::new(&mut common);
+    let mut i2s = PioI2sOut::new(
+        &mut common,
+        sm0,
+        p.DMA_CH0,
+        Irqs,
+        p.PIN_16, // DIN
+        p.PIN_14, // BCLK
+        p.PIN_15, // LRCLK
+        SAMPLE_RATE,
+        16,       // bit depth
+        &i2s_prog,
+    );
+    i2s.start();
+
+    // Draw static letterbox bars once; game loop only repaints the 240×216 area.
+    hw_disp.inner.draw_letterbox_bars();
+
+    // Double-buffering: front_buf is being DMA'd while back_buf is being filled.
+    // `use_a_as_front` tracks which static array is currently the front buffer.
+    let mut use_a_as_front = true;
+    let mut front_n: usize = 0; // valid samples in the current front buffer
 
     let mut prev_state = ButtonState::default();
-    let mut tick: u32 = 0;
 
     loop {
-        Timer::after(Duration::from_millis(16)).await;
-        watchdog.feed(Duration::from_millis(5_000));
+        // Start DMA transfer of last frame's audio output.
+        // Safety: A and B are separate statics and are never aliased — one is
+        // read-only (DMA) and the other is write-only (APU fill) per iteration.
+        let (front_buf, back_buf): (&[u32], &mut [u32]) = unsafe {
+            if use_a_as_front {
+                (
+                    core::slice::from_raw_parts(
+                        core::ptr::addr_of!(AUDIO_BUF_A).cast::<u32>(), front_n),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(AUDIO_BUF_B).cast::<u32>(), AUDIO_BUF_SIZE),
+                )
+            } else {
+                (
+                    core::slice::from_raw_parts(
+                        core::ptr::addr_of!(AUDIO_BUF_B).cast::<u32>(), front_n),
+                    core::slice::from_raw_parts_mut(
+                        core::ptr::addr_of_mut!(AUDIO_BUF_A).cast::<u32>(), AUDIO_BUF_SIZE),
+                )
+            }
+        };
+        let dma_future = i2s.write(front_buf);
 
+        // Run exactly one Game Boy frame (70 224 T-cycles ≈ 16.74 ms).
+        let frame_start = cpu.cycle_counter();
+        while cpu.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+            let _ = cpu.tick();
+        }
+
+        // Propagate button changes to the CPU.
         let (state, menu) = input.poll();
-
         for (btn, pressed) in prev_state.diff(state) {
+            cpu.set_button(btn, pressed);
             if pressed {
                 info!("btn press:   {}", btn_name(btn));
             } else {
@@ -115,16 +196,42 @@ async fn main(_spawner: Spawner) {
             }
         }
         prev_state = state;
-
         if menu {
             warn!("menu combo triggered");
         }
 
-        tick += 1;
-        if tick % 62 == 0 {
-            led.toggle();
-        }
+        // Render the game area.  Letterbox bars are static and not repainted.
+        hw_disp.inner.render_game_only(cpu.framebuffer());
+
+        // Convert APU f32 output into I2S-packed u32 words for the next DMA.
+        let samples = cpu.drain_audio_samples();
+        let back_n = samples_to_i2s(&samples, back_buf);
+
+        // Await DMA completion — this naturally paces the loop to ~59.7 fps.
+        dma_future.await;
+        watchdog.feed(Duration::from_millis(5_000));
+
+        // Flip buffers for the next iteration.
+        use_a_as_front = !use_a_as_front;
+        front_n = back_n;
+
+        // Hold the SD power rail alive so the card stays powered.
+        let _ = &sd_power;
     }
+}
+
+/// Pack interleaved stereo f32 samples [L, R, L, R …] into I2S u32 words.
+///
+/// Each word carries one stereo pair: left channel in bits 31:16, right in
+/// bits 15:0.  Converts f32 [-1.0, 1.0] → i16 and reinterprets as u16.
+fn samples_to_i2s(samples: &[f32], buf: &mut [u32]) -> usize {
+    let pairs = (samples.len() / 2).min(buf.len());
+    for i in 0..pairs {
+        let l = (samples[i * 2]     * 32767.0) as i16;
+        let r = (samples[i * 2 + 1] * 32767.0) as i16;
+        buf[i] = ((l as u16 as u32) << 16) | (r as u16 as u32);
+    }
+    pairs
 }
 
 fn btn_name(b: Button) -> &'static str {

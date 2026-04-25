@@ -81,6 +81,23 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
         self.fill_bar(Y_OFFSET + SCALED_H, Y_OFFSET, Rgb565::BLACK);
     }
 
+    /// Draw the static letterbox bars above and below the game area.
+    ///
+    /// Call once before the game loop. Subsequent frames can use
+    /// [`render_game_only`] to skip repainting the unchanging bars.
+    pub fn draw_letterbox_bars(&mut self) {
+        self.fill_bar(0, Y_OFFSET, C3);
+        self.fill_bar(Y_OFFSET + SCALED_H, Y_OFFSET, Rgb565::BLACK);
+    }
+
+    /// Render only the scaled Game Boy frame (240×216), skipping letterbox bars.
+    ///
+    /// Saves ~6.4 ms per frame vs [`render_frame`] by not repainting the static
+    /// top/bottom bars. Call [`draw_letterbox_bars`] once before the game loop.
+    pub fn render_game_only(&mut self, fb: &[u8; 23040]) {
+        self.fill_scaled_frame(fb);
+    }
+
     fn fill_bar(&mut self, y: i32, height: i32, color: Rgb565) {
         if height <= 0 {
             return;
@@ -358,6 +375,26 @@ mod tests {
 
         assert!(!disp.splash_step(total - 1), "should still be animating");
         assert!(disp.splash_step(total), "should be done on last frame");
+    }
+
+    #[test]
+    fn draw_letterbox_bars_colors() {
+        let mut disp = make_display();
+        disp.draw_letterbox_bars();
+        let fb_ref = disp.inner.as_ref();
+        assert_eq!(fb_ref[0], C3, "top bar should be C3");
+        let bot_start = ((Y_OFFSET + SCALED_H) * SCREEN_W) as usize;
+        assert_eq!(fb_ref[bot_start], Rgb565::BLACK, "bottom bar should be black");
+    }
+
+    #[test]
+    fn render_game_only_updates_game_region() {
+        let mut disp = make_display();
+        let fb = [1u8; 23040]; // all palette index 1 → C1
+        disp.render_game_only(&fb);
+        let fb_ref = disp.inner.as_ref();
+        let mid = (Y_OFFSET * SCREEN_W) as usize;
+        assert_eq!(fb_ref[mid], C1, "game region pixel should be C1");
     }
 
     #[test]

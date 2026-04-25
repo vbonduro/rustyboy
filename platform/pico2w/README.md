@@ -131,17 +131,22 @@ RTT logs are not available without a debug probe. After Bead 7, syslog over WiFi
 On boot the firmware:
 
 1. Plays the **VINTENDO** splash animation on the ILI9341 display (~640ms slide-in + 2s hold)
-2. Enters a **~60 Hz main loop** that polls all 8 buttons with 10ms software debounce
-3. Logs button press/release events over defmt RTT
-4. Detects a **Start+Select hold (1s)** and logs a menu-combo event
-5. Blinks the dev LED on GP15 at 1Hz as a heartbeat
+2. Reads the first `.gb` ROM from the SD card and loads it into a `StreamingCartridge`
+3. Starts the **SM83 core** at the DMG post-boot-ROM state (PC = 0x0100, registers seeded)
+4. Enters a **~59.7 Hz game loop**:
+   - Executes exactly **70 224 T-cycles** (one Game Boy frame) per iteration
+   - Renders the 160×144 framebuffer scaled 1.5× to 240×216 on the ILI9341, centred with letterbox bars
+   - Polls all 8 buttons with 10 ms software debounce and feeds changes to the CPU via `set_button()`
+   - Drains APU stereo PCM (48 kHz) and outputs to the MAX98357A via PIO I2S DMA on GP14/GP15/GP16
+   - Detects a **Start+Select hold (1s)** and logs a menu-combo event (save/load UI comes in Bead 9)
+5. Feeds the watchdog every frame
 
 Example RTT output:
 
 ```
 INFO  rustyboy-pico2w v0.1.0 starting
 INFO  display: ILI9341 initialised
-INFO  entering main loop
+INFO  ROM loaded, entering game loop
 INFO  btn press:   A
 INFO  btn release: A
 INFO  btn press:   Start
@@ -223,8 +228,8 @@ syslog_port = 514               # optional, default 514
 | 1 | Scaffold, build system, blinky | ✅ Done |
 | 2 | ILI9341 display driver + framebuffer | ✅ Done |
 | 3 | Input (8 buttons, debounce, menu combo) | ✅ Done |
-| 4 | SD card ROM storage + StreamingCartridge | 🔲 Pending |
-| 5 | Core integration + game loop + I2S audio | 🔲 Pending |
+| 4 | SD card ROM storage + StreamingCartridge | ✅ Done |
+| 5 | Core integration + game loop + I2S audio | ✅ Done |
 | 6 | WiFi + captive portal setup | 🔲 Pending |
 | 7 | Logging + UDP syslog | 🔲 Pending |
 | 8 | OTA via GitHub Releases | 🔲 Pending |
