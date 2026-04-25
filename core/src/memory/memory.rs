@@ -41,7 +41,7 @@ pub trait Memory {
 
 /// Resolved mapping for a given address: which region and the offset within it.
 enum RegionMapping {
-    Rom(u16),
+    Rom,
     Vram(u16),
     ExternalRam(u16),
     Wram(u16),
@@ -59,7 +59,7 @@ enum RegionMapping {
 impl RegionMapping {
     fn for_address(address: u16) -> Self {
         match address {
-            0x0000..=0x7FFF => RegionMapping::Rom(address),
+            0x0000..=0x7FFF => RegionMapping::Rom,
             0x8000..=0x9FFF => RegionMapping::Vram(address - 0x8000),
             0xA000..=0xBFFF => RegionMapping::ExternalRam(address - 0xA000),
             0xC000..=0xDFFF => RegionMapping::Wram(address - 0xC000),
@@ -101,6 +101,20 @@ impl GameBoyMemory {
     pub fn new() -> Self {
         Self {
             cartridge: Box::new(NoMbc::new(vec![0u8; 0x8000])),
+            vram: Ram::new(0x2000),
+            wram: Ram::new(0x2000),
+            oam: Ram::new(0xA0),
+            io: Ram::new(0x80),
+            hram: Ram::new(0x7F),
+            ie: 0,
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Construct memory backed by a pre-built cartridge implementation.
+    pub fn with_cartridge(cart: Box<dyn Cartridge>) -> Self {
+        Self {
+            cartridge: cart,
             vram: Ram::new(0x2000),
             wram: Ram::new(0x2000),
             oam: Ram::new(0xA0),
@@ -283,7 +297,7 @@ impl GameBoyMemory {
 impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom(_) => Ok(self.cartridge.read_rom(address)),
+            RegionMapping::Rom => Ok(self.cartridge.read_rom(address)),
             RegionMapping::Vram(offset) => self
                 .vram
                 .read(offset)
@@ -317,7 +331,7 @@ impl Memory for GameBoyMemory {
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         match RegionMapping::for_address(address) {
             // ROM writes and external RAM writes go to the cartridge (MBC registers or RAM)
-            RegionMapping::Rom(_) | RegionMapping::ExternalRam(_) => {
+            RegionMapping::Rom | RegionMapping::ExternalRam(_) => {
                 self.cartridge.write(address, value);
                 Ok(())
             }

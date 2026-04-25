@@ -112,6 +112,37 @@ updated with the new layout.
 Full pin table is maintained in `docs/wiring.md` (created in Bead 11).
 Summary of allocations so far:
 
-| GPIO | Function          | Bead |
-|------|-------------------|------|
-| GP15 | Dev blinky LED    |  1   |
+| GPIO | Function                  | Bead |
+|------|---------------------------|------|
+| GP4  | SPI0 MISO (SD card)       |  4   |
+| GP5  | SPI0 CS   (SD card)       |  4   |
+| GP6  | SPI0 CLK  (SD card)       |  4   |
+| GP7  | SPI0 MOSI (SD card)       |  4   |
+| GP15 | Dev blinky LED            |  1   |
+| GP16 | I2S DIN (MAX98357A)       |  5   |
+| GP17 | MAX98357A SD_MODE         |  5   |
+| GP18 | Brown-out detect          |  9   |
+| GP20 | SD module power enable    |  4   |
+
+### SD module power switch (GP20)
+
+GP20 controls a P-channel MOSFET (or a load switch IC such as AP2112/TPS22860)
+that gates VBUS (5 V) to the SD module's VCC pin. This allows the firmware to
+power-cycle the module for reliable recovery after a stuck SPI transaction:
+
+```
+Pico GP20 ──[1 kΩ]──► NPN base   (e.g. MMBT3904)
+                        NPN emitter ── GND
+                        NPN collector ──[10 kΩ pull-up to VBUS]──► PMOS gate
+VBUS ──────────────────────────────────────────────────────────────► PMOS source
+                                                                      PMOS drain ── Module VCC
+```
+
+Or replace the discrete circuit with a dedicated load switch (EN active-high):
+```
+GP20 ── EN,  VBUS ── VIN,  VOUT ── Module VCC
+```
+
+Logic: GP20 HIGH = module powered, GP20 LOW = module off.
+Hold LOW for ≥ 100 ms (cap discharge), then HIGH + 250 ms (card power-up)
+before reinitialising the SdCard object.
