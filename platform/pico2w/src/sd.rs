@@ -1,5 +1,7 @@
+use defmt::{info, warn};
 use embedded_sdmmc::{
-    BlockDevice, Mode, RawFile, RawVolume, ShortFileName, TimeSource, VolumeIdx, VolumeManager,
+    BlockDevice, Mode, RawDirectory, RawFile, RawVolume, ShortFileName, TimeSource, VolumeIdx,
+    VolumeManager,
 };
 
 use rustyboy_core::memory::RomReader;
@@ -44,24 +46,37 @@ where
     <D as BlockDevice>::Error: core::fmt::Debug,
     T: TimeSource,
 {
-    /// Mount the first partition, scan the root directory for a `.gb` or `.gbc`
-    /// file, and open it for sequential bank reads.
+    /// Mount the first partition, search root then `roms/` for a `.gb` or
+    /// `.gbc` file, and open it for sequential bank reads.
     pub fn new(mgr: VolumeManager<D, T>) -> Result<Self, SdError<D::Error>> {
         let volume = mgr.open_raw_volume(VolumeIdx(0))?;
-        let dir    = mgr.open_root_dir(volume)?;
+        let root   = mgr.open_root_dir(volume)?;
 
-        let mut found: Option<ShortFileName> = None;
-        mgr.iterate_dir(dir, |entry| {
-            if found.is_none() && is_rom_file(&entry.name) {
-                found = Some(entry.name.clone());
+        // Search root directory first.
+        if let Some(file) = find_rom_in_dir(&mgr, root)? {
+            let _ = mgr.close_dir(root);
+            return Ok(Self { mgr, volume, file });
+        }
+
+        // Search roms/ subdirectory.
+        if let Ok(roms_dir) = mgr.open_dir(root, "ROMS") {
+            let result = find_rom_in_dir(&mgr, roms_dir)?;
+            let _ = mgr.close_dir(roms_dir);
+            if let Some(file) = result {
+                let _ = mgr.close_dir(root);
+                return Ok(Self { mgr, volume, file });
             }
-        })?;
+        }
 
-        let name = found.ok_or(SdError::NoRomFound)?;
-        let file = mgr.open_file_in_dir(dir, name, Mode::ReadOnly)?;
-        mgr.close_dir(dir)?;
-
-        Ok(Self { mgr, volume, file })
+        // Nothing found — log card contents before returning the error.
+        warn!("no .gb/.gbc file found; listing card contents");
+        log_dir(&mgr, root, "/");
+        if let Ok(roms_dir) = mgr.open_dir(root, "ROMS") {
+            log_dir(&mgr, roms_dir, "/roms/");
+            let _ = mgr.close_dir(roms_dir);
+        }
+        let _ = mgr.close_dir(root);
+        Err(SdError::NoRomFound)
     }
 }
 
@@ -100,7 +115,45 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+fn find_rom_in_dir<D, T>(
+    mgr: &VolumeManager<D, T>,
+    dir: RawDirectory,
+) -> Result<Option<RawFile>, SdError<D::Error>>
+where
+    D: BlockDevice,
+    <D as BlockDevice>::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    let mut found: Option<ShortFileName> = None;
+    mgr.iterate_dir(dir, |entry| {
+        if found.is_none() && !entry.attributes.is_directory() && is_rom_file(&entry.name) {
+            found = Some(entry.name.clone());
+        }
+    })?;
+    match found {
+        Some(name) => Ok(Some(mgr.open_file_in_dir(dir, &name, Mode::ReadOnly)?)),
+        None => Ok(None),
+    }
+}
+
 fn is_rom_file(name: &ShortFileName) -> bool {
     let ext = name.extension();
-    ext == b"GB " || ext == b"GBC"
+    ext == b"GB" || ext == b"GBC"
+}
+
+/// Log every entry in `dir` at INFO level.  Used only when no ROM is found.
+fn log_dir<D, T>(mgr: &VolumeManager<D, T>, dir: RawDirectory, path: &str)
+where
+    D: BlockDevice,
+    <D as BlockDevice>::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    info!("{}:", path);
+    let _ = mgr.iterate_dir(dir, |entry| {
+        if entry.attributes.is_directory() {
+            info!("  [DIR] {}", defmt::Display2Format(&entry.name));
+        } else {
+            info!("  {} B  {}", entry.size, defmt::Display2Format(&entry.name));
+        }
+    });
 }

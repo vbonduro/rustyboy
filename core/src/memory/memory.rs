@@ -8,7 +8,7 @@ use super::rom::Ram;
 use crate::cpu::save_state::SaveState;
 
 /// An event produced when a write occurs to an I/O or IE register address.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub struct BusEvent {
     pub address: u16,
     pub value: u8,
@@ -291,6 +291,11 @@ impl GameBoyMemory {
             }
             _ => {}
         }
+    }
+
+    /// Drain pending bus events into an existing buffer, reusing its allocation.
+    pub fn drain_into(&mut self, buf: &mut Vec<BusEvent>) {
+        buf.extend(self.events.drain(..));
     }
 }
 

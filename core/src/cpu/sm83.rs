@@ -1,13 +1,13 @@
-use alloc::{boxed::Box, format};
+use alloc::{boxed::Box, format, vec::Vec};
 
 use super::cpu::{Cpu, CpuError};
 use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add16, Add8, AddSP16};
 use super::instructions::call::opcode::{Call, CallOp};
-use super::instructions::cb::decoder::CbDecoder;
 use super::instructions::cb::opcode::{CbInstruction, CbOp, CbTarget};
 use super::instructions::cp::opcode::Cp8;
 use super::instructions::decoder::Decoder;
+use super::instructions::opcodes::OpCodeTable;
 use super::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
 use super::instructions::instructions::{Error as InstructionError, Instructions};
 use super::instructions::jump::opcode::{Condition, Jump, JumpOp};
@@ -46,7 +46,7 @@ use super::peripheral::timer::{
 use super::registers::{Flags, Registers};
 use super::save_state::{CpuState, SaveState};
 
-use crate::memory::memory::{Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
+use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
 
 impl From<MemoryError> for InstructionError {
     fn from(error: MemoryError) -> Self {
@@ -84,7 +84,7 @@ pub struct TraceEvent<'a> {
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
-    opcodes: Box<dyn Decoder>,
+    opcodes: OpCodeTable,
     serial: SerialPort,
     timer: TimerPeripheral,
     ppu: PpuPeripheral,
@@ -100,6 +100,9 @@ pub struct Sm83 {
     /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
     /// read a fully-rendered frame rather than one mid-render.
     front_buffer: [u8; FRAMEBUFFER_SIZE],
+    /// Scratch buffer for `route_bus_events` — reused each M-cycle to avoid
+    /// allocating a fresh Vec on every bus event drain.
+    events_scratch: Vec<BusEvent>,
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
@@ -116,10 +119,11 @@ struct DmaState {
 impl Sm83 {
     pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
         let joypad = JoypadPeripheral::new();
+        let opcodes = OpCodeTable::from_decoder(&*opcode_decoder);
         let mut sm83 = Self {
             memory,
             registers: Registers::default(),
-            opcodes: opcode_decoder,
+            opcodes,
             serial: SerialPort::new(),
             timer: TimerPeripheral::new(),
             ppu: PpuPeripheral::new(),
@@ -130,6 +134,7 @@ impl Sm83 {
             cycle_counter: 0,
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            events_scratch: Vec::new(),
             #[cfg(feature = "trace")]
             trace_hook: None,
         };
@@ -406,9 +411,13 @@ impl Sm83 {
     }
 
     fn route_bus_events(&mut self) {
-        let events = self.memory.drain_events();
-        for event in &events {
-            self.handle_bus_event(event.address, event.value);
+        self.events_scratch.clear();
+        self.memory.drain_into(&mut self.events_scratch);
+        // Index-based loop: BusEvent is Copy, so each `e` is copied out before
+        // handle_bus_event borrows &mut self, avoiding a borrow conflict.
+        for i in 0..self.events_scratch.len() {
+            let e = self.events_scratch[i];
+            self.handle_bus_event(e.address, e.value);
         }
     }
 
@@ -693,12 +702,16 @@ impl Cpu for Sm83 {
 
         // Opcode fetch is the first M-cycle (via bus_read inside read_next_pc)
         let opcode = self.read_next_pc()?;
-        if opcode == 0xCB {
+        // Arc::clone releases the borrow of self.opcodes before execute() needs
+        // &mut self.  The atomic increment is ~10 cycles vs ~50 000 cycles for
+        // the previous Box::new() per instruction.
+        let op = if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
-            CbDecoder.decode(cb_opcode)?.execute(self)?;
+            self.opcodes.get_cb(cb_opcode)?
         } else {
-            self.opcodes.decode(opcode)?.execute(self)?;
+            self.opcodes.get(opcode)?
         };
+        op.execute(self)?;
 
         // Peripherals and bus events are already advanced per M-cycle
         // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
