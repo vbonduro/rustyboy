@@ -52,7 +52,7 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 3] = [
 async fn main(_spawner: Spawner) {
     {
         use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 32 * 1024;
+        const HEAP_SIZE: usize = 256 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
@@ -60,7 +60,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut watchdog = Watchdog::new(p.WATCHDOG);
-    watchdog.start(Duration::from_millis(5_000));
+    watchdog.start(Duration::from_millis(10_000));
 
     info!("rustyboy-pico2w v{} starting", FIRMWARE_VERSION);
 

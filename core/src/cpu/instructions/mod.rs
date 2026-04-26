@@ -20,5 +20,5 @@ pub mod sbc;
 pub mod stack;
 pub mod sub;
 
-mod opcode;
+pub(crate) mod opcode;
 mod test;
