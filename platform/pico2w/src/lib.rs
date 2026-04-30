@@ -3,6 +3,8 @@
 #[cfg(target_arch = "arm")]
 pub mod audio;
 pub mod display;
+#[cfg(target_arch = "arm")]
+pub mod flash_rom;
 pub mod input;
 #[cfg(target_arch = "arm")]
 pub mod sd;
