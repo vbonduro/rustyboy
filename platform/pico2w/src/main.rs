@@ -29,6 +29,9 @@ use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::memory::{GameBoyMemory, StreamingCartridge};
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::HwDisplay;
+use rustyboy_pico2w::flash_rom::{
+    new_onboard_flash, probe_staged_rom, stage_rom_from_reader, FlashRomReader,
+};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 
@@ -76,28 +79,58 @@ async fn main(_spawner: Spawner) {
         p.PIN_21, p.PIN_22, p.PIN_26, p.PIN_27, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3,
     );
 
-    let mut spi_cfg = spi::Config::default();
-    spi_cfg.frequency = 400_000;
-    let spi_bus = Spi::new_blocking(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, spi_cfg);
-    // SD card MISO (GP4) is open-collector — enable the internal pull-up.
-    rp_pac::PADS_BANK0.gpio(4).modify(|w| w.set_pue(true));
-    let spi_dev = ExclusiveDevice::new(spi_bus, Output::new(p.PIN_5, Level::High), Delay);
-    let sdcard = SdCard::new(spi_dev, Delay);
-    let mgr = VolumeManager::new(sdcard, DummyClock);
+    let mut onboard_flash = new_onboard_flash(p.FLASH);
+    let flash_info = if let Some(info) = probe_staged_rom() {
+        info!(
+            "staged ROM found in flash: {} banks ({} KiB)",
+            info.bank_count,
+            info.size_bytes / 1024
+        );
+        info
+    } else {
+        info!("no staged ROM in flash; loading from SD");
 
-    let reader = match SdRomReader::new(mgr) {
-        Ok(r) => r,
-        Err(e) => {
-            error!("SD init failed: {:?}", defmt::Debug2Format(&e));
-            loop {
-                Timer::after(Duration::from_millis(2_000)).await;
+        let mut spi_cfg = spi::Config::default();
+        spi_cfg.frequency = 400_000;
+        let spi_bus = Spi::new_blocking(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, spi_cfg);
+        // SD card MISO (GP4) is open-collector — enable the internal pull-up.
+        rp_pac::PADS_BANK0.gpio(4).modify(|w| w.set_pue(true));
+        let spi_dev = ExclusiveDevice::new(spi_bus, Output::new(p.PIN_5, Level::High), Delay);
+        let sdcard = SdCard::new(spi_dev, Delay);
+        let mgr = VolumeManager::new(sdcard, DummyClock);
+
+        let mut reader = match SdRomReader::new(mgr) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("SD init failed: {:?}", defmt::Debug2Format(&e));
+                loop {
+                    Timer::after(Duration::from_millis(2_000)).await;
+                }
             }
-        }
+        };
+
+        let info = match stage_rom_from_reader(&mut onboard_flash, &mut reader) {
+            Ok(info) => info,
+            Err(e) => {
+                error!("ROM staging failed: {:?}", defmt::Debug2Format(&e));
+                loop {
+                    Timer::after(Duration::from_millis(2_000)).await;
+                }
+            }
+        };
+
+        info!(
+            "ROM staged to flash: {} banks ({} KiB)",
+            info.bank_count,
+            info.size_bytes / 1024
+        );
+        info
     };
-    let cart = match StreamingCartridge::new(reader) {
+
+    let cart = match StreamingCartridge::new(FlashRomReader::new(flash_info)) {
         Ok(c) => c,
         Err(e) => {
-            error!("ROM load failed: {:?}", defmt::Debug2Format(&e));
+            error!("flash ROM load failed: {:?}", defmt::Debug2Format(&e));
             loop {
                 Timer::after(Duration::from_millis(2_000)).await;
             }
