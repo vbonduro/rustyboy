@@ -18,13 +18,8 @@ RUN curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
 WORKDIR /build
 
-# Copy workspace files needed for the WASM crate
-COPY Cargo.toml Cargo.lock ./
-COPY core ./core
-COPY platform/web/client ./platform/web/client
-# Stub out server so workspace resolves
-COPY platform/web/server/Cargo.toml ./platform/web/server/Cargo.toml
-RUN mkdir -p platform/web/server/src && echo "fn main() {}" > platform/web/server/src/main.rs
+# Copy the full workspace so platform-specific builds can run from the root.
+COPY . .
 
 # Build WASM with wasm-pack (--target web = native ES module, no bundler)
 # Pass --features debug-overlay when DEBUG_OVERLAY=1
@@ -46,12 +41,7 @@ FROM rust:1.88-slim AS server-builder
 
 WORKDIR /build
 
-COPY Cargo.toml Cargo.lock ./
-COPY core ./core
-COPY platform/web/server ./platform/web/server
-# Stub out the WASM client so workspace resolves
-COPY platform/web/client/Cargo.toml ./platform/web/client/Cargo.toml
-RUN mkdir -p platform/web/client/src && echo "// stub" > platform/web/client/src/lib.rs
+COPY . .
 
 RUN cargo build --release -p rustyboy-web-server
 
