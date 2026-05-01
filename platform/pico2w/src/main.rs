@@ -80,7 +80,7 @@ async fn main(_spawner: Spawner) {
     );
 
     let mut onboard_flash = new_onboard_flash(p.FLASH);
-    let flash_info = if let Some(info) = probe_staged_rom() {
+    let flash_info = if let Some(info) = probe_staged_rom(&mut onboard_flash) {
         info!(
             "staged ROM found in flash: {} banks ({} KiB)",
             info.bank_count,
@@ -127,7 +127,7 @@ async fn main(_spawner: Spawner) {
         info
     };
 
-    let cart = match StreamingCartridge::new(FlashRomReader::new(flash_info)) {
+    let cart = match StreamingCartridge::new(FlashRomReader::new(onboard_flash, flash_info)) {
         Ok(c) => c,
         Err(e) => {
             error!("flash ROM load failed: {:?}", defmt::Debug2Format(&e));
