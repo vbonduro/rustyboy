@@ -66,6 +66,11 @@ impl Ram {
         Ok(self.data[index])
     }
 
+    #[inline(always)]
+    pub fn read_fast(&self, address: u16) -> u8 {
+        self.data[address as usize]
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }
@@ -77,6 +82,11 @@ impl Ram {
         }
         self.data[index] = value;
         Ok(())
+    }
+
+    #[inline(always)]
+    pub fn write_fast(&mut self, address: u16, value: u8) {
+        self.data[address as usize] = value;
     }
 }
 
