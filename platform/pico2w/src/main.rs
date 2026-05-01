@@ -35,6 +35,14 @@ use rustyboy_pico2w::flash_rom::{
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 
+#[cfg(feature = "oc-266")]
+const TARGET_SYS_HZ: u32 = 266_000_000;
+#[cfg(not(feature = "oc-266"))]
+const TARGET_SYS_HZ: u32 = 250_000_000;
+
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_20;
+
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CYCLES_PER_FRAME: u64 = 70_224;
 
@@ -60,12 +68,22 @@ async fn main(_spawner: Spawner) {
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
 
-    let p = embassy_rp::init(Default::default());
+    let p = {
+        use embassy_rp::clocks::ClockConfig;
+        let mut clk =
+            ClockConfig::system_freq(TARGET_SYS_HZ).expect("valid PLL params for target clock");
+        clk.core_voltage = TARGET_CORE_VOLTAGE;
+        embassy_rp::init(embassy_rp::config::Config::new(clk))
+    };
 
     let mut watchdog = Watchdog::new(p.WATCHDOG);
     watchdog.start(Duration::from_millis(10_000));
 
-    info!("rustyboy-pico2w v{} starting", FIRMWARE_VERSION);
+    info!(
+        "rustyboy-pico2w v{} starting @{}MHz",
+        FIRMWARE_VERSION,
+        TARGET_SYS_HZ / 1_000_000
+    );
 
     // GP8=DC  GP9=CS  GP10=CLK  GP11=MOSI  GP12=RST  GP13=BL
     let mut hw_disp = HwDisplay::new(
