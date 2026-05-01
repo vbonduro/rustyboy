@@ -56,10 +56,25 @@ const CPU_FREQ: u32 = 4_194_304;
 /// Using fixed-point: accumulator counts in units of SAMPLE_RATE.
 const SAMPLE_PERIOD_NUM: u32 = CPU_FREQ;
 const SAMPLE_PERIOD_DEN: u32 = SAMPLE_RATE;
+/// About 804 stereo pairs are produced per Game Boy frame at 48 kHz.
+/// Reserve some headroom so the hot audio path doesn't regrow this buffer.
+const SAMPLE_BUFFER_CAPACITY_HINT: usize = 2048;
+/// Max possible mixer output before normalization: 4 channels * level 15 * volume 8.
+const MIXER_MAX: u32 = 4 * 15 * 8;
 
 /// Result of an APU tick.
 pub struct ApuOutput {
     pub nr52: u8,
+}
+
+#[cfg(feature = "perf")]
+#[derive(Default)]
+pub struct ApuPerfProfile {
+    pub frame_seq: u32,
+    pub pulse: u32,
+    pub wave: u32,
+    pub noise: u32,
+    pub mix: u32,
 }
 
 /// Pulse (square wave) channel — used by ch1 (with sweep) and ch2.
@@ -85,6 +100,8 @@ struct SquareChannel {
     envelope_timer: u8,
     /// 11-bit frequency value (not the actual Hz, used to derive timer period).
     frequency: u16,
+    /// Cached timer reload period `(2048 - frequency) * 4`.
+    frequency_period: u16,
     /// Counts down T-cycles; reloads to `(2048 - frequency) * 4` at 0.
     frequency_timer: u16,
     /// Duty pattern index (0–3).
@@ -94,12 +111,17 @@ struct SquareChannel {
 }
 
 impl SquareChannel {
+    fn sync_frequency_period(&mut self) {
+        self.frequency_period = (2048 - self.frequency) * 4;
+    }
+
     fn trigger(&mut self) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 64;
         }
-        self.frequency_timer = (2048 - self.frequency) * 4;
+        self.sync_frequency_period();
+        self.frequency_timer = self.frequency_period;
         self.volume = self.volume_initial;
         self.envelope_timer = if self.envelope_period == 0 { 8 } else { self.envelope_period };
     }
@@ -130,13 +152,34 @@ impl SquareChannel {
         }
     }
 
-    fn clock_frequency(&mut self) {
-        if self.frequency_timer > 0 {
-            self.frequency_timer -= 1;
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_frequency(&mut self, cycles: u16) {
+        if cycles == 0 { return; }
+        if self.frequency_timer > cycles {
+            self.frequency_timer -= cycles;
+            return;
         }
-        if self.frequency_timer == 0 {
-            self.frequency_timer = (2048 - self.frequency) * 4;
-            self.duty_position = (self.duty_position + 1) % 8;
+        if self.frequency_period == 0 {
+            self.sync_frequency_period();
+        }
+        let period = self.frequency_period;
+        let (fires, final_timer) = if self.frequency_timer == 0 {
+            // timer=0: fires immediately without decrement, then `cycles` normal steps follow
+            let n = cycles as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        } else {
+            let remaining = (cycles - self.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        };
+        self.frequency_timer = final_timer;
+        if fires > 0 {
+            self.duty_position = self.duty_position.wrapping_add(fires as u8) & 0x07;
         }
     }
 
@@ -206,6 +249,7 @@ impl SweepState {
                 } else if self.shift != 0 {
                     self.shadow_frequency = new_freq;
                     channel.frequency = new_freq;
+                    channel.sync_frequency_period();
                     // Do overflow check again with new frequency
                     let check_freq = self.calculate_frequency();
                     if check_freq > 2047 {
@@ -237,6 +281,8 @@ struct WaveChannel {
     volume_code: u8,
     /// 11-bit frequency value. Timer period = `2048 - frequency` in 2MHz ticks.
     frequency: u16,
+    /// Cached timer reload period `2048 - frequency`.
+    frequency_period: u16,
     /// Counts down 2MHz ticks; reloads to `2048 - frequency` at 0.
     frequency_timer: u16,
     /// Current sample position within the 32-nibble wave table (0–31).
@@ -252,14 +298,19 @@ struct WaveChannel {
 }
 
 impl WaveChannel {
+    fn sync_frequency_period(&mut self) {
+        self.frequency_period = 2048 - self.frequency;
+    }
+
     fn trigger(&mut self) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 256;
         }
+        self.sync_frequency_period();
         // Timer counts in 2 MHz cycles. DMG quirk: trigger adds 3 extra 2MHz-cycles
         // to the initial timer reload (does NOT apply to clock_frequency() reload).
-        self.frequency_timer = (2048 - self.frequency) + 3;
+        self.frequency_timer = self.frequency_period + 3;
         self.position = 0;
     }
 
@@ -287,23 +338,42 @@ impl WaveChannel {
         }
     }
 
-    /// Clock wave frequency timer at 2 MHz (called every other T-cycle).
-    /// `just_read` is cleared here (start of 2 MHz tick) and set on position
-    /// advance, giving a 2 T-cycle window where wave RAM is accessible.
-    fn clock_frequency(&mut self) {
+    /// Advance wave frequency timer by `n_ticks` 2 MHz ticks (batch path).
+    /// Mirrors the per-tick `clock_frequency` logic with skip-ahead arithmetic.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_frequency_wave(&mut self, n_ticks: u16) {
+        if n_ticks == 0 { return; }
+        // Every 2MHz tick clears just_read at its start; only the last tick can leave it set.
         self.just_read = false;
-        if !self.enabled {
+        if !self.enabled { return; }
+        if self.frequency_timer > n_ticks {
+            self.frequency_timer -= n_ticks;
             return;
         }
-        if self.frequency_timer > 0 {
-            self.frequency_timer -= 1;
+        if self.frequency_period == 0 {
+            self.sync_frequency_period();
         }
-        if self.frequency_timer == 0 {
-            self.frequency_timer = 2048 - self.frequency;
-            self.position = (self.position + 1) % 32;
+        let period = self.frequency_period;
+        let (fires, final_timer) = if self.frequency_timer == 0 {
+            let n = n_ticks as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        } else {
+            let remaining = (n_ticks - self.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        };
+        self.frequency_timer = final_timer;
+        if fires > 0 {
+            self.position = self.position.wrapping_add(fires as u8) & 0x1F;
             let byte_index = (self.position / 2) as usize;
             self.sample_buffer = self.wave_ram[byte_index];
-            self.just_read = true;
+            // just_read is true only if the last 2MHz tick fired (timer reloaded at the end)
+            self.just_read = final_timer == period;
         }
     }
 }
@@ -336,6 +406,9 @@ struct NoiseChannel {
     width_mode: bool,
     /// Index into `NOISE_DIVISORS` table (NR43 bits 2–0).
     divisor_code: u8,
+    /// Cached timer reload period `NOISE_DIVISORS[divisor_code] << clock_shift`.
+    /// A value of 0 represents the wrapped overflow case used by the current model.
+    frequency_period: u16,
     /// Counts down T-cycles until the next LFSR step.
     frequency_timer: u16,
     /// 15-bit (or 7-bit in width mode) linear feedback shift register.
@@ -344,12 +417,17 @@ struct NoiseChannel {
 }
 
 impl NoiseChannel {
+    fn sync_frequency_period(&mut self) {
+        self.frequency_period = NOISE_DIVISORS[self.divisor_code as usize] << self.clock_shift;
+    }
+
     fn trigger(&mut self) {
         self.enabled = self.dac_enabled;
         if self.length_counter == 0 {
             self.length_counter = 64;
         }
-        self.frequency_timer = NOISE_DIVISORS[self.divisor_code as usize] << self.clock_shift;
+        self.sync_frequency_period();
+        self.frequency_timer = self.frequency_period;
         self.volume = self.volume_initial;
         self.envelope_timer = if self.envelope_period == 0 { 8 } else { self.envelope_period };
         self.lfsr = 0x7FFF;
@@ -381,20 +459,48 @@ impl NoiseChannel {
         }
     }
 
-    fn clock_frequency(&mut self) {
-        if self.frequency_timer > 0 {
-            self.frequency_timer -= 1;
+    fn clock_lfsr(&mut self) {
+        let xor_bit = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
+        self.lfsr >>= 1;
+        self.lfsr |= xor_bit << 14;
+        if self.width_mode {
+            self.lfsr &= !(1 << 6);
+            self.lfsr |= xor_bit << 6;
         }
-        if self.frequency_timer == 0 {
-            self.frequency_timer = NOISE_DIVISORS[self.divisor_code as usize] << self.clock_shift;
-            let xor_bit = (self.lfsr & 1) ^ ((self.lfsr >> 1) & 1);
-            self.lfsr >>= 1;
-            self.lfsr |= xor_bit << 14;
-            if self.width_mode {
-                self.lfsr &= !(1 << 6);
-                self.lfsr |= xor_bit << 6;
-            }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_frequency_noise(&mut self, cycles: u16) {
+        if cycles == 0 { return; }
+        if self.frequency_timer > cycles {
+            self.frequency_timer -= cycles;
+            return;
         }
+        if self.frequency_period == 0 {
+            self.sync_frequency_period();
+        }
+        let period = self.frequency_period;
+        if period == 0 {
+            // u16 overflow: treat as period=65536, effectively no firing in short batches
+            self.frequency_timer = self.frequency_timer.saturating_sub(cycles);
+            return;
+        }
+        let fires = if self.frequency_timer == 0 {
+            let n = cycles as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            self.frequency_timer = if rem == 0 { period } else { period - rem as u16 };
+            fires
+        } else {
+            let remaining = (cycles - self.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            self.frequency_timer = if rem == 0 { period } else { period - rem as u16 };
+            fires
+        };
+        for _ in 0..fires { self.clock_lfsr(); }
     }
 
     fn digital_output(&self) -> u8 {
@@ -444,8 +550,16 @@ pub struct ApuPeripheral {
     /// when it reaches SAMPLE_PERIOD_NUM a stereo sample is emitted and the
     /// remainder is kept to avoid pitch drift.
     sample_acc: u32,
-    /// Interleaved stereo PCM output buffer: [L, R, L, R, ...], f32 in [-1, 1].
-    sample_buffer: alloc::vec::Vec<f32>,
+    /// Interleaved stereo PCM output buffer: [L, R, L, R, ...], i16 PCM words.
+    sample_buffer: alloc::vec::Vec<i16>,
+    /// Cached NR50 master-volume gains scaled for direct integer PCM output.
+    left_scale: u16,
+    right_scale: u16,
+    /// Cached NR51 routing bits normalized to channel bits 0..3.
+    left_routes: u8,
+    right_routes: u8,
+    #[cfg(feature = "perf")]
+    perf_profile: ApuPerfProfile,
 }
 
 impl ApuPeripheral {
@@ -462,14 +576,47 @@ impl ApuPeripheral {
             channel4: NoiseChannel::default(),
             regs: [0u8; 23],
             sample_acc: 0,
-            sample_buffer: alloc::vec::Vec::new(),
+            sample_buffer: alloc::vec::Vec::with_capacity(SAMPLE_BUFFER_CAPACITY_HINT),
+            left_scale: 0,
+            right_scale: 0,
+            left_routes: 0,
+            right_routes: 0,
+            #[cfg(feature = "perf")]
+            perf_profile: ApuPerfProfile::default(),
         }
     }
 
     /// Drain and return accumulated PCM samples since the last call.
     /// Returns interleaved stereo f32 samples: [L, R, L, R, ...] in [-1.0, 1.0].
     pub fn drain_samples(&mut self) -> alloc::vec::Vec<f32> {
-        core::mem::take(&mut self.sample_buffer)
+        let mut raw = alloc::vec::Vec::new();
+        core::mem::swap(&mut raw, &mut self.sample_buffer);
+
+        let mut out = alloc::vec::Vec::with_capacity(raw.len());
+        for sample in raw.iter().copied() {
+            out.push(sample as f32 / 32767.0);
+        }
+
+        raw.clear();
+        core::mem::swap(&mut raw, &mut self.sample_buffer);
+        out
+    }
+
+    /// Drain accumulated PCM samples into a caller-owned buffer so the hot
+    /// producer path can keep reusing the same allocation across frames.
+    pub fn drain_samples_into(&mut self, out: &mut alloc::vec::Vec<i16>) {
+        out.clear();
+        core::mem::swap(out, &mut self.sample_buffer);
+    }
+
+    pub fn clear_samples(&mut self) {
+        self.sample_buffer.clear();
+        self.sample_acc = 0;
+    }
+
+    #[cfg(feature = "perf")]
+    pub fn take_perf_profile(&mut self) -> ApuPerfProfile {
+        core::mem::take(&mut self.perf_profile)
     }
 
     /// Read a register with OR masks applied.
@@ -551,47 +698,123 @@ impl ApuPeripheral {
     /// `div_counter` is the timer's internal 16-bit counter *after* the timer
     /// has been advanced for these cycles. The frame sequencer clocks on the
     /// falling edge of bit 12 (DIV bit 4).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn tick(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
         if !self.powered {
             self.prev_div_bit = div_counter & FRAME_SEQ_BIT != 0;
             return ApuOutput { nr52: self.build_nr52() };
         }
 
-        // Reconstruct per-T-cycle DIV values to detect falling edge of bit 12.
-        let div_start = div_counter.wrapping_sub(cycles);
-        for i in 0..cycles {
-            let div_now = div_start.wrapping_add(i + 1);
-            let cur_bit = div_now & FRAME_SEQ_BIT != 0;
-
-            if self.prev_div_bit && !cur_bit {
-                self.clock_frame_sequencer();
+        // Frame sequencer: check O(1) if bit 12 fell anywhere in (div_start, div_counter].
+        // A falling edge of bit 12 occurs at every counter value that is a multiple of 8192.
+        // Distance from div_start+1 to the next multiple of 8192:
+        //   k = (8192 - ((div_start+1) & 8191)) & 8191
+        // Edge occurred in batch iff k < cycles.
+        let cur_div_bit = div_counter & FRAME_SEQ_BIT != 0;
+        let frame_seq_fell = if cycles <= 4 {
+            self.prev_div_bit && !cur_div_bit
+        } else {
+            let div_start = div_counter.wrapping_sub(cycles);
+            let k = (0x2000u16.wrapping_sub(div_start.wrapping_add(1) & 0x1FFF)) & 0x1FFF;
+            (k as u32) < (cycles as u32)
+        };
+        if frame_seq_fell {
+            #[cfg(feature = "perf")]
+            let t0 = crate::cpu::perf::cyccnt();
+            self.clock_frame_sequencer();
+            #[cfg(feature = "perf")]
+            {
+                let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+                self.perf_profile.frame_seq = self.perf_profile.frame_seq.wrapping_add(dt);
             }
-            self.prev_div_bit = cur_bit;
+        }
+        self.prev_div_bit = cur_div_bit;
 
-            self.channel1.clock_frequency();
-            self.channel2.clock_frequency();
-            // Wave channel period divider clocks at 2 MHz (once per 2 T-cycles).
-            // `just_read` is cleared at the start of each 2 MHz tick, giving a
-            // 2 T-cycle coincidence window for wave RAM reads/writes.
+        // Square channel frequency timers: skip-ahead arithmetic.
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
+        self.channel1.advance_frequency(cycles);
+        self.channel2.advance_frequency(cycles);
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf_profile.pulse = self.perf_profile.pulse.wrapping_add(dt);
+        }
+
+        // Wave channel clocks at 2 MHz (once per 2 T-cycles).
+        // Number of 2MHz ticks depends on current phase:
+        //   phase=false: fires on odd ticks → ceil(cycles/2)
+        //   phase=true:  fires on even ticks → floor(cycles/2)
+        let n_wave_ticks = if self.wave_2mhz_phase {
+            cycles / 2
+        } else {
+            (cycles + 1) / 2
+        };
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
+        self.channel3.advance_frequency_wave(n_wave_ticks);
+        if cycles % 2 != 0 {
             self.wave_2mhz_phase = !self.wave_2mhz_phase;
-            if self.wave_2mhz_phase {
-                self.channel3.clock_frequency();
-            }
-            self.channel4.clock_frequency();
+        }
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf_profile.wave = self.perf_profile.wave.wrapping_add(dt);
+        }
 
-            // Downsample: emit one stereo sample every ~87.38 T-cycles.
-            self.sample_acc += SAMPLE_PERIOD_DEN;
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
+        self.channel4.advance_frequency_noise(cycles);
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf_profile.noise = self.perf_profile.noise.wrapping_add(dt);
+        }
+
+        // Downsample to 48 kHz. The Pico runtime almost always calls this with
+        // cycles=1/3/4, so a single-sample fast path avoids a 64-bit divide/mod
+        // in the common case while keeping the generic batch path for tests and
+        // any larger callers.
+        let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
+        if cycles <= 4 {
+            self.sample_acc += sample_inc;
             if self.sample_acc >= SAMPLE_PERIOD_NUM {
                 self.sample_acc -= SAMPLE_PERIOD_NUM;
+                #[cfg(feature = "perf")]
+                let t0 = crate::cpu::perf::cyccnt();
                 let (left, right) = self.mix_sample();
                 self.sample_buffer.push(left);
                 self.sample_buffer.push(right);
+                #[cfg(feature = "perf")]
+                {
+                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
+                }
+            }
+        } else {
+            let acc = self.sample_acc as u64 + sample_inc as u64;
+            let n_samples = acc / SAMPLE_PERIOD_NUM as u64;
+            self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
+            if n_samples != 0 {
+                #[cfg(feature = "perf")]
+                let t0 = crate::cpu::perf::cyccnt();
+                for _ in 0..n_samples {
+                    let (left, right) = self.mix_sample();
+                    self.sample_buffer.push(left);
+                    self.sample_buffer.push(right);
+                }
+                #[cfg(feature = "perf")]
+                {
+                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
+                }
             }
         }
 
         ApuOutput { nr52: self.build_nr52() }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn clock_frame_sequencer(&mut self) {
         match self.frame_sequencer_step {
             0 | 4 => {
@@ -619,40 +842,31 @@ impl ApuPeripheral {
     }
 
     /// Mix all four channels into a stereo sample pair using NR50/NR51.
-    /// Returns (left, right) in [0.0, 1.0].
-    fn mix_sample(&self) -> (f32, f32) {
-        let outputs = [
-            self.channel1.digital_output(),
-            self.channel2.digital_output(),
-            self.channel3.digital_output(),
-            self.channel4.digital_output(),
-        ];
-        let (left_mix, right_mix) = self.apply_panning(&outputs);
-        self.apply_master_volume(left_mix, right_mix)
-    }
+    /// Returns signed 16-bit PCM values packed as an interleaved stereo pair.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn mix_sample(&self) -> (i16, i16) {
+        let ch1 = self.channel1.digital_output() as u16;
+        let ch2 = self.channel2.digital_output() as u16;
+        let ch3 = self.channel3.digital_output() as u16;
+        let ch4 = self.channel4.digital_output() as u16;
 
-    /// Apply NR51 panning: sum channels routed to each side.
-    /// NR51 bits 7-4 = ch4-ch1 left, bits 3-0 = ch4-ch1 right.
-    fn apply_panning(&self, outputs: &[u8; 4]) -> (f32, f32) {
-        let nr51 = self.regs[21];
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
-        for (i, &out) in outputs.iter().enumerate() {
-            if nr51 & (0x10 << i) != 0 { left  += out as f32; }
-            if nr51 & (0x01 << i) != 0 { right += out as f32; }
-        }
-        (left, right)
-    }
+        let mut left = 0u16;
+        let mut right = 0u16;
 
-    /// Apply NR50 master volume and normalize to [0.0, 1.0].
-    /// NR50 bits 6-4 = left vol (0-7), bits 2-0 = right vol (0-7).
-    fn apply_master_volume(&self, left: f32, right: f32) -> (f32, f32) {
-        let nr50 = self.regs[20];
-        let left_vol  = ((nr50 >> 4) & 0x07) as f32 + 1.0; // 1–8
-        let right_vol = ( nr50       & 0x07) as f32 + 1.0; // 1–8
-        // Max possible: 4 channels × vol 15 × master 8 = 480
-        const NORM: f32 = 4.0 * 15.0 * 8.0;
-        (left * left_vol / NORM, right * right_vol / NORM)
+        if self.left_routes & 0x01 != 0 { left += ch1; }
+        if self.left_routes & 0x02 != 0 { left += ch2; }
+        if self.left_routes & 0x04 != 0 { left += ch3; }
+        if self.left_routes & 0x08 != 0 { left += ch4; }
+
+        if self.right_routes & 0x01 != 0 { right += ch1; }
+        if self.right_routes & 0x02 != 0 { right += ch2; }
+        if self.right_routes & 0x04 != 0 { right += ch3; }
+        if self.right_routes & 0x08 != 0 { right += ch4; }
+
+        (
+            (left as u32 * self.left_scale as u32) as i16,
+            (right as u32 * self.right_scale as u32) as i16,
+        )
     }
 
     fn build_nr52(&self) -> u8 {
@@ -688,9 +902,11 @@ impl ApuPeripheral {
             self.channel4.length_counter = ch4_len;
             self.sweep = SweepState::default();
             self.frame_sequencer_step = 0;
+            self.sync_mixer_cache();
         } else if !was_powered && self.powered {
             // Power on: reset frame sequencer
             self.frame_sequencer_step = 0;
+            self.sync_mixer_cache();
         }
     }
 
@@ -701,6 +917,18 @@ impl ApuPeripheral {
     /// counter is incremented to odd. So odd step = just clocked length.
     fn frame_step_clocks_length(&self) -> bool {
         self.frame_sequencer_step % 2 == 1
+    }
+
+    fn sync_mixer_cache(&mut self) {
+        let nr50 = self.regs[20];
+        let left_vol = ((nr50 >> 4) & 0x07) as u32 + 1;
+        let right_vol = (nr50 & 0x07) as u32 + 1;
+        self.left_scale = ((left_vol * 32767) / MIXER_MAX) as u16;
+        self.right_scale = ((right_vol * 32767) / MIXER_MAX) as u16;
+
+        let nr51 = self.regs[21];
+        self.left_routes = (nr51 >> 4) & 0x0F;
+        self.right_routes = nr51 & 0x0F;
     }
 
     fn apply_register_write(&mut self, address: u16, value: u8) {
@@ -716,6 +944,7 @@ impl ApuPeripheral {
             0xFF13 => {
                 // NR13: frequency low byte
                 self.channel1.frequency = (self.channel1.frequency & 0x700) | value as u16;
+                self.channel1.sync_frequency_period();
             }
             0xFF14 => self.write_ch1_trigger(value),
 
@@ -729,6 +958,7 @@ impl ApuPeripheral {
             0xFF18 => {
                 // NR23: frequency low byte
                 self.channel2.frequency = (self.channel2.frequency & 0x700) | value as u16;
+                self.channel2.sync_frequency_period();
             }
             0xFF19 => self.write_ch2_trigger(value),
 
@@ -751,6 +981,7 @@ impl ApuPeripheral {
             0xFF1D => {
                 // NR33: frequency low byte
                 self.channel3.frequency = (self.channel3.frequency & 0x700) | value as u16;
+                self.channel3.sync_frequency_period();
             }
             0xFF1E => self.write_ch3_trigger(value),
 
@@ -765,11 +996,12 @@ impl ApuPeripheral {
                 self.channel4.clock_shift = (value >> 4) & 0x0F;
                 self.channel4.width_mode = value & 0x08 != 0;
                 self.channel4.divisor_code = value & 0x07;
+                self.channel4.sync_frequency_period();
             }
             0xFF23 => self.write_ch4_trigger(value),
 
             // NR50, NR51: master volume / stereo panning — stored in regs[] only
-            0xFF24 | 0xFF25 => {}
+            0xFF24 | 0xFF25 => self.sync_mixer_cache(),
             _ => {}
         }
     }
@@ -831,6 +1063,7 @@ impl ApuPeripheral {
     fn write_ch1_trigger(&mut self, value: u8) {
         self.channel1.frequency =
             (self.channel1.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        self.channel1.sync_frequency_period();
         let new_len_enable = value & 0x40 != 0;
         let on_length_step = self.frame_step_clocks_length();
         if new_len_enable && !self.channel1.length_enabled && on_length_step {
@@ -858,6 +1091,7 @@ impl ApuPeripheral {
     fn write_ch2_trigger(&mut self, value: u8) {
         self.channel2.frequency =
             (self.channel2.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        self.channel2.sync_frequency_period();
         let new_len_enable = value & 0x40 != 0;
         let on_length_step = self.frame_step_clocks_length();
         if new_len_enable && !self.channel2.length_enabled && on_length_step {
@@ -882,6 +1116,7 @@ impl ApuPeripheral {
     fn write_ch3_trigger(&mut self, value: u8) {
         self.channel3.frequency =
             (self.channel3.frequency & 0xFF) | ((value as u16 & 0x07) << 8);
+        self.channel3.sync_frequency_period();
         let new_len_enable = value & 0x40 != 0;
         let on_length_step = self.frame_step_clocks_length();
         if new_len_enable && !self.channel3.length_enabled && on_length_step {
@@ -944,6 +1179,97 @@ mod tests {
     use super::*;
 
     const FRAME_SEQUENCER_PERIOD: u16 = 8192;
+
+    fn advance_square_reference(channel: &mut SquareChannel, cycles: u16) {
+        if cycles == 0 {
+            return;
+        }
+        let period = (2048 - channel.frequency) * 4;
+        let (fires, final_timer) = if channel.frequency_timer == 0 {
+            let n = cycles as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        } else if channel.frequency_timer > cycles {
+            (0u32, channel.frequency_timer - cycles)
+        } else {
+            let remaining = (cycles - channel.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        };
+        channel.frequency_timer = final_timer;
+        if fires > 0 {
+            channel.duty_position = ((channel.duty_position as u32 + fires) % 8) as u8;
+        }
+    }
+
+    fn advance_wave_reference(channel: &mut WaveChannel, n_ticks: u16) {
+        if n_ticks == 0 {
+            return;
+        }
+        channel.just_read = false;
+        if !channel.enabled {
+            return;
+        }
+        let period = 2048 - channel.frequency;
+        let (fires, final_timer) = if channel.frequency_timer == 0 {
+            let n = n_ticks as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        } else if channel.frequency_timer > n_ticks {
+            (0u32, channel.frequency_timer - n_ticks)
+        } else {
+            let remaining = (n_ticks - channel.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            (fires, if rem == 0 { period } else { period - rem as u16 })
+        };
+        channel.frequency_timer = final_timer;
+        if fires > 0 {
+            channel.position = ((channel.position as u32 + fires) % 32) as u8;
+            let byte_index = (channel.position / 2) as usize;
+            channel.sample_buffer = channel.wave_ram[byte_index];
+            channel.just_read = final_timer == period;
+        }
+    }
+
+    fn advance_noise_reference(channel: &mut NoiseChannel, cycles: u16) {
+        if cycles == 0 {
+            return;
+        }
+        let period = NOISE_DIVISORS[channel.divisor_code as usize] << channel.clock_shift;
+        if period == 0 {
+            channel.frequency_timer = channel.frequency_timer.saturating_sub(cycles);
+            return;
+        }
+        let fires = if channel.frequency_timer == 0 {
+            let n = cycles as u32;
+            let p = period as u32;
+            let fires = 1 + (n - 1) / p;
+            let rem = (n - 1) % p;
+            channel.frequency_timer = if rem == 0 { period } else { period - rem as u16 };
+            fires
+        } else if channel.frequency_timer > cycles {
+            channel.frequency_timer -= cycles;
+            0u32
+        } else {
+            let remaining = (cycles - channel.frequency_timer) as u32;
+            let p = period as u32;
+            let fires = 1 + remaining / p;
+            let rem = remaining % p;
+            channel.frequency_timer = if rem == 0 { period } else { period - rem as u16 };
+            fires
+        };
+        for _ in 0..fires {
+            channel.clock_lfsr();
+        }
+    }
 
     #[test]
     fn test_read_masks() {
@@ -1069,10 +1395,8 @@ mod tests {
         apu.write_register(0xFF23, 0x80); // trigger
         assert_eq!(apu.channel4.lfsr, 0x7FFF);
         // frequency_timer = NOISE_DIVISORS[0] << 0 = 8
-        // Clock 8 times to expire timer and advance LFSR once
-        for _ in 0..8 {
-            apu.channel4.clock_frequency();
-        }
+        // Advance 8 T-cycles to expire timer and advance LFSR once
+        apu.channel4.advance_frequency_noise(8);
         // XOR of bits 0,1 of 0x7FFF: both 1, XOR = 0
         // Shift right: 0x3FFF, set bit 14 to 0 = 0x3FFF
         assert_eq!(apu.channel4.lfsr, 0x3FFF);
@@ -1192,6 +1516,142 @@ mod tests {
         // Write NR11 (mask=0x3F, only duty bits 6-7 readable)
         apu.write_register(0xFF11, 0xC0); // duty=3
         assert_eq!(apu.read_register(0xFF11), 0xC0 | 0x3F); // 0xFF
+    }
+
+    #[test]
+    fn test_square_small_cycle_path_matches_reference() {
+        for &frequency in &[0u16, 1, 511, 1024, 2047] {
+            for &frequency_timer in &[0u16, 1, 2, 3, 4, 7, 32, 255] {
+                for &duty_position in &[0u8, 3, 7] {
+                    for &cycles in &[1u16, 2, 3, 4] {
+                        let mut fast = SquareChannel {
+                            frequency,
+                            frequency_period: (2048 - frequency) * 4,
+                            frequency_timer,
+                            duty_position,
+                            ..Default::default()
+                        };
+                        let mut reference = SquareChannel {
+                            frequency,
+                            frequency_period: (2048 - frequency) * 4,
+                            frequency_timer,
+                            duty_position,
+                            ..Default::default()
+                        };
+
+                        fast.advance_frequency(cycles);
+                        advance_square_reference(&mut reference, cycles);
+
+                        assert_eq!(
+                            (fast.frequency_timer, fast.duty_position),
+                            (reference.frequency_timer, reference.duty_position),
+                            "square mismatch: freq={frequency} timer={frequency_timer} duty={duty_position} cycles={cycles}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wave_small_cycle_path_matches_reference() {
+        let mut wave_ram = [0u8; 16];
+        for (idx, byte) in wave_ram.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_mul(0x11);
+        }
+
+        for &enabled in &[false, true] {
+            for &frequency in &[0u16, 1, 1024, 2047] {
+                for &frequency_timer in &[0u16, 1, 2, 3, 4, 7] {
+                    for &position in &[0u8, 1, 14, 31] {
+                        for &n_ticks in &[1u16, 2] {
+                            let mut fast = WaveChannel {
+                                enabled,
+                                frequency,
+                                frequency_period: 2048 - frequency,
+                                frequency_timer,
+                                position,
+                                sample_buffer: 0xAA,
+                                wave_ram,
+                                just_read: true,
+                                ..Default::default()
+                            };
+                            let mut reference = WaveChannel {
+                                enabled,
+                                frequency,
+                                frequency_period: 2048 - frequency,
+                                frequency_timer,
+                                position,
+                                sample_buffer: 0xAA,
+                                wave_ram,
+                                just_read: true,
+                                ..Default::default()
+                            };
+
+                            fast.advance_frequency_wave(n_ticks);
+                            advance_wave_reference(&mut reference, n_ticks);
+
+                            assert_eq!(
+                                (
+                                    fast.frequency_timer,
+                                    fast.position,
+                                    fast.sample_buffer,
+                                    fast.just_read,
+                                ),
+                                (
+                                    reference.frequency_timer,
+                                    reference.position,
+                                    reference.sample_buffer,
+                                    reference.just_read,
+                                ),
+                                "wave mismatch: enabled={enabled} freq={frequency} timer={frequency_timer} pos={position} ticks={n_ticks}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_noise_small_cycle_path_matches_reference() {
+        for &clock_shift in &[0u8, 1, 7, 15] {
+            for &divisor_code in &[0u8, 1, 7] {
+                for &width_mode in &[false, true] {
+                    for &frequency_timer in &[0u16, 1, 2, 3, 8, 32] {
+                        for &cycles in &[1u16, 2, 3, 4] {
+                            let mut fast = NoiseChannel {
+                                clock_shift,
+                                divisor_code,
+                                width_mode,
+                                frequency_period: NOISE_DIVISORS[divisor_code as usize] << clock_shift,
+                                frequency_timer,
+                                lfsr: 0x5A5A,
+                                ..Default::default()
+                            };
+                            let mut reference = NoiseChannel {
+                                clock_shift,
+                                divisor_code,
+                                width_mode,
+                                frequency_period: NOISE_DIVISORS[divisor_code as usize] << clock_shift,
+                                frequency_timer,
+                                lfsr: 0x5A5A,
+                                ..Default::default()
+                            };
+
+                            fast.advance_frequency_noise(cycles);
+                            advance_noise_reference(&mut reference, cycles);
+
+                            assert_eq!(
+                                (fast.frequency_timer, fast.lfsr),
+                                (reference.frequency_timer, reference.lfsr),
+                                "noise mismatch: shift={clock_shift} divisor={divisor_code} width={width_mode} timer={frequency_timer} cycles={cycles}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
