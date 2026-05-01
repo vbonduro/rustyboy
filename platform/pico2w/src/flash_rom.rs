@@ -1,6 +1,6 @@
 use core::fmt::Debug;
 
-use embassy_rp::flash::{Blocking, Error as FlashError, Flash, FLASH_BASE, ERASE_SIZE};
+use embassy_rp::flash::{Blocking, Error as FlashError, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 use embassy_rp::Peri;
 
@@ -43,17 +43,18 @@ pub enum FlashRomStageError<E: Debug> {
     },
 }
 
-pub struct FlashRomReader {
+pub struct FlashRomReader<'d> {
+    flash: OnboardFlash<'d>,
     info: FlashRomInfo,
 }
 
-impl FlashRomReader {
-    pub fn new(info: FlashRomInfo) -> Self {
-        Self { info }
+impl<'d> FlashRomReader<'d> {
+    pub fn new(flash: OnboardFlash<'d>, info: FlashRomInfo) -> Self {
+        Self { flash, info }
     }
 }
 
-impl RomReader for FlashRomReader {
+impl RomReader for FlashRomReader<'_> {
     type Error = FlashRomReadError;
 
     fn read_bank(&mut self, bank: usize, buf: &mut [u8; ROM_BANK_BYTES]) -> Result<(), Self::Error> {
@@ -62,13 +63,9 @@ impl RomReader for FlashRomReader {
             return Err(FlashRomReadError::OutOfBounds);
         }
 
-        let src = (FLASH_BASE as usize) + ROM_DATA_OFFSET + bank * ROM_BANK_BYTES;
-        let src = src as *const u8;
-
-        unsafe {
-            let rom = core::slice::from_raw_parts(src, ROM_BANK_BYTES);
-            buf.copy_from_slice(rom);
-        }
+        self.flash
+            .blocking_read((ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32, buf)
+            .map_err(|_| FlashRomReadError::OutOfBounds)?;
 
         Ok(())
     }
@@ -78,8 +75,8 @@ pub fn new_onboard_flash<'d>(flash: Peri<'d, FLASH>) -> OnboardFlash<'d> {
     Flash::new_blocking(flash)
 }
 
-pub fn probe_staged_rom() -> Option<FlashRomInfo> {
-    let header = read_header();
+pub fn probe_staged_rom(flash: &mut OnboardFlash<'_>) -> Option<FlashRomInfo> {
+    let header = read_header(flash).ok()?;
     parse_header(&header)
 }
 
@@ -138,13 +135,10 @@ where
     Ok(info)
 }
 
-fn read_header() -> [u8; HEADER_LEN] {
+fn read_header(flash: &mut OnboardFlash<'_>) -> Result<[u8; HEADER_LEN], FlashError> {
     let mut header = [0u8; HEADER_LEN];
-    let src = (FLASH_BASE as usize + ROM_SLOT_OFFSET) as *const u8;
-    unsafe {
-        header.copy_from_slice(core::slice::from_raw_parts(src, HEADER_LEN));
-    }
-    header
+    flash.blocking_read(ROM_SLOT_OFFSET as u32, &mut header)?;
+    Ok(header)
 }
 
 fn parse_header(header: &[u8; HEADER_LEN]) -> Option<FlashRomInfo> {
