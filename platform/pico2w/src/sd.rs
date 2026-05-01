@@ -46,35 +46,20 @@ where
     <D as BlockDevice>::Error: core::fmt::Debug,
     T: TimeSource,
 {
-    /// Mount the first partition, search root then `roms/` for a `.gb` or
-    /// `.gbc` file, and open it for sequential bank reads.
+    /// Mount the first partition, search root for a `.gb` or `.gbc` file, and
+    /// open it for sequential bank reads.
     pub fn new(mgr: VolumeManager<D, T>) -> Result<Self, SdError<D::Error>> {
         let volume = mgr.open_raw_volume(VolumeIdx(0))?;
         let root   = mgr.open_root_dir(volume)?;
 
-        // Search root directory first.
         if let Some(file) = find_rom_in_dir(&mgr, root)? {
             let _ = mgr.close_dir(root);
             return Ok(Self { mgr, volume, file });
         }
 
-        // Search roms/ subdirectory.
-        if let Ok(roms_dir) = mgr.open_dir(root, "ROMS") {
-            let result = find_rom_in_dir(&mgr, roms_dir)?;
-            let _ = mgr.close_dir(roms_dir);
-            if let Some(file) = result {
-                let _ = mgr.close_dir(root);
-                return Ok(Self { mgr, volume, file });
-            }
-        }
-
         // Nothing found — log card contents before returning the error.
         warn!("no .gb/.gbc file found; listing card contents");
         log_dir(&mgr, root, "/");
-        if let Ok(roms_dir) = mgr.open_dir(root, "ROMS") {
-            log_dir(&mgr, roms_dir, "/roms/");
-            let _ = mgr.close_dir(roms_dir);
-        }
         let _ = mgr.close_dir(root);
         Err(SdError::NoRomFound)
     }
