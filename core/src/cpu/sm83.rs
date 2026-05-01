@@ -302,7 +302,7 @@ impl Sm83 {
             return Ok(value);
         }
         self.tick_cycle();
-        self.memory.read(addr)
+        Ok(self.memory.read_fast(addr))
     }
 
     /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
@@ -324,7 +324,14 @@ impl Sm83 {
             return Ok(());
         }
         self.tick_cycle();
-        self.memory.write(addr, value)
+        match addr {
+            0xFF00..=0xFF7F | 0xFFFF => self.memory.write(addr, value),
+            0xE000..=0xFDFF => Err(MemoryError::ReadOnly(addr)),
+            _ => {
+                self.memory.write_fast(addr, value);
+                Ok(())
+            }
+        }
     }
 
     /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
@@ -342,8 +349,8 @@ impl Sm83 {
             Some(ref d) => (d.source, d.progress),
             None => return,
         };
-        let byte = self.memory.read(source + progress as u16).unwrap_or(0xFF);
-        let _ = self.memory.write(0xFE00 + progress as u16, byte);
+        let byte = self.memory.read_fast(source + progress as u16);
+        self.memory.write_fast(0xFE00 + progress as u16, byte);
         let next = progress + 1;
         self.dma = if next < 160 {
             Some(DmaState { source, progress: next })

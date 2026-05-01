@@ -150,6 +150,39 @@ impl GameBoyMemory {
         self.cartridge.tick_rtc(cycles);
     }
 
+    /// Fast infallible memory read used by the CPU hot path.
+    #[inline(always)]
+    pub fn read_fast(&self, address: u16) -> u8 {
+        match address {
+            0x0000..=0x7FFF => self.cartridge.read_rom(address),
+            0x8000..=0x9FFF => self.vram.read_fast(address - 0x8000),
+            0xA000..=0xBFFF => self.cartridge.read_ram(address - 0xA000),
+            0xC000..=0xDFFF => self.wram.read_fast(address - 0xC000),
+            0xE000..=0xFDFF => self.wram.read_fast(address - 0xE000),
+            0xFE00..=0xFE9F => self.oam.read_fast(address - 0xFE00),
+            0xFF00..=0xFF7F => self.io.read_fast(address - 0xFF00),
+            0xFF80..=0xFFFE => self.hram.read_fast(address - 0xFF80),
+            0xFFFF => self.ie,
+            _ => 0xFF,
+        }
+    }
+
+    /// Fast infallible memory write used by hot non-IO paths.
+    #[inline(always)]
+    pub fn write_fast(&mut self, address: u16, value: u8) {
+        match address {
+            0x0000..=0x7FFF | 0xA000..=0xBFFF => self.cartridge.write(address, value),
+            0x8000..=0x9FFF => self.vram.write_fast(address - 0x8000, value),
+            0xC000..=0xDFFF => self.wram.write_fast(address - 0xC000, value),
+            0xE000..=0xFDFF => {}
+            0xFE00..=0xFE9F => self.oam.write_fast(address - 0xFE00, value),
+            0xFF00..=0xFF7F => self.io.write_fast(address - 0xFF00, value),
+            0xFF80..=0xFFFE => self.hram.write_fast(address - 0xFF80, value),
+            0xFFFF => self.ie = value,
+            _ => {}
+        }
+    }
+
     /// Perform OAM DMA: copy 160 bytes from the source page to OAM.
     /// Source address = page * 0x100. Reads go through normal memory mapping.
     pub fn dma_to_oam(&mut self, page: u8) {
