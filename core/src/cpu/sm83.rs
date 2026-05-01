@@ -81,6 +81,25 @@ pub struct TraceEvent<'a> {
     pub lcdc: u8,
 }
 
+struct PpuInputCache {
+    lcdc: u8,
+    stat: u8,
+    scy: u8,
+    scx: u8,
+    lyc: u8,
+    bgp: u8,
+    obp0: u8,
+    obp1: u8,
+    wy: u8,
+    wx: u8,
+}
+
+struct TimerCache {
+    tima: u8,
+    tma: u8,
+    tac: u8,
+}
+
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
@@ -100,9 +119,15 @@ pub struct Sm83 {
     /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
     /// read a fully-rendered frame rather than one mid-render.
     front_buffer: [u8; FRAMEBUFFER_SIZE],
-    /// Scratch buffer for `route_bus_events` — reused each M-cycle to avoid
-    /// allocating a fresh Vec on every bus event drain.
-    events_scratch: Vec<BusEvent>,
+    /// CPU MMIO writes are routed here and applied on the next M-cycle.
+    pending_bus_events: Vec<BusEvent>,
+    ppu_cache: PpuInputCache,
+    timer_cache: TimerCache,
+    last_ly: u8,
+    last_stat: u8,
+    last_nr52: u8,
+    last_tima: u8,
+    last_div: u8,
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
@@ -134,7 +159,25 @@ impl Sm83 {
             cycle_counter: 0,
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
-            events_scratch: Vec::new(),
+            pending_bus_events: Vec::with_capacity(4),
+            ppu_cache: PpuInputCache {
+                lcdc: 0,
+                stat: 0,
+                scy: 0,
+                scx: 0,
+                lyc: 0,
+                bgp: 0,
+                obp0: 0,
+                obp1: 0,
+                wy: 0,
+                wx: 0,
+            },
+            timer_cache: TimerCache { tima: 0, tma: 0, tac: 0 },
+            last_ly: 0,
+            last_stat: 0,
+            last_nr52: 0,
+            last_tima: 0,
+            last_div: 0,
             #[cfg(feature = "trace")]
             trace_hook: None,
         };
@@ -153,6 +196,13 @@ impl Sm83 {
             let offset = (addr - WAVE_RAM_START) as u8;
             sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
         }
+        sm83.sync_ppu_cache();
+        sm83.sync_timer_cache();
+        sm83.last_stat = sm83.memory.read_io(STAT_ADDR);
+        sm83.last_ly = sm83.memory.read_io(LY_ADDR);
+        sm83.last_nr52 = sm83.memory.read_io(NR52_ADDR);
+        sm83.last_tima = sm83.memory.read_io(TIMA_ADDR);
+        sm83.last_div = sm83.memory.read_io(DIV_ADDR);
         sm83
     }
 
@@ -259,6 +309,13 @@ impl Sm83 {
         self.timer.load_state(state.timer);
         self.ppu.load_state(state.ppu);
         self.memory.load_state(&state);
+        self.sync_ppu_cache();
+        self.sync_timer_cache();
+        self.last_stat = self.memory.read_io(STAT_ADDR);
+        self.last_ly = self.memory.read_io(LY_ADDR);
+        self.last_nr52 = self.memory.read_io(NR52_ADDR);
+        self.last_tima = self.memory.read_io(TIMA_ADDR);
+        self.last_div = self.memory.read_io(DIV_ADDR);
         Ok(())
     }
 
@@ -282,7 +339,37 @@ impl Sm83 {
         self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
         self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
         self.write_apu_register(0xFF24, 0x77); // NR50: max volume both sides
+        self.sync_ppu_cache();
+        self.sync_timer_cache();
+        self.last_stat = self.memory.read_io(STAT_ADDR);
+        self.last_ly = self.memory.read_io(LY_ADDR);
+        self.last_nr52 = self.memory.read_io(NR52_ADDR);
+        self.last_tima = self.memory.read_io(TIMA_ADDR);
+        self.last_div = self.memory.read_io(DIV_ADDR);
         self
+    }
+
+    fn sync_ppu_cache(&mut self) {
+        self.ppu_cache = PpuInputCache {
+            lcdc: self.memory.read_io(LCDC_ADDR),
+            stat: self.memory.read_io(STAT_ADDR),
+            scy: self.memory.read_io(SCY_ADDR),
+            scx: self.memory.read_io(SCX_ADDR),
+            lyc: self.memory.read_io(LYC_ADDR),
+            bgp: self.memory.read_io(BGP_ADDR),
+            obp0: self.memory.read_io(OBP0_ADDR),
+            obp1: self.memory.read_io(OBP1_ADDR),
+            wy: self.memory.read_io(WY_ADDR),
+            wx: self.memory.read_io(WX_ADDR),
+        };
+    }
+
+    fn sync_timer_cache(&mut self) {
+        self.timer_cache = TimerCache {
+            tima: self.memory.read_io(TIMA_ADDR),
+            tma: self.memory.read_io(TMA_ADDR),
+            tac: self.memory.read_io(TAC_ADDR),
+        };
     }
 
     // ── M-cycle–accurate bus access ─────────────────────────────────────────
@@ -298,7 +385,8 @@ impl Sm83 {
             self.tick_cycle_to_t3();
             let offset = (addr - WAVE_RAM_START) as u8;
             let value = self.apu.read_wave_ram(offset);
-            self.advance_timer_apu(1);
+            self.advance_timer(1);
+            self.advance_apu(1);
             return Ok(value);
         }
         self.tick_cycle();
@@ -314,18 +402,27 @@ impl Sm83 {
         if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
             self.tick_cycle_to_t3();
             self.write_apu_register(addr, value);
-            self.advance_timer_apu(1);
+            self.advance_timer(1);
+            self.advance_apu(1);
             return Ok(());
         }
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
             self.tick_cycle_to_t3();
             self.write_wave_ram(addr, value);
-            self.advance_timer_apu(1);
+            self.advance_timer(1);
+            self.advance_apu(1);
             return Ok(());
         }
         self.tick_cycle();
         match addr {
-            0xFF00..=0xFF7F | 0xFFFF => self.memory.write(addr, value),
+            0xFF00..=0xFF7F | 0xFFFF => {
+                self.memory.write_io(addr, value);
+                self.pending_bus_events.push(BusEvent {
+                    address: addr,
+                    value,
+                });
+                Ok(())
+            }
             0xE000..=0xFDFF => Err(MemoryError::ReadOnly(addr)),
             _ => {
                 self.memory.write_fast(addr, value);
@@ -361,12 +458,8 @@ impl Sm83 {
 
     fn advance_peripherals(&mut self, cycles: u16) {
         self.advance_ppu(cycles);
-        // Timer and APU advance per T-cycle so the APU sees the correct
-        // intermediate DIV counter at each step. This gives T-cycle accurate
-        // wave channel position tracking needed for dmg_sound tests 09/10/12.
-        for _ in 0..cycles {
-            self.advance_timer_apu(1);
-        }
+        self.advance_timer(cycles);
+        self.advance_apu(cycles);
         self.memory.tick_rtc(cycles as u32);
         self.advance_serial(cycles);
     }
@@ -387,26 +480,14 @@ impl Sm83 {
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
     /// stopping so the caller can perform a time-sensitive APU read or write at T3.
-    /// The caller must call `advance_timer_apu(1)` afterwards to complete T4.
-    ///
-    /// PPU advances for the full M-cycle up front; only timer+APU need per-T-cycle
-    /// precision for wave channel position tracking.
+    /// The caller must call `advance_timer(1)` + `advance_apu(1)` afterwards to complete T4.
     fn tick_cycle_to_t3(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
         self.advance_dma();
         self.advance_ppu(4);
-        for _ in 0..3 {
-            self.advance_timer_apu(1);
-        }
-    }
-
-    /// Advance timer and APU together by `cycles` T-cycles.
-    fn advance_timer_apu(&mut self, cycles: u16) {
-        for _ in 0..cycles {
-            self.advance_timer(1);
-            self.advance_apu(1);
-        }
+        self.advance_timer(3);
+        self.advance_apu(3);
     }
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
@@ -418,14 +499,13 @@ impl Sm83 {
     }
 
     fn route_bus_events(&mut self) {
-        self.events_scratch.clear();
-        self.memory.drain_into(&mut self.events_scratch);
         // Index-based loop: BusEvent is Copy, so each `e` is copied out before
         // handle_bus_event borrows &mut self, avoiding a borrow conflict.
-        for i in 0..self.events_scratch.len() {
-            let e = self.events_scratch[i];
+        for i in 0..self.pending_bus_events.len() {
+            let e = self.pending_bus_events[i];
             self.handle_bus_event(e.address, e.value);
         }
+        self.pending_bus_events.clear();
     }
 
     fn handle_bus_event(&mut self, addr: u16, value: u8) {
@@ -438,7 +518,10 @@ impl Sm83 {
                 let sb = self.memory.read_io(SB_ADDR);
                 self.serial.handle_sc_write(value, sb);
             }
-            a if a == DIV_ADDR => self.timer.reset_div(),
+            a if a == DIV_ADDR => {
+                self.timer.reset_div();
+                self.last_div = 0xFF;
+            }
             a if a == LY_ADDR => self.ppu.reset_ly(),
             a if a == DMA_ADDR => {
                 self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
@@ -447,6 +530,19 @@ impl Sm83 {
             // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
             a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
             a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
+            a if a == TIMA_ADDR => self.timer_cache.tima = value,
+            a if a == TMA_ADDR => self.timer_cache.tma = value,
+            a if a == TAC_ADDR => self.timer_cache.tac = value,
+            a if a == LCDC_ADDR => self.ppu_cache.lcdc = value,
+            a if a == STAT_ADDR => self.ppu_cache.stat = value,
+            a if a == SCY_ADDR => self.ppu_cache.scy = value,
+            a if a == SCX_ADDR => self.ppu_cache.scx = value,
+            a if a == LYC_ADDR => self.ppu_cache.lyc = value,
+            a if a == BGP_ADDR => self.ppu_cache.bgp = value,
+            a if a == OBP0_ADDR => self.ppu_cache.obp0 = value,
+            a if a == OBP1_ADDR => self.ppu_cache.obp1 = value,
+            a if a == WY_ADDR => self.ppu_cache.wy = value,
+            a if a == WX_ADDR => self.ppu_cache.wx = value,
             _ => {}
         }
     }
@@ -475,22 +571,29 @@ impl Sm83 {
         let output = self.ppu.tick(
             cycles,
             PpuInput {
-                lcdc: self.memory.read_io(LCDC_ADDR),
-                stat: self.memory.read_io(STAT_ADDR),
-                scy: self.memory.read_io(SCY_ADDR),
-                scx: self.memory.read_io(SCX_ADDR),
-                lyc: self.memory.read_io(LYC_ADDR),
-                bgp: self.memory.read_io(BGP_ADDR),
-                obp0: self.memory.read_io(OBP0_ADDR),
-                obp1: self.memory.read_io(OBP1_ADDR),
-                wy: self.memory.read_io(WY_ADDR),
-                wx: self.memory.read_io(WX_ADDR),
+                lcdc: self.ppu_cache.lcdc,
+                stat: self.ppu_cache.stat,
+                scy: self.ppu_cache.scy,
+                scx: self.ppu_cache.scx,
+                lyc: self.ppu_cache.lyc,
+                bgp: self.ppu_cache.bgp,
+                obp0: self.ppu_cache.obp0,
+                obp1: self.ppu_cache.obp1,
+                wy: self.ppu_cache.wy,
+                wx: self.ppu_cache.wx,
                 vram: self.memory.vram(),
                 oam: self.memory.oam(),
             },
         );
-        self.memory.write_io(LY_ADDR, output.ly);
-        self.memory.write_io(STAT_ADDR, output.stat);
+        if output.ly != self.last_ly {
+            self.last_ly = output.ly;
+            self.memory.write_io(LY_ADDR, output.ly);
+        }
+        if output.stat != self.last_stat {
+            self.last_stat = output.stat;
+            self.ppu_cache.stat = output.stat;
+            self.memory.write_io(STAT_ADDR, output.stat);
+        }
         if output.vblank_interrupt {
             // Snapshot the completed frame into the front buffer before the PPU
             // starts overwriting scanlines for the next frame.
@@ -508,13 +611,20 @@ impl Sm83 {
         let output = self.timer.tick(
             cycles,
             TimerInput {
-                tima: self.memory.read_io(TIMA_ADDR),
-                tma: self.memory.read_io(TMA_ADDR),
-                tac: self.memory.read_io(TAC_ADDR),
+                tima: self.timer_cache.tima,
+                tma: self.timer_cache.tma,
+                tac: self.timer_cache.tac,
             },
         );
-        self.memory.write_io(TIMA_ADDR, output.tima);
-        self.memory.write_io(DIV_ADDR, output.div);
+        self.timer_cache.tima = output.tima;
+        if output.tima != self.last_tima {
+            self.last_tima = output.tima;
+            self.memory.write_io(TIMA_ADDR, output.tima);
+        }
+        if output.div != self.last_div {
+            self.last_div = output.div;
+            self.memory.write_io(DIV_ADDR, output.div);
+        }
         if output.interrupt {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
@@ -523,7 +633,10 @@ impl Sm83 {
 
     fn advance_apu(&mut self, cycles: u16) {
         let output = self.apu.tick(cycles, self.timer.internal_counter());
-        self.memory.write_io(NR52_ADDR, output.nr52);
+        if output.nr52 != self.last_nr52 {
+            self.last_nr52 = output.nr52;
+            self.memory.write_io(NR52_ADDR, output.nr52);
+        }
     }
 
     fn has_pending_interrupt(&self) -> bool {
