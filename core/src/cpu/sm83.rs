@@ -81,23 +81,67 @@ pub struct TraceEvent<'a> {
     pub lcdc: u8,
 }
 
-struct PpuInputCache {
-    lcdc: u8,
-    stat: u8,
-    scy: u8,
-    scx: u8,
-    lyc: u8,
-    bgp: u8,
-    obp0: u8,
-    obp1: u8,
-    wy: u8,
-    wx: u8,
+#[derive(Default)]
+pub struct Sm83Cache {
+    pub lcdc: u8,
+    pub stat: u8,
+    pub scy: u8,
+    pub scx: u8,
+    pub lyc: u8,
+    pub bgp: u8,
+    pub obp0: u8,
+    pub obp1: u8,
+    pub wy: u8,
+    pub wx: u8,
+    pub tima: u8,
+    pub tma: u8,
+    pub tac: u8,
+    pub ly: u8,
+    pub nr52: u8,
+    pub div: u8,
 }
 
-struct TimerCache {
-    tima: u8,
-    tma: u8,
-    tac: u8,
+impl Sm83Cache {
+    pub fn sync(&mut self, mem: &GameBoyMemory) {
+        self.lcdc = mem.read_io(LCDC_ADDR);
+        self.stat = mem.read_io(STAT_ADDR);
+        self.scy  = mem.read_io(SCY_ADDR);
+        self.scx  = mem.read_io(SCX_ADDR);
+        self.lyc  = mem.read_io(LYC_ADDR);
+        self.bgp  = mem.read_io(BGP_ADDR);
+        self.obp0 = mem.read_io(OBP0_ADDR);
+        self.obp1 = mem.read_io(OBP1_ADDR);
+        self.wy   = mem.read_io(WY_ADDR);
+        self.wx   = mem.read_io(WX_ADDR);
+        self.tima = mem.read_io(TIMA_ADDR);
+        self.tma  = mem.read_io(TMA_ADDR);
+        self.tac  = mem.read_io(TAC_ADDR);
+        self.ly   = mem.read_io(LY_ADDR);
+        self.nr52 = mem.read_io(NR52_ADDR);
+        self.div  = mem.read_io(DIV_ADDR);
+    }
+
+    pub fn read(&self, addr: u16) -> Option<u8> {
+        match addr {
+            a if a == LCDC_ADDR => Some(self.lcdc),
+            a if a == STAT_ADDR => Some(self.stat),
+            a if a == SCY_ADDR  => Some(self.scy),
+            a if a == SCX_ADDR  => Some(self.scx),
+            a if a == LYC_ADDR  => Some(self.lyc),
+            a if a == BGP_ADDR  => Some(self.bgp),
+            a if a == OBP0_ADDR => Some(self.obp0),
+            a if a == OBP1_ADDR => Some(self.obp1),
+            a if a == WY_ADDR   => Some(self.wy),
+            a if a == WX_ADDR   => Some(self.wx),
+            a if a == TIMA_ADDR => Some(self.tima),
+            a if a == TMA_ADDR  => Some(self.tma),
+            a if a == TAC_ADDR  => Some(self.tac),
+            a if a == LY_ADDR   => Some(self.ly),
+            a if a == NR52_ADDR => Some(self.nr52),
+            a if a == DIV_ADDR  => Some(self.div),
+            _ => None,
+        }
+    }
 }
 
 pub struct Sm83 {
@@ -121,13 +165,7 @@ pub struct Sm83 {
     front_buffer: [u8; FRAMEBUFFER_SIZE],
     /// CPU MMIO writes are routed here and applied on the next M-cycle.
     pending_bus_events: Vec<BusEvent>,
-    ppu_cache: PpuInputCache,
-    timer_cache: TimerCache,
-    last_ly: u8,
-    last_stat: u8,
-    last_nr52: u8,
-    last_tima: u8,
-    last_div: u8,
+    pub cache: Sm83Cache,
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
@@ -160,24 +198,7 @@ impl Sm83 {
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
             pending_bus_events: Vec::with_capacity(4),
-            ppu_cache: PpuInputCache {
-                lcdc: 0,
-                stat: 0,
-                scy: 0,
-                scx: 0,
-                lyc: 0,
-                bgp: 0,
-                obp0: 0,
-                obp1: 0,
-                wy: 0,
-                wx: 0,
-            },
-            timer_cache: TimerCache { tima: 0, tma: 0, tac: 0 },
-            last_ly: 0,
-            last_stat: 0,
-            last_nr52: 0,
-            last_tima: 0,
-            last_div: 0,
+            cache: Sm83Cache::default(),
             #[cfg(feature = "trace")]
             trace_hook: None,
         };
@@ -196,13 +217,7 @@ impl Sm83 {
             let offset = (addr - WAVE_RAM_START) as u8;
             sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
         }
-        sm83.sync_ppu_cache();
-        sm83.sync_timer_cache();
-        sm83.last_stat = sm83.memory.read_io(STAT_ADDR);
-        sm83.last_ly = sm83.memory.read_io(LY_ADDR);
-        sm83.last_nr52 = sm83.memory.read_io(NR52_ADDR);
-        sm83.last_tima = sm83.memory.read_io(TIMA_ADDR);
-        sm83.last_div = sm83.memory.read_io(DIV_ADDR);
+        sm83.cache.sync(&sm83.memory);
         sm83
     }
 
@@ -309,13 +324,7 @@ impl Sm83 {
         self.timer.load_state(state.timer);
         self.ppu.load_state(state.ppu);
         self.memory.load_state(&state);
-        self.sync_ppu_cache();
-        self.sync_timer_cache();
-        self.last_stat = self.memory.read_io(STAT_ADDR);
-        self.last_ly = self.memory.read_io(LY_ADDR);
-        self.last_nr52 = self.memory.read_io(NR52_ADDR);
-        self.last_tima = self.memory.read_io(TIMA_ADDR);
-        self.last_div = self.memory.read_io(DIV_ADDR);
+        self.cache.sync(&self.memory);
         Ok(())
     }
 
@@ -339,37 +348,8 @@ impl Sm83 {
         self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
         self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
         self.write_apu_register(0xFF24, 0x77); // NR50: max volume both sides
-        self.sync_ppu_cache();
-        self.sync_timer_cache();
-        self.last_stat = self.memory.read_io(STAT_ADDR);
-        self.last_ly = self.memory.read_io(LY_ADDR);
-        self.last_nr52 = self.memory.read_io(NR52_ADDR);
-        self.last_tima = self.memory.read_io(TIMA_ADDR);
-        self.last_div = self.memory.read_io(DIV_ADDR);
+        self.cache.sync(&self.memory);
         self
-    }
-
-    fn sync_ppu_cache(&mut self) {
-        self.ppu_cache = PpuInputCache {
-            lcdc: self.memory.read_io(LCDC_ADDR),
-            stat: self.memory.read_io(STAT_ADDR),
-            scy: self.memory.read_io(SCY_ADDR),
-            scx: self.memory.read_io(SCX_ADDR),
-            lyc: self.memory.read_io(LYC_ADDR),
-            bgp: self.memory.read_io(BGP_ADDR),
-            obp0: self.memory.read_io(OBP0_ADDR),
-            obp1: self.memory.read_io(OBP1_ADDR),
-            wy: self.memory.read_io(WY_ADDR),
-            wx: self.memory.read_io(WX_ADDR),
-        };
-    }
-
-    fn sync_timer_cache(&mut self) {
-        self.timer_cache = TimerCache {
-            tima: self.memory.read_io(TIMA_ADDR),
-            tma: self.memory.read_io(TMA_ADDR),
-            tac: self.memory.read_io(TAC_ADDR),
-        };
     }
 
     // ── M-cycle–accurate bus access ─────────────────────────────────────────
@@ -520,7 +500,7 @@ impl Sm83 {
             }
             a if a == DIV_ADDR => {
                 self.timer.reset_div();
-                self.last_div = 0xFF;
+                self.cache.div = 0xFF;
             }
             a if a == LY_ADDR => self.ppu.reset_ly(),
             a if a == DMA_ADDR => {
@@ -530,19 +510,19 @@ impl Sm83 {
             // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
             a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
             a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
-            a if a == TIMA_ADDR => self.timer_cache.tima = value,
-            a if a == TMA_ADDR => self.timer_cache.tma = value,
-            a if a == TAC_ADDR => self.timer_cache.tac = value,
-            a if a == LCDC_ADDR => self.ppu_cache.lcdc = value,
-            a if a == STAT_ADDR => self.ppu_cache.stat = value,
-            a if a == SCY_ADDR => self.ppu_cache.scy = value,
-            a if a == SCX_ADDR => self.ppu_cache.scx = value,
-            a if a == LYC_ADDR => self.ppu_cache.lyc = value,
-            a if a == BGP_ADDR => self.ppu_cache.bgp = value,
-            a if a == OBP0_ADDR => self.ppu_cache.obp0 = value,
-            a if a == OBP1_ADDR => self.ppu_cache.obp1 = value,
-            a if a == WY_ADDR => self.ppu_cache.wy = value,
-            a if a == WX_ADDR => self.ppu_cache.wx = value,
+            a if a == TIMA_ADDR => self.cache.tima = value,
+            a if a == TMA_ADDR  => self.cache.tma  = value,
+            a if a == TAC_ADDR  => self.cache.tac  = value,
+            a if a == LCDC_ADDR => self.cache.lcdc = value,
+            a if a == STAT_ADDR => self.cache.stat = value,
+            a if a == SCY_ADDR  => self.cache.scy  = value,
+            a if a == SCX_ADDR  => self.cache.scx  = value,
+            a if a == LYC_ADDR  => self.cache.lyc  = value,
+            a if a == BGP_ADDR  => self.cache.bgp  = value,
+            a if a == OBP0_ADDR => self.cache.obp0 = value,
+            a if a == OBP1_ADDR => self.cache.obp1 = value,
+            a if a == WY_ADDR   => self.cache.wy   = value,
+            a if a == WX_ADDR   => self.cache.wx   = value,
             _ => {}
         }
     }
@@ -571,27 +551,26 @@ impl Sm83 {
         let output = self.ppu.tick(
             cycles,
             PpuInput {
-                lcdc: self.ppu_cache.lcdc,
-                stat: self.ppu_cache.stat,
-                scy: self.ppu_cache.scy,
-                scx: self.ppu_cache.scx,
-                lyc: self.ppu_cache.lyc,
-                bgp: self.ppu_cache.bgp,
-                obp0: self.ppu_cache.obp0,
-                obp1: self.ppu_cache.obp1,
-                wy: self.ppu_cache.wy,
-                wx: self.ppu_cache.wx,
+                lcdc: self.cache.lcdc,
+                stat: self.cache.stat,
+                scy: self.cache.scy,
+                scx: self.cache.scx,
+                lyc: self.cache.lyc,
+                bgp: self.cache.bgp,
+                obp0: self.cache.obp0,
+                obp1: self.cache.obp1,
+                wy: self.cache.wy,
+                wx: self.cache.wx,
                 vram: self.memory.vram(),
                 oam: self.memory.oam(),
             },
         );
-        if output.ly != self.last_ly {
-            self.last_ly = output.ly;
+        if output.ly != self.cache.ly {
+            self.cache.ly = output.ly;
             self.memory.write_io(LY_ADDR, output.ly);
         }
-        if output.stat != self.last_stat {
-            self.last_stat = output.stat;
-            self.ppu_cache.stat = output.stat;
+        if output.stat != self.cache.stat {
+            self.cache.stat = output.stat;
             self.memory.write_io(STAT_ADDR, output.stat);
         }
         if output.vblank_interrupt {
@@ -611,18 +590,17 @@ impl Sm83 {
         let output = self.timer.tick(
             cycles,
             TimerInput {
-                tima: self.timer_cache.tima,
-                tma: self.timer_cache.tma,
-                tac: self.timer_cache.tac,
+                tima: self.cache.tima,
+                tma: self.cache.tma,
+                tac: self.cache.tac,
             },
         );
-        self.timer_cache.tima = output.tima;
-        if output.tima != self.last_tima {
-            self.last_tima = output.tima;
+        if output.tima != self.cache.tima {
+            self.cache.tima = output.tima;
             self.memory.write_io(TIMA_ADDR, output.tima);
         }
-        if output.div != self.last_div {
-            self.last_div = output.div;
+        if output.div != self.cache.div {
+            self.cache.div = output.div;
             self.memory.write_io(DIV_ADDR, output.div);
         }
         if output.interrupt {
@@ -633,8 +611,8 @@ impl Sm83 {
 
     fn advance_apu(&mut self, cycles: u16) {
         let output = self.apu.tick(cycles, self.timer.internal_counter());
-        if output.nr52 != self.last_nr52 {
-            self.last_nr52 = output.nr52;
+        if output.nr52 != self.cache.nr52 {
+            self.cache.nr52 = output.nr52;
             self.memory.write_io(NR52_ADDR, output.nr52);
         }
     }
