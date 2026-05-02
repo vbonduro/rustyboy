@@ -4,7 +4,6 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 
 use super::cartridge::{self, Cartridge, NoMbc};
-use super::rom::Ram;
 use crate::cpu::save_state::SaveState;
 
 /// An event produced when a write occurs to an I/O or IE register address.
@@ -88,11 +87,11 @@ impl RegionMapping {
 ///   Everything else: unmapped (returns 0xFF on read, silently ignored on write)
 pub struct GameBoyMemory {
     cartridge: Box<dyn Cartridge>,
-    vram: Ram,
-    wram: Ram,
-    oam: Ram,
-    io: Ram,
-    hram: Ram,
+    vram: [u8; 0x2000],
+    wram: [u8; 0x2000],
+    oam: [u8; 0xA0],
+    io: [u8; 0x80],
+    hram: [u8; 0x7F],
     ie: u8,
     events: VecDeque<BusEvent>,
 }
@@ -101,13 +100,13 @@ impl GameBoyMemory {
     pub fn new() -> Self {
         Self {
             cartridge: Box::new(NoMbc::new(vec![0u8; 0x8000])),
-            vram: Ram::new(0x2000),
-            wram: Ram::new(0x2000),
-            oam: Ram::new(0xA0),
-            io: Ram::new(0x80),
-            hram: Ram::new(0x7F),
+            vram: [0; 0x2000],
+            wram: [0; 0x2000],
+            oam: [0; 0xA0],
+            io: [0; 0x80],
+            hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::new(),
+            events: VecDeque::with_capacity(8),
         }
     }
 
@@ -115,13 +114,13 @@ impl GameBoyMemory {
     pub fn with_cartridge(cart: Box<dyn Cartridge>) -> Self {
         Self {
             cartridge: cart,
-            vram: Ram::new(0x2000),
-            wram: Ram::new(0x2000),
-            oam: Ram::new(0xA0),
-            io: Ram::new(0x80),
-            hram: Ram::new(0x7F),
+            vram: [0; 0x2000],
+            wram: [0; 0x2000],
+            oam: [0; 0xA0],
+            io: [0; 0x80],
+            hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::new(),
+            events: VecDeque::with_capacity(8),
         }
     }
 
@@ -130,13 +129,27 @@ impl GameBoyMemory {
     pub fn with_rom(data: Vec<u8>) -> Self {
         Self {
             cartridge: cartridge::from_rom(data),
-            vram: Ram::new(0x2000),
-            wram: Ram::new(0x2000),
-            oam: Ram::new(0xA0),
-            io: Ram::new(0x80),
-            hram: Ram::new(0x7F),
+            vram: [0; 0x2000],
+            wram: [0; 0x2000],
+            oam: [0; 0xA0],
+            io: [0; 0x80],
+            hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::new(),
+            events: VecDeque::with_capacity(8),
+        }
+    }
+
+    #[inline(always)]
+    fn read_region_fast<const N: usize>(region: &[u8; N], offset: u16) -> u8 {
+        // The caller's address decode guarantees the offset is valid.
+        unsafe { *region.get_unchecked(offset as usize) }
+    }
+
+    #[inline(always)]
+    fn write_region_fast<const N: usize>(region: &mut [u8; N], offset: u16, value: u8) {
+        // The caller's address decode guarantees the offset is valid.
+        unsafe {
+            *region.get_unchecked_mut(offset as usize) = value;
         }
     }
 
@@ -155,13 +168,13 @@ impl GameBoyMemory {
     pub fn read_fast(&self, address: u16) -> u8 {
         match address {
             0x0000..=0x7FFF => self.cartridge.read_rom(address),
-            0x8000..=0x9FFF => self.vram.read_fast(address - 0x8000),
+            0x8000..=0x9FFF => Self::read_region_fast(&self.vram, address - 0x8000),
             0xA000..=0xBFFF => self.cartridge.read_ram(address - 0xA000),
-            0xC000..=0xDFFF => self.wram.read_fast(address - 0xC000),
-            0xE000..=0xFDFF => self.wram.read_fast(address - 0xE000),
-            0xFE00..=0xFE9F => self.oam.read_fast(address - 0xFE00),
-            0xFF00..=0xFF7F => self.io.read_fast(address - 0xFF00),
-            0xFF80..=0xFFFE => self.hram.read_fast(address - 0xFF80),
+            0xC000..=0xDFFF => Self::read_region_fast(&self.wram, address - 0xC000),
+            0xE000..=0xFDFF => Self::read_region_fast(&self.wram, address - 0xE000),
+            0xFE00..=0xFE9F => Self::read_region_fast(&self.oam, address - 0xFE00),
+            0xFF00..=0xFF7F => Self::read_region_fast(&self.io, address - 0xFF00),
+            0xFF80..=0xFFFE => Self::read_region_fast(&self.hram, address - 0xFF80),
             0xFFFF => self.ie,
             _ => 0xFF,
         }
@@ -172,12 +185,12 @@ impl GameBoyMemory {
     pub fn write_fast(&mut self, address: u16, value: u8) {
         match address {
             0x0000..=0x7FFF | 0xA000..=0xBFFF => self.cartridge.write(address, value),
-            0x8000..=0x9FFF => self.vram.write_fast(address - 0x8000, value),
-            0xC000..=0xDFFF => self.wram.write_fast(address - 0xC000, value),
+            0x8000..=0x9FFF => Self::write_region_fast(&mut self.vram, address - 0x8000, value),
+            0xC000..=0xDFFF => Self::write_region_fast(&mut self.wram, address - 0xC000, value),
             0xE000..=0xFDFF => {}
-            0xFE00..=0xFE9F => self.oam.write_fast(address - 0xFE00, value),
-            0xFF00..=0xFF7F => self.io.write_fast(address - 0xFF00, value),
-            0xFF80..=0xFFFE => self.hram.write_fast(address - 0xFF80, value),
+            0xFE00..=0xFE9F => Self::write_region_fast(&mut self.oam, address - 0xFE00, value),
+            0xFF00..=0xFF7F => Self::write_region_fast(&mut self.io, address - 0xFF00, value),
+            0xFF80..=0xFFFE => Self::write_region_fast(&mut self.hram, address - 0xFF80, value),
             0xFFFF => self.ie = value,
             _ => {}
         }
@@ -189,24 +202,24 @@ impl GameBoyMemory {
         let base = (page as u16) << 8;
         for i in 0..0xA0u16 {
             let byte = self.read(base + i).unwrap_or(0xFF);
-            let _ = self.oam.write(i, byte);
+            Self::write_region_fast(&mut self.oam, i, byte);
         }
     }
 
     pub fn vram(&self) -> &[u8] {
-        self.vram.as_slice()
+        &self.vram
     }
 
     pub fn oam(&self) -> &[u8] {
-        self.oam.as_slice()
+        &self.oam
     }
 
     pub fn wram(&self) -> &[u8] {
-        self.wram.as_slice()
+        &self.wram
     }
 
     pub fn hram(&self) -> &[u8] {
-        self.hram.as_slice()
+        &self.hram
     }
 
     pub fn ie(&self) -> u8 {
@@ -214,31 +227,23 @@ impl GameBoyMemory {
     }
 
     pub fn set_wram(&mut self, data: &[u8]) {
-        let len = data.len().min(self.wram.as_slice().len());
-        for i in 0..len {
-            let _ = self.wram.write(i as u16, data[i]);
-        }
+        let len = data.len().min(self.wram.len());
+        self.wram[..len].copy_from_slice(&data[..len]);
     }
 
     pub fn set_hram(&mut self, data: &[u8]) {
-        let len = data.len().min(self.hram.as_slice().len());
-        for i in 0..len {
-            let _ = self.hram.write(i as u16, data[i]);
-        }
+        let len = data.len().min(self.hram.len());
+        self.hram[..len].copy_from_slice(&data[..len]);
     }
 
     pub fn set_vram(&mut self, data: &[u8]) {
-        let len = data.len().min(self.vram.as_slice().len());
-        for i in 0..len {
-            let _ = self.vram.write(i as u16, data[i]);
-        }
+        let len = data.len().min(self.vram.len());
+        self.vram[..len].copy_from_slice(&data[..len]);
     }
 
     pub fn set_oam(&mut self, data: &[u8]) {
-        let len = data.len().min(self.oam.as_slice().len());
-        for i in 0..len {
-            let _ = self.oam.write(i as u16, data[i]);
-        }
+        let len = data.len().min(self.oam.len());
+        self.oam[..len].copy_from_slice(&data[..len]);
     }
 
     pub fn set_ie(&mut self, value: u8) {
@@ -306,7 +311,7 @@ impl GameBoyMemory {
     /// Handles 0xFF00-0xFF7F from io array, 0xFFFF from ie field.
     pub fn read_io(&self, address: u16) -> u8 {
         match address {
-            0xFF00..=0xFF7F => self.io.read(address - 0xFF00).unwrap_or(0xFF),
+            0xFF00..=0xFF7F => self.io[(address - 0xFF00) as usize],
             0xFFFF => self.ie,
             _ => 0xFF,
         }
@@ -317,7 +322,7 @@ impl GameBoyMemory {
     pub fn write_io(&mut self, address: u16, value: u8) {
         match address {
             0xFF00..=0xFF7F => {
-                let _ = self.io.write(address - 0xFF00, value);
+                self.io[(address - 0xFF00) as usize] = value;
             }
             0xFFFF => {
                 self.ie = value;
@@ -336,31 +341,13 @@ impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
         match RegionMapping::for_address(address) {
             RegionMapping::Rom => Ok(self.cartridge.read_rom(address)),
-            RegionMapping::Vram(offset) => self
-                .vram
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Vram(offset) => Ok(self.vram[offset as usize]),
             RegionMapping::ExternalRam(offset) => Ok(self.cartridge.read_ram(offset)),
-            RegionMapping::Wram(offset) => self
-                .wram
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::EchoRam(offset) => self
-                .wram
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Oam(offset) => self
-                .oam
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Io(offset) => self
-                .io
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Hram(offset) => self
-                .hram
-                .read(offset)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Wram(offset) => Ok(self.wram[offset as usize]),
+            RegionMapping::EchoRam(offset) => Ok(self.wram[offset as usize]),
+            RegionMapping::Oam(offset) => Ok(self.oam[offset as usize]),
+            RegionMapping::Io(offset) => Ok(self.io[offset as usize]),
+            RegionMapping::Hram(offset) => Ok(self.hram[offset as usize]),
             RegionMapping::InterruptEnable => Ok(self.ie),
             RegionMapping::Unmapped => Ok(0xFF),
         }
@@ -373,30 +360,28 @@ impl Memory for GameBoyMemory {
                 self.cartridge.write(address, value);
                 Ok(())
             }
-            RegionMapping::Vram(offset) => self
-                .vram
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
-            RegionMapping::Wram(offset) => self
-                .wram
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Vram(offset) => {
+                self.vram[offset as usize] = value;
+                Ok(())
+            }
+            RegionMapping::Wram(offset) => {
+                self.wram[offset as usize] = value;
+                Ok(())
+            }
             RegionMapping::EchoRam(_) => Err(Error::ReadOnly(address)),
-            RegionMapping::Oam(offset) => self
-                .oam
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Oam(offset) => {
+                self.oam[offset as usize] = value;
+                Ok(())
+            }
             RegionMapping::Io(offset) => {
-                self.io
-                    .write(offset, value)
-                    .map_err(|_| Error::OutOfRange(address))?;
+                self.io[offset as usize] = value;
                 self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
-            RegionMapping::Hram(offset) => self
-                .hram
-                .write(offset, value)
-                .map_err(|_| Error::OutOfRange(address)),
+            RegionMapping::Hram(offset) => {
+                self.hram[offset as usize] = value;
+                Ok(())
+            }
             RegionMapping::InterruptEnable => {
                 self.ie = value;
                 self.events.push_back(BusEvent { address, value });

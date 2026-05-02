@@ -8,5 +8,5 @@ pub mod streaming;
 #[cfg(test)]
 pub use fake::FakeMemory;
 pub use memory::{GameBoyMemory, Memory};
-pub use rom::{ROMVec, Ram, ReadOnlyMemory};
+pub use rom::{ROMVec, ReadOnlyMemory};
 pub use streaming::{RomReader, StreamingCartridge, StreamingError};
