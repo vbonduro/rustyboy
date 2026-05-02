@@ -69,26 +69,29 @@ impl TimerPeripheral {
     /// Pure transform: reads register state from `input`, returns new state
     /// in `TimerOutput`. The caller (CPU) writes the results back to memory.
     pub fn tick(&mut self, cycles: u16, input: TimerInput) -> TimerOutput {
-        let timer_enabled = input.tac & 0x04 != 0;
-        let divisor = CLOCK_DIVISORS[(input.tac & 0x03) as usize];
+        let prev = self.internal_counter;
+        self.internal_counter = self.internal_counter.wrapping_add(cycles);
+
         let mut tima = input.tima;
         let mut interrupt = false;
 
-        for _ in 0..cycles {
-            let prev = self.internal_counter;
-            self.internal_counter = self.internal_counter.wrapping_add(1);
+        if input.tac & 0x04 != 0 {
+            let divisor = CLOCK_DIVISORS[(input.tac & 0x03) as usize];
+            let n_edges = if self.internal_counter < prev {
+                (65536u32 / divisor as u32 - prev as u32 / divisor as u32)
+                    + self.internal_counter as u32 / divisor as u32
+            } else {
+                self.internal_counter as u32 / divisor as u32
+                    - prev as u32 / divisor as u32
+            };
 
-            if timer_enabled {
-                // TIMA increments on the falling edge of the relevant bit.
-                let bit = divisor / 2;
-                if prev & bit != 0 && self.internal_counter & bit == 0 {
-                    let (new_tima, overflow) = tima.overflowing_add(1);
-                    if overflow {
-                        tima = input.tma;
-                        interrupt = true;
-                    } else {
-                        tima = new_tima;
-                    }
+            for _ in 0..n_edges {
+                let (new_tima, overflow) = tima.overflowing_add(1);
+                if overflow {
+                    tima = input.tma;
+                    interrupt = true;
+                } else {
+                    tima = new_tima;
                 }
             }
         }
