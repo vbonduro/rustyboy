@@ -68,6 +68,7 @@ impl TimerPeripheral {
     ///
     /// Pure transform: reads register state from `input`, returns new state
     /// in `TimerOutput`. The caller (CPU) writes the results back to memory.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn tick(&mut self, cycles: u16, input: TimerInput) -> TimerOutput {
         let prev = self.internal_counter;
         self.internal_counter = self.internal_counter.wrapping_add(cycles);
