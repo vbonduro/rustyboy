@@ -3,7 +3,6 @@ use wasm_bindgen::prelude::*;
 use rustyboy_core::{
     cpu::{
         cpu::Cpu,
-        instructions::opcodes::OpCodeDecoder,
         peripheral::joypad::Button,
         registers::{Flags, Registers},
         save_state::SaveState,
@@ -36,9 +35,8 @@ impl EmulatorHandle {
     #[wasm_bindgen(constructor)]
     pub fn new(rom: Vec<u8>) -> EmulatorHandle {
         let memory = GameBoyMemory::with_rom(rom);
-        let decoder = Box::new(OpCodeDecoder::new());
         // Start at 0x100 with DMG post-boot-ROM state (skips boot ROM).
-        let cpu = Sm83::new(Box::new(memory), decoder)
+        let cpu = Sm83::new(Box::new(memory))
             .with_registers(Registers {
                 a: 0x01, f: Flags::from_bits_truncate(0xB0),
                 b: 0x00, c: 0x13,

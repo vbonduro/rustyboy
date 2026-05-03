@@ -2,7 +2,6 @@
 #![allow(dead_code)]
 
 use rustyboy_core::cpu::cpu::Cpu;
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::Registers;
 use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::memory::memory::GameBoyMemory;
@@ -27,8 +26,7 @@ pub fn load_rom(path: &str) -> Vec<u8> {
 pub fn run_blargg_rom(path: &str) -> String {
     let rom_data = load_rom(path);
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut cpu = Sm83::new(memory).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -71,8 +69,7 @@ pub fn assert_blargg_passed(path: &str, name: &str) {
 pub fn run_blargg_mem_rom(path: &str) -> String {
     let rom_data = load_rom(path);
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut cpu = Sm83::new(memory).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -128,8 +125,7 @@ pub fn assert_blargg_mem_passed(path: &str, name: &str) {
 pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
     let rom_data = load_rom(path);
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut cpu = Sm83::new(memory).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -199,8 +195,7 @@ pub fn assert_mooneye_passed(path: &str, name: &str) {
 pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
     let rom_data = load_rom(path);
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut cpu = Sm83::new(memory).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
