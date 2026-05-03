@@ -358,6 +358,7 @@ impl Sm83 {
     /// process any pending bus events, then read from memory.
     /// Wave RAM reads (0xFF30-0xFF3F) are routed through the APU so that
     /// reads while ch3 is on return the current sample buffer.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
             // Wave RAM reads require T-cycle precision. The sample is latched
@@ -378,6 +379,7 @@ impl Sm83 {
     ///
     /// APU register and wave RAM writes are applied at T3 within the M-cycle
     /// for T-cycle accurate timing.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
         if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
             self.tick_cycle_to_t3();
@@ -413,6 +415,7 @@ impl Sm83 {
 
     /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
     /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
@@ -421,6 +424,7 @@ impl Sm83 {
     }
 
     /// Advance the OAM DMA transfer by one byte (one M-cycle).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_dma(&mut self) {
         let (source, progress) = match self.dma {
             Some(ref d) => (d.source, d.progress),
@@ -436,6 +440,7 @@ impl Sm83 {
         };
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_peripherals(&mut self, cycles: u16) {
         self.advance_ppu(cycles);
         self.advance_timer(cycles);
@@ -444,6 +449,7 @@ impl Sm83 {
         self.advance_serial(cycles);
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_serial(&mut self, cycles: u16) {
         let output = self.serial.tick(cycles);
         if output.interrupt {
@@ -461,6 +467,7 @@ impl Sm83 {
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
     /// stopping so the caller can perform a time-sensitive APU read or write at T3.
     /// The caller must call `advance_timer(1)` + `advance_apu(1)` afterwards to complete T4.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle_to_t3(&mut self) {
         self.cycle_counter += 4;
         self.route_bus_events();
@@ -472,12 +479,14 @@ impl Sm83 {
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_ime(&mut self) {
         if self.ime == ImeState::Pending {
             self.ime = ImeState::Enabled;
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn route_bus_events(&mut self) {
         // Index-based loop: BusEvent is Copy, so each `e` is copied out before
         // handle_bus_event borrows &mut self, avoiding a borrow conflict.
@@ -488,6 +497,7 @@ impl Sm83 {
         self.pending_bus_events.clear();
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn handle_bus_event(&mut self, addr: u16, value: u8) {
         match addr {
             a if a == JOYP_ADDR => {
@@ -529,6 +539,7 @@ impl Sm83 {
 
     /// Write an APU register and sync the masked read-back value to IO memory.
     /// NR52 writes may power off all channels, so all registers are resynced.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn write_apu_register(&mut self, addr: u16, value: u8) {
         self.apu.write_register(addr, value);
         if addr == NR52_ADDR {
@@ -541,12 +552,14 @@ impl Sm83 {
     }
 
     /// Write to wave RAM through the APU and sync the result to IO memory.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn write_wave_ram(&mut self, addr: u16, value: u8) {
         let offset = (addr - WAVE_RAM_START) as u8;
         self.apu.write_wave_ram(offset, value);
         self.memory.write_io(addr, self.apu.read_wave_ram(offset));
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_ppu(&mut self, cycles: u16) {
         let output = self.ppu.tick(
             cycles,
@@ -586,6 +599,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_timer(&mut self, cycles: u16) {
         let output = self.timer.tick(
             cycles,
@@ -609,6 +623,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_apu(&mut self, cycles: u16) {
         let output = self.apu.tick(cycles, self.timer.internal_counter());
         if output.nr52 != self.cache.nr52 {
@@ -617,12 +632,14 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn has_pending_interrupt(&self) -> bool {
         let ie = self.memory.read_io(IE_ADDR);
         let if_val = self.memory.read_io(IF_ADDR);
         ie & if_val != 0
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn take_pending_interrupt(&mut self) -> Option<u8> {
         let ie = self.memory.read_io(IE_ADDR);
         let if_val = self.memory.read_io(IF_ADDR);
@@ -635,6 +652,7 @@ impl Sm83 {
         Some(bit)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn dispatch_interrupt(&mut self, bit: u8) -> Result<(), InstructionError> {
         self.ime = ImeState::Disabled;
         // Interrupt dispatch: 2 internal + push PC (2 writes) + 1 internal = 5 M-cycles
@@ -649,12 +667,14 @@ impl Sm83 {
         Ok(())
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
         let byte = self.bus_read(self.registers.pc)?;
         self.registers.pc = self.registers.pc.wrapping_add(1);
         Ok(byte)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, InstructionError> {
         match operand {
             Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
@@ -672,6 +692,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_register8_operand(&self, operand: Register8) -> u8 {
         match operand {
             Register8::A => self.registers.a,
@@ -684,6 +705,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_register16_operand(&self, operand: Register16) -> u16 {
         match operand {
             Register16::AF => self.registers.af(),
@@ -694,6 +716,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_register8_operand(&mut self, operand: Register8, value: u8) {
         match operand {
             Register8::A => self.registers.a = value,
@@ -706,6 +729,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_register16_operand(&mut self, operand: Register16, value: u16) {
         match operand {
             Register16::AF => self.registers.set_af(value),
@@ -716,6 +740,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_8bit_operand(&mut self, operand: Operand, value: u8) -> Result<(), InstructionError> {
         match operand {
             Operand::Register8(reg) => {
@@ -733,6 +758,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn write_cb_target(&mut self, target: CbTarget, value: u8) -> Result<(), InstructionError> {
         match target {
             CbTarget::Reg(reg) => {
@@ -746,6 +772,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn push_pc(&mut self) -> Result<(), MemoryError> {
         let pc = self.registers.pc;
         self.registers.sp = self.registers.sp.wrapping_sub(1);
@@ -755,6 +782,7 @@ impl Sm83 {
         Ok(())
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn pop_pc(&mut self) -> Result<u16, MemoryError> {
         let lo = self.bus_read(self.registers.sp)? as u16;
         self.registers.sp = self.registers.sp.wrapping_add(1);
@@ -763,6 +791,7 @@ impl Sm83 {
         Ok((hi << 8) | lo)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn check_condition(&self, cond: &Condition) -> bool {
         match cond {
             Condition::NZ => !self.registers.f.contains(Flags::Z),
@@ -774,6 +803,7 @@ impl Sm83 {
 }
 
 impl Cpu for Sm83 {
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick(&mut self) -> Result<u8, CpuError> {
         let start_cycles = self.cycle_counter;
 
@@ -838,12 +868,14 @@ impl Cpu for Sm83 {
 }
 
 impl Instructions for Sm83 {
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add8(&mut self, opcode: &Add8) -> Result<u8, InstructionError> {
         (self.registers.a, self.registers.f) =
             add_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add16(&mut self, opcode: &Add16) -> Result<u8, InstructionError> {
         let operand: u16 = match opcode.operand {
             Operand::Register16(reg) => self.get_register16_operand(reg),
@@ -865,6 +897,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, InstructionError> {
         if opcode.operand != Operand::ImmSigned8 {
             return Err(InstructionError::InvalidOperand(format!(
@@ -882,6 +915,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn adc(&mut self, opcode: &Adc) -> Result<u8, InstructionError> {
         let carry: u8 = self.registers.f.contains(Flags::C) as u8;
         (self.registers.a, self.registers.f) = adc_u8(
@@ -892,12 +926,14 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn sub8(&mut self, opcode: &Sub8) -> Result<u8, InstructionError> {
         (self.registers.a, self.registers.f) =
             sub_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, InstructionError> {
         let carry: u8 = self.registers.f.contains(Flags::C) as u8;
         (self.registers.a, self.registers.f) = sbc_u8(
@@ -908,11 +944,13 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn cp8(&mut self, opcode: &Cp8) -> Result<u8, InstructionError> {
         self.registers.f = cp_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ld8(&mut self, opcode: &Ld8) -> Result<u8, InstructionError> {
         // Read the source value
         let value = match opcode.src {
@@ -948,6 +986,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn inc8(&mut self, opcode: &Inc8) -> Result<u8, InstructionError> {
         let val = self.get_8bit_operand(opcode.operand)?;
         let (result, flags) = inc_u8(val, self.registers.f);
@@ -956,6 +995,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn dec8(&mut self, opcode: &Dec8) -> Result<u8, InstructionError> {
         let val = self.get_8bit_operand(opcode.operand)?;
         let (result, flags) = dec_u8(val, self.registers.f);
@@ -964,6 +1004,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn inc16(&mut self, opcode: &Inc16) -> Result<u8, InstructionError> {
         let val = self.get_register16_operand(opcode.operand);
         self.set_register16_operand(opcode.operand, val.wrapping_add(1));
@@ -971,6 +1012,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn dec16(&mut self, opcode: &Dec16) -> Result<u8, InstructionError> {
         let val = self.get_register16_operand(opcode.operand);
         self.set_register16_operand(opcode.operand, val.wrapping_sub(1));
@@ -978,6 +1020,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn rotate_accumulator(&mut self, opcode: &Rotate) -> Result<u8, InstructionError> {
         let a = self.registers.a;
         let carry_in = self.registers.f.contains(Flags::C) as u8;
@@ -1009,6 +1052,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ld16(&mut self, opcode: &Ld16) -> Result<u8, InstructionError> {
         use super::instructions::ld16::opcode::Ld16Op;
         match &opcode.op {
@@ -1111,6 +1155,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn jump(&mut self, opcode: &Jump) -> Result<u8, InstructionError> {
         match &opcode.op {
             JumpOp::Jp => {
@@ -1160,24 +1205,28 @@ impl Instructions for Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn and8(&mut self, opcode: &And8) -> Result<u8, InstructionError> {
         let val = self.get_8bit_operand(opcode.operand)?;
         (self.registers.a, self.registers.f) = and_u8(self.registers.a, val);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn or8(&mut self, opcode: &Or8) -> Result<u8, InstructionError> {
         let val = self.get_8bit_operand(opcode.operand)?;
         (self.registers.a, self.registers.f) = or_u8(self.registers.a, val);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn xor8(&mut self, opcode: &Xor8) -> Result<u8, InstructionError> {
         let val = self.get_8bit_operand(opcode.operand)?;
         (self.registers.a, self.registers.f) = xor_u8(self.registers.a, val);
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn misc(&mut self, opcode: &Misc) -> Result<u8, InstructionError> {
         use super::instructions::misc::opcode::MiscOp;
         match opcode.op {
@@ -1223,6 +1272,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn push16(&mut self, opcode: &Push16) -> Result<u8, InstructionError> {
         // fetch + internal + write hi + write lo = 4 M-cycles
         let value = self.get_register16_operand(opcode.operand);
@@ -1234,6 +1284,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn pop16(&mut self, opcode: &Pop16) -> Result<u8, InstructionError> {
         // fetch + read lo + read hi = 3 M-cycles
         let lo = self.bus_read(self.registers.sp)? as u16;
@@ -1244,6 +1295,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn call(&mut self, opcode: &Call) -> Result<u8, InstructionError> {
         // fetch + read lo + read hi [+ internal + push hi + push lo] = 3 or 6 M-cycles
         let lo = self.read_next_pc()? as u16;
@@ -1269,6 +1321,7 @@ impl Instructions for Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ret(&mut self, opcode: &Ret) -> Result<u8, InstructionError> {
         match &opcode.op {
             RetOp::Ret => {
@@ -1298,6 +1351,7 @@ impl Instructions for Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn rst(&mut self, opcode: &Rst) -> Result<u8, InstructionError> {
         // fetch + internal + push hi + push lo = 4 M-cycles
         self.tick_cycle(); // internal
@@ -1306,6 +1360,7 @@ impl Instructions for Sm83 {
         Ok(opcode.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, InstructionError> {
         let carry_in = self.registers.f.contains(Flags::C);
 

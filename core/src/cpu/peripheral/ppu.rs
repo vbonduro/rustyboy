@@ -137,6 +137,7 @@ impl PpuPeripheral {
     }
 
     /// Advance the PPU by `cycles` T-cycles.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
         let lcdc = Lcdc(input.lcdc);
 
@@ -216,6 +217,7 @@ impl PpuPeripheral {
     }
 
     /// Build the STAT register value and detect STAT interrupt rising edge.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn build_stat(&mut self, input: &PpuInput) -> (u8, bool) {
         let lyc_match = self.ly == input.lyc;
         let stat = (input.stat & 0x78)
@@ -234,6 +236,7 @@ impl PpuPeripheral {
     }
 
     /// Reset all PPU state when the LCD is disabled.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn reset_lcd(&mut self) {
         self.dot = 0;
         self.ly = 0;
@@ -242,6 +245,7 @@ impl PpuPeripheral {
         self.prev_stat_line = false;
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_scanline(&mut self, input: &PpuInput) {
         let lcdc = Lcdc(input.lcdc);
         let ly = self.ly as usize;
@@ -269,6 +273,7 @@ impl PpuPeripheral {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_bg_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
         let tilemap_base: usize = if lcdc.bg_tilemap_high() { 0x1C00 } else { 0x1800 };
         let y = input.scy.wrapping_add(self.ly);
@@ -299,6 +304,7 @@ impl PpuPeripheral {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_window_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
         if self.ly < input.wy || input.wx > 166 {
             return;
@@ -337,6 +343,7 @@ impl PpuPeripheral {
         self.window_line_counter += 1;
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_sprite_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
         let sprite_height: u8 = if lcdc.obj_tall() { 16 } else { 8 };
         let ly = self.ly as i16;
@@ -378,6 +385,7 @@ impl PpuPeripheral {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn draw_sprite(
         &mut self,
         input: &PpuInput,
@@ -443,11 +451,13 @@ impl PpuPeripheral {
 
 
 /// Decode a single pixel from a 2bpp tile row.
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn decode_2bpp_pixel(lo: u8, hi: u8, bit: u8) -> u8 {
     ((hi >> bit) & 1) << 1 | ((lo >> bit) & 1)
 }
 
 /// Compute the VRAM address for a tile row given the tile index and addressing mode.
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn tile_data_address(lcdc: Lcdc, tile_index: u8, fine_y: usize) -> usize {
     let base = if lcdc.bg_tile_data_unsigned() {
         (tile_index as usize) * 16
@@ -459,6 +469,7 @@ fn tile_data_address(lcdc: Lcdc, tile_index: u8, fine_y: usize) -> usize {
 }
 
 /// Apply a 4-shade palette (BGP/OBP0/OBP1) to a 2-bit color index.
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn apply_palette(palette: u8, color_index: u8) -> u8 {
     (palette >> (color_index * 2)) & 0x03
 }
