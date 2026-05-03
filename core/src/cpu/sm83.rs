@@ -144,6 +144,21 @@ impl Sm83Cache {
     }
 }
 
+/// Per-component DWT cycle accumulator. Drained each time `take_perf_profile` is called.
+/// `cpu` = `total` − `ppu` − `timer` − `apu` (instruction fetch/decode/execute overhead).
+#[cfg(feature = "perf")]
+#[derive(Default)]
+pub struct Sm83PerfProfile {
+    pub ppu: u32,
+    pub timer: u32,
+    pub apu: u32,
+    pub total: u32,
+    /// Time spent in memory reads (read_fast) inside bus_read, excluding tick overhead.
+    pub mem_read: u32,
+    /// Time spent in memory writes (write_fast/write_io) inside bus_write, excluding tick overhead.
+    pub mem_write: u32,
+}
+
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
@@ -169,6 +184,8 @@ pub struct Sm83 {
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
+    #[cfg(feature = "perf")]
+    perf: Sm83PerfProfile,
 }
 
 /// State for an in-progress OAM DMA transfer.
@@ -201,6 +218,8 @@ impl Sm83 {
             cache: Sm83Cache::default(),
             #[cfg(feature = "trace")]
             trace_hook: None,
+            #[cfg(feature = "perf")]
+            perf: Sm83PerfProfile::default(),
         };
         // Seed JOYP with no buttons pressed (all lines high).
         sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
@@ -288,6 +307,21 @@ impl Sm83 {
         self.apu.drain_samples()
     }
 
+    #[cfg(feature = "perf")]
+    pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
+        core::mem::take(&mut self.perf)
+    }
+
+    #[cfg(feature = "perf")]
+    pub fn take_ppu_perf_profile(&mut self) -> super::peripheral::ppu::PpuPerfProfile {
+        self.ppu.take_perf_profile()
+    }
+
+    #[cfg(feature = "perf")]
+    pub fn take_apu_perf_profile(&mut self) -> super::peripheral::apu::ApuPerfProfile {
+        self.apu.take_perf_profile()
+    }
+
     /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
     pub fn external_ram(&self) -> Option<&[u8]> {
         self.memory.external_ram()
@@ -371,7 +405,12 @@ impl Sm83 {
             return Ok(value);
         }
         self.tick_cycle();
-        Ok(self.memory.read_fast(addr))
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
+        let value = self.memory.read_fast(addr);
+        #[cfg(feature = "perf")]
+        { self.perf.mem_read = self.perf.mem_read.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+        Ok(value)
     }
 
     /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
@@ -396,7 +435,9 @@ impl Sm83 {
             return Ok(());
         }
         self.tick_cycle();
-        match addr {
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
+        let result = match addr {
             0xFF00..=0xFF7F | 0xFFFF => {
                 self.memory.write_io(addr, value);
                 self.pending_bus_events.push(BusEvent {
@@ -410,7 +451,10 @@ impl Sm83 {
                 self.memory.write_fast(addr, value);
                 Ok(())
             }
-        }
+        };
+        #[cfg(feature = "perf")]
+        { self.perf.mem_write = self.perf.mem_write.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+        result
     }
 
     /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
@@ -561,6 +605,8 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_ppu(&mut self, cycles: u16) {
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
         let output = self.ppu.tick(
             cycles,
             PpuInput {
@@ -597,10 +643,17 @@ impl Sm83 {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << STAT_INTERRUPT_BIT));
         }
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf.ppu = self.perf.ppu.wrapping_add(dt);
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_timer(&mut self, cycles: u16) {
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
         let output = self.timer.tick(
             cycles,
             TimerInput {
@@ -621,14 +674,26 @@ impl Sm83 {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
         }
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf.timer = self.perf.timer.wrapping_add(dt);
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_apu(&mut self, cycles: u16) {
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
         let output = self.apu.tick(cycles, self.timer.internal_counter());
         if output.nr52 != self.cache.nr52 {
             self.cache.nr52 = output.nr52;
             self.memory.write_io(NR52_ADDR, output.nr52);
+        }
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+            self.perf.apu = self.perf.apu.wrapping_add(dt);
         }
     }
 
@@ -805,6 +870,22 @@ impl Sm83 {
 impl Cpu for Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick(&mut self) -> Result<u8, CpuError> {
+        #[cfg(feature = "perf")]
+        let tick_t0 = crate::cpu::perf::cyccnt();
+        let result = self.tick_impl();
+        #[cfg(feature = "perf")]
+        {
+            let dt = crate::cpu::perf::cyccnt().wrapping_sub(tick_t0);
+            self.perf.total = self.perf.total.wrapping_add(dt);
+        }
+        result
+    }
+}
+
+impl Sm83 {
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn tick_impl(&mut self) -> Result<u8, CpuError> {
         let start_cycles = self.cycle_counter;
 
         if self.halted {

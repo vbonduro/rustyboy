@@ -197,8 +197,16 @@ async fn main(_spawner: Spawner) {
     // Draw static letterbox bars once; game loop only repaints the 240×216 area.
     hw_disp.inner.draw_letterbox_bars();
 
+    #[cfg(feature = "perf")]
+    rustyboy_core::cpu::perf::init_cyccnt();
+
     let mut audio_buffers = AudioBuffers::new();
     let mut prev_state = ButtonState::default();
+
+    #[cfg(feature = "fps")]
+    let mut fps_frame_count: u32 = 0;
+    #[cfg(feature = "fps")]
+    let mut fps_window_start = embassy_time::Instant::now();
 
     loop {
         // Start DMA transfer of last frame's audio output while we fill the
@@ -237,6 +245,43 @@ async fn main(_spawner: Spawner) {
         // Await DMA completion — this naturally paces the loop to ~59.7 fps.
         dma_future.await;
         watchdog.feed(Duration::from_millis(5_000));
+
+        #[cfg(feature = "fps")]
+        {
+            fps_frame_count += 1;
+            if fps_frame_count >= 60 {
+                let elapsed_us = fps_window_start.elapsed().as_micros();
+                let fps = (fps_frame_count as u64 * 1_000_000) / elapsed_us.max(1);
+                info!("fps: {}", fps);
+                fps_frame_count = 0;
+                fps_window_start = embassy_time::Instant::now();
+            }
+        }
+
+        #[cfg(feature = "perf")]
+        {
+            if fps_frame_count == 0 {
+                let p = cpu.take_perf_profile();
+                let cpu_exec = p.total.wrapping_sub(p.ppu).wrapping_sub(p.timer).wrapping_sub(p.apu);
+                let cpu_decode = cpu_exec.wrapping_sub(p.mem_read).wrapping_sub(p.mem_write);
+                info!(
+                    "cycles/60f — total={} ppu={} timer={} apu={} cpu_exec={} (mem_r={} mem_w={} decode={})",
+                    p.total, p.ppu, p.timer, p.apu, cpu_exec, p.mem_read, p.mem_write, cpu_decode
+                );
+
+                let pp = cpu.take_ppu_perf_profile();
+                info!(
+                    "ppu breakdown — bg={} window={} sprites={} stat={}",
+                    pp.render_bg, pp.render_window, pp.render_sprites, pp.build_stat
+                );
+
+                let ap = cpu.take_apu_perf_profile();
+                info!(
+                    "apu breakdown — frame_seq={} pulse={} wave={} noise={} mix={}",
+                    ap.frame_seq, ap.pulse, ap.wave, ap.noise, ap.mix
+                );
+            }
+        }
     }
 }
 
