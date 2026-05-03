@@ -17,7 +17,7 @@ pub mod fb;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::RgbColor;
+use embedded_graphics::prelude::{IntoStorage, RgbColor};
 use embedded_graphics::primitives::Rectangle;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +63,21 @@ pub struct Display<D> {
     inner: D,
 }
 
+/// Pre-scale a Game Boy framebuffer (160×144, palette indices) to 240×216 Rgb565.
+///
+/// Stores raw `u16` Rgb565 storage values. Pass the result to
+/// [`Display::render_game_only_scaled`] or, in Phase C, directly to DMA.
+pub fn scale_to_rgb565(src: &[u8; 23040], dst: &mut [u16; 51840]) {
+    for sy in 0..216usize {
+        let gy = sy * 2 / 3;
+        let src_row = &src[gy * 160..(gy + 1) * 160];
+        let dst_row = &mut dst[sy * 240..(sy + 1) * 240];
+        for sx in 0..240usize {
+            dst_row[sx] = dmg_color(src_row[sx * 2 / 3]).into_storage();
+        }
+    }
+}
+
 impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
     pub fn from_draw_target(inner: D) -> Self {
         Self { inner }
@@ -96,6 +111,19 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
     /// top/bottom bars. Call [`draw_letterbox_bars`] once before the game loop.
     pub fn render_game_only(&mut self, fb: &[u8; 23040]) {
         self.fill_scaled_frame(fb);
+    }
+
+    /// Render a pre-scaled 240×216 frame from a [`scale_to_rgb565`] buffer.
+    ///
+    /// Eliminates per-pixel scaling work during the SPI transfer. The buffer
+    /// holds raw `Rgb565` storage values produced by [`scale_to_rgb565`].
+    pub fn render_game_only_scaled(&mut self, buf: &[u16; 51840]) {
+        use embedded_graphics::pixelcolor::raw::RawU16;
+        let rect = Rectangle::new(
+            Point::new(0, Y_OFFSET),
+            Size::new(SCALED_W as u32, SCALED_H as u32),
+        );
+        let _ = self.inner.fill_contiguous(&rect, buf.iter().map(|&v| Rgb565::from(RawU16::new(v))));
     }
 
     fn fill_bar(&mut self, y: i32, height: i32, color: Rgb565) {

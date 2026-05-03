@@ -32,6 +32,7 @@ use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::memory::{GameBoyMemory, StreamingCartridge};
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::HwDisplay;
+use rustyboy_pico2w::display::scale_to_rgb565;
 use rustyboy_pico2w::flash_rom::{
     new_onboard_flash, probe_staged_rom, stage_rom_from_reader, FlashRomReader,
 };
@@ -70,6 +71,14 @@ async fn main(_spawner: Spawner) {
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
+
+    // Allocate the pre-scaled display frame buffer from the heap so it does not
+    // live in .bss and eat into the stack guard region.
+    let frame_buf: &'static mut [u16; 51840] = {
+        let layout = core::alloc::Layout::new::<[u16; 51840]>();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut [u16; 51840];
+        unsafe { alloc::boxed::Box::leak(alloc::boxed::Box::from_raw(ptr)) }
+    };
 
     let p = {
         use embassy_rp::clocks::ClockConfig;
@@ -236,8 +245,19 @@ async fn main(_spawner: Spawner) {
             warn!("menu combo triggered");
         }
 
-        // Render the game area.  Letterbox bars are static and not repainted.
-        hw_disp.inner.render_game_only(cpu.framebuffer());
+        // Pre-scale into the static buffer then push to display.
+        // Letterbox bars are static and not repainted.
+        #[cfg(feature = "perf")]
+        let scale_start = perf::perf_cycle_read();
+        scale_to_rgb565(cpu.framebuffer(), frame_buf);
+        #[cfg(feature = "perf")]
+        tracker.record_scale(perf::perf_cycle_read().wrapping_sub(scale_start));
+
+        #[cfg(feature = "perf")]
+        let render_start = perf::perf_cycle_read();
+        hw_disp.inner.render_game_only_scaled(frame_buf);
+        #[cfg(feature = "perf")]
+        tracker.record_render(perf::perf_cycle_read().wrapping_sub(render_start));
 
         // Convert APU f32 output into I2S-packed u32 words for the next DMA.
         let samples = cpu.drain_audio_samples();

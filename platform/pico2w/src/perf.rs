@@ -7,6 +7,10 @@ use rustyboy_core::cpu::sm83::Sm83;
 pub struct PerfTracker {
     frame_count: u32,
     window_start: Instant,
+    #[cfg(feature = "perf")]
+    scale_cycles: u64,
+    #[cfg(feature = "perf")]
+    render_cycles: u64,
 }
 
 impl PerfTracker {
@@ -14,7 +18,23 @@ impl PerfTracker {
         Self {
             frame_count: 0,
             window_start: Instant::now(),
+            #[cfg(feature = "perf")]
+            scale_cycles: 0,
+            #[cfg(feature = "perf")]
+            render_cycles: 0,
         }
+    }
+
+    /// Accumulate DWT cycles spent in `scale_to_rgb565` for one frame.
+    #[cfg(feature = "perf")]
+    pub fn record_scale(&mut self, cycles: u32) {
+        self.scale_cycles += cycles as u64;
+    }
+
+    /// Accumulate DWT cycles spent in `render_game_only_scaled` for one frame.
+    #[cfg(feature = "perf")]
+    pub fn record_render(&mut self, cycles: u32) {
+        self.render_cycles += cycles as u64;
     }
 
     pub fn tick(&mut self, cpu: &mut Sm83) {
@@ -48,6 +68,18 @@ impl PerfTracker {
                 "apu breakdown — frame_seq={} pulse={} wave={} noise={} mix={}",
                 ap.frame_seq, ap.pulse, ap.wave, ap.noise, ap.mix
             );
+
+            // At 250 MHz, divide cycles by 250_000 to get milliseconds.
+            let display_total = self.scale_cycles + self.render_cycles;
+            info!(
+                "display/60f — {}ms total (scale={}ms fill={}ms) avg {}ms/frame",
+                display_total / 250_000,
+                self.scale_cycles / 250_000,
+                self.render_cycles / 250_000,
+                display_total / 250_000 / 60,
+            );
+            self.scale_cycles = 0;
+            self.render_cycles = 0;
         }
 
         // Suppress unused-variable warning when only `fps` (not `perf`) is enabled.
