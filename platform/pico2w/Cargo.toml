@@ -15,6 +15,10 @@ path = "src/main.rs"
 # Re-exported for display-viewer which depends on this crate.
 std = []
 oc-266 = []
+# Log FPS to RTT every 60 frames.
+fps = []
+# Enable all profiling: implies fps and enables core APU cycle counters.
+perf = ["fps", "rustyboy-core/perf"]
 
 # ---------------------------------------------------------------------------
 # Cross-platform dependencies (compile on any target, including host tests)
