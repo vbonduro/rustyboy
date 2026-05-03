@@ -4,7 +4,6 @@
 mod common;
 
 use rustyboy_core::cpu::cpu::Cpu;
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
@@ -24,8 +23,7 @@ fn build_cpu() -> Sm83 {
     let rom_path = "/home/vbonduro/roms/extracted/Donkey Kong Land 2 (USA, Europe) (SGB Enhanced).gb";
     let rom_data = std::fs::read(rom_path).expect("DKL2 ROM not found");
     let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    Sm83::new(memory, decoder)
+    Sm83::new(memory)
         .with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),

@@ -25,7 +25,6 @@ use embedded_sdmmc::{SdCard, VolumeManager};
 use {defmt_rtt as _, panic_probe as _};
 
 use rustyboy_core::cpu::cpu::Cpu;
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
@@ -159,8 +158,7 @@ async fn main(_spawner: Spawner) {
     };
 
     let memory = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
-    let decoder = alloc::boxed::Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(alloc::boxed::Box::new(memory), decoder)
+    let mut cpu = Sm83::new(alloc::boxed::Box::new(memory))
         .with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),

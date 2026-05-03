@@ -3,7 +3,6 @@
 mod common;
 
 use rustyboy_core::cpu::cpu::Cpu;
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::cpu::save_state::SaveState;
@@ -25,8 +24,7 @@ fn make_rom(cart_type: u8, rom_size_code: u8, ram_size_code: u8) -> Vec<u8> {
 /// Create a fresh Sm83 with DMG post-boot register state.
 fn make_emulator(rom: Vec<u8>) -> Sm83 {
     let memory = Box::new(GameBoyMemory::with_rom(rom));
-    let decoder = Box::new(OpCodeDecoder::new());
-    Sm83::new(memory, decoder)
+    Sm83::new(memory)
         .with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),

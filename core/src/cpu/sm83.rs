@@ -3,10 +3,10 @@ use alloc::{boxed::Box, format, vec::Vec};
 use super::cpu::{Cpu, CpuError};
 use super::instructions::adc::opcode::Adc;
 use super::instructions::add::opcode::{Add16, Add8, AddSP16};
+use super::instructions::arg;
 use super::instructions::call::opcode::{Call, CallOp};
 use super::instructions::cb::opcode::{CbInstruction, CbOp, CbTarget};
 use super::instructions::cp::opcode::Cp8;
-use super::instructions::decoder::Decoder;
 use super::instructions::opcodes::OpCodeTable;
 use super::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
 use super::instructions::instructions::{Error as InstructionError, Instructions};
@@ -197,9 +197,9 @@ struct DmaState {
 }
 
 impl Sm83 {
-    pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
+    pub fn new(memory: Box<GameBoyMemory>) -> Self {
         let joypad = JoypadPeripheral::new();
-        let opcodes = OpCodeTable::from_decoder(&*opcode_decoder);
+        let opcodes = OpCodeTable::new();
         let mut sm83 = Self {
             memory,
             registers: Registers::default(),
@@ -865,6 +865,725 @@ impl Sm83 {
             Condition::C => self.registers.f.contains(Flags::C),
         }
     }
+
+    // ── Flat-dispatch helpers ────────────────────────────────────────────────
+
+    /// Check a condition from an encoded `arg::NZ/Z/NC/CC` constant.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn check_cond_u8(&self, cond: u8) -> bool {
+        match cond {
+            arg::NZ => !self.registers.f.contains(Flags::Z),
+            arg::Z  =>  self.registers.f.contains(Flags::Z),
+            arg::NC => !self.registers.f.contains(Flags::C),
+            arg::CC =>  self.registers.f.contains(Flags::C),
+            _       => false,
+        }
+    }
+
+    /// Resolve an r8 arg constant to its current value, advancing peripherals
+    /// for memory reads.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn resolve_r8(&mut self, arg0: u8) -> Result<u8, InstructionError> {
+        Ok(match arg0 {
+            arg::B      => self.registers.b,
+            arg::C      => self.registers.c,
+            arg::D      => self.registers.d,
+            arg::E      => self.registers.e,
+            arg::H      => self.registers.h,
+            arg::L      => self.registers.l,
+            arg::MEM_HL => self.bus_read(self.registers.hl())?,
+            arg::A      => self.registers.a,
+            arg::IMM8   => self.read_next_pc()?,
+            _           => return Err(InstructionError::Failed(format!("bad r8 arg {}", arg0))),
+        })
+    }
+
+    /// Write a value to the register/memory target encoded as an r8 arg constant.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn set_r8(&mut self, arg0: u8, val: u8) -> Result<(), InstructionError> {
+        match arg0 {
+            arg::B      => self.registers.b = val,
+            arg::C      => self.registers.c = val,
+            arg::D      => self.registers.d = val,
+            arg::E      => self.registers.e = val,
+            arg::H      => self.registers.h = val,
+            arg::L      => self.registers.l = val,
+            arg::MEM_HL => self.bus_write(self.registers.hl(), val)?,
+            arg::A      => self.registers.a = val,
+            _           => return Err(InstructionError::Failed(format!("bad r8 dst arg {}", arg0))),
+        }
+        Ok(())
+    }
+
+    /// Resolve an r16 arg constant to its current 16-bit value.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn resolve_r16(&self, arg0: u8) -> Result<u16, InstructionError> {
+        Ok(match arg0 {
+            arg::BC => self.registers.bc(),
+            arg::DE => self.registers.de(),
+            arg::HL => self.registers.hl(),
+            arg::SP => self.registers.sp,
+            arg::AF => self.registers.af(),
+            _       => return Err(InstructionError::Failed(format!("bad r16 arg {}", arg0))),
+        })
+    }
+
+    /// Write a 16-bit value to the register pair encoded as an r16 arg constant.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn set_r16(&mut self, arg0: u8, val: u16) -> Result<(), InstructionError> {
+        match arg0 {
+            arg::BC => self.registers.set_bc(val),
+            arg::DE => self.registers.set_de(val),
+            arg::HL => self.registers.set_hl(val),
+            arg::SP => self.registers.sp = val,
+            arg::AF => self.registers.set_af(val),
+            _       => return Err(InstructionError::Failed(format!("bad r16 dst arg {}", arg0))),
+        }
+        Ok(())
+    }
+
+    // ── Flat dispatch handlers ───────────────────────────────────────────────
+
+    /// Sentinel handler for invalid / unimplemented opcodes.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_invalid(_cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        Err(InstructionError::Failed("invalid opcode".into()))
+    }
+
+    // ── Misc ─────────────────────────────────────────────────────────────────
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_nop(_cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_halt(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.halted = true;
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_stop(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let _ = cpu.read_next_pc()?;
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_daa(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        use super::operations::misc::daa_u8;
+        (cpu.registers.a, cpu.registers.f) = daa_u8(cpu.registers.a, cpu.registers.f);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cpl(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.a = !cpu.registers.a;
+        cpu.registers.f.insert(Flags::N);
+        cpu.registers.f.insert(Flags::H);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_scf(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.f.remove(Flags::N);
+        cpu.registers.f.remove(Flags::H);
+        cpu.registers.f.insert(Flags::C);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ccf(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let c = cpu.registers.f.contains(Flags::C);
+        cpu.registers.f.remove(Flags::N);
+        cpu.registers.f.remove(Flags::H);
+        cpu.registers.f.set(Flags::C, !c);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_di(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.ime = ImeState::Disabled;
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ei(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.ime = ImeState::Pending;
+        Ok(())
+    }
+
+    // ── Rotate accumulator ────────────────────────────────────────────────────
+
+    /// data = pack1(rot_op, cycles) where rot_op is one of RLCA/RRCA/RLA/RRA
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_rot_acc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let op = arg::unpack_arg0(data);
+        let a = cpu.registers.a;
+        let carry_in = cpu.registers.f.contains(Flags::C) as u8;
+        let (result, carry_out) = match op {
+            arg::RLCA => { let b7 = a >> 7; ((a << 1) | b7,    b7 != 0) }
+            arg::RRCA => { let b0 = a & 1;  ((a >> 1) | (b0 << 7), b0 != 0) }
+            arg::RLA  => { let b7 = a >> 7; ((a << 1) | carry_in, b7 != 0) }
+            arg::RRA  => { let b0 = a & 1;  ((a >> 1) | (carry_in << 7), b0 != 0) }
+            _ => return Err(InstructionError::Failed("bad rot_acc op".into())),
+        };
+        cpu.registers.a = result;
+        cpu.registers.f = Flags::empty();
+        cpu.registers.f.set(Flags::C, carry_out);
+        Ok(())
+    }
+
+    // ── ALU 8-bit ─────────────────────────────────────────────────────────────
+
+    /// data = pack1(r8_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_add8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::add::add_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = add_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_adc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::add::adc_u8;
+        let carry = cpu.registers.f.contains(Flags::C) as u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = adc_u8(cpu.registers.a, val, carry);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_sub8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::sub::sub_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = sub_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_sbc8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::sub::sbc_u8;
+        let carry = cpu.registers.f.contains(Flags::C) as u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = sbc_u8(cpu.registers.a, val, carry);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_and8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::logic::and_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = and_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_xor8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::logic::xor_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = xor_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_or8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::logic::or_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        (cpu.registers.a, cpu.registers.f) = or_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cp8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::sub::cp_u8;
+        let val = cpu.resolve_r8(arg::unpack_arg0(data))?;
+        cpu.registers.f = cp_u8(cpu.registers.a, val);
+        Ok(())
+    }
+
+    // ── INC/DEC 8-bit ─────────────────────────────────────────────────────────
+
+    /// data = pack1(r8_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_inc8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::inc_dec::inc_u8;
+        let a0 = arg::unpack_arg0(data);
+        let val = cpu.resolve_r8(a0)?;
+        let (result, flags) = inc_u8(val, cpu.registers.f);
+        cpu.registers.f = flags;
+        cpu.set_r8(a0, result)?;
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_dec8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::inc_dec::dec_u8;
+        let a0 = arg::unpack_arg0(data);
+        let val = cpu.resolve_r8(a0)?;
+        let (result, flags) = dec_u8(val, cpu.registers.f);
+        cpu.registers.f = flags;
+        cpu.set_r8(a0, result)?;
+        Ok(())
+    }
+
+    // ── INC/DEC 16-bit ────────────────────────────────────────────────────────
+
+    /// data = pack1(r16_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_inc16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let a0 = arg::unpack_arg0(data);
+        let val = cpu.resolve_r16(a0)?;
+        cpu.set_r16(a0, val.wrapping_add(1))?;
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_dec16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let a0 = arg::unpack_arg0(data);
+        let val = cpu.resolve_r16(a0)?;
+        cpu.set_r16(a0, val.wrapping_sub(1))?;
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    // ── ADD 16-bit ────────────────────────────────────────────────────────────
+
+    /// data = pack1(r16_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_add16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::add::add_u16;
+        let operand = cpu.resolve_r16(arg::unpack_arg0(data))?;
+        let (hl, new_flags) = add_u16(cpu.registers.hl(), operand);
+        cpu.registers.f.set(Flags::N, false);
+        cpu.registers.f.set(Flags::H, new_flags.contains(Flags::H));
+        cpu.registers.f.set(Flags::C, new_flags.contains(Flags::C));
+        cpu.registers.set_hl(hl);
+        cpu.tick_cycle(); // internal — 16-bit ALU
+        Ok(())
+    }
+
+    /// ADD SP, e8 — data = pack0(cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_add_sp_e8(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        use super::operations::add::add_sp_u16;
+        let offset = cpu.read_next_pc()? as i8;
+        (cpu.registers.sp, cpu.registers.f) = add_sp_u16(cpu.registers.sp, offset);
+        cpu.tick_cycle(); // internal
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    // ── LD 8-bit ──────────────────────────────────────────────────────────────
+
+    /// data = pack2(dst_arg, src_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld8(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let dst = arg::unpack_arg0(data);
+        let src = arg::unpack_arg1(data);
+        let val = cpu.resolve_r8(src)?;
+        cpu.set_r8(dst, val)?;
+        Ok(())
+    }
+
+    // ── LD 16-bit ─────────────────────────────────────────────────────────────
+
+    /// LD rr, nn — data = pack1(r16_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld16_rr_imm16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let val = (hi << 8) | lo;
+        cpu.set_r16(arg::unpack_arg0(data), val)?;
+        Ok(())
+    }
+
+    /// LD (nn), SP
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_nn_sp(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let addr = (hi << 8) | lo;
+        let sp = cpu.registers.sp;
+        cpu.bus_write(addr, (sp & 0xFF) as u8)?;
+        cpu.bus_write(addr.wrapping_add(1), (sp >> 8) as u8)?;
+        Ok(())
+    }
+
+    /// LD SP, HL
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_sp_hl(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.sp = cpu.registers.hl();
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    /// LD HL, SP+e
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_hl_sp_e(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        use super::operations::add::add_sp_u16;
+        let offset = cpu.read_next_pc()? as i8;
+        let (result, flags) = add_sp_u16(cpu.registers.sp, offset);
+        cpu.registers.set_hl(result);
+        cpu.registers.f = flags;
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    /// LD (BC), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_bc_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.bus_write(cpu.registers.bc(), cpu.registers.a)?;
+        Ok(())
+    }
+
+    /// LD (DE), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_de_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.bus_write(cpu.registers.de(), cpu.registers.a)?;
+        Ok(())
+    }
+
+    /// LD A, (BC)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_bc(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.a = cpu.bus_read(cpu.registers.bc())?;
+        Ok(())
+    }
+
+    /// LD A, (DE)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_de(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.a = cpu.bus_read(cpu.registers.de())?;
+        Ok(())
+    }
+
+    /// LD (HL+), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_hli_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = cpu.registers.hl();
+        cpu.bus_write(addr, cpu.registers.a)?;
+        cpu.registers.set_hl(addr.wrapping_add(1));
+        Ok(())
+    }
+
+    /// LD (HL-), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_hld_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = cpu.registers.hl();
+        cpu.bus_write(addr, cpu.registers.a)?;
+        cpu.registers.set_hl(addr.wrapping_sub(1));
+        Ok(())
+    }
+
+    /// LD A, (HL+)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_hli(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = cpu.registers.hl();
+        cpu.registers.a = cpu.bus_read(addr)?;
+        cpu.registers.set_hl(addr.wrapping_add(1));
+        Ok(())
+    }
+
+    /// LD A, (HL-)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_hld(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = cpu.registers.hl();
+        cpu.registers.a = cpu.bus_read(addr)?;
+        cpu.registers.set_hl(addr.wrapping_sub(1));
+        Ok(())
+    }
+
+    /// LD (nn), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_nn_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let addr = (hi << 8) | lo;
+        cpu.bus_write(addr, cpu.registers.a)?;
+        Ok(())
+    }
+
+    /// LD A, (nn)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_nn(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let addr = (hi << 8) | lo;
+        cpu.registers.a = cpu.bus_read(addr)?;
+        Ok(())
+    }
+
+    /// LDH (n), A
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ldh_n_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let offset = cpu.read_next_pc()? as u16;
+        cpu.bus_write(0xFF00 | offset, cpu.registers.a)?;
+        Ok(())
+    }
+
+    /// LDH A, (n)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ldh_a_n(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let offset = cpu.read_next_pc()? as u16;
+        cpu.registers.a = cpu.bus_read(0xFF00 | offset)?;
+        Ok(())
+    }
+
+    /// LD (C), A  — 0xE2
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_c_a(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = 0xFF00 | (cpu.registers.c as u16);
+        cpu.bus_write(addr, cpu.registers.a)?;
+        Ok(())
+    }
+
+    /// LD A, (C)  — 0xF2
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ld_a_c(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let addr = 0xFF00 | (cpu.registers.c as u16);
+        cpu.registers.a = cpu.bus_read(addr)?;
+        Ok(())
+    }
+
+    // ── PUSH / POP ────────────────────────────────────────────────────────────
+
+    /// data = pack1(r16_arg, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_push16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let val = cpu.resolve_r16(arg::unpack_arg0(data))?;
+        cpu.tick_cycle(); // internal
+        cpu.registers.sp = cpu.registers.sp.wrapping_sub(1);
+        cpu.bus_write(cpu.registers.sp, (val >> 8) as u8)?;
+        cpu.registers.sp = cpu.registers.sp.wrapping_sub(1);
+        cpu.bus_write(cpu.registers.sp, (val & 0xFF) as u8)?;
+        Ok(())
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_pop16(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.bus_read(cpu.registers.sp)? as u16;
+        cpu.registers.sp = cpu.registers.sp.wrapping_add(1);
+        let hi = cpu.bus_read(cpu.registers.sp)? as u16;
+        cpu.registers.sp = cpu.registers.sp.wrapping_add(1);
+        cpu.set_r16(arg::unpack_arg0(data), (hi << 8) | lo)?;
+        Ok(())
+    }
+
+    // ── Jumps ─────────────────────────────────────────────────────────────────
+
+    /// JP nn — unconditional absolute jump
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_jp_nn(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        cpu.registers.pc = (hi << 8) | lo;
+        cpu.tick_cycle(); // internal — load new PC
+        Ok(())
+    }
+
+    /// JP HL — jump to address in HL
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_jp_hl(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.pc = cpu.registers.hl();
+        Ok(())
+    }
+
+    /// JR e — unconditional relative jump
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_jr(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let offset = cpu.read_next_pc()? as i8 as i16;
+        cpu.registers.pc = cpu.registers.pc.wrapping_add(offset as u16);
+        cpu.tick_cycle(); // internal — apply offset
+        Ok(())
+    }
+
+    /// JP cc, nn — data = pack_cc(cond, cycles_taken, cycles_not_taken)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_jp_cc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let target = (hi << 8) | lo;
+        if cpu.check_cond_u8(arg::unpack_arg0(data)) {
+            cpu.registers.pc = target;
+            cpu.tick_cycle(); // internal — branch taken
+        }
+        Ok(())
+    }
+
+    /// JR cc, e — data = pack_cc(cond, cycles_taken, cycles_not_taken)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_jr_cc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let offset = cpu.read_next_pc()? as i8 as i16;
+        if cpu.check_cond_u8(arg::unpack_arg0(data)) {
+            cpu.registers.pc = cpu.registers.pc.wrapping_add(offset as u16);
+            cpu.tick_cycle(); // internal — branch taken
+        }
+        Ok(())
+    }
+
+    // ── Calls / Returns ───────────────────────────────────────────────────────
+
+    /// CALL nn
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_call(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let target = (hi << 8) | lo;
+        cpu.tick_cycle(); // internal
+        cpu.push_pc()?;
+        cpu.registers.pc = target;
+        Ok(())
+    }
+
+    /// CALL cc, nn — data = pack_cc(cond, cycles_taken, cycles_not_taken)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_call_cc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let lo = cpu.read_next_pc()? as u16;
+        let hi = cpu.read_next_pc()? as u16;
+        let target = (hi << 8) | lo;
+        if cpu.check_cond_u8(arg::unpack_arg0(data)) {
+            cpu.tick_cycle(); // internal
+            cpu.push_pc()?;
+            cpu.registers.pc = target;
+        }
+        Ok(())
+    }
+
+    /// RET
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ret(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.pc = cpu.pop_pc()?;
+        cpu.tick_cycle(); // internal
+        Ok(())
+    }
+
+    /// RETI
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_reti(cpu: &mut Sm83, _data: u32) -> Result<(), InstructionError> {
+        cpu.registers.pc = cpu.pop_pc()?;
+        cpu.tick_cycle(); // internal
+        cpu.ime = ImeState::Enabled;
+        Ok(())
+    }
+
+    /// RET cc — data = pack_cc(cond, cycles_taken, cycles_not_taken)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_ret_cc(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        cpu.tick_cycle(); // internal — condition evaluation
+        if cpu.check_cond_u8(arg::unpack_arg0(data)) {
+            cpu.registers.pc = cpu.pop_pc()?;
+            cpu.tick_cycle(); // internal
+        }
+        Ok(())
+    }
+
+    /// RST n — data = pack1(vector, cycles) where vector is the target address (0x00,0x08,...0x38)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_rst(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        let vector = arg::unpack_arg0(data) as u16;
+        cpu.tick_cycle(); // internal
+        cpu.push_pc()?;
+        cpu.registers.pc = vector;
+        Ok(())
+    }
+
+    // ── CB-prefixed handlers ───────────────────────────────────────────────────
+
+    /// Read the r8/memory target identified by the CB target encoding (0=B..5=L,6=(HL),7=A).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn resolve_cb_target(&mut self, tgt: u8) -> Result<u8, InstructionError> {
+        Ok(match tgt {
+            arg::B      => self.registers.b,
+            arg::C      => self.registers.c,
+            arg::D      => self.registers.d,
+            arg::E      => self.registers.e,
+            arg::H      => self.registers.h,
+            arg::L      => self.registers.l,
+            arg::MEM_HL => self.bus_read(self.registers.hl())?,
+            arg::A      => self.registers.a,
+            _           => return Err(InstructionError::Failed("bad cb target".into())),
+        })
+    }
+
+    /// Write to the r8/memory target identified by the CB target encoding.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn write_cb_target_u8(&mut self, tgt: u8, val: u8) -> Result<(), InstructionError> {
+        match tgt {
+            arg::B      => self.registers.b = val,
+            arg::C      => self.registers.c = val,
+            arg::D      => self.registers.d = val,
+            arg::E      => self.registers.e = val,
+            arg::H      => self.registers.h = val,
+            arg::L      => self.registers.l = val,
+            arg::MEM_HL => self.bus_write(self.registers.hl(), val)?,
+            arg::A      => self.registers.a = val,
+            _           => return Err(InstructionError::Failed("bad cb target write".into())),
+        }
+        Ok(())
+    }
+
+    /// CB shift/rotate — data = pack2(target, shift_op, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cb_shift(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::cb::*;
+        let tgt    = arg::unpack_arg0(data);
+        let op     = arg::unpack_arg1(data);
+        let val    = cpu.resolve_cb_target(tgt)?;
+        let carry  = cpu.registers.f.contains(Flags::C);
+        let (result, flags) = match op {
+            arg::RLC  => rlc_u8(val),
+            arg::RRC  => rrc_u8(val),
+            arg::RL   => rl_u8(val, carry),
+            arg::RR   => rr_u8(val, carry),
+            arg::SLA  => sla_u8(val),
+            arg::SRA  => sra_u8(val),
+            arg::SWAP => swap_u8(val),
+            arg::SRL  => srl_u8(val),
+            _ => return Err(InstructionError::Failed("bad cb shift op".into())),
+        };
+        cpu.registers.f = flags;
+        cpu.write_cb_target_u8(tgt, result)?;
+        Ok(())
+    }
+
+    /// CB BIT b, r — data = pack2(target, bit, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cb_bit(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::cb::bit_u8;
+        let tgt = arg::unpack_arg0(data);
+        let bit = arg::unpack_arg1(data);
+        let val = cpu.resolve_cb_target(tgt)?;
+        cpu.registers.f = bit_u8(val, bit, cpu.registers.f);
+        Ok(())
+    }
+
+    /// CB RES b, r — data = pack2(target, bit, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cb_res(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::cb::res_u8;
+        let tgt = arg::unpack_arg0(data);
+        let bit = arg::unpack_arg1(data);
+        let val = cpu.resolve_cb_target(tgt)?;
+        let result = res_u8(val, bit);
+        cpu.write_cb_target_u8(tgt, result)?;
+        Ok(())
+    }
+
+    /// CB SET b, r — data = pack2(target, bit, cycles)
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn handle_cb_set(cpu: &mut Sm83, data: u32) -> Result<(), InstructionError> {
+        use super::operations::cb::set_u8;
+        let tgt = arg::unpack_arg0(data);
+        let bit = arg::unpack_arg1(data);
+        let val = cpu.resolve_cb_target(tgt)?;
+        let result = set_u8(val, bit);
+        cpu.write_cb_target_u8(tgt, result)?;
+        Ok(())
+    }
 }
 
 impl Cpu for Sm83 {
@@ -911,16 +1630,15 @@ impl Sm83 {
 
         // Opcode fetch is the first M-cycle (via bus_read inside read_next_pc)
         let opcode = self.read_next_pc()?;
-        // Arc::clone releases the borrow of self.opcodes before execute() needs
-        // &mut self.  The atomic increment is ~10 cycles vs ~50 000 cycles for
-        // the previous Box::new() per instruction.
-        let op = if opcode == 0xCB {
+        // Flat function-pointer dispatch: copy 8 bytes out of the table, borrow
+        // released immediately — no Arc clone, no vtable, no atomics.
+        let entry = if opcode == 0xCB {
             let cb_opcode = self.read_next_pc()?;
-            self.opcodes.get_cb(cb_opcode)?
+            self.opcodes.flat[256 + cb_opcode as usize]
         } else {
-            self.opcodes.get(opcode)?
+            self.opcodes.flat[opcode as usize]
         };
-        op.execute(self)?;
+        (entry.handler)(self, entry.data)?;
 
         // Peripherals and bus events are already advanced per M-cycle
         // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
@@ -1487,16 +2205,13 @@ impl Instructions for Sm83 {
 mod tests {
     use super::*;
     use alloc::{boxed::Box, vec, vec::Vec};
-    use crate::cpu::instructions::opcodes::OpCodeDecoder;
     use crate::cpu::registers::Flags;
 
     use crate::memory::memory::GameBoyMemory;
 
     pub fn make_test_cpu(rom_data: Vec<u8>) -> Sm83 {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::with_rom(rom_data));
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        Sm83::new(memory, decoder)
+        Sm83::new(memory)
     }
 
     pub fn make_test_cpu_with_memory(
@@ -1505,8 +2220,7 @@ mod tests {
     ) -> Sm83 {
         let mut mem = GameBoyMemory::with_rom(rom_data);
         setup(&mut mem);
-        let decoder = Box::new(OpCodeDecoder::new());
-        Sm83::new(Box::new(mem), decoder)
+        Sm83::new(Box::new(mem))
     }
 
     /// Add a constant to the accumulator register and expect the register's value to be the
@@ -1567,9 +2281,8 @@ mod tests {
     #[test]
     fn test_add8_invalid_opcode() {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory));
         assert!(cpu
             .add8(&Add8 {
                 operand: Operand::Imm16,
@@ -1662,9 +2375,8 @@ mod tests {
     #[test]
     fn test_add16_invalid_opcode() {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory));
         assert!(cpu
             .add16(&Add16 {
                 operand: Operand::Imm8,
@@ -1685,9 +2397,8 @@ mod tests {
     #[test]
     fn test_add_sp16_invalid_opcode() {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory));
         assert!(cpu
             .add_sp16(&AddSP16 {
                 operand: Operand::Imm8,
@@ -1820,9 +2531,8 @@ mod tests {
     #[test]
     fn test_adc_invalid_operand() {
         let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
 
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
+        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory));
         assert!(cpu
             .adc(&Adc {
                 operand: Operand::Register16(Register16::BC),
@@ -2022,8 +2732,7 @@ mod tests {
         // After tick 1 (LD (HL),A): memory[0xC000]=0xCD, cycles=8
         // After tick 2 (LD A,(HL)): A=0xCD, cycles=8
         let memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory)).with_registers(Registers {
             a: 0xCD,
             h: 0xC0,
             l: 0x00,
@@ -2065,8 +2774,7 @@ mod tests {
     #[test]
     fn test_ld8_mem_hl_imm8() {
         let memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory)).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -2094,8 +2802,7 @@ mod tests {
         // Pre-populate the memory location HL will point to
         memory.write(0xC010, 0x0F).unwrap();
 
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory)).with_registers(Registers {
             a: 0x01,
             h: 0xC0,
             l: 0x10,
@@ -2891,8 +3598,7 @@ mod tests {
     fn test_inc8_mem_hl() {
         let mut memory = GameBoyMemory::with_rom(vec![0x34, 0x7E]);
         memory.write(0xC000, 0x07).unwrap();
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory)).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -2916,8 +3622,7 @@ mod tests {
     fn test_dec8_mem_hl() {
         let mut memory = GameBoyMemory::with_rom(vec![0x35, 0x7E]);
         memory.write(0xC000, 0x07).unwrap();
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = Sm83::new(Box::new(memory)).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
