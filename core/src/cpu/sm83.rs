@@ -159,6 +159,31 @@ pub struct Sm83PerfProfile {
     pub mem_write: u32,
 }
 
+#[derive(Default)]
+struct PendingApuCycles {
+    cycles: u16,
+}
+
+impl PendingApuCycles {
+    fn queue(&mut self, cycles: u16) {
+        if cycles == 0 {
+            return;
+        }
+        self.cycles = self
+            .cycles
+            .checked_add(cycles)
+            .expect("pending APU cycle batch overflow");
+    }
+
+    fn take(&mut self) -> u16 {
+        core::mem::take(&mut self.cycles)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cycles == 0
+    }
+}
+
 pub struct Sm83 {
     memory: Box<GameBoyMemory>,
     registers: Registers,
@@ -178,6 +203,9 @@ pub struct Sm83 {
     /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
     /// read a fully-rendered frame rather than one mid-render.
     front_buffer: [u8; FRAMEBUFFER_SIZE],
+    /// Accumulates APU T-cycles between timing-sensitive boundaries so normal
+    /// M-cycles can batch one `apu.tick(...)` per instruction instead of per cycle.
+    pending_apu_cycles: PendingApuCycles,
     /// CPU MMIO writes are routed here and applied on the next M-cycle.
     pending_bus_events: Vec<BusEvent>,
     pub cache: Sm83Cache,
@@ -214,6 +242,7 @@ impl Sm83 {
             cycle_counter: 0,
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            pending_apu_cycles: PendingApuCycles::default(),
             pending_bus_events: Vec::with_capacity(4),
             cache: Sm83Cache::default(),
             #[cfg(feature = "trace")]
@@ -401,7 +430,7 @@ impl Sm83 {
             let offset = (addr - WAVE_RAM_START) as u8;
             let value = self.apu.read_wave_ram(offset);
             self.advance_timer(1);
-            self.advance_apu(1);
+            self.queue_apu_cycles(1);
             return Ok(value);
         }
         self.tick_cycle();
@@ -424,14 +453,14 @@ impl Sm83 {
             self.tick_cycle_to_t3();
             self.write_apu_register(addr, value);
             self.advance_timer(1);
-            self.advance_apu(1);
+            self.queue_apu_cycles(1);
             return Ok(());
         }
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
             self.tick_cycle_to_t3();
             self.write_wave_ram(addr, value);
             self.advance_timer(1);
-            self.advance_apu(1);
+            self.queue_apu_cycles(1);
             return Ok(());
         }
         self.tick_cycle();
@@ -461,9 +490,7 @@ impl Sm83 {
     /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle(&mut self) {
-        self.cycle_counter += 4;
-        self.route_bus_events();
-        self.advance_dma();
+        self.begin_m_cycle();
         self.advance_peripherals(4);
     }
 
@@ -488,7 +515,7 @@ impl Sm83 {
     fn advance_peripherals(&mut self, cycles: u16) {
         self.advance_ppu(cycles);
         self.advance_timer(cycles);
-        self.advance_apu(cycles);
+        self.queue_apu_cycles(cycles);
         self.memory.tick_rtc(cycles as u32);
         self.advance_serial(cycles);
     }
@@ -510,24 +537,60 @@ impl Sm83 {
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
     /// stopping so the caller can perform a time-sensitive APU read or write at T3.
-    /// The caller must call `advance_timer(1)` + `advance_apu(1)` afterwards to complete T4.
+    /// The caller must account for T4 afterwards with `advance_timer(1)` plus
+    /// one queued APU cycle.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle_to_t3(&mut self) {
-        self.cycle_counter += 4;
-        self.route_bus_events();
-        self.advance_dma();
+        self.begin_t3_sensitive_m_cycle();
         self.advance_ppu(4);
         self.advance_timer(3);
-        self.advance_apu(3);
+        self.queue_apu_cycles(3);
     }
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn begin_m_cycle(&mut self) {
+        self.cycle_counter += 4;
+        self.flush_apu_before_bus_events();
+        self.route_bus_events();
+        self.advance_dma();
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn begin_t3_sensitive_m_cycle(&mut self) {
+        self.cycle_counter += 4;
+        self.flush_pending_apu_cycles();
+        self.route_bus_events();
+        self.advance_dma();
+    }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_ime(&mut self) {
         if self.ime == ImeState::Pending {
             self.ime = ImeState::Enabled;
         }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn flush_apu_before_bus_events(&mut self) {
+        if self.pending_apu_cycles.is_empty() || !self.pending_bus_events_require_apu_flush() {
+            return;
+        }
+        self.flush_pending_apu_cycles();
+    }
+
+    fn pending_bus_events_require_apu_flush(&self) -> bool {
+        self.pending_bus_events
+            .iter()
+            .copied()
+            .any(Self::bus_event_requires_apu_flush)
+    }
+
+    fn bus_event_requires_apu_flush(event: BusEvent) -> bool {
+        event.address == DIV_ADDR
+            || (NR10_ADDR..=NR52_ADDR).contains(&event.address)
+            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -682,7 +745,21 @@ impl Sm83 {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_apu(&mut self, cycles: u16) {
+    fn queue_apu_cycles(&mut self, cycles: u16) {
+        self.pending_apu_cycles.queue(cycles);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn flush_pending_apu_cycles(&mut self) {
+        let cycles = self.pending_apu_cycles.take();
+        if cycles == 0 {
+            return;
+        }
+        self.tick_apu(cycles);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn tick_apu(&mut self, cycles: u16) {
         #[cfg(feature = "perf")]
         let t0 = crate::cpu::perf::cyccnt();
         let output = self.apu.tick(cycles, self.timer.internal_counter());
@@ -695,6 +772,12 @@ impl Sm83 {
             let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
             self.perf.apu = self.perf.apu.wrapping_add(dt);
         }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn finish_tick(&mut self, start_cycles: u64) -> u8 {
+        self.flush_pending_apu_cycles();
+        (self.cycle_counter - start_cycles) as u8
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -900,10 +983,10 @@ impl Sm83 {
                     if let Some(bit) = self.take_pending_interrupt() {
                         self.dispatch_interrupt(bit)?;
                     }
-                    return Ok((self.cycle_counter - start_cycles) as u8);
+                    return Ok(self.finish_tick(start_cycles));
                 }
             } else {
-                return Ok((self.cycle_counter - start_cycles) as u8);
+                return Ok(self.finish_tick(start_cycles));
             }
         }
 
@@ -924,6 +1007,7 @@ impl Sm83 {
 
         // Peripherals and bus events are already advanced per M-cycle
         // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
+        self.flush_pending_apu_cycles();
 
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt() {
@@ -944,7 +1028,7 @@ impl Sm83 {
             });
         }
 
-        Ok((self.cycle_counter - start_cycles) as u8)
+        Ok(self.finish_tick(start_cycles))
     }
 }
 
@@ -3427,5 +3511,48 @@ mod tests {
         let cycles = cpu.tick().unwrap();
         assert!(!cpu.is_halted());
         assert_eq!(cycles, 8); // halted M-cycle + NOP
+    }
+
+    #[test]
+    fn test_tick_returns_with_no_pending_apu_cycles() {
+        let mut cpu = make_test_cpu(vec![0x00]);
+
+        cpu.tick().unwrap();
+
+        assert!(cpu.pending_apu_cycles.is_empty());
+    }
+
+    #[test]
+    fn test_halted_tick_returns_with_no_pending_apu_cycles() {
+        let mut cpu = make_test_cpu(vec![0x76, 0x00]);
+
+        cpu.tick().unwrap(); // HALT
+        cpu.tick().unwrap(); // halted early return
+
+        assert!(cpu.pending_apu_cycles.is_empty());
+    }
+
+    #[test]
+    fn test_interrupt_dispatch_returns_with_no_pending_apu_cycles() {
+        let mut cpu = make_test_cpu(vec![0xFB, 0x00, 0x00, 0x00]);
+        cpu.memory.write_io(IE_ADDR, 0x01);
+        cpu.memory.write_io(IF_ADDR, 0x01);
+
+        cpu.tick().unwrap(); // EI
+        cpu.tick().unwrap(); // NOP + interrupt dispatch
+
+        assert!(cpu.pending_apu_cycles.is_empty());
+    }
+
+    #[test]
+    fn test_tick_cycle_to_t3_flushes_prior_apu_batch() {
+        let mut cpu = make_test_cpu(vec![0x00]);
+
+        cpu.tick_cycle();
+        assert_eq!(cpu.pending_apu_cycles.cycles, 4);
+
+        cpu.tick_cycle_to_t3();
+
+        assert_eq!(cpu.pending_apu_cycles.cycles, 3);
     }
 }

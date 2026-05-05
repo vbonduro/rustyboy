@@ -520,8 +520,9 @@ const FRAME_SEQ_BIT: u16 = 1 << 12;
 /// that drives length/envelope/sweep clocking, and raw register storage for
 /// read-back through the IO bus.
 ///
-/// `tick()` must be called once per T-cycle. The frame sequencer is driven by
-/// the falling edge of bit 12 of the timer's internal counter (DIV bit 4).
+/// `tick()` advances the APU by a caller-provided batch of T-cycles. The frame
+/// sequencer is driven by the falling edge of bit 12 of the timer's internal
+/// counter (DIV bit 4).
 pub struct ApuPeripheral {
     /// Whether the APU is powered on (NR52 bit 7). When false, all registers
     /// except NRx1 (length) are frozen and channels are silent.
