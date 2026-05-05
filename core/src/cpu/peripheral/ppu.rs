@@ -104,7 +104,9 @@ pub struct PpuPeripheral {
     ly: u8,
     mode: PpuMode,
     window_line_counter: u8,
-    prev_stat_line: bool,
+    stat_cache: u8,
+    stat_line_cache: bool,
+    stat_dirty: bool,
     framebuffer: [u8; FRAMEBUFFER_SIZE],
     /// Raw BG/window color indices (0-3) for the current scanline, used for sprite priority.
     bg_color_indices: [u8; SCREEN_WIDTH],
@@ -119,7 +121,9 @@ impl PpuPeripheral {
             ly: 0,
             mode: PpuMode::OamScan,
             window_line_counter: 0,
-            prev_stat_line: false,
+            stat_cache: 0,
+            stat_line_cache: false,
+            stat_dirty: true,
             framebuffer: [0u8; FRAMEBUFFER_SIZE],
             bg_color_indices: [0u8; SCREEN_WIDTH],
             #[cfg(feature = "perf")]
@@ -152,6 +156,9 @@ impl PpuPeripheral {
         self.ly = state.ly;
         self.mode = state.mode;
         self.window_line_counter = state.window_line_counter;
+        self.stat_cache = 0;
+        self.stat_line_cache = false;
+        self.stat_dirty = true;
     }
 
     /// Advance the PPU by `cycles` T-cycles.
@@ -191,28 +198,28 @@ impl PpuPeripheral {
 
             match self.mode {
                 PpuMode::OamScan => {
-                    self.mode = PpuMode::PixelTransfer;
+                    self.set_mode(PpuMode::PixelTransfer);
                 }
                 PpuMode::PixelTransfer => {
-                    self.mode = PpuMode::HBlank;
+                    self.set_mode(PpuMode::HBlank);
                     self.render_scanline(&input);
                 }
                 PpuMode::HBlank => {
                     self.dot = 0;
-                    self.ly += 1;
+                    self.set_ly(self.ly + 1);
                     if self.ly >= VISIBLE_SCANLINES {
-                        self.mode = PpuMode::VBlank;
+                        self.set_mode(PpuMode::VBlank);
                         vblank_interrupt = true;
                     } else {
-                        self.mode = PpuMode::OamScan;
+                        self.set_mode(PpuMode::OamScan);
                     }
                 }
                 PpuMode::VBlank => {
                     self.dot = 0;
-                    self.ly += 1;
+                    self.set_ly(self.ly + 1);
                     if self.ly >= TOTAL_SCANLINES {
-                        self.ly = 0;
-                        self.mode = PpuMode::OamScan;
+                        self.set_ly(0);
+                        self.set_mode(PpuMode::OamScan);
                         self.window_line_counter = 0;
                     }
                 }
@@ -223,7 +230,12 @@ impl PpuPeripheral {
         let t0 = crate::cpu::perf::cyccnt();
         let (stat, stat_interrupt) = self.build_stat(&input);
         #[cfg(feature = "perf")]
-        { self.perf_profile.build_stat = self.perf_profile.build_stat.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+        {
+            self.perf_profile.build_stat = self
+                .perf_profile
+                .build_stat
+                .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+        }
 
         PpuOutput {
             ly: self.ly,
@@ -235,24 +247,28 @@ impl PpuPeripheral {
 
     /// Reset LY to 0 (triggered by CPU write to LY register).
     pub fn reset_ly(&mut self) {
-        self.ly = 0;
+        self.set_ly(0);
     }
 
     /// Build the STAT register value and detect STAT interrupt rising edge.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn build_stat(&mut self, input: &PpuInput) -> (u8, bool) {
+        if !self.stat_dirty && (self.stat_cache & 0x78) == (input.stat & 0x78) {
+            return (self.stat_cache, false);
+        }
+
         let lyc_match = self.ly == input.lyc;
-        let stat = (input.stat & 0x78)
-            | if lyc_match { 0x04 } else { 0x00 }
-            | (self.mode as u8);
+        let stat = (input.stat & 0x78) | if lyc_match { 0x04 } else { 0x00 } | (self.mode as u8);
 
         let stat_line = (lyc_match && (input.stat & 0x40 != 0))
             || (self.mode == PpuMode::HBlank && (input.stat & 0x08 != 0))
             || (self.mode == PpuMode::VBlank && (input.stat & 0x10 != 0))
             || (self.mode == PpuMode::OamScan && (input.stat & 0x20 != 0));
 
-        let interrupt = stat_line && !self.prev_stat_line;
-        self.prev_stat_line = stat_line;
+        let interrupt = stat_line && !self.stat_line_cache;
+        self.stat_cache = stat;
+        self.stat_line_cache = stat_line;
+        self.stat_dirty = false;
 
         (stat, interrupt)
     }
@@ -264,7 +280,24 @@ impl PpuPeripheral {
         self.ly = 0;
         self.mode = PpuMode::HBlank;
         self.window_line_counter = 0;
-        self.prev_stat_line = false;
+        self.stat_line_cache = false;
+        self.stat_dirty = true;
+    }
+
+    #[inline]
+    fn set_ly(&mut self, ly: u8) {
+        if self.ly != ly {
+            self.ly = ly;
+            self.stat_dirty = true;
+        }
+    }
+
+    #[inline]
+    fn set_mode(&mut self, mode: PpuMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.stat_dirty = true;
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -282,7 +315,12 @@ impl PpuPeripheral {
             let t0 = crate::cpu::perf::cyccnt();
             self.render_bg_scanline(input, lcdc, row_start);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_bg = self.perf_profile.render_bg.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_bg = self
+                    .perf_profile
+                    .render_bg
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         } else {
             for x in 0..SCREEN_WIDTH {
                 self.framebuffer[row_start + x] = 0;
@@ -295,7 +333,12 @@ impl PpuPeripheral {
             let t0 = crate::cpu::perf::cyccnt();
             self.render_window_scanline(input, lcdc, row_start);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_window = self.perf_profile.render_window.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_window = self
+                    .perf_profile
+                    .render_window
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         }
 
         if lcdc.obj_enabled() {
@@ -303,13 +346,22 @@ impl PpuPeripheral {
             let t0 = crate::cpu::perf::cyccnt();
             self.render_sprite_scanline(input, lcdc, row_start);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_sprites = self.perf_profile.render_sprites.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_sprites = self
+                    .perf_profile
+                    .render_sprites
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_bg_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
-        let tilemap_base: usize = if lcdc.bg_tilemap_high() { 0x1C00 } else { 0x1800 };
+        let tilemap_base: usize = if lcdc.bg_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
+        };
         let y = input.scy.wrapping_add(self.ly);
         let tile_row = (y / 8) as usize;
         let fine_y = (y % 8) as usize;
@@ -344,12 +396,20 @@ impl PpuPeripheral {
             return;
         }
 
-        let tilemap_base: usize = if lcdc.window_tilemap_high() { 0x1C00 } else { 0x1800 };
+        let tilemap_base: usize = if lcdc.window_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
+        };
         let win_y = self.window_line_counter as usize;
         let tile_row = win_y / 8;
         let fine_y = win_y % 8;
 
-        let screen_x_start = if input.wx < 7 { 0 } else { (input.wx - 7) as usize };
+        let screen_x_start = if input.wx < 7 {
+            0
+        } else {
+            (input.wx - 7) as usize
+        };
 
         let mut current_tile_col = usize::MAX;
         let mut lo = 0u8;
@@ -436,7 +496,11 @@ impl PpuPeripheral {
         let y_flip = attrs & 0x40 != 0;
         let x_flip = attrs & 0x20 != 0;
         let bg_priority = attrs & 0x80 != 0;
-        let palette = if attrs & 0x10 != 0 { input.obp1 } else { input.obp0 };
+        let palette = if attrs & 0x10 != 0 {
+            input.obp1
+        } else {
+            input.obp0
+        };
 
         let mut row_in_sprite = (ly - sprite_y_pos) as u8;
         let tile_index = if lcdc.obj_tall() {
@@ -482,7 +546,6 @@ impl PpuPeripheral {
         }
     }
 }
-
 
 /// Decode a single pixel from a 2bpp tile row.
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -538,20 +601,23 @@ mod tests {
         };
         // Tick one at a time to get correct mode transitions
         for _ in 0..dots {
-            let o = ppu.tick(1, PpuInput {
-                lcdc: input.lcdc,
-                stat: input.stat,
-                scy: input.scy,
-                scx: input.scx,
-                lyc: input.lyc,
-                bgp: input.bgp,
-                obp0: input.obp0,
-                obp1: input.obp1,
-                wy: input.wy,
-                wx: input.wx,
-                vram: input.vram,
-                oam: input.oam,
-            });
+            let o = ppu.tick(
+                1,
+                PpuInput {
+                    lcdc: input.lcdc,
+                    stat: input.stat,
+                    scy: input.scy,
+                    scx: input.scx,
+                    lyc: input.lyc,
+                    bgp: input.bgp,
+                    obp0: input.obp0,
+                    obp1: input.obp1,
+                    wy: input.wy,
+                    wx: input.wx,
+                    vram: input.vram,
+                    oam: input.oam,
+                },
+            );
             if o.vblank_interrupt {
                 output.vblank_interrupt = true;
             }
@@ -584,7 +650,11 @@ mod tests {
         assert_eq!(output.ly, 0);
 
         // After 204 more dots (456 total): transition to next scanline
-        let output = tick_dots(&mut ppu, (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32, &input);
+        let output = tick_dots(
+            &mut ppu,
+            (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32,
+            &input,
+        );
         assert_eq!(ppu.mode, PpuMode::OamScan);
         assert_eq!(output.ly, 1);
     }
@@ -597,7 +667,11 @@ mod tests {
         let input = default_input(&vram, &oam);
 
         // Tick through 144 scanlines
-        let output = tick_dots(&mut ppu, VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(
+            &mut ppu,
+            VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32,
+            &input,
+        );
         assert_eq!(ppu.mode, PpuMode::VBlank);
         assert_eq!(output.ly, 144);
         assert!(output.vblank_interrupt);
@@ -611,7 +685,11 @@ mod tests {
         let input = default_input(&vram, &oam);
 
         // Full frame: 154 scanlines
-        let output = tick_dots(&mut ppu, TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(
+            &mut ppu,
+            TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32,
+            &input,
+        );
         assert_eq!(ppu.mode, PpuMode::OamScan);
         assert_eq!(output.ly, 0);
     }
@@ -837,6 +915,28 @@ mod tests {
         assert!(output.stat_interrupt);
 
         // Subsequent ticks in same mode should NOT re-fire
+        let output = tick_dots(&mut ppu, 1, &input);
+        assert!(!output.stat_interrupt);
+    }
+
+    #[test]
+    fn test_stat_write_invalidates_cached_line_state() {
+        let vram = [0u8; 0x2000];
+        let oam = [0u8; 0xA0];
+        let mut ppu = PpuPeripheral::new();
+        let mut input = default_input(&vram, &oam);
+
+        // Prime the cache while mode 2 is active but the interrupt is disabled.
+        let output = tick_dots(&mut ppu, 1, &input);
+        assert_eq!(output.stat & 0x03, 2);
+        assert!(!output.stat_interrupt);
+
+        // Enabling mode-2 STAT in the same mode should still raise the edge once.
+        input.stat = 0x20;
+        let output = tick_dots(&mut ppu, 1, &input);
+        assert!(output.stat_interrupt);
+
+        // Further ticks in the same mode should remain quiet.
         let output = tick_dots(&mut ppu, 1, &input);
         assert!(!output.stat_interrupt);
     }

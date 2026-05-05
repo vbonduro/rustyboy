@@ -1,91 +1,80 @@
 # Performance Roadmap
 
-## Current state — post dispatch-refactor baseline
+## Current state — post display DMA + APU batching
 
 ROM: Tetris, Pico2W @ 250 MHz.
 
-### Wall-clock breakdown (fps = 9)
+Latest `perf` build measurement:
+
+```
+fps: 12
+cycles/60f — total=1087658401 ppu=226370324 timer=17928846 apu=88093231 cpu_exec=755266000 (mem_r=29927803 mem_w=226325431 decode=499012766)
+ppu breakdown — bg=43526449 window=95196 sprites=8074787 stat=30854900
+apu breakdown — frame_seq=312708 pulse=17766610 wave=6626594 noise=6414055 mix=12869944
+display/60f — 238ms total (scale=236ms fill=1ms) avg 3ms/frame
+```
+
+### Updated breakdown (60 frames, `perf` build)
 
 | Bucket | Time / 60 frames | % of wall clock |
 |---|---|---|
-| Emulation (DWT) | 3.52 s (879M cycles) | 53% |
-| Display + other | 3.15 s | 47% |
-| **Total** | **6.67 s** | **100%** |
+| Emulation (DWT) | 4.35 s (1088M cycles) | dominant |
+| Display scaler + residual wait | 0.24 s | small |
+| **Total** | **~5.02 s** | **100%** |
 
 Target: 1.00 s / 60 frames (60 fps).  
-Required speedup: **6.7×**.
+Required speedup from current `perf` run: **~5×**.
 
-### Emulation sub-breakdown (879M cycles)
+### Emulation sub-breakdown (1088M cycles)
 
 | Component | Cycles | % of emulation |
 |---|---|---|
-| decode / dispatch | 406M | 46% |
-| apu | 205M | 23% |
-| ppu | 160M | 18% |
-| mem_write | 54M | 6% |
+| decode / dispatch | 499M | 46% |
+| mem_write | 226M | 21% |
+| ppu | 226M | 21% |
+| apu | 88M | 8% |
 | mem_read | 29M | 3% |
-| timer | 26M | 3% |
+| timer | 18M | 2% |
 
-### Hard ceiling without touching display
+### What changed
 
-Even if emulation cost were zero, the display/other overhead alone gives:
+- Async display DMA is working: residual display wait is `1ms / 60f`, so the
+  SPI transfer is no longer the main limiter.
+- Pre-scaling is now the only notable display cost at `236ms / 60f`
+  (`~3.9ms/frame`).
+- APU batching is working: APU cost fell from `~205M` cycles to `~88M`.
 
-60 ÷ 3.15 s = **~19 fps maximum**
+### New hotspot order
 
-Both tracks (emulation and display) must be attacked together to reach 60 fps.
-
----
-
-## Priority 1 — Async display transfer
-
-**Expected impact: largest single lever, potentially 2–3× fps gain**
-
-The display currently blocks the CPU for ~13 ms per frame (240×216 × 2 bytes over
-62.5 MHz SPI), plus unknown software-scaling overhead. The game loop sits idle
-waiting for this transfer to complete.
-
-### What to do
-
-1. **Profile the display path** — add DWT instrumentation around `render_game_only`
-   to separate the SPI transfer time from the software scaler (1.5× pixel iterator).
-
-2. **DMA-backed SPI transfer** — `embassy-rp` supports async DMA SPI writes. Start
-   the transfer at VBlank, let emulation run for the next frame concurrently, await
-   completion only if the next VBlank arrives before the DMA finishes. This hides
-   the transfer latency almost entirely behind emulation work.
-
-3. **Pre-scale into a u16 framebuffer** — instead of running the 1.5× scale iterator
-   inside the SPI callback, maintain a `[u16; 240 * 216]` front buffer that is updated
-   once per VBlank. The DMA transfer then reads directly from this buffer with no
-   per-pixel CPU work during the transfer.
+1. `decode / dispatch` at `499M`
+2. `mem_write` at `226M`
+3. `ppu` at `226M`, with `build_stat = 30.9M`
 
 ---
 
-## Priority 2 — APU cycle batching
+## Completed — Async display transfer
 
-**Expected impact: ~80–100M cycles saved (~9–11% of total emulation)**
+**Status: done**
 
-`advance_apu` is called on every M-cycle (~1.05M times/second). The APU already
-implements skip-ahead arithmetic for frequency timers, so it handles large cycle
-batches correctly.
-
-### What to do
-
-Add a `pending_apu_cycles: u16` accumulator to `Sm83`. Increment it instead of
-calling `apu.tick()` on every `tick_cycle`. Flush via `apu.tick(pending, ...)` at:
-- End of each instruction (in `tick_impl`, before the interrupt check)
-- Before any APU register write (the `tick_cycle_to_t3` path already handles
-  T-cycle precision for writes — flush before entering that path)
-
-This reduces APU tick call frequency from ~1M/s to ~350K/s (once per instruction
-on average), cutting function-call overhead by ~3× while the skip-ahead arithmetic
-absorbs the larger cycle batches.
+- DMA-backed SPI transfer overlaps with emulation successfully.
+- Static letterbox bars are no longer repainted every frame.
+- Remaining display work, if needed later, is reducing scaler cost rather than
+  fixing transfer latency.
 
 ---
 
-## Priority 3 — PPU `build_stat` cache
+## Completed — APU cycle batching
 
-**Expected impact: ~20M cycles saved (~2% of total emulation)**
+**Status: done**
+
+- Batched APU ticking reduced APU cost from `~205M` cycles to `~88M`.
+- No longer a top-three hotspot for this ROM/profile.
+
+---
+
+## Priority 1 — PPU `build_stat` cache
+
+**Expected impact: ~25–30M cycles saved (~2–3% of total emulation)**
 
 `build_stat` recomputes the STAT register and STAT interrupt edge on every M-cycle
 (~1M times/second). The result only changes when LY changes (154×/frame), the PPU
@@ -104,9 +93,27 @@ recomputing. This drops 99%+ of `build_stat` calls to a single branch.
 
 ---
 
-## Priority 4 — `pending_bus_events` fixed-size array
+## Priority 2 — Split `mem_write` before optimizing it
 
-**Expected impact: small, reduces mem_write overhead**
+**Expected impact: diagnostic; determines the real next hot path**
+
+`mem_write` is now `226M` cycles, much larger than the old baseline. That is too
+large to attribute solely to `Vec` push overhead in `pending_bus_events`.
+
+### What to do
+
+Add separate perf counters around:
+- `memory.write_io` / `memory.write_fast`
+- enqueueing `pending_bus_events`
+- `route_bus_events` / `handle_bus_event`
+
+This tells us whether the cost is queue management, event fan-out, or raw IO writes.
+
+---
+
+## Priority 3 — `pending_bus_events` fixed-size array
+
+**Expected impact: small-to-moderate, only if queueing is a real slice of `mem_write`**
 
 `pending_bus_events: Vec<BusEvent>` does a bounds-check + capacity-check on every
 I/O write. Since at most one I/O write can be pending per M-cycle before
@@ -119,7 +126,7 @@ indirection and capacity check on the write hot path.
 
 ---
 
-## Priority 5 — `decode` remainder (longer term)
+## Priority 4 — `decode` remainder (longer term)
 
 After the above changes, decode/dispatch will still sit at ~350–400M cycles. The
 remaining cost is dominated by:
@@ -141,8 +148,9 @@ Further gains here would require either:
 
 | # | Change | Est. savings | Effort | Unblocks |
 |---|---|---|---|---|
-| 1 | Async DMA display | ~2–3× fps | Medium | 60 fps ceiling |
-| 2 | APU cycle batching | ~80–100M cycles | Small | — |
-| 3 | PPU build_stat cache | ~20M cycles | Small | — |
-| 4 | Fixed pending_bus_events | small | Trivial | — |
-| 5 | Instruction-level tick batching | ~100M+ cycles | Large | — |
+| done | Async DMA display | large | Medium | 60 fps ceiling |
+| done | APU cycle batching | ~117M cycles observed | Small | — |
+| 1 | PPU build_stat cache | ~25–30M cycles | Small | — |
+| 2 | Split mem_write perf counters | diagnostic | Small | mem_write direction |
+| 3 | Fixed pending_bus_events | small-to-moderate | Trivial | — |
+| 4 | ROM opcode-fetch fast path / decode follow-up | large | Medium | decode direction |
