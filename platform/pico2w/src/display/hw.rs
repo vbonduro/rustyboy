@@ -96,6 +96,15 @@ impl<'d> HwDisplay<'d> {
 // Sent MSB-first over SPI: [0x08, 0xC4] → ILI9341 decodes R=1 G=6 B=4. ✓
 const C3_BE: [u8; 2] = [0x08, 0xC4];
 const BLACK_BE: [u8; 2] = [0x00, 0x00];
+const DISPLAY_X_END: u16 = 239;
+const DISPLAY_Y_END: u16 = 319;
+const GAME_Y_START: u16 = 52;
+const GAME_Y_END: u16 = 267;
+const TOP_BAR_Y_END: u16 = GAME_Y_START - 1;
+const BOTTOM_BAR_Y_START: u16 = GAME_Y_END + 1;
+const DISPLAY_ROW_PIXELS: usize = 240;
+const LETTERBOX_ROWS: usize = 52;
+const ROW_BYTES: usize = DISPLAY_ROW_PIXELS * 2;
 
 pub struct GameDisplay<'d> {
     spi: Spi<'d, SPI1, Async>,
@@ -160,15 +169,15 @@ impl<'d> GameDisplay<'d> {
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
-        self.set_window(0, 0, 239, 51).await;
+        self.set_window(0, 0, DISPLAY_X_END, TOP_BAR_Y_END).await;
         self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(52 * 240, &C3_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE).await;
         info!("display: top bar done");
 
         // Bottom bar: rows 268..319, colour black
-        self.set_window(0, 268, 239, 319).await;
+        self.set_window(0, BOTTOM_BAR_Y_START, DISPLAY_X_END, DISPLAY_Y_END).await;
         self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(52 * 240, &BLACK_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE).await;
         info!("display: letterbox bars done");
     }
 
@@ -178,8 +187,7 @@ impl<'d> GameDisplay<'d> {
     /// [`super::scale_to_rgb565`]. Returns a future; `.await` it after doing
     /// other work to overlap the ~13 ms transfer with emulation.
     pub async fn send_frame_raw(&mut self, buf: &[u16; 51840]) {
-        // CASET 0..239 / PASET 52..267 (Y_OFFSET=52, 52+216-1=267=0x010B)
-        self.set_window(0, 52, 239, 267).await;
+        self.set_window(0, GAME_Y_START, DISPLAY_X_END, GAME_Y_END).await;
         self.write_command(0x2C, &[]).await;
 
         self.dc.set_high();
@@ -212,14 +220,14 @@ impl<'d> GameDisplay<'d> {
 
     async fn fill_rect_raw(&mut self, n_pixels: usize, pixel_be: &[u8; 2]) {
         // Send 240 pixels (480 bytes) per row to keep the stack usage bounded.
-        let mut row = [0u8; 480];
+        let mut row = [0u8; ROW_BYTES];
         let mut i = 0;
-        while i < 480 {
+        while i < ROW_BYTES {
             row[i]     = pixel_be[0];
             row[i + 1] = pixel_be[1];
             i += 2;
         }
-        let n_rows = n_pixels / 240;
+        let n_rows = n_pixels / DISPLAY_ROW_PIXELS;
         self.dc.set_high();
         self.cs.set_low();
         for _ in 0..n_rows {

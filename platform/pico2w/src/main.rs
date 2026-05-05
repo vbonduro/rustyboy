@@ -132,12 +132,10 @@ async fn main(_spawner: Spawner) {
         p.SPI1, p.PIN_10, p.PIN_11, p.PIN_9, p.PIN_8, p.PIN_12, p.PIN_13,
     );
     stack_probe::paint();
-    stack_probe::log("before splash");
     info!("starting splash");
     hw_disp.splash().await;
     drop(hw_disp); // release SPI1 and all display pins for re-use as async SPI
     stack_probe::paint();
-    stack_probe::log("before cart");
 
     // GP21=Up  GP22=Down  GP26=Left  GP27=Right
     // GP0=A    GP1=B      GP2=Start  GP3=Select
@@ -203,7 +201,6 @@ async fn main(_spawner: Spawner) {
             }
         }
     };
-    stack_probe::log("after cart");
 
     info!("building GameBoyMemory");
     let memory = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
@@ -224,7 +221,6 @@ async fn main(_spawner: Spawner) {
             sp: 0xFFFE,
         })
         .with_dmg_state();
-    stack_probe::log("after cpu init");
     info!("ROM loaded, starting peripheral init");
 
     // I2S audio: GP14=BCLK  GP15=LRCLK  GP16=DIN  GP17=SD_MODE (MAX98357A).
@@ -249,7 +245,6 @@ async fn main(_spawner: Spawner) {
     i2s.start();
 
     stack_probe::paint();
-    stack_probe::log("before display dma init");
 
     // Re-initialise SPI1 as async for DMA-driven display transfers.
     // SAFETY: hw_disp was dropped above, SPI1 and all display pins are free.
@@ -264,7 +259,6 @@ async fn main(_spawner: Spawner) {
     };
     // Draw the static letterbox bars that the game loop never repaints.
     game_disp.draw_letterbox_bars().await;
-    stack_probe::log("after display dma init");
 
     info!("entering game loop");
 
