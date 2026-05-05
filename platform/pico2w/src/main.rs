@@ -41,16 +41,17 @@ use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
-use rustyboy_core::memory::{GameBoyMemory, StreamingCartridge};
+use rustyboy_core::memory::GameBoyMemory;
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::display::scale_to_rgb565;
 use rustyboy_pico2w::flash_rom::{
-    new_onboard_flash, probe_staged_rom, stage_rom_from_reader, FlashRomReader,
+    new_onboard_flash, probe_staged_rom, stage_rom_from_reader,
 };
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 use rustyboy_pico2w::stack_probe;
+use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 #[cfg(feature = "oc-266")]
 const TARGET_SYS_HZ: u32 = 266_000_000;
@@ -191,11 +192,11 @@ async fn main(_spawner: Spawner) {
         info
     };
 
-    info!("building StreamingCartridge");
-    let cart = match StreamingCartridge::new(FlashRomReader::new(onboard_flash, flash_info)) {
+    info!("building XipCartridge");
+    let cart = match XipCartridge::from_staged_flash(flash_info) {
         Ok(c) => c,
         Err(e) => {
-            error!("flash ROM load failed: {:?}", defmt::Debug2Format(&e));
+            error!("flash ROM mapping failed: {:?}", defmt::Debug2Format(&e));
             loop {
                 Timer::after(Duration::from_millis(2_000)).await;
             }

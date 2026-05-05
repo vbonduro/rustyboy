@@ -9,6 +9,20 @@ use alloc::{boxed::Box, vec, vec::Vec};
 
 // ── Cartridge trait ──────────────────────────────────────────────────────────
 
+#[cfg(feature = "perf")]
+#[derive(Default)]
+pub struct CartridgePerfProfile {
+    pub write_rom: u32,
+    pub write_ram: u32,
+    pub control_write: u32,
+    pub sync_caches: u32,
+    pub sync_caches_calls: u32,
+    pub read_bank_fixed: u32,
+    pub read_bank_fixed_calls: u32,
+    pub read_bank_switchable: u32,
+    pub read_bank_switchable_calls: u32,
+}
+
 pub trait Cartridge {
     fn read_rom(&self, addr: u16) -> u8;
     fn read_ram(&self, addr: u16) -> u8;
@@ -28,6 +42,10 @@ pub trait Cartridge {
     /// Restore MBC register state from `data` starting at `offset`.
     /// Returns number of bytes consumed. Default: 0 (no state).
     fn load_mbc_state(&mut self, _data: &[u8], _offset: usize) -> usize { 0 }
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> CartridgePerfProfile {
+        CartridgePerfProfile::default()
+    }
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -268,23 +286,35 @@ impl Cartridge for Mbc1 {
         match addr {
             // RAM enable: any write with lower nibble 0x0A enables, anything else disables
             0x0000..=0x1FFF => {
-                self.ram_enabled = value & 0x0F == 0x0A;
+                let enabled = value & 0x0F == 0x0A;
+                if self.ram_enabled != enabled {
+                    self.ram_enabled = enabled;
+                }
             }
             // ROM bank number (lower 5 bits)
             0x2000..=0x3FFF => {
-                self.rom_bank_lo = value & 0x1F;
+                let mut bank = value & 0x1F;
                 // Writing 0 is treated as 1
-                if self.rom_bank_lo == 0 {
-                    self.rom_bank_lo = 1;
+                if bank == 0 {
+                    bank = 1;
+                }
+                if self.rom_bank_lo != bank {
+                    self.rom_bank_lo = bank;
                 }
             }
             // Upper bits register (2 bits)
             0x4000..=0x5FFF => {
-                self.upper_bits = value & 0x03;
+                let bits = value & 0x03;
+                if self.upper_bits != bits {
+                    self.upper_bits = bits;
+                }
             }
             // Banking mode select
             0x6000..=0x7FFF => {
-                self.ram_mode = value & 0x01 != 0;
+                let ram_mode = value & 0x01 != 0;
+                if self.ram_mode != ram_mode {
+                    self.ram_mode = ram_mode;
+                }
             }
             // External RAM write
             0xA000..=0xBFFF => {
@@ -412,20 +442,32 @@ impl Cartridge for Mbc1Multicart {
     fn write(&mut self, addr: u16, value: u8) {
         match addr {
             0x0000..=0x1FFF => {
-                self.ram_enabled = value & 0x0F == 0x0A;
+                let enabled = value & 0x0F == 0x0A;
+                if self.ram_enabled != enabled {
+                    self.ram_enabled = enabled;
+                }
             }
             // Lower bank register: 4-bit effective, 0→1 alias preserved
             0x2000..=0x3FFF => {
-                self.rom_bank_lo = value & 0x1F;
-                if self.rom_bank_lo == 0 {
-                    self.rom_bank_lo = 1;
+                let mut bank = value & 0x1F;
+                if bank == 0 {
+                    bank = 1;
+                }
+                if self.rom_bank_lo != bank {
+                    self.rom_bank_lo = bank;
                 }
             }
             0x4000..=0x5FFF => {
-                self.upper_bits = value & 0x03;
+                let bits = value & 0x03;
+                if self.upper_bits != bits {
+                    self.upper_bits = bits;
+                }
             }
             0x6000..=0x7FFF => {
-                self.ram_mode = value & 0x01 != 0;
+                let ram_mode = value & 0x01 != 0;
+                if self.ram_mode != ram_mode {
+                    self.ram_mode = ram_mode;
+                }
             }
             0xA000..=0xBFFF => {
                 if self.ram_enabled && !self.ram.is_empty() {
@@ -638,15 +680,23 @@ impl Cartridge for Mbc3 {
         match addr {
             // RAM/timer enable
             0x0000..=0x1FFF => {
-                self.ram_rtc_enabled = value & 0x0F == 0x0A;
+                let enabled = value & 0x0F == 0x0A;
+                if self.ram_rtc_enabled != enabled {
+                    self.ram_rtc_enabled = enabled;
+                }
             }
             // ROM bank number (7-bit, 0→1)
             0x2000..=0x3FFF => {
-                self.rom_bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
+                let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
+                if self.rom_bank != bank {
+                    self.rom_bank = bank;
+                }
             }
             // RAM bank / RTC register select
             0x4000..=0x5FFF => {
-                self.bank_or_rtc = value;
+                if self.bank_or_rtc != value {
+                    self.bank_or_rtc = value;
+                }
             }
             // Latch clock data: 0x00 arms, 0x01 latches
             0x6000..=0x7FFF => {
