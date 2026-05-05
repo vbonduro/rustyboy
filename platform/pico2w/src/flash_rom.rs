@@ -1,10 +1,13 @@
 use core::fmt::Debug;
 
+use defmt::info;
 use embassy_rp::flash::{Blocking, Error as FlashError, Flash, ERASE_SIZE};
 use embassy_rp::peripherals::FLASH;
 use embassy_rp::Peri;
 
 use rustyboy_core::memory::RomReader;
+
+use crate::stack_probe;
 
 pub const FLASH_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
 pub const FIRMWARE_SLOT_BYTES: usize = 512 * 1024;
@@ -63,9 +66,23 @@ impl RomReader for FlashRomReader<'_> {
             return Err(FlashRomReadError::OutOfBounds);
         }
 
+        let offset = (ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32;
+        let log_stack = stack_probe::read_bank_logging_enabled();
+        if log_stack {
+            info!("read_bank {}: offset=0x{:x}", bank, offset);
+        }
         self.flash
-            .blocking_read((ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32, buf)
+            .blocking_read(offset, buf)
             .map_err(|_| FlashRomReadError::OutOfBounds)?;
+        if log_stack {
+            info!(
+                "read_bank {}: done, cart_type=0x{:x} ram_size_code=0x{:x}",
+                bank,
+                buf[0x0147],
+                buf[0x0149]
+            );
+            stack_probe::log_read_bank_stack(bank);
+        }
 
         Ok(())
     }

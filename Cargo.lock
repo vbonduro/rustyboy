@@ -2723,6 +2723,7 @@ dependencies = [
 name = "rustyboy-pico2w"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cortex-m",
  "cortex-m-rt",
  "defmt",

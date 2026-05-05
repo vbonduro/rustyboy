@@ -73,7 +73,9 @@ pub fn scale_to_rgb565(src: &[u8; 23040], dst: &mut [u16; 51840]) {
         let src_row = &src[gy * 160..(gy + 1) * 160];
         let dst_row = &mut dst[sy * 240..(sy + 1) * 240];
         for sx in 0..240usize {
-            dst_row[sx] = dmg_color(src_row[sx * 2 / 3]).into_storage();
+            // Store big-endian so bytemuck::cast_slice in send_frame_raw gives
+            // the correct SPI byte order without an extra copy.
+            dst_row[sx] = dmg_color(src_row[sx * 2 / 3]).into_storage().swap_bytes();
         }
     }
 }
@@ -123,7 +125,9 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
             Point::new(0, Y_OFFSET),
             Size::new(SCALED_W as u32, SCALED_H as u32),
         );
-        let _ = self.inner.fill_contiguous(&rect, buf.iter().map(|&v| Rgb565::from(RawU16::new(v))));
+        // buf stores big-endian u16s; swap back to native-endian before handing
+        // to mipidsi, which handles its own byte ordering.
+        let _ = self.inner.fill_contiguous(&rect, buf.iter().map(|&v| Rgb565::from(RawU16::new(v.swap_bytes()))));
     }
 
     fn fill_bar(&mut self, y: i32, height: i32, color: Rgb565) {
