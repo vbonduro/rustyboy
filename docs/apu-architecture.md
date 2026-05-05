@@ -57,8 +57,8 @@ Pan Docs reference: [Frequency and timer](https://gbdev.io/pandocs/Audio_details
 
 ## Ticking
 
-`ApuPeripheral::tick(cycles, div_counter)` is called **once per T-cycle** from
-`Sm83::advance_apu`. It receives the timer's internal counter *after* the timer
+`ApuPeripheral::tick(cycles, div_counter)` is called from `Sm83` with a batch of
+one or more T-cycles. It receives the timer's internal counter *after* the timer
 has advanced, and reconstructs intermediate DIV values per T-cycle to correctly
 detect the falling edge of bit 12.
 
