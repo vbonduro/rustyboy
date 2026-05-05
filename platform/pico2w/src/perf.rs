@@ -52,9 +52,39 @@ impl PerfTracker {
             let p = cpu.take_perf_profile();
             let cpu_exec = p.total.wrapping_sub(p.ppu).wrapping_sub(p.timer).wrapping_sub(p.apu);
             let decode = cpu_exec.wrapping_sub(p.mem_read).wrapping_sub(p.mem_write);
+            let mem_write_other = p
+                .mem_write
+                .wrapping_sub(p.mem_write_fast)
+                .wrapping_sub(p.mem_write_io)
+                .wrapping_sub(p.mem_write_enqueue);
             info!(
                 "cycles/60f — total={} ppu={} timer={} apu={} cpu_exec={} (mem_r={} mem_w={} decode={})",
                 p.total, p.ppu, p.timer, p.apu, cpu_exec, p.mem_read, p.mem_write, decode
+            );
+            info!(
+                "mem_write breakdown — fast={} io={} enqueue={} other={} route={}",
+                p.mem_write_fast,
+                p.mem_write_io,
+                p.mem_write_enqueue,
+                mem_write_other,
+                p.mem_write_route
+            );
+            info!(
+                "mem_write fast breakdown — rom={} eram={} vram={} wram={} oam={} hram={} unmapped={}",
+                p.mem_write_fast_rom,
+                p.mem_write_fast_eram,
+                p.mem_write_fast_vram,
+                p.mem_write_fast_wram,
+                p.mem_write_fast_oam,
+                p.mem_write_fast_hram,
+                p.mem_write_fast_unmapped
+            );
+            info!(
+                "mem_write rom breakdown — 0000-1fff={} 2000-3fff={} 4000-5fff={} 6000-7fff={}",
+                p.mem_write_fast_rom_0000_1fff,
+                p.mem_write_fast_rom_2000_3fff,
+                p.mem_write_fast_rom_4000_5fff,
+                p.mem_write_fast_rom_6000_7fff
             );
 
             let pp = cpu.take_ppu_perf_profile();
@@ -67,6 +97,20 @@ impl PerfTracker {
             info!(
                 "apu breakdown — frame_seq={} pulse={} wave={} noise={} mix={}",
                 ap.frame_seq, ap.pulse, ap.wave, ap.noise, ap.mix
+            );
+
+            let cp = cpu.take_cartridge_perf_profile();
+            info!(
+                "cart breakdown — rom={} ram={} control={} sync={} sync_calls={} bank0={} bank0_calls={} banked={} banked_calls={}",
+                cp.write_rom,
+                cp.write_ram,
+                cp.control_write,
+                cp.sync_caches,
+                cp.sync_caches_calls,
+                cp.read_bank_fixed,
+                cp.read_bank_fixed_calls,
+                cp.read_bank_switchable,
+                cp.read_bank_switchable_calls
             );
 
             // At 250 MHz, divide cycles by 250_000 to get milliseconds.

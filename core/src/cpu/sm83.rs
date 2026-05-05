@@ -157,6 +157,36 @@ pub struct Sm83PerfProfile {
     pub mem_read: u32,
     /// Time spent in memory writes (write_fast/write_io) inside bus_write, excluding tick overhead.
     pub mem_write: u32,
+    /// Time spent in direct `memory.write_fast(...)` calls from bus_write.
+    pub mem_write_fast: u32,
+    /// Time spent in `write_fast` for ROM/MBC control writes (0x0000-0x7FFF).
+    pub mem_write_fast_rom: u32,
+    /// Time spent in `write_fast` for ROM control writes at 0x0000-0x1FFF.
+    pub mem_write_fast_rom_0000_1fff: u32,
+    /// Time spent in `write_fast` for ROM control writes at 0x2000-0x3FFF.
+    pub mem_write_fast_rom_2000_3fff: u32,
+    /// Time spent in `write_fast` for ROM control writes at 0x4000-0x5FFF.
+    pub mem_write_fast_rom_4000_5fff: u32,
+    /// Time spent in `write_fast` for ROM control writes at 0x6000-0x7FFF.
+    pub mem_write_fast_rom_6000_7fff: u32,
+    /// Time spent in `write_fast` for external RAM / cartridge RAM writes (0xA000-0xBFFF).
+    pub mem_write_fast_eram: u32,
+    /// Time spent in `write_fast` for VRAM writes (0x8000-0x9FFF).
+    pub mem_write_fast_vram: u32,
+    /// Time spent in `write_fast` for WRAM writes (0xC000-0xDFFF).
+    pub mem_write_fast_wram: u32,
+    /// Time spent in `write_fast` for OAM writes (0xFE00-0xFE9F).
+    pub mem_write_fast_oam: u32,
+    /// Time spent in `write_fast` for HRAM writes (0xFF80-0xFFFE).
+    pub mem_write_fast_hram: u32,
+    /// Time spent in `write_fast` for unmapped / ignored writes.
+    pub mem_write_fast_unmapped: u32,
+    /// Time spent in direct `memory.write_io(...)` calls from bus_write.
+    pub mem_write_io: u32,
+    /// Time spent enqueueing `pending_bus_events` from bus_write.
+    pub mem_write_enqueue: u32,
+    /// Time spent draining and handling queued bus events on the next M-cycle.
+    pub mem_write_route: u32,
 }
 
 #[derive(Default)]
@@ -351,6 +381,13 @@ impl Sm83 {
         self.apu.take_perf_profile()
     }
 
+    #[cfg(feature = "perf")]
+    pub fn take_cartridge_perf_profile(
+        &mut self,
+    ) -> crate::memory::cartridge::CartridgePerfProfile {
+        self.memory.take_cartridge_perf_profile()
+    }
+
     /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
     pub fn external_ram(&self) -> Option<&[u8]> {
         self.memory.external_ram()
@@ -468,22 +505,105 @@ impl Sm83 {
         let t0 = crate::cpu::perf::cyccnt();
         let result = match addr {
             0xFF00..=0xFF7F | 0xFFFF => {
+                #[cfg(feature = "perf")]
+                let t_io = crate::cpu::perf::cyccnt();
                 self.memory.write_io(addr, value);
+                #[cfg(feature = "perf")]
+                {
+                    self.perf.mem_write_io = self
+                        .perf
+                        .mem_write_io
+                        .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_io));
+                }
+
+                #[cfg(feature = "perf")]
+                let t_enqueue = crate::cpu::perf::cyccnt();
                 self.pending_bus_events.push(BusEvent {
                     address: addr,
                     value,
                 });
+                #[cfg(feature = "perf")]
+                {
+                    self.perf.mem_write_enqueue = self
+                        .perf
+                        .mem_write_enqueue
+                        .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_enqueue));
+                }
                 Ok(())
             }
             0xE000..=0xFDFF => Err(MemoryError::ReadOnly(addr)),
             _ => {
+                #[cfg(feature = "perf")]
+                let t_fast = crate::cpu::perf::cyccnt();
                 self.memory.write_fast(addr, value);
+                #[cfg(feature = "perf")]
+                {
+                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t_fast);
+                    self.perf.mem_write_fast = self.perf.mem_write_fast.wrapping_add(dt);
+                    self.record_mem_write_fast_region(addr, dt);
+                }
                 Ok(())
             }
         };
         #[cfg(feature = "perf")]
         { self.perf.mem_write = self.perf.mem_write.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
         result
+    }
+
+    #[cfg(feature = "perf")]
+    #[inline]
+    fn record_mem_write_fast_region(&mut self, addr: u16, dt: u32) {
+        match addr {
+            0x0000..=0x7FFF => {
+                self.perf.mem_write_fast_rom = self.perf.mem_write_fast_rom.wrapping_add(dt);
+                match addr {
+                    0x0000..=0x1FFF => {
+                        self.perf.mem_write_fast_rom_0000_1fff = self
+                            .perf
+                            .mem_write_fast_rom_0000_1fff
+                            .wrapping_add(dt);
+                    }
+                    0x2000..=0x3FFF => {
+                        self.perf.mem_write_fast_rom_2000_3fff = self
+                            .perf
+                            .mem_write_fast_rom_2000_3fff
+                            .wrapping_add(dt);
+                    }
+                    0x4000..=0x5FFF => {
+                        self.perf.mem_write_fast_rom_4000_5fff = self
+                            .perf
+                            .mem_write_fast_rom_4000_5fff
+                            .wrapping_add(dt);
+                    }
+                    0x6000..=0x7FFF => {
+                        self.perf.mem_write_fast_rom_6000_7fff = self
+                            .perf
+                            .mem_write_fast_rom_6000_7fff
+                            .wrapping_add(dt);
+                    }
+                    _ => {}
+                }
+            }
+            0x8000..=0x9FFF => {
+                self.perf.mem_write_fast_vram = self.perf.mem_write_fast_vram.wrapping_add(dt);
+            }
+            0xA000..=0xBFFF => {
+                self.perf.mem_write_fast_eram = self.perf.mem_write_fast_eram.wrapping_add(dt);
+            }
+            0xC000..=0xDFFF => {
+                self.perf.mem_write_fast_wram = self.perf.mem_write_fast_wram.wrapping_add(dt);
+            }
+            0xFE00..=0xFE9F => {
+                self.perf.mem_write_fast_oam = self.perf.mem_write_fast_oam.wrapping_add(dt);
+            }
+            0xFF80..=0xFFFE => {
+                self.perf.mem_write_fast_hram = self.perf.mem_write_fast_hram.wrapping_add(dt);
+            }
+            _ => {
+                self.perf.mem_write_fast_unmapped =
+                    self.perf.mem_write_fast_unmapped.wrapping_add(dt);
+            }
+        }
     }
 
     /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
@@ -595,6 +715,12 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn route_bus_events(&mut self) {
+        if self.pending_bus_events.is_empty() {
+            return;
+        }
+
+        #[cfg(feature = "perf")]
+        let t0 = crate::cpu::perf::cyccnt();
         // Index-based loop: BusEvent is Copy, so each `e` is copied out before
         // handle_bus_event borrows &mut self, avoiding a borrow conflict.
         for i in 0..self.pending_bus_events.len() {
@@ -602,6 +728,13 @@ impl Sm83 {
             self.handle_bus_event(e.address, e.value);
         }
         self.pending_bus_events.clear();
+        #[cfg(feature = "perf")]
+        {
+            self.perf.mem_write_route = self
+                .perf
+                .mem_write_route
+                .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
