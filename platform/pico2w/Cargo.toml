@@ -19,6 +19,8 @@ oc-266 = []
 fps = []
 # Enable all profiling: implies fps and enables core APU cycle counters.
 perf = ["fps", "rustyboy-core/perf"]
+# Enable stack sentinel / collision detection instrumentation.
+stack-probe = []
 
 # ---------------------------------------------------------------------------
 # Cross-platform dependencies (compile on any target, including host tests)
@@ -67,3 +69,4 @@ embedded-sdmmc = "0.9.0"
 mipidsi = "0.8"
 display-interface-spi = "0.5"
 embedded-hal-bus = "0.1"
+bytemuck = { version = "1", default-features = false }
