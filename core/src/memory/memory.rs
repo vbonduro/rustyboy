@@ -3,7 +3,7 @@ use alloc::collections::VecDeque;
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
-use super::cartridge::{self, Cartridge, NoMbc};
+use super::cartridge::{self, Cartridge, CartridgeRomWindows, NoMbc};
 use crate::cpu::save_state::SaveState;
 
 /// An event produced when a write occurs to an I/O or IE register address.
@@ -87,6 +87,11 @@ impl RegionMapping {
 ///   Everything else: unmapped (returns 0xFF on read, silently ignored on write)
 pub struct GameBoyMemory {
     cartridge: Box<dyn Cartridge>,
+    cartridge_has_rtc: bool,
+    rom_fixed_ptr: *const u8,
+    rom_fixed_len: usize,
+    rom_banked_ptr: *const u8,
+    rom_banked_len: usize,
     vram: [u8; 0x2000],
     wram: [u8; 0x2000],
     oam: [u8; 0xA0],
@@ -98,8 +103,15 @@ pub struct GameBoyMemory {
 
 impl GameBoyMemory {
     pub fn new() -> Self {
+        let cartridge: Box<dyn Cartridge> = Box::new(NoMbc::new(vec![0u8; 0x8000]));
+        let rom_windows = cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
         Self {
-            cartridge: Box::new(NoMbc::new(vec![0u8; 0x8000])),
+            cartridge_has_rtc: cartridge.has_rtc(),
+            rom_fixed_ptr: rom_windows.fixed_ptr,
+            rom_fixed_len: rom_windows.fixed_len,
+            rom_banked_ptr: rom_windows.banked_ptr,
+            rom_banked_len: rom_windows.banked_len,
+            cartridge,
             vram: [0; 0x2000],
             wram: [0; 0x2000],
             oam: [0; 0xA0],
@@ -112,7 +124,14 @@ impl GameBoyMemory {
 
     /// Construct memory backed by a pre-built cartridge implementation.
     pub fn with_cartridge(cart: Box<dyn Cartridge>) -> Self {
+        let cartridge_has_rtc = cart.has_rtc();
+        let rom_windows = cart.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
         Self {
+            cartridge_has_rtc,
+            rom_fixed_ptr: rom_windows.fixed_ptr,
+            rom_fixed_len: rom_windows.fixed_len,
+            rom_banked_ptr: rom_windows.banked_ptr,
+            rom_banked_len: rom_windows.banked_len,
             cartridge: cart,
             vram: [0; 0x2000],
             wram: [0; 0x2000],
@@ -127,8 +146,15 @@ impl GameBoyMemory {
     /// Construct memory with a cartridge ROM. The cartridge type is auto-detected
     /// from the ROM header (byte 0x0147) to select the correct MBC.
     pub fn with_rom(data: Vec<u8>) -> Self {
+        let cartridge = cartridge::from_rom(data);
+        let rom_windows = cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
         Self {
-            cartridge: cartridge::from_rom(data),
+            cartridge_has_rtc: cartridge.has_rtc(),
+            rom_fixed_ptr: rom_windows.fixed_ptr,
+            rom_fixed_len: rom_windows.fixed_len,
+            rom_banked_ptr: rom_windows.banked_ptr,
+            rom_banked_len: rom_windows.banked_len,
+            cartridge,
             vram: [0; 0x2000],
             wram: [0; 0x2000],
             oam: [0; 0xA0],
@@ -153,9 +179,33 @@ impl GameBoyMemory {
         }
     }
 
+    #[inline(always)]
+    fn refresh_rom_windows(&mut self) {
+        let rom_windows = self.cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
+        self.rom_fixed_ptr = rom_windows.fixed_ptr;
+        self.rom_fixed_len = rom_windows.fixed_len;
+        self.rom_banked_ptr = rom_windows.banked_ptr;
+        self.rom_banked_len = rom_windows.banked_len;
+    }
+
+    #[inline(always)]
+    fn read_cached_rom(ptr: *const u8, len: usize, offset: usize) -> u8 {
+        if offset >= len {
+            return 0xFF;
+        }
+        // The cached ROM window length is derived from a live cartridge-backed
+        // slice, so offsets below `len` are valid for direct reads.
+        unsafe { *ptr.add(offset) }
+    }
+
     /// Returns the currently mapped ROM bank number for the switchable window.
     pub fn current_rom_bank(&self) -> usize {
         self.cartridge.current_rom_bank()
+    }
+
+    #[inline(always)]
+    pub fn has_rtc(&self) -> bool {
+        self.cartridge_has_rtc
     }
 
     #[cfg(feature = "perf")]
@@ -164,6 +214,7 @@ impl GameBoyMemory {
     }
 
     /// Advance the cartridge RTC by `cycles` T-cycles. No-op for non-RTC carts.
+    #[inline(always)]
     pub fn tick_rtc(&mut self, cycles: u32) {
         self.cartridge.tick_rtc(cycles);
     }
@@ -172,7 +223,7 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn read_fast(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x7FFF => self.cartridge.read_rom(address),
+            0x0000..=0x7FFF => self.read_rom_fast(address),
             0x8000..=0x9FFF => Self::read_region_fast(&self.vram, address - 0x8000),
             0xA000..=0xBFFF => self.cartridge.read_ram(address - 0xA000),
             0xC000..=0xDFFF => Self::read_region_fast(&self.wram, address - 0xC000),
@@ -185,11 +236,42 @@ impl GameBoyMemory {
         }
     }
 
+    /// Fast direct cartridge-ROM read for callers that have already proven the
+    /// address is in `0x0000..=0x7FFF`.
+    #[inline(always)]
+    pub fn read_rom_fast(&self, address: u16) -> u8 {
+        match address {
+            0x0000..=0x3FFF => {
+                if self.rom_fixed_len != 0 {
+                    Self::read_cached_rom(self.rom_fixed_ptr, self.rom_fixed_len, address as usize)
+                } else {
+                    self.cartridge.read_rom(address)
+                }
+            }
+            0x4000..=0x7FFF => {
+                if self.rom_banked_len != 0 {
+                    Self::read_cached_rom(
+                        self.rom_banked_ptr,
+                        self.rom_banked_len,
+                        (address - 0x4000) as usize,
+                    )
+                } else {
+                    self.cartridge.read_rom(address)
+                }
+            }
+            _ => 0xFF,
+        }
+    }
+
     /// Fast infallible memory write used by hot non-IO paths.
     #[inline(always)]
     pub fn write_fast(&mut self, address: u16, value: u8) {
         match address {
-            0x0000..=0x7FFF | 0xA000..=0xBFFF => self.cartridge.write(address, value),
+            0x0000..=0x7FFF => {
+                self.cartridge.write(address, value);
+                self.refresh_rom_windows();
+            }
+            0xA000..=0xBFFF => self.cartridge.write(address, value),
             0x8000..=0x9FFF => Self::write_region_fast(&mut self.vram, address - 0x8000, value),
             0xC000..=0xDFFF => Self::write_region_fast(&mut self.wram, address - 0xC000, value),
             0xE000..=0xFDFF => {}
@@ -296,6 +378,7 @@ impl GameBoyMemory {
             // We build a minimal 4-byte buffer and reuse load_mbc_state.
             let buf = [mbc.rom_bank_lo, mbc.upper_bits, mbc.ram_mode as u8, mbc.ram_enabled as u8];
             self.cartridge.load_mbc_state(&buf, 0);
+            self.refresh_rom_windows();
         }
         if let Some(ram) = state.cart_ram() {
             self.cartridge.set_external_ram(ram);
@@ -345,7 +428,7 @@ impl GameBoyMemory {
 impl Memory for GameBoyMemory {
     fn read(&self, address: u16) -> Result<u8, Error> {
         match RegionMapping::for_address(address) {
-            RegionMapping::Rom => Ok(self.cartridge.read_rom(address)),
+            RegionMapping::Rom => Ok(self.read_rom_fast(address)),
             RegionMapping::Vram(offset) => Ok(self.vram[offset as usize]),
             RegionMapping::ExternalRam(offset) => Ok(self.cartridge.read_ram(offset)),
             RegionMapping::Wram(offset) => Ok(self.wram[offset as usize]),
@@ -361,7 +444,12 @@ impl Memory for GameBoyMemory {
     fn write(&mut self, address: u16, value: u8) -> Result<(), Error> {
         match RegionMapping::for_address(address) {
             // ROM writes and external RAM writes go to the cartridge (MBC registers or RAM)
-            RegionMapping::Rom | RegionMapping::ExternalRam(_) => {
+            RegionMapping::Rom => {
+                self.cartridge.write(address, value);
+                self.refresh_rom_windows();
+                Ok(())
+            }
+            RegionMapping::ExternalRam(_) => {
                 self.cartridge.write(address, value);
                 Ok(())
             }
@@ -406,6 +494,19 @@ mod tests {
     use super::*;
     use alloc::format;
 
+    fn make_mbc1_rom(size_kb: usize) -> Vec<u8> {
+        let size = size_kb * 1024;
+        let mut data = vec![0u8; size];
+        for bank in 0..(size / 0x4000) {
+            for byte in &mut data[bank * 0x4000..(bank + 1) * 0x4000] {
+                *byte = bank as u8;
+            }
+        }
+        data[0x0147] = 0x01;
+        data[0x0148] = (size / (32 * 1024)).trailing_zeros() as u8;
+        data
+    }
+
     // --- ROM region (read-only) ---
 
     #[test]
@@ -425,6 +526,21 @@ mod tests {
         assert!(mem.write(0x0000, 0xFF).is_ok());
         // ROM data should be unchanged
         assert_eq!(mem.read(0x0000).unwrap(), 0x11);
+    }
+
+    #[test]
+    fn test_read_fast_rom_cache_tracks_bank_switches() {
+        let mut mem = GameBoyMemory::with_rom(make_mbc1_rom(128));
+
+        assert_eq!(mem.read_fast(0x0000), 0x00);
+        assert_eq!(mem.read_fast(0x4000), 0x01);
+
+        mem.write(0x2000, 0x03).unwrap();
+        assert_eq!(mem.read_fast(0x0000), 0x00);
+        assert_eq!(mem.read_fast(0x4000), 0x03);
+
+        mem.write_fast(0x2000, 0x02);
+        assert_eq!(mem.read_fast(0x4000), 0x02);
     }
 
     // --- VRAM (0x8000–0x9FFF) ---

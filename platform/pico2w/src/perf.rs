@@ -50,7 +50,11 @@ impl PerfTracker {
         #[cfg(feature = "perf")]
         {
             let p = cpu.take_perf_profile();
-            let cpu_exec = p.total.wrapping_sub(p.ppu).wrapping_sub(p.timer).wrapping_sub(p.apu);
+            let cpu_exec = p
+                .total
+                .wrapping_sub(p.ppu)
+                .wrapping_sub(p.timer)
+                .wrapping_sub(p.apu);
             let decode = cpu_exec.wrapping_sub(p.mem_read).wrapping_sub(p.mem_write);
             let mem_write_other = p
                 .mem_write
@@ -60,6 +64,26 @@ impl PerfTracker {
             info!(
                 "cycles/60f — total={} ppu={} timer={} apu={} cpu_exec={} (mem_r={} mem_w={} decode={})",
                 p.total, p.ppu, p.timer, p.apu, cpu_exec, p.mem_read, p.mem_write, decode
+            );
+            info!(
+                "decode hotspots/60f (nested) — pc_fetch={} rom_pc_fetch={} rom_pc_fetch_idle={} bus_read={} opcode={} cb_prefix={} operand8={}",
+                p.pc_fetch,
+                p.pc_fetch_rom,
+                p.pc_fetch_rom_idle,
+                p.bus_read,
+                p.opcode_dispatch,
+                p.cb_prefix,
+                p.operand8
+            );
+            info!(
+                "decode hotspot calls/60f — pc_fetch={} rom_pc_fetch={} rom_pc_fetch_idle={} bus_read={} opcode={} cb_prefix={} operand8={}",
+                p.pc_fetch_calls,
+                p.pc_fetch_rom_calls,
+                p.pc_fetch_rom_idle_calls,
+                p.bus_read_calls,
+                p.opcode_dispatch_calls,
+                p.cb_prefix_calls,
+                p.operand8_calls
             );
             info!(
                 "mem_write breakdown — fast={} io={} enqueue={} other={} route={}",

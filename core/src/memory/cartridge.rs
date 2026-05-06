@@ -23,12 +23,34 @@ pub struct CartridgePerfProfile {
     pub read_bank_switchable_calls: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct CartridgeRomWindows {
+    pub fixed_ptr: *const u8,
+    pub fixed_len: usize,
+    pub banked_ptr: *const u8,
+    pub banked_len: usize,
+}
+
+impl CartridgeRomWindows {
+    pub const EMPTY: Self = Self {
+        fixed_ptr: core::ptr::null(),
+        fixed_len: 0,
+        banked_ptr: core::ptr::null(),
+        banked_len: 0,
+    };
+}
+
 pub trait Cartridge {
     fn read_rom(&self, addr: u16) -> u8;
     fn read_ram(&self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, value: u8);
+    /// Returns direct pointers to the currently mapped ROM windows when the
+    /// cartridge can expose them safely for hot-path reads.
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> { None }
     /// Returns the currently mapped ROM bank number for the switchable window (0x4000–0x7FFF).
     fn current_rom_bank(&self) -> usize { 1 }
+    /// Returns whether this cartridge needs per-M-cycle RTC ticking.
+    fn has_rtc(&self) -> bool { false }
     /// Advance the cartridge clock by `cycles` T-cycles (4 MHz). Only meaningful for
     /// MBC3 carts with an RTC; other implementations ignore this.
     fn tick_rtc(&mut self, _cycles: u32) {}
@@ -134,6 +156,13 @@ fn decode_ram_size(code: u8) -> usize {
     }
 }
 
+fn rom_window(rom: &[u8], base: usize) -> (*const u8, usize) {
+    match rom.get(base..) {
+        Some(slice) => (slice.as_ptr(), slice.len().min(0x4000)),
+        None => (core::ptr::null(), 0),
+    }
+}
+
 // ── NoMbc ────────────────────────────────────────────────────────────────────
 
 /// Flat ROM with no bank switching. Supports up to 32 KiB ROM and 8 KiB RAM.
@@ -152,6 +181,17 @@ impl NoMbc {
 }
 
 impl Cartridge for NoMbc {
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> {
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, 0);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, 0x4000);
+        Some(CartridgeRomWindows {
+            fixed_ptr,
+            fixed_len,
+            banked_ptr,
+            banked_len,
+        })
+    }
+
     fn read_rom(&self, addr: u16) -> u8 {
         self.rom.get(addr as usize).copied().unwrap_or(0xFF)
     }
@@ -256,6 +296,17 @@ impl Mbc1 {
 }
 
 impl Cartridge for Mbc1 {
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> {
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * 0x4000);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * 0x4000);
+        Some(CartridgeRomWindows {
+            fixed_ptr,
+            fixed_len,
+            banked_ptr,
+            banked_len,
+        })
+    }
+
     fn external_ram(&self) -> Option<&[u8]> {
         if self.ram.is_empty() { None } else { Some(&self.ram) }
     }
@@ -415,6 +466,17 @@ impl Mbc1Multicart {
 }
 
 impl Cartridge for Mbc1Multicart {
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> {
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * 0x4000);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * 0x4000);
+        Some(CartridgeRomWindows {
+            fixed_ptr,
+            fixed_len,
+            banked_ptr,
+            banked_len,
+        })
+    }
+
     fn external_ram(&self) -> Option<&[u8]> {
         if self.ram.is_empty() { None } else { Some(&self.ram) }
     }
@@ -640,6 +702,17 @@ impl Mbc3 {
 }
 
 impl Cartridge for Mbc3 {
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> {
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, 0);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank as usize * 0x4000);
+        Some(CartridgeRomWindows {
+            fixed_ptr,
+            fixed_len,
+            banked_ptr,
+            banked_len,
+        })
+    }
+
     fn external_ram(&self) -> Option<&[u8]> {
         if self.ram.is_empty() { None } else { Some(&self.ram) }
     }
@@ -648,6 +721,10 @@ impl Cartridge for Mbc3 {
         self.ram[..len].copy_from_slice(&data[..len]);
     }
     fn current_rom_bank(&self) -> usize { self.rom_bank as usize }
+
+    fn has_rtc(&self) -> bool {
+        self.has_timer
+    }
 
     fn tick_rtc(&mut self, cycles: u32) {
         self.tick(cycles);

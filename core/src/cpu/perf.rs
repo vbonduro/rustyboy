@@ -44,6 +44,35 @@ pub struct Sm83PerfProfile {
     pub mem_write_enqueue: u32,
     /// Time spent draining and handling queued bus events on the next M-cycle.
     pub mem_write_route: u32,
+    /// Nested decode hotspot: time spent in `read_next_pc`, excluding nested PPU/timer/APU work.
+    pub pc_fetch: u32,
+    /// Number of `read_next_pc` calls.
+    pub pc_fetch_calls: u32,
+    /// Nested decode hotspot: `read_next_pc` time for PC reads in cartridge ROM space.
+    pub pc_fetch_rom: u32,
+    /// Number of `read_next_pc` calls in `0x0000..=0x7FFF`.
+    pub pc_fetch_rom_calls: u32,
+    /// Nested decode hotspot: ROM `read_next_pc` common-case fast path
+    /// (no queued bus events, DMA, active serial transfer, or cartridge RTC).
+    pub pc_fetch_rom_idle: u32,
+    /// Number of ROM `read_next_pc` calls that used the common-case fast path.
+    pub pc_fetch_rom_idle_calls: u32,
+    /// Nested decode hotspot: time spent in generic non-wave `bus_read`, excluding nested PPU/timer/APU work.
+    pub bus_read: u32,
+    /// Number of generic non-wave `bus_read` calls.
+    pub bus_read_calls: u32,
+    /// Nested decode hotspot: time spent in opcode-table lookup (`get` / `get_cb`).
+    pub opcode_dispatch: u32,
+    /// Number of opcode-table lookups.
+    pub opcode_dispatch_calls: u32,
+    /// Nested decode hotspot: time spent in the `0xCB` prefix path, including second-byte fetch.
+    pub cb_prefix: u32,
+    /// Number of `0xCB` prefix dispatches.
+    pub cb_prefix_calls: u32,
+    /// Nested decode hotspot: time spent in `get_8bit_operand`, excluding nested PPU/timer/APU work.
+    pub operand8: u32,
+    /// Number of `get_8bit_operand` calls.
+    pub operand8_calls: u32,
 }
 
 #[cfg(feature = "perf")]
@@ -53,10 +82,36 @@ pub(crate) struct Sm83PerfRecorder {
 }
 
 #[cfg(feature = "perf")]
+#[derive(Clone, Copy)]
+pub(crate) struct NestedPerfSnapshot {
+    ppu: u32,
+    timer: u32,
+    apu: u32,
+}
+
+#[cfg(feature = "perf")]
 impl Sm83PerfRecorder {
     #[inline]
     pub(crate) fn take_profile(&mut self) -> Sm83PerfProfile {
         core::mem::take(&mut self.profile)
+    }
+
+    #[inline]
+    pub(crate) fn nested_snapshot(&self) -> NestedPerfSnapshot {
+        NestedPerfSnapshot {
+            ppu: self.profile.ppu,
+            timer: self.profile.timer,
+            apu: self.profile.apu,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn nested_cycles_since(&self, snapshot: NestedPerfSnapshot) -> u32 {
+        self.profile
+            .ppu
+            .wrapping_sub(snapshot.ppu)
+            .wrapping_add(self.profile.timer.wrapping_sub(snapshot.timer))
+            .wrapping_add(self.profile.apu.wrapping_sub(snapshot.apu))
     }
 
     #[inline]
@@ -141,6 +196,46 @@ impl Sm83PerfRecorder {
     }
 
     #[inline]
+    pub(crate) fn record_pc_fetch(&mut self, addr: u16, dt: u32) {
+        self.profile.pc_fetch = self.profile.pc_fetch.wrapping_add(dt);
+        self.profile.pc_fetch_calls = self.profile.pc_fetch_calls.wrapping_add(1);
+        if addr <= 0x7FFF {
+            self.profile.pc_fetch_rom = self.profile.pc_fetch_rom.wrapping_add(dt);
+            self.profile.pc_fetch_rom_calls = self.profile.pc_fetch_rom_calls.wrapping_add(1);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn record_pc_fetch_rom_idle(&mut self, dt: u32) {
+        self.profile.pc_fetch_rom_idle = self.profile.pc_fetch_rom_idle.wrapping_add(dt);
+        self.profile.pc_fetch_rom_idle_calls = self.profile.pc_fetch_rom_idle_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_bus_read(&mut self, dt: u32) {
+        self.profile.bus_read = self.profile.bus_read.wrapping_add(dt);
+        self.profile.bus_read_calls = self.profile.bus_read_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_opcode_dispatch(&mut self, dt: u32) {
+        self.profile.opcode_dispatch = self.profile.opcode_dispatch.wrapping_add(dt);
+        self.profile.opcode_dispatch_calls = self.profile.opcode_dispatch_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_cb_prefix(&mut self, dt: u32) {
+        self.profile.cb_prefix = self.profile.cb_prefix.wrapping_add(dt);
+        self.profile.cb_prefix_calls = self.profile.cb_prefix_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_operand8(&mut self, dt: u32) {
+        self.profile.operand8 = self.profile.operand8.wrapping_add(dt);
+        self.profile.operand8_calls = self.profile.operand8_calls.wrapping_add(1);
+    }
+
+    #[inline]
     pub(crate) fn record_ppu(&mut self, dt: u32) {
         self.profile.ppu = self.profile.ppu.wrapping_add(dt);
     }
@@ -196,6 +291,31 @@ mod tests {
         assert_eq!(profile.mem_write_fast_rom, 3);
         assert_eq!(profile.mem_write_fast_rom_2000_3fff, 3);
         assert_eq!(profile.mem_write_fast_wram, 5);
+    }
+
+    #[test]
+    fn record_decode_hotspots_track_cycles_and_calls() {
+        let mut perf = Sm83PerfRecorder::default();
+        perf.record_pc_fetch(0x1234, 3);
+        perf.record_pc_fetch(0xC123, 5);
+        perf.record_bus_read(7);
+        perf.record_opcode_dispatch(11);
+        perf.record_cb_prefix(13);
+        perf.record_operand8(17);
+
+        let profile = perf.take_profile();
+        assert_eq!(profile.pc_fetch, 8);
+        assert_eq!(profile.pc_fetch_calls, 2);
+        assert_eq!(profile.pc_fetch_rom, 3);
+        assert_eq!(profile.pc_fetch_rom_calls, 1);
+        assert_eq!(profile.bus_read, 7);
+        assert_eq!(profile.bus_read_calls, 1);
+        assert_eq!(profile.opcode_dispatch, 11);
+        assert_eq!(profile.opcode_dispatch_calls, 1);
+        assert_eq!(profile.cb_prefix, 13);
+        assert_eq!(profile.cb_prefix_calls, 1);
+        assert_eq!(profile.operand8, 17);
+        assert_eq!(profile.operand8_calls, 1);
     }
 
     #[test]
