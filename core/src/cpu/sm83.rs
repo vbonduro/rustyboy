@@ -154,20 +154,22 @@ struct PendingApuCycles {
 }
 
 impl PendingApuCycles {
+    #[inline(always)]
     fn queue(&mut self, cycles: u16) {
-        if cycles == 0 {
-            return;
-        }
-        self.cycles = self
-            .cycles
-            .checked_add(cycles)
-            .expect("pending APU cycle batch overflow");
+        debug_assert!(cycles != 0);
+        debug_assert!(
+            self.cycles <= u16::MAX - cycles,
+            "pending APU cycle batch overflow"
+        );
+        self.cycles = self.cycles.wrapping_add(cycles);
     }
 
+    #[inline(always)]
     fn take(&mut self) -> u16 {
         core::mem::take(&mut self.cycles)
     }
 
+    #[inline(always)]
     fn is_empty(&self) -> bool {
         self.cycles == 0
     }
@@ -184,11 +186,19 @@ pub struct Sm83 {
     joypad: JoypadPeripheral,
     ime: ImeState,
     halted: bool,
-    /// Cycle counter incremented by 4 on each M-cycle (bus_read/bus_write/tick_cycle).
+    /// Total committed T-cycles. Current-instruction M-cycles are batched in
+    /// `pending_cycle_counter` and flushed once per `tick()`.
     cycle_counter: u64,
+    /// Unflushed T-cycles accrued inside the current instruction or direct
+    /// internal M-cycle helpers. This keeps the hot path on a small integer
+    /// add instead of touching the `u64` total on every M-cycle.
+    pending_cycle_counter: u16,
     /// Pending OAM DMA transfer. When Some, holds the source page and number of
     /// bytes already copied. Each M-cycle advances the transfer by one byte.
     dma: Option<DmaState>,
+    /// Cached blockers for the idle M-cycle fast path so hot fetches do not
+    /// have to rescan DMA/serial/bus-event state on every call.
+    idle_m_cycle_blockers: u8,
     /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
     /// read a fully-rendered frame rather than one mid-render.
     front_buffer: [u8; FRAMEBUFFER_SIZE],
@@ -213,6 +223,11 @@ struct DmaState {
     progress: u8,
 }
 
+const IDLE_M_CYCLE_BLOCK_BUS_EVENTS: u8 = 1 << 0;
+const IDLE_M_CYCLE_BLOCK_DMA: u8 = 1 << 1;
+const IDLE_M_CYCLE_BLOCK_SERIAL: u8 = 1 << 2;
+const IDLE_M_CYCLE_BLOCK_RTC: u8 = 1 << 3;
+
 impl Sm83 {
     pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
         let joypad = JoypadPeripheral::new();
@@ -229,7 +244,9 @@ impl Sm83 {
             ime: ImeState::Disabled,
             halted: false,
             cycle_counter: 0,
+            pending_cycle_counter: 0,
             dma: None,
+            idle_m_cycle_blockers: 0,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
             pending_apu_cycles: PendingApuCycles::default(),
             pending_bus_events: Vec::with_capacity(4),
@@ -255,6 +272,7 @@ impl Sm83 {
             sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
         }
         sm83.cache.sync(&sm83.memory);
+        sm83.refresh_idle_m_cycle_fast_path_blockers();
         sm83
     }
 
@@ -313,6 +331,7 @@ impl Sm83 {
     /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
     pub fn cycle_counter(&self) -> u64 {
         self.cycle_counter
+            .wrapping_add(self.pending_cycle_counter as u64)
     }
 
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
@@ -364,7 +383,9 @@ impl Sm83 {
             d: self.registers.d, e: self.registers.e, h: self.registers.h,
             l: self.registers.l, f: self.registers.f,
             sp: self.registers.sp, pc: self.registers.pc,
-            ime: self.ime, halted: self.halted, cycle_counter: self.cycle_counter,
+            ime: self.ime,
+            halted: self.halted,
+            cycle_counter: self.cycle_counter(),
         };
         SaveState::serialize(cpu, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
     }
@@ -380,10 +401,12 @@ impl Sm83 {
         self.ime           = state.cpu.ime;
         self.halted        = state.cpu.halted;
         self.cycle_counter = state.cpu.cycle_counter;
+        self.pending_cycle_counter = 0;
         self.timer.load_state(state.timer);
         self.ppu.load_state(state.ppu);
         self.memory.load_state(&state);
         self.cache.sync(&self.memory);
+        self.refresh_idle_m_cycle_fast_path_blockers();
         Ok(())
     }
 
@@ -451,40 +474,65 @@ impl Sm83 {
 
     /// Fast path for opcode/immediate fetches when `PC` is in cartridge ROM.
     ///
-    /// This preserves the exact same M-cycle-side effects as `bus_read`.
-    /// When the M-cycle is otherwise idle, we bypass the generic helper stack
-    /// entirely and run the straight-line common case directly.
+    /// This preserves the exact same M-cycle-side effects as `bus_read`,
+    /// but only for ROM fetches that still need the full generic M-cycle path.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn read_pc_rom_fast(&mut self, addr: u16) -> u8 {
+        self.tick_cycle();
+        #[cfg(feature = "perf")]
+        let t_read = cyccnt();
+        let value = self.read_pc_rom_byte_fast(addr);
+        #[cfg(feature = "perf")]
+        {
+            let dt = cyccnt().wrapping_sub(t_read);
+            self.perf.record_mem_read(dt);
+            self.perf.record_pc_fetch_rom_read(dt);
+        }
+        value
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn read_pc_rom_byte_fast(&self, addr: u16) -> u8 {
+        if addr <= 0x3FFF {
+            self.memory.read_rom_fixed_fast(addr)
+        } else {
+            self.memory.read_rom_banked_fast(addr)
+        }
+    }
+
+    /// Fused common-case ROM `PC` fetch. This collapses the hot idle-ROM path
+    /// into one straight-line helper so `read_next_pc()` does not pay another
+    /// layer of dispatch and bookkeeping on the overwhelmingly common case.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn read_next_pc_rom_idle_fast(&mut self, addr: u16) -> u8 {
         #[cfg(feature = "perf")]
         let nested0 = self.perf.nested_snapshot();
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
-        if self.can_use_idle_m_cycle_fast_path() {
-            self.run_idle_m_cycle();
-            #[cfg(feature = "perf")]
-            let t_read = cyccnt();
-            let value = self.memory.read_rom_fast(addr);
-            #[cfg(feature = "perf")]
-            {
-                let t1 = cyccnt();
-                self.perf.record_mem_read(t1.wrapping_sub(t_read));
-                self.perf.record_pc_fetch_rom_idle(
-                    t1.wrapping_sub(t0)
-                        .wrapping_sub(self.perf.nested_cycles_since(nested0)),
-                );
-            }
-            return value;
-        }
-
-        self.tick_cycle();
+        self.run_idle_m_cycle();
         #[cfg(feature = "perf")]
         let t_read = cyccnt();
-        let value = self.memory.read_rom_fast(addr);
+        let value = self.read_pc_rom_byte_fast(addr);
+        #[cfg(feature = "perf")]
+        let t_after_read = cyccnt();
+        self.registers.pc = self.registers.pc.wrapping_add(1);
         #[cfg(feature = "perf")]
         {
-            self.perf.record_mem_read(cyccnt().wrapping_sub(t_read));
+            let t_after_pc = cyccnt();
+            let nested = self.perf.nested_cycles_since(nested0);
+            let rom_read_dt = t_after_read.wrapping_sub(t_read);
+            self.perf.record_mem_read(rom_read_dt);
+            self.perf.record_pc_fetch_rom_read(rom_read_dt);
+            self.perf.record_pc_fetch_rom_idle(
+                t_after_read.wrapping_sub(t0).wrapping_sub(nested),
+            );
+            self.perf
+                .record_pc_fetch_wrapper(t_after_pc.wrapping_sub(t_after_read));
+            self.perf
+                .record_pc_fetch(addr, t_after_pc.wrapping_sub(t0).wrapping_sub(nested));
         }
         value
     }
@@ -529,6 +577,7 @@ impl Sm83 {
                     address: addr,
                     value,
                 });
+                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
                 #[cfg(feature = "perf")]
                 {
                     self.perf.record_mem_write_enqueue(cyccnt().wrapping_sub(t_enqueue));
@@ -581,6 +630,11 @@ impl Sm83 {
         } else {
             None
         };
+        if self.dma.is_some() {
+            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
+        } else {
+            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -609,6 +663,11 @@ impl Sm83 {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << SERIAL_INTERRUPT_BIT));
         }
+        if self.serial.is_idle() {
+            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+        } else {
+            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+        }
     }
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
@@ -627,7 +686,7 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn begin_m_cycle(&mut self) {
-        self.cycle_counter += 4;
+        self.pending_cycle_counter += 4;
         self.flush_apu_before_bus_events();
         self.route_bus_events();
         self.advance_dma();
@@ -636,16 +695,13 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn can_use_idle_m_cycle_fast_path(&self) -> bool {
-        self.pending_bus_events.is_empty()
-            && self.dma.is_none()
-            && self.serial.is_idle()
-            && !self.memory.has_rtc()
+        self.idle_m_cycle_blockers == 0
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn run_idle_m_cycle(&mut self) {
-        self.cycle_counter += 4;
+        self.pending_cycle_counter += 4;
         self.advance_ppu(4);
         self.advance_timer(4);
         self.queue_apu_cycles(4);
@@ -653,10 +709,37 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn begin_t3_sensitive_m_cycle(&mut self) {
-        self.cycle_counter += 4;
+        self.pending_cycle_counter += 4;
         self.flush_pending_apu_cycles();
         self.route_bus_events();
         self.advance_dma();
+    }
+
+    #[inline(always)]
+    fn set_idle_m_cycle_blocker(&mut self, blocker: u8) {
+        self.idle_m_cycle_blockers |= blocker;
+    }
+
+    #[inline(always)]
+    fn clear_idle_m_cycle_blocker(&mut self, blocker: u8) {
+        self.idle_m_cycle_blockers &= !blocker;
+    }
+
+    fn refresh_idle_m_cycle_fast_path_blockers(&mut self) {
+        let mut blockers = 0;
+        if !self.pending_bus_events.is_empty() {
+            blockers |= IDLE_M_CYCLE_BLOCK_BUS_EVENTS;
+        }
+        if self.dma.is_some() {
+            blockers |= IDLE_M_CYCLE_BLOCK_DMA;
+        }
+        if !self.serial.is_idle() {
+            blockers |= IDLE_M_CYCLE_BLOCK_SERIAL;
+        }
+        if self.memory.has_rtc() {
+            blockers |= IDLE_M_CYCLE_BLOCK_RTC;
+        }
+        self.idle_m_cycle_blockers = blockers;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -702,6 +785,7 @@ impl Sm83 {
             self.handle_bus_event(e.address, e.value);
         }
         self.pending_bus_events.clear();
+        self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
         #[cfg(feature = "perf")]
         {
             self.perf.record_mem_write_route(cyccnt().wrapping_sub(t0));
@@ -718,6 +802,11 @@ impl Sm83 {
             a if a == SC_ADDR => {
                 let sb = self.memory.read_io(SB_ADDR);
                 self.serial.handle_sc_write(value, sb);
+                if self.serial.is_idle() {
+                    self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+                } else {
+                    self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+                }
             }
             a if a == DIV_ADDR => {
                 self.timer.reset_div();
@@ -726,6 +815,7 @@ impl Sm83 {
             a if a == LY_ADDR => self.ppu.reset_ly(),
             a if a == DMA_ADDR => {
                 self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
+                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
             }
             a if (NR10_ADDR..=NR52_ADDR).contains(&a) => self.write_apu_register(a, value),
             // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
@@ -876,9 +966,14 @@ impl Sm83 {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn finish_tick(&mut self, start_cycles: u64) -> u8 {
+    fn finish_tick(&mut self) -> u8 {
         self.flush_pending_apu_cycles();
-        (self.cycle_counter - start_cycles) as u8
+        let cycles = self.pending_cycle_counter as u8;
+        self.cycle_counter = self
+            .cycle_counter
+            .wrapping_add(self.pending_cycle_counter as u64);
+        self.pending_cycle_counter = 0;
+        cycles
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -919,6 +1014,9 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
         let addr = self.registers.pc;
+        if addr <= 0x7FFF && self.can_use_idle_m_cycle_fast_path() {
+            return Ok(self.read_next_pc_rom_idle_fast(addr));
+        }
         #[cfg(feature = "perf")]
         let nested0 = self.perf.nested_snapshot();
         #[cfg(feature = "perf")]
@@ -928,12 +1026,17 @@ impl Sm83 {
         } else {
             self.bus_read(addr)?
         };
+        #[cfg(feature = "perf")]
+        let t_after_fetch = cyccnt();
         self.registers.pc = self.registers.pc.wrapping_add(1);
         #[cfg(feature = "perf")]
         {
+            let t_after_pc = cyccnt();
+            self.perf
+                .record_pc_fetch_wrapper(t_after_pc.wrapping_sub(t_after_fetch));
             self.perf.record_pc_fetch(
                 addr,
-                cyccnt()
+                t_after_pc
                     .wrapping_sub(t0)
                     .wrapping_sub(self.perf.nested_cycles_since(nested0)),
             );
@@ -1100,7 +1203,12 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn tick_impl(&mut self) -> Result<u8, CpuError> {
-        let start_cycles = self.cycle_counter;
+        if self.pending_cycle_counter != 0 {
+            self.cycle_counter = self
+                .cycle_counter
+                .wrapping_add(self.pending_cycle_counter as u64);
+            self.pending_cycle_counter = 0;
+        }
 
         if self.halted {
             self.tick_cycle(); // 1 M-cycle while halted
@@ -1114,10 +1222,10 @@ impl Sm83 {
                     if let Some(bit) = self.take_pending_interrupt() {
                         self.dispatch_interrupt(bit)?;
                     }
-                    return Ok(self.finish_tick(start_cycles));
+                    return Ok(self.finish_tick());
                 }
             } else {
-                return Ok(self.finish_tick(start_cycles));
+                return Ok(self.finish_tick());
             }
         }
 
@@ -1183,7 +1291,7 @@ impl Sm83 {
             });
         }
 
-        Ok(self.finish_tick(start_cycles))
+        Ok(self.finish_tick())
     }
 }
 
@@ -2903,6 +3011,8 @@ mod tests {
         assert_eq!(perf.pc_fetch_calls, 1);
         assert_eq!(perf.pc_fetch_rom_calls, 1);
         assert_eq!(perf.pc_fetch_rom_idle_calls, 1);
+        assert_eq!(perf.pc_fetch_wrapper_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_read_calls, 1);
         assert_eq!(perf.bus_read_calls, 0);
     }
 
@@ -2924,6 +3034,8 @@ mod tests {
         assert_eq!(perf.pc_fetch_calls, 1);
         assert_eq!(perf.pc_fetch_rom_calls, 0);
         assert_eq!(perf.pc_fetch_rom_idle_calls, 0);
+        assert_eq!(perf.pc_fetch_wrapper_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_read_calls, 0);
         assert_eq!(perf.bus_read_calls, 1);
     }
 
@@ -2934,6 +3046,7 @@ mod tests {
             ..Default::default()
         });
         cpu.dma = Some(DmaState { source: 0x0000, progress: 0 });
+        cpu.refresh_idle_m_cycle_fast_path_blockers();
 
         let cycles = cpu.tick().unwrap();
         let perf = cpu.take_perf_profile();
@@ -2942,7 +3055,33 @@ mod tests {
         assert_eq!(perf.pc_fetch_calls, 1);
         assert_eq!(perf.pc_fetch_rom_calls, 1);
         assert_eq!(perf.pc_fetch_rom_idle_calls, 0);
+        assert_eq!(perf.pc_fetch_wrapper_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_read_calls, 1);
         assert_eq!(cpu.dma.as_ref().map(|d| d.progress), Some(1));
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn test_rom_pc_fetch_skips_idle_fast_path_when_bus_events_are_pending() {
+        let mut cpu = make_test_cpu(vec![0x00]).with_registers(Registers {
+            ..Default::default()
+        });
+        cpu.pending_bus_events.push(BusEvent {
+            address: JOYP_ADDR,
+            value: 0x20,
+        });
+        cpu.refresh_idle_m_cycle_fast_path_blockers();
+
+        let cycles = cpu.tick().unwrap();
+        let perf = cpu.take_perf_profile();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(perf.pc_fetch_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_idle_calls, 0);
+        assert_eq!(perf.pc_fetch_wrapper_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_read_calls, 1);
+        assert!(cpu.pending_bus_events.is_empty());
     }
 
     /// HALT (0x76): returns 4 cycles without crashing.
@@ -3761,9 +3900,11 @@ mod tests {
 
         cpu.tick_cycle();
         assert_eq!(cpu.pending_apu_cycles.cycles, 4);
+        assert_eq!(cpu.cycle_counter(), 4);
 
         cpu.tick_cycle_to_t3();
 
         assert_eq!(cpu.pending_apu_cycles.cycles, 3);
+        assert_eq!(cpu.cycle_counter(), 8);
     }
 }

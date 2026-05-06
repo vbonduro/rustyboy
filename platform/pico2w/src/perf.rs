@@ -66,20 +66,24 @@ impl PerfTracker {
                 p.total, p.ppu, p.timer, p.apu, cpu_exec, p.mem_read, p.mem_write, decode
             );
             info!(
-                "decode hotspots/60f (nested) — pc_fetch={} rom_pc_fetch={} rom_pc_fetch_idle={} bus_read={} opcode={} cb_prefix={} operand8={}",
+                "decode hotspots/60f (nested) — pc_fetch={} pc_fetch_wrapper={} rom_pc_fetch={} rom_pc_fetch_idle={} rom_pc_fetch_read={} bus_read={} opcode={} cb_prefix={} operand8={}",
                 p.pc_fetch,
+                p.pc_fetch_wrapper,
                 p.pc_fetch_rom,
                 p.pc_fetch_rom_idle,
+                p.pc_fetch_rom_read,
                 p.bus_read,
                 p.opcode_dispatch,
                 p.cb_prefix,
                 p.operand8
             );
             info!(
-                "decode hotspot calls/60f — pc_fetch={} rom_pc_fetch={} rom_pc_fetch_idle={} bus_read={} opcode={} cb_prefix={} operand8={}",
+                "decode hotspot calls/60f — pc_fetch={} pc_fetch_wrapper={} rom_pc_fetch={} rom_pc_fetch_idle={} rom_pc_fetch_read={} bus_read={} opcode={} cb_prefix={} operand8={}",
                 p.pc_fetch_calls,
+                p.pc_fetch_wrapper_calls,
                 p.pc_fetch_rom_calls,
                 p.pc_fetch_rom_idle_calls,
+                p.pc_fetch_rom_read_calls,
                 p.bus_read_calls,
                 p.opcode_dispatch_calls,
                 p.cb_prefix_calls,
