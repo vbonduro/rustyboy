@@ -88,6 +88,9 @@ impl RegionMapping {
 pub struct GameBoyMemory {
     cartridge: Box<dyn Cartridge>,
     cartridge_has_rtc: bool,
+    cartridge_has_rom_windows: bool,
+    rom_fixed_full_window: bool,
+    rom_banked_full_window: bool,
     rom_fixed_ptr: *const u8,
     rom_fixed_len: usize,
     rom_banked_ptr: *const u8,
@@ -104,9 +107,15 @@ pub struct GameBoyMemory {
 impl GameBoyMemory {
     pub fn new() -> Self {
         let cartridge: Box<dyn Cartridge> = Box::new(NoMbc::new(vec![0u8; 0x8000]));
-        let rom_windows = cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
+        let (cartridge_has_rom_windows, rom_windows) = match cartridge.rom_windows() {
+            Some(rom_windows) => (true, rom_windows),
+            None => (false, CartridgeRomWindows::EMPTY),
+        };
         Self {
             cartridge_has_rtc: cartridge.has_rtc(),
+            cartridge_has_rom_windows,
+            rom_fixed_full_window: rom_windows.fixed_len == 0x4000,
+            rom_banked_full_window: rom_windows.banked_len == 0x4000,
             rom_fixed_ptr: rom_windows.fixed_ptr,
             rom_fixed_len: rom_windows.fixed_len,
             rom_banked_ptr: rom_windows.banked_ptr,
@@ -125,9 +134,15 @@ impl GameBoyMemory {
     /// Construct memory backed by a pre-built cartridge implementation.
     pub fn with_cartridge(cart: Box<dyn Cartridge>) -> Self {
         let cartridge_has_rtc = cart.has_rtc();
-        let rom_windows = cart.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
+        let (cartridge_has_rom_windows, rom_windows) = match cart.rom_windows() {
+            Some(rom_windows) => (true, rom_windows),
+            None => (false, CartridgeRomWindows::EMPTY),
+        };
         Self {
             cartridge_has_rtc,
+            cartridge_has_rom_windows,
+            rom_fixed_full_window: rom_windows.fixed_len == 0x4000,
+            rom_banked_full_window: rom_windows.banked_len == 0x4000,
             rom_fixed_ptr: rom_windows.fixed_ptr,
             rom_fixed_len: rom_windows.fixed_len,
             rom_banked_ptr: rom_windows.banked_ptr,
@@ -147,9 +162,15 @@ impl GameBoyMemory {
     /// from the ROM header (byte 0x0147) to select the correct MBC.
     pub fn with_rom(data: Vec<u8>) -> Self {
         let cartridge = cartridge::from_rom(data);
-        let rom_windows = cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
+        let (cartridge_has_rom_windows, rom_windows) = match cartridge.rom_windows() {
+            Some(rom_windows) => (true, rom_windows),
+            None => (false, CartridgeRomWindows::EMPTY),
+        };
         Self {
             cartridge_has_rtc: cartridge.has_rtc(),
+            cartridge_has_rom_windows,
+            rom_fixed_full_window: rom_windows.fixed_len == 0x4000,
+            rom_banked_full_window: rom_windows.banked_len == 0x4000,
             rom_fixed_ptr: rom_windows.fixed_ptr,
             rom_fixed_len: rom_windows.fixed_len,
             rom_banked_ptr: rom_windows.banked_ptr,
@@ -181,7 +202,13 @@ impl GameBoyMemory {
 
     #[inline(always)]
     fn refresh_rom_windows(&mut self) {
-        let rom_windows = self.cartridge.rom_windows().unwrap_or(CartridgeRomWindows::EMPTY);
+        let (cartridge_has_rom_windows, rom_windows) = match self.cartridge.rom_windows() {
+            Some(rom_windows) => (true, rom_windows),
+            None => (false, CartridgeRomWindows::EMPTY),
+        };
+        self.cartridge_has_rom_windows = cartridge_has_rom_windows;
+        self.rom_fixed_full_window = rom_windows.fixed_len == 0x4000;
+        self.rom_banked_full_window = rom_windows.banked_len == 0x4000;
         self.rom_fixed_ptr = rom_windows.fixed_ptr;
         self.rom_fixed_len = rom_windows.fixed_len;
         self.rom_banked_ptr = rom_windows.banked_ptr;
@@ -189,13 +216,20 @@ impl GameBoyMemory {
     }
 
     #[inline(always)]
-    fn read_cached_rom(ptr: *const u8, len: usize, offset: usize) -> u8 {
-        if offset >= len {
+    fn read_cached_rom_window(ptr: *const u8, len: usize, offset: usize) -> u8 {
+        const ROM_WINDOW_BYTES: usize = 0x4000;
+        if len == ROM_WINDOW_BYTES {
+            // Full ROM windows dominate real cartridge fetches. Skip the bounds
+            // compare on the common case and go straight to the cached pointer.
+            unsafe { *ptr.add(offset) }
+        } else if offset >= len {
             return 0xFF;
+        } else {
+            // The cached ROM window length is derived from a live
+            // cartridge-backed slice, so offsets below `len` are valid for
+            // direct reads.
+            unsafe { *ptr.add(offset) }
         }
-        // The cached ROM window length is derived from a live cartridge-backed
-        // slice, so offsets below `len` are valid for direct reads.
-        unsafe { *ptr.add(offset) }
     }
 
     /// Returns the currently mapped ROM bank number for the switchable window.
@@ -241,25 +275,37 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn read_rom_fast(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x3FFF => {
-                if self.rom_fixed_len != 0 {
-                    Self::read_cached_rom(self.rom_fixed_ptr, self.rom_fixed_len, address as usize)
-                } else {
-                    self.cartridge.read_rom(address)
-                }
-            }
-            0x4000..=0x7FFF => {
-                if self.rom_banked_len != 0 {
-                    Self::read_cached_rom(
-                        self.rom_banked_ptr,
-                        self.rom_banked_len,
-                        (address - 0x4000) as usize,
-                    )
-                } else {
-                    self.cartridge.read_rom(address)
-                }
-            }
+            0x0000..=0x3FFF => self.read_rom_fixed_fast(address),
+            0x4000..=0x7FFF => self.read_rom_banked_fast(address),
             _ => 0xFF,
+        }
+    }
+
+    #[inline(always)]
+    pub fn read_rom_fixed_fast(&self, address: u16) -> u8 {
+        debug_assert!(address <= 0x3FFF);
+        if self.rom_fixed_full_window {
+            unsafe { *self.rom_fixed_ptr.add(address as usize) }
+        } else if self.cartridge_has_rom_windows {
+            Self::read_cached_rom_window(self.rom_fixed_ptr, self.rom_fixed_len, address as usize)
+        } else {
+            self.cartridge.read_rom(address)
+        }
+    }
+
+    #[inline(always)]
+    pub fn read_rom_banked_fast(&self, address: u16) -> u8 {
+        debug_assert!((0x4000..=0x7FFF).contains(&address));
+        if self.rom_banked_full_window {
+            unsafe { *self.rom_banked_ptr.add((address - 0x4000) as usize) }
+        } else if self.cartridge_has_rom_windows {
+            Self::read_cached_rom_window(
+                self.rom_banked_ptr,
+                self.rom_banked_len,
+                (address - 0x4000) as usize,
+            )
+        } else {
+            self.cartridge.read_rom(address)
         }
     }
 
@@ -541,6 +587,16 @@ mod tests {
 
         mem.write_fast(0x2000, 0x02);
         assert_eq!(mem.read_fast(0x4000), 0x02);
+    }
+
+    #[test]
+    fn test_read_fast_short_rom_keeps_open_bus_semantics() {
+        let mem = GameBoyMemory::with_rom(vec![0x11, 0x22, 0x33]);
+
+        assert_eq!(mem.read_fast(0x0000), 0x11);
+        assert_eq!(mem.read_fast(0x0002), 0x33);
+        assert_eq!(mem.read_fast(0x0003), 0xFF);
+        assert_eq!(mem.read_fast(0x4000), 0xFF);
     }
 
     // --- VRAM (0x8000–0x9FFF) ---

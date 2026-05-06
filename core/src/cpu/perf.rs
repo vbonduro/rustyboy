@@ -52,11 +52,21 @@ pub struct Sm83PerfProfile {
     pub pc_fetch_rom: u32,
     /// Number of `read_next_pc` calls in `0x0000..=0x7FFF`.
     pub pc_fetch_rom_calls: u32,
+    /// Nested decode hotspot: post-read `read_next_pc` wrap-up work
+    /// (primarily `PC += 1`) after the underlying fetch completes.
+    pub pc_fetch_wrapper: u32,
+    /// Number of `read_next_pc` wrap-up measurements.
+    pub pc_fetch_wrapper_calls: u32,
     /// Nested decode hotspot: ROM `read_next_pc` common-case fast path
     /// (no queued bus events, DMA, active serial transfer, or cartridge RTC).
     pub pc_fetch_rom_idle: u32,
     /// Number of ROM `read_next_pc` calls that used the common-case fast path.
     pub pc_fetch_rom_idle_calls: u32,
+    /// Nested decode hotspot: raw direct ROM window read time inside
+    /// cartridge-ROM `PC` fetches.
+    pub pc_fetch_rom_read: u32,
+    /// Number of raw direct ROM window reads in cartridge-ROM `PC` fetches.
+    pub pc_fetch_rom_read_calls: u32,
     /// Nested decode hotspot: time spent in generic non-wave `bus_read`, excluding nested PPU/timer/APU work.
     pub bus_read: u32,
     /// Number of generic non-wave `bus_read` calls.
@@ -206,9 +216,21 @@ impl Sm83PerfRecorder {
     }
 
     #[inline]
+    pub(crate) fn record_pc_fetch_wrapper(&mut self, dt: u32) {
+        self.profile.pc_fetch_wrapper = self.profile.pc_fetch_wrapper.wrapping_add(dt);
+        self.profile.pc_fetch_wrapper_calls = self.profile.pc_fetch_wrapper_calls.wrapping_add(1);
+    }
+
+    #[inline]
     pub(crate) fn record_pc_fetch_rom_idle(&mut self, dt: u32) {
         self.profile.pc_fetch_rom_idle = self.profile.pc_fetch_rom_idle.wrapping_add(dt);
         self.profile.pc_fetch_rom_idle_calls = self.profile.pc_fetch_rom_idle_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_pc_fetch_rom_read(&mut self, dt: u32) {
+        self.profile.pc_fetch_rom_read = self.profile.pc_fetch_rom_read.wrapping_add(dt);
+        self.profile.pc_fetch_rom_read_calls = self.profile.pc_fetch_rom_read_calls.wrapping_add(1);
     }
 
     #[inline]
@@ -298,6 +320,9 @@ mod tests {
         let mut perf = Sm83PerfRecorder::default();
         perf.record_pc_fetch(0x1234, 3);
         perf.record_pc_fetch(0xC123, 5);
+        perf.record_pc_fetch_wrapper(2);
+        perf.record_pc_fetch_rom_idle(7);
+        perf.record_pc_fetch_rom_read(11);
         perf.record_bus_read(7);
         perf.record_opcode_dispatch(11);
         perf.record_cb_prefix(13);
@@ -308,6 +333,12 @@ mod tests {
         assert_eq!(profile.pc_fetch_calls, 2);
         assert_eq!(profile.pc_fetch_rom, 3);
         assert_eq!(profile.pc_fetch_rom_calls, 1);
+        assert_eq!(profile.pc_fetch_wrapper, 2);
+        assert_eq!(profile.pc_fetch_wrapper_calls, 1);
+        assert_eq!(profile.pc_fetch_rom_idle, 7);
+        assert_eq!(profile.pc_fetch_rom_idle_calls, 1);
+        assert_eq!(profile.pc_fetch_rom_read, 11);
+        assert_eq!(profile.pc_fetch_rom_read_calls, 1);
         assert_eq!(profile.bus_read, 7);
         assert_eq!(profile.bus_read_calls, 1);
         assert_eq!(profile.opcode_dispatch, 11);
