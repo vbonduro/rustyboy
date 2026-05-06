@@ -43,6 +43,11 @@ impl SerialPort {
         &self.output
     }
 
+    #[inline(always)]
+    pub fn is_idle(&self) -> bool {
+        self.cycles_remaining.is_none()
+    }
+
     /// Called when SC (0xFF02) is written. Captures `sb` and starts a timed
     /// transfer if the internal clock bit is set; completes immediately for
     /// external-clock transfers (no link cable present).

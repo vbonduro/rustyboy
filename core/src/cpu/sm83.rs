@@ -429,15 +429,64 @@ impl Sm83 {
             self.queue_apu_cycles(1);
             return Ok(value);
         }
-        self.tick_cycle();
+        #[cfg(feature = "perf")]
+        let nested0 = self.perf.nested_snapshot();
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
+        self.tick_cycle();
+        #[cfg(feature = "perf")]
+        let t_read = cyccnt();
         let value = self.memory.read_fast(addr);
         #[cfg(feature = "perf")]
         {
-            self.perf.record_mem_read(cyccnt().wrapping_sub(t0));
+            let t1 = cyccnt();
+            self.perf.record_mem_read(t1.wrapping_sub(t_read));
+            self.perf.record_bus_read(
+                t1.wrapping_sub(t0)
+                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
+            );
         }
         Ok(value)
+    }
+
+    /// Fast path for opcode/immediate fetches when `PC` is in cartridge ROM.
+    ///
+    /// This preserves the exact same M-cycle-side effects as `bus_read`.
+    /// When the M-cycle is otherwise idle, we bypass the generic helper stack
+    /// entirely and run the straight-line common case directly.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn read_pc_rom_fast(&mut self, addr: u16) -> u8 {
+        #[cfg(feature = "perf")]
+        let nested0 = self.perf.nested_snapshot();
+        #[cfg(feature = "perf")]
+        let t0 = cyccnt();
+        if self.can_use_idle_m_cycle_fast_path() {
+            self.run_idle_m_cycle();
+            #[cfg(feature = "perf")]
+            let t_read = cyccnt();
+            let value = self.memory.read_rom_fast(addr);
+            #[cfg(feature = "perf")]
+            {
+                let t1 = cyccnt();
+                self.perf.record_mem_read(t1.wrapping_sub(t_read));
+                self.perf.record_pc_fetch_rom_idle(
+                    t1.wrapping_sub(t0)
+                        .wrapping_sub(self.perf.nested_cycles_since(nested0)),
+                );
+            }
+            return value;
+        }
+
+        self.tick_cycle();
+        #[cfg(feature = "perf")]
+        let t_read = cyccnt();
+        let value = self.memory.read_rom_fast(addr);
+        #[cfg(feature = "perf")]
+        {
+            self.perf.record_mem_read(cyccnt().wrapping_sub(t_read));
+        }
+        value
     }
 
     /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
@@ -509,6 +558,10 @@ impl Sm83 {
     /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle(&mut self) {
+        if self.can_use_idle_m_cycle_fast_path() {
+            self.run_idle_m_cycle();
+            return;
+        }
         self.begin_m_cycle();
         self.advance_peripherals(4);
     }
@@ -535,8 +588,12 @@ impl Sm83 {
         self.advance_ppu(cycles);
         self.advance_timer(cycles);
         self.queue_apu_cycles(cycles);
-        self.memory.tick_rtc(cycles as u32);
-        self.advance_serial(cycles);
+        if self.memory.has_rtc() {
+            self.memory.tick_rtc(cycles as u32);
+        }
+        if !self.serial.is_idle() {
+            self.advance_serial(cycles);
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -574,6 +631,24 @@ impl Sm83 {
         self.flush_apu_before_bus_events();
         self.route_bus_events();
         self.advance_dma();
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn can_use_idle_m_cycle_fast_path(&self) -> bool {
+        self.pending_bus_events.is_empty()
+            && self.dma.is_none()
+            && self.serial.is_idle()
+            && !self.memory.has_rtc()
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn run_idle_m_cycle(&mut self) {
+        self.cycle_counter += 4;
+        self.advance_ppu(4);
+        self.advance_timer(4);
+        self.queue_apu_cycles(4);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -843,14 +918,36 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
-        let byte = self.bus_read(self.registers.pc)?;
+        let addr = self.registers.pc;
+        #[cfg(feature = "perf")]
+        let nested0 = self.perf.nested_snapshot();
+        #[cfg(feature = "perf")]
+        let t0 = cyccnt();
+        let byte = if addr <= 0x7FFF {
+            self.read_pc_rom_fast(addr)
+        } else {
+            self.bus_read(addr)?
+        };
         self.registers.pc = self.registers.pc.wrapping_add(1);
+        #[cfg(feature = "perf")]
+        {
+            self.perf.record_pc_fetch(
+                addr,
+                cyccnt()
+                    .wrapping_sub(t0)
+                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
+            );
+        }
         Ok(byte)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, InstructionError> {
-        match operand {
+        #[cfg(feature = "perf")]
+        let nested0 = self.perf.nested_snapshot();
+        #[cfg(feature = "perf")]
+        let t0 = cyccnt();
+        let result = match operand {
             Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
             Operand::Memory(Memory::HL) => {
                 let address = self.registers.hl();
@@ -863,7 +960,16 @@ impl Sm83 {
                     operand
                 )))
             }
+        };
+        #[cfg(feature = "perf")]
+        {
+            self.perf.record_operand8(
+                cyccnt()
+                    .wrapping_sub(t0)
+                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
+            );
         }
+        result
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -1023,10 +1129,34 @@ impl Sm83 {
         // &mut self.  The atomic increment is ~10 cycles vs ~50 000 cycles for
         // the previous Box::new() per instruction.
         let op = if opcode == 0xCB {
+            #[cfg(feature = "perf")]
+            let nested0 = self.perf.nested_snapshot();
+            #[cfg(feature = "perf")]
+            let cb_t0 = cyccnt();
             let cb_opcode = self.read_next_pc()?;
-            self.opcodes.get_cb(cb_opcode)?
+            #[cfg(feature = "perf")]
+            let dispatch_t0 = cyccnt();
+            let op = self.opcodes.get_cb(cb_opcode)?;
+            #[cfg(feature = "perf")]
+            {
+                let t1 = cyccnt();
+                self.perf.record_opcode_dispatch(t1.wrapping_sub(dispatch_t0));
+                self.perf.record_cb_prefix(
+                    t1.wrapping_sub(cb_t0)
+                        .wrapping_sub(self.perf.nested_cycles_since(nested0)),
+                );
+            }
+            op
         } else {
-            self.opcodes.get(opcode)?
+            #[cfg(feature = "perf")]
+            let dispatch_t0 = cyccnt();
+            let op = self.opcodes.get(opcode)?;
+            #[cfg(feature = "perf")]
+            {
+                self.perf
+                    .record_opcode_dispatch(cyccnt().wrapping_sub(dispatch_t0));
+            }
+            op
         };
         op.execute(self)?;
 
@@ -2757,6 +2887,62 @@ mod tests {
         assert_eq!(cpu.registers().pc, 1);
         assert_eq!(cpu.registers().a, 0x00);
         assert_eq!(cpu.registers().f, Flags::empty());
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn test_rom_pc_fetch_uses_fast_path_not_generic_bus_read() {
+        let mut cpu = make_test_cpu(vec![0x00]).with_registers(Registers {
+            ..Default::default()
+        });
+
+        let cycles = cpu.tick().unwrap();
+        let perf = cpu.take_perf_profile();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(perf.pc_fetch_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_idle_calls, 1);
+        assert_eq!(perf.bus_read_calls, 0);
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn test_non_rom_pc_fetch_stays_on_generic_bus_read_path() {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x00).unwrap(); },
+            vec![],
+        ).with_registers(Registers {
+            pc: 0xC000,
+            ..Default::default()
+        });
+
+        let cycles = cpu.tick().unwrap();
+        let perf = cpu.take_perf_profile();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(perf.pc_fetch_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_calls, 0);
+        assert_eq!(perf.pc_fetch_rom_idle_calls, 0);
+        assert_eq!(perf.bus_read_calls, 1);
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn test_rom_pc_fetch_skips_idle_fast_path_when_dma_active() {
+        let mut cpu = make_test_cpu(vec![0x00]).with_registers(Registers {
+            ..Default::default()
+        });
+        cpu.dma = Some(DmaState { source: 0x0000, progress: 0 });
+
+        let cycles = cpu.tick().unwrap();
+        let perf = cpu.take_perf_profile();
+
+        assert_eq!(cycles, 4);
+        assert_eq!(perf.pc_fetch_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_calls, 1);
+        assert_eq!(perf.pc_fetch_rom_idle_calls, 0);
+        assert_eq!(cpu.dma.as_ref().map(|d| d.progress), Some(1));
     }
 
     /// HALT (0x76): returns 4 cycles without crashing.

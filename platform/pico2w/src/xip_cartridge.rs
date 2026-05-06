@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use rustyboy_core::memory::cartridge::Cartridge;
+use rustyboy_core::memory::cartridge::{Cartridge, CartridgeRomWindows};
 #[cfg(feature = "perf")]
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
 
@@ -238,9 +238,32 @@ impl XipCartridge {
             } => *ram_rtc_enabled && !matches!(bank_or_rtc, 0x08..=0x0C),
         }
     }
+
+    #[inline(always)]
+    fn rom_window(&self, base: usize, valid: bool) -> (*const u8, usize) {
+        if !valid {
+            return (core::ptr::null(), 0);
+        }
+        match self.rom.get(base..) {
+            Some(slice) => (slice.as_ptr(), slice.len().min(ROM_BANK_BYTES)),
+            None => (core::ptr::null(), 0),
+        }
+    }
 }
 
 impl Cartridge for XipCartridge {
+    fn rom_windows(&self) -> Option<CartridgeRomWindows> {
+        let (fixed_ptr, fixed_len) = self.rom_window(self.fixed_bank_base, self.fixed_bank_valid);
+        let (banked_ptr, banked_len) =
+            self.rom_window(self.current_bank_base, self.current_bank_valid);
+        Some(CartridgeRomWindows {
+            fixed_ptr,
+            fixed_len,
+            banked_ptr,
+            banked_len,
+        })
+    }
+
     #[inline(always)]
     fn read_rom(&self, addr: u16) -> u8 {
         match addr {
@@ -248,11 +271,7 @@ impl Cartridge for XipCartridge {
                 if !self.fixed_bank_valid {
                     return 0xFF;
                 }
-                unsafe {
-                    *self
-                        .rom
-                        .get_unchecked(self.fixed_bank_base + addr as usize)
-                }
+                unsafe { *self.rom.get_unchecked(self.fixed_bank_base + addr as usize) }
             }
             0x4000..=0x7FFF => {
                 if !self.current_bank_valid {
