@@ -182,13 +182,11 @@ impl NoMbc {
 
 impl Cartridge for NoMbc {
     fn rom_windows(&self) -> Option<CartridgeRomWindows> {
-        let (fixed_ptr, fixed_len) = rom_window(&self.rom, 0);
-        let (banked_ptr, banked_len) = rom_window(&self.rom, 0x4000);
         Some(CartridgeRomWindows {
-            fixed_ptr,
-            fixed_len,
-            banked_ptr,
-            banked_len,
+            fixed_ptr: rom_window(&self.rom, 0).0,
+            fixed_len: rom_window(&self.rom, 0).1,
+            banked_ptr: rom_window(&self.rom, 0x4000).0,
+            banked_len: rom_window(&self.rom, 0x4000).1,
         })
     }
 
