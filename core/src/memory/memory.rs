@@ -180,13 +180,18 @@ impl GameBoyMemory {
 
     #[inline(always)]
     fn read_region_fast<const N: usize>(region: &[u8; N], offset: u16) -> u8 {
-        // The caller's address decode guarantees the offset is valid.
+        // Callers only pass offsets produced by a matching address-range decode
+        // (for example `0x8000..=0x9FFF => address - 0x8000` for VRAM), so
+        // `offset as usize` is always in `0..N`.
         unsafe { *region.get_unchecked(offset as usize) }
     }
 
     #[inline(always)]
     fn write_region_fast<const N: usize>(region: &mut [u8; N], offset: u16, value: u8) {
-        // The caller's address decode guarantees the offset is valid.
+        // Callers only pass offsets produced by a matching address-range decode,
+        // so `offset as usize` is always in bounds for `region`. The `&mut`
+        // borrow also guarantees this unchecked write is the only active access
+        // to the destination element.
         unsafe {
             *region.get_unchecked_mut(offset as usize) = value;
         }
@@ -210,6 +215,12 @@ impl GameBoyMemory {
         if offset >= len {
             return 0xFF;
         }
+        // `refresh_rom_windows()` only caches pointer/length pairs returned by
+        // the cartridge for stable ROM storage, and every ROM-control write
+        // refreshes those cached windows before the next fast-path read. The
+        // guard above proves `offset < len`, so `ptr.add(offset)` stays within
+        // the advertised window. When `len == 0` we return early and never
+        // dereference the pointer.
         unsafe { *ptr.add(offset) }
     }
 
