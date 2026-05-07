@@ -30,19 +30,17 @@ use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
-use super::peripheral::apu::{
-    ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
+use super::peripheral::apu::{NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END};
+use super::peripheral::island::{
+    LocalPeripheralBackend, PeripheralBackend, PeripheralRegs, PeripheralShadowState,
 };
 use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
 use super::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
 use super::peripheral::ppu::{
-    PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
-    LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
-    VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
+    FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR, LY_ADDR, LYC_ADDR, BGP_ADDR,
+    OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR, VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
 };
-use super::peripheral::timer::{
-    TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
-};
+use super::peripheral::timer::{DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR};
 #[cfg(feature = "perf")]
 use super::perf::{cyccnt, Sm83PerfRecorder};
 use super::registers::{Flags, Registers};
@@ -148,30 +146,29 @@ impl Sm83Cache {
     }
 }
 
-#[derive(Default)]
-struct PendingApuCycles {
-    cycles: u16,
+#[derive(Default, Clone, Copy)]
+struct PendingPeripheralCycles {
+    ppu: u16,
+    timer: u16,
+    apu: u16,
 }
 
-impl PendingApuCycles {
+impl PendingPeripheralCycles {
     #[inline(always)]
-    fn queue(&mut self, cycles: u16) {
-        debug_assert!(cycles != 0);
-        debug_assert!(
-            self.cycles <= u16::MAX - cycles,
-            "pending APU cycle batch overflow"
-        );
-        self.cycles = self.cycles.wrapping_add(cycles);
-    }
-
-    #[inline(always)]
-    fn take(&mut self) -> u16 {
-        core::mem::take(&mut self.cycles)
+    fn add(&mut self, ppu: u16, timer: u16, apu: u16) {
+        self.ppu = self.ppu.wrapping_add(ppu);
+        self.timer = self.timer.wrapping_add(timer);
+        self.apu = self.apu.wrapping_add(apu);
     }
 
     #[inline(always)]
     fn is_empty(&self) -> bool {
-        self.cycles == 0
+        self.ppu == 0 && self.timer == 0 && self.apu == 0
+    }
+
+    #[inline(always)]
+    fn take(&mut self) -> Self {
+        core::mem::take(self)
     }
 }
 
@@ -180,9 +177,7 @@ pub struct Sm83 {
     registers: Registers,
     opcodes: OpCodeTable,
     serial: SerialPort,
-    timer: TimerPeripheral,
-    ppu: PpuPeripheral,
-    apu: ApuPeripheral,
+    peripherals: Box<dyn PeripheralBackend>,
     joypad: JoypadPeripheral,
     ime: ImeState,
     halted: bool,
@@ -193,6 +188,23 @@ pub struct Sm83 {
     /// internal M-cycle helpers. This keeps the hot path on a small integer
     /// add instead of touching the `u64` total on every M-cycle.
     pending_cycle_counter: u16,
+    /// Deferred peripheral cycles for the current instruction. These are
+    /// flushed at observable boundaries instead of on every M-cycle.
+    pending_peripheral_cycles: PendingPeripheralCycles,
+    /// True when the backend supports queued peripheral advances, allowing the
+    /// CPU to submit remote work before it needs the result.
+    queued_peripheral_pipeline: bool,
+    /// Last queued advance sequence submitted to the remote peripheral island.
+    queued_peripheral_submitted_seq: u32,
+    /// Highest remote advance sequence already applied back into CPU-visible
+    /// MMIO state from the pushed shadow registers.
+    queued_peripheral_applied_seq: u32,
+    /// Last remote VBlank event count applied locally.
+    queued_peripheral_vblank_count: u32,
+    /// Last remote STAT interrupt event count applied locally.
+    queued_peripheral_stat_interrupt_count: u32,
+    /// Last remote timer interrupt event count applied locally.
+    queued_peripheral_timer_interrupt_count: u32,
     /// Pending OAM DMA transfer. When Some, holds the source page and number of
     /// bytes already copied. Each M-cycle advances the transfer by one byte.
     dma: Option<DmaState>,
@@ -202,9 +214,6 @@ pub struct Sm83 {
     /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
     /// read a fully-rendered frame rather than one mid-render.
     front_buffer: [u8; FRAMEBUFFER_SIZE],
-    /// Accumulates APU T-cycles between timing-sensitive boundaries so normal
-    /// M-cycles can batch one `apu.tick(...)` per instruction instead of per cycle.
-    pending_apu_cycles: PendingApuCycles,
     /// CPU MMIO writes are routed here and applied on the next M-cycle.
     pending_bus_events: Vec<BusEvent>,
     pub cache: Sm83Cache,
@@ -227,9 +236,23 @@ const IDLE_M_CYCLE_BLOCK_BUS_EVENTS: u8 = 1 << 0;
 const IDLE_M_CYCLE_BLOCK_DMA: u8 = 1 << 1;
 const IDLE_M_CYCLE_BLOCK_SERIAL: u8 = 1 << 2;
 const IDLE_M_CYCLE_BLOCK_RTC: u8 = 1 << 3;
+const QUEUED_PERIPHERAL_SUBMIT_THRESHOLD: u16 = 16;
 
 impl Sm83 {
     pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
+        Self::new_with_peripherals(
+            memory,
+            opcode_decoder,
+            Box::new(LocalPeripheralBackend::new()),
+        )
+    }
+
+    pub fn new_with_peripherals(
+        memory: Box<GameBoyMemory>,
+        opcode_decoder: Box<dyn Decoder>,
+        peripherals: Box<dyn PeripheralBackend>,
+    ) -> Self {
+        let queued_peripheral_pipeline = peripherals.supports_queued_advance();
         let joypad = JoypadPeripheral::new();
         let opcodes = OpCodeTable::from_decoder(&*opcode_decoder);
         let mut sm83 = Self {
@@ -237,18 +260,22 @@ impl Sm83 {
             registers: Registers::default(),
             opcodes,
             serial: SerialPort::new(),
-            timer: TimerPeripheral::new(),
-            ppu: PpuPeripheral::new(),
-            apu: ApuPeripheral::new(),
+            peripherals,
             joypad,
             ime: ImeState::Disabled,
             halted: false,
             cycle_counter: 0,
             pending_cycle_counter: 0,
+            pending_peripheral_cycles: PendingPeripheralCycles::default(),
+            queued_peripheral_pipeline,
+            queued_peripheral_submitted_seq: 0,
+            queued_peripheral_applied_seq: 0,
+            queued_peripheral_vblank_count: 0,
+            queued_peripheral_stat_interrupt_count: 0,
+            queued_peripheral_timer_interrupt_count: 0,
             dma: None,
             idle_m_cycle_blockers: 0,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
-            pending_apu_cycles: PendingApuCycles::default(),
             pending_bus_events: Vec::with_capacity(4),
             cache: Sm83Cache::default(),
             #[cfg(feature = "trace")]
@@ -261,7 +288,7 @@ impl Sm83 {
         // Seed IO memory with initial APU register read values so games
         // reading registers before any write see correct masked values.
         for addr in NR10_ADDR..=NR52_ADDR {
-            sm83.memory.write_io(addr, sm83.apu.read_register(addr));
+            sm83.memory.write_io(addr, sm83.peripherals.read_apu_register(addr));
         }
         // Unused APU addresses always read as 0xFF
         for addr in 0xFF27u16..WAVE_RAM_START {
@@ -269,8 +296,9 @@ impl Sm83 {
         }
         for addr in WAVE_RAM_START..=WAVE_RAM_END {
             let offset = (addr - WAVE_RAM_START) as u8;
-            sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
+            sm83.memory.write_io(addr, sm83.peripherals.read_wave_ram(offset));
         }
+        sm83.peripherals.sync_memory(sm83.memory.vram(), sm83.memory.oam());
         sm83.cache.sync(&sm83.memory);
         sm83.refresh_idle_m_cycle_fast_path_blockers();
         sm83
@@ -319,7 +347,10 @@ impl Sm83 {
     }
 
     /// Read a byte from the memory bus (for test/debug access).
-    pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
+    pub fn read_memory(&mut self, address: u16) -> Result<u8, MemoryError> {
+        if matches!(address, 0xFF00..=0xFF7F | 0xFFFF) {
+            self.flush_pending_peripherals();
+        }
         self.memory.read(address)
     }
 
@@ -338,25 +369,35 @@ impl Sm83 {
         &self.front_buffer
     }
 
+    /// Flush deferred peripheral work so external callers can observe the latest
+    /// framebuffer/audio/timer state without paying that cost every instruction.
+    pub fn sync_peripherals(&mut self) {
+        self.flush_pending_peripherals();
+    }
+
     /// Drain accumulated PCM audio samples since the last call.
     /// Returns interleaved stereo f32 samples [L, R, L, R, ...] at 48,000 Hz.
     pub fn drain_audio_samples(&mut self) -> alloc::vec::Vec<f32> {
-        self.apu.drain_samples()
+        self.flush_pending_peripherals();
+        self.peripherals.drain_samples()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
+        self.flush_pending_peripherals();
         self.perf.take_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_ppu_perf_profile(&mut self) -> super::peripheral::ppu::PpuPerfProfile {
-        self.ppu.take_perf_profile()
+        self.flush_pending_peripherals();
+        self.peripherals.take_ppu_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_apu_perf_profile(&mut self) -> super::peripheral::apu::ApuPerfProfile {
-        self.apu.take_perf_profile()
+        self.flush_pending_peripherals();
+        self.peripherals.take_apu_perf_profile()
     }
 
     #[cfg(feature = "perf")]
@@ -377,7 +418,8 @@ impl Sm83 {
     }
 
     /// Serialize the full emulator state to an RBSS v1 blob.
-    pub fn save_state(&self) -> alloc::vec::Vec<u8> {
+    pub fn save_state(&mut self) -> alloc::vec::Vec<u8> {
+        self.flush_pending_peripherals();
         let cpu = CpuState {
             a: self.registers.a, b: self.registers.b, c: self.registers.c,
             d: self.registers.d, e: self.registers.e, h: self.registers.h,
@@ -387,7 +429,12 @@ impl Sm83 {
             halted: self.halted,
             cycle_counter: self.cycle_counter(),
         };
-        SaveState::serialize(cpu, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
+        SaveState::serialize(
+            cpu,
+            self.peripherals.timer_state(),
+            self.peripherals.ppu_state(),
+            &self.memory,
+        )
     }
 
     /// Restore emulator state from a parsed [`SaveState`].
@@ -397,14 +444,21 @@ impl Sm83 {
     /// well-formed `SaveState`. Returns `Ok(())` always; kept as `Result` for
     /// call-site symmetry and future extensibility.
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
+        self.flush_pending_peripherals();
         self.registers     = state.cpu.to_registers();
         self.ime           = state.cpu.ime;
         self.halted        = state.cpu.halted;
         self.cycle_counter = state.cpu.cycle_counter;
         self.pending_cycle_counter = 0;
-        self.timer.load_state(state.timer);
-        self.ppu.load_state(state.ppu);
+        self.pending_peripheral_cycles = PendingPeripheralCycles::default();
+        self.queued_peripheral_submitted_seq = 0;
+        self.queued_peripheral_applied_seq = 0;
         self.memory.load_state(&state);
+        self.peripherals
+            .load_state(state.timer, state.ppu, self.memory.vram(), self.memory.oam());
+        self.queued_peripheral_vblank_count = 0;
+        self.queued_peripheral_stat_interrupt_count = 0;
+        self.queued_peripheral_timer_interrupt_count = 0;
         self.cache.sync(&self.memory);
         self.refresh_idle_m_cycle_fast_path_blockers();
         Ok(())
@@ -427,9 +481,9 @@ impl Sm83 {
         self.memory.write_io(OBP0_ADDR, 0xFF); // obj palette 0
         self.memory.write_io(OBP1_ADDR, 0xFF); // obj palette 1
         // APU post-boot state (Pan Docs)
-        self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
-        self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
-        self.write_apu_register(0xFF24, 0x77); // NR50: max volume both sides
+        self.write_apu_register(0xFF26, 0xF1);
+        self.write_apu_register(0xFF25, 0xF3);
+        self.write_apu_register(0xFF24, 0x77);
         self.cache.sync(&self.memory);
         self
     }
@@ -447,9 +501,8 @@ impl Sm83 {
             // at T3 within the M-cycle on real hardware.
             self.tick_cycle_to_t3();
             let offset = (addr - WAVE_RAM_START) as u8;
-            let value = self.apu.read_wave_ram(offset);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
+            let value = self.peripherals.read_wave_ram(offset);
+            self.advance_peripherals_split(0, 1, 1);
             return Ok(value);
         }
         #[cfg(feature = "perf")]
@@ -457,6 +510,9 @@ impl Sm83 {
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
         self.tick_cycle();
+        if matches!(addr, 0xFF00..=0xFF7F | 0xFFFF) {
+            self.flush_pending_peripherals();
+        }
         #[cfg(feature = "perf")]
         let t_read = cyccnt();
         let value = self.memory.read_fast(addr);
@@ -547,15 +603,13 @@ impl Sm83 {
         if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
             self.tick_cycle_to_t3();
             self.write_apu_register(addr, value);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
+            self.advance_peripherals_split(0, 1, 1);
             return Ok(());
         }
         if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
             self.tick_cycle_to_t3();
             self.write_wave_ram(addr, value);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
+            self.advance_peripherals_split(0, 1, 1);
             return Ok(());
         }
         self.tick_cycle();
@@ -586,9 +640,17 @@ impl Sm83 {
             }
             0xE000..=0xFDFF => Err(MemoryError::ReadOnly(addr)),
             _ => {
+                if matches!(addr, 0x8000..=0x9FFF | 0xFE00..=0xFE9F) {
+                    self.flush_pending_peripherals();
+                }
                 #[cfg(feature = "perf")]
                 let t_fast = cyccnt();
                 self.memory.write_fast(addr, value);
+                match addr {
+                    0x8000..=0x9FFF => self.peripherals.on_vram_write(addr - 0x8000, value),
+                    0xFE00..=0xFE9F => self.peripherals.on_oam_write(addr - 0xFE00, value),
+                    _ => {}
+                }
                 #[cfg(feature = "perf")]
                 {
                     self.perf.record_mem_write_fast(addr, cyccnt().wrapping_sub(t_fast));
@@ -624,6 +686,7 @@ impl Sm83 {
         };
         let byte = self.memory.read_fast(source + progress as u16);
         self.memory.write_fast(0xFE00 + progress as u16, byte);
+        self.peripherals.on_oam_dma_byte(progress, byte);
         let next = progress + 1;
         self.dma = if next < 160 {
             Some(DmaState { source, progress: next })
@@ -639,9 +702,7 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_peripherals(&mut self, cycles: u16) {
-        self.advance_ppu(cycles);
-        self.advance_timer(cycles);
-        self.queue_apu_cycles(cycles);
+        self.advance_peripherals_split(cycles, cycles, cycles);
         if self.memory.has_rtc() {
             self.memory.tick_rtc(cycles as u32);
         }
@@ -672,14 +733,12 @@ impl Sm83 {
 
     /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
     /// stopping so the caller can perform a time-sensitive APU read or write at T3.
-    /// The caller must account for T4 afterwards with `advance_timer(1)` plus
-    /// one queued APU cycle.
+    /// The caller must account for T4 afterwards with `advance_peripherals_split(0, 1, 1)`.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_cycle_to_t3(&mut self) {
         self.begin_t3_sensitive_m_cycle();
-        self.advance_ppu(4);
-        self.advance_timer(3);
-        self.queue_apu_cycles(3);
+        self.advance_peripherals_split(4, 3, 3);
+        self.flush_pending_peripherals();
     }
 
     // ── Tick phase helpers ──────────────────────────────────────────────────
@@ -687,7 +746,7 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn begin_m_cycle(&mut self) {
         self.pending_cycle_counter += 4;
-        self.flush_apu_before_bus_events();
+        self.flush_pending_peripherals();
         self.route_bus_events();
         self.advance_dma();
     }
@@ -702,15 +761,18 @@ impl Sm83 {
     #[inline(always)]
     fn run_idle_m_cycle(&mut self) {
         self.pending_cycle_counter += 4;
-        self.advance_ppu(4);
-        self.advance_timer(4);
-        self.queue_apu_cycles(4);
+        self.advance_peripherals_split(4, 4, 4);
+        if self.queued_peripheral_applied_seq != self.queued_peripheral_submitted_seq
+            || (self.queued_peripheral_pipeline && self.ime != ImeState::Enabled)
+        {
+            self.try_submit_pending_peripherals(false);
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn begin_t3_sensitive_m_cycle(&mut self) {
         self.pending_cycle_counter += 4;
-        self.flush_pending_apu_cycles();
+        self.flush_pending_peripherals();
         self.route_bus_events();
         self.advance_dma();
     }
@@ -747,27 +809,6 @@ impl Sm83 {
         if self.ime == ImeState::Pending {
             self.ime = ImeState::Enabled;
         }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn flush_apu_before_bus_events(&mut self) {
-        if self.pending_apu_cycles.is_empty() || !self.pending_bus_events_require_apu_flush() {
-            return;
-        }
-        self.flush_pending_apu_cycles();
-    }
-
-    fn pending_bus_events_require_apu_flush(&self) -> bool {
-        self.pending_bus_events
-            .iter()
-            .copied()
-            .any(Self::bus_event_requires_apu_flush)
-    }
-
-    fn bus_event_requires_apu_flush(event: BusEvent) -> bool {
-        event.address == DIV_ADDR
-            || (NR10_ADDR..=NR52_ADDR).contains(&event.address)
-            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -809,10 +850,13 @@ impl Sm83 {
                 }
             }
             a if a == DIV_ADDR => {
-                self.timer.reset_div();
+                self.peripherals.reset_div();
                 self.cache.div = 0xFF;
             }
-            a if a == LY_ADDR => self.ppu.reset_ly(),
+            a if a == LY_ADDR => {
+                self.peripherals.reset_ly();
+                self.cache.ly = 0xFF;
+            }
             a if a == DMA_ADDR => {
                 self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
                 self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
@@ -842,13 +886,13 @@ impl Sm83 {
     /// NR52 writes may power off all channels, so all registers are resynced.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn write_apu_register(&mut self, addr: u16, value: u8) {
-        self.apu.write_register(addr, value);
+        self.peripherals.write_apu_register(addr, value);
         if addr == NR52_ADDR {
             for a in NR10_ADDR..=NR52_ADDR {
-                self.memory.write_io(a, self.apu.read_register(a));
+                self.memory.write_io(a, self.peripherals.read_apu_register(a));
             }
         } else {
-            self.memory.write_io(addr, self.apu.read_register(addr));
+            self.memory.write_io(addr, self.peripherals.read_apu_register(addr));
         }
     }
 
@@ -856,31 +900,12 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn write_wave_ram(&mut self, addr: u16, value: u8) {
         let offset = (addr - WAVE_RAM_START) as u8;
-        self.apu.write_wave_ram(offset, value);
-        self.memory.write_io(addr, self.apu.read_wave_ram(offset));
+        self.peripherals.write_wave_ram(offset, value);
+        self.memory.write_io(addr, self.peripherals.read_wave_ram(offset));
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_ppu(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let output = self.ppu.tick(
-            cycles,
-            PpuInput {
-                lcdc: self.cache.lcdc,
-                stat: self.cache.stat,
-                scy: self.cache.scy,
-                scx: self.cache.scx,
-                lyc: self.cache.lyc,
-                bgp: self.cache.bgp,
-                obp0: self.cache.obp0,
-                obp1: self.cache.obp1,
-                wy: self.cache.wy,
-                wx: self.cache.wx,
-                vram: self.memory.vram(),
-                oam: self.memory.oam(),
-            },
-        );
+    fn apply_peripheral_output(&mut self, output: super::peripheral::island::PeripheralAdvanceOutput) {
         if output.ly != self.cache.ly {
             self.cache.ly = output.ly;
             self.memory.write_io(LY_ADDR, output.ly);
@@ -892,7 +917,8 @@ impl Sm83 {
         if output.vblank_interrupt {
             // Snapshot the completed frame into the front buffer before the PPU
             // starts overwriting scanlines for the next frame.
-            self.front_buffer.copy_from_slice(self.ppu.framebuffer());
+            self.peripherals
+                .snapshot_framebuffer_into(&mut self.front_buffer);
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << VBLANK_INTERRUPT_BIT));
         }
@@ -900,24 +926,6 @@ impl Sm83 {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << STAT_INTERRUPT_BIT));
         }
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_ppu(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_timer(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let output = self.timer.tick(
-            cycles,
-            TimerInput {
-                tima: self.cache.tima,
-                tma: self.cache.tma,
-                tac: self.cache.tac,
-            },
-        );
         if output.tima != self.cache.tima {
             self.cache.tima = output.tima;
             self.memory.write_io(TIMA_ADDR, output.tima);
@@ -926,48 +934,195 @@ impl Sm83 {
             self.cache.div = output.div;
             self.memory.write_io(DIV_ADDR, output.div);
         }
-        if output.interrupt {
+        if output.timer_interrupt {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
         }
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_timer(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn queue_apu_cycles(&mut self, cycles: u16) {
-        self.pending_apu_cycles.queue(cycles);
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn flush_pending_apu_cycles(&mut self) {
-        let cycles = self.pending_apu_cycles.take();
-        if cycles == 0 {
-            return;
-        }
-        self.tick_apu(cycles);
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_apu(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let output = self.apu.tick(cycles, self.timer.internal_counter());
         if output.nr52 != self.cache.nr52 {
             self.cache.nr52 = output.nr52;
             self.memory.write_io(NR52_ADDR, output.nr52);
         }
-        #[cfg(feature = "perf")]
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn apply_queued_shadow_state(&mut self, shadow: PeripheralShadowState) {
+        if shadow.ly != self.cache.ly {
+            self.cache.ly = shadow.ly;
+            self.memory.write_io(LY_ADDR, shadow.ly);
+        }
+        if shadow.stat != self.cache.stat {
+            self.cache.stat = shadow.stat;
+            self.memory.write_io(STAT_ADDR, shadow.stat);
+        }
+        if shadow.tima != self.cache.tima {
+            self.cache.tima = shadow.tima;
+            self.memory.write_io(TIMA_ADDR, shadow.tima);
+        }
+        if shadow.div != self.cache.div {
+            self.cache.div = shadow.div;
+            self.memory.write_io(DIV_ADDR, shadow.div);
+        }
+        if shadow.nr52 != self.cache.nr52 {
+            self.cache.nr52 = shadow.nr52;
+            self.memory.write_io(NR52_ADDR, shadow.nr52);
+        }
+        if shadow.vblank_count != self.queued_peripheral_vblank_count {
+            self.queued_peripheral_vblank_count = shadow.vblank_count;
+            self.peripherals
+                .snapshot_framebuffer_into(&mut self.front_buffer);
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << VBLANK_INTERRUPT_BIT));
+        }
+        if shadow.stat_interrupt_count != self.queued_peripheral_stat_interrupt_count {
+            self.queued_peripheral_stat_interrupt_count = shadow.stat_interrupt_count;
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << STAT_INTERRUPT_BIT));
+        }
+        if shadow.timer_interrupt_count != self.queued_peripheral_timer_interrupt_count {
+            self.queued_peripheral_timer_interrupt_count = shadow.timer_interrupt_count;
+            let if_val = self.memory.read_io(IF_ADDR);
+            self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
+        }
+    }
+
+    #[inline(always)]
+    fn should_try_queue_pending_peripherals(&self) -> bool {
+        if !self.queued_peripheral_pipeline || self.pending_peripheral_cycles.is_empty() {
+            return false;
+        }
+
+        if self.queued_peripheral_applied_seq != self.queued_peripheral_submitted_seq {
+            return true;
+        }
+
+        let max_pending = self
+            .pending_peripheral_cycles
+            .ppu
+            .max(self.pending_peripheral_cycles.timer)
+            .max(self.pending_peripheral_cycles.apu);
+
+        self.ime != ImeState::Enabled
+            && max_pending >= QUEUED_PERIPHERAL_SUBMIT_THRESHOLD
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn try_submit_pending_peripherals(&mut self, force: bool) -> bool {
+        if !self.queued_peripheral_pipeline || self.pending_peripheral_cycles.is_empty() {
+            return false;
+        }
+        if !force && !self.should_try_queue_pending_peripherals() {
+            return false;
+        }
+
+        let pending = self.pending_peripheral_cycles;
+        if self.peripherals.try_queue_advance(
+            pending.ppu,
+            pending.timer,
+            pending.apu,
+            PeripheralRegs {
+                lcdc: self.cache.lcdc,
+                stat: self.cache.stat,
+                scy: self.cache.scy,
+                scx: self.cache.scx,
+                lyc: self.cache.lyc,
+                bgp: self.cache.bgp,
+                obp0: self.cache.obp0,
+                obp1: self.cache.obp1,
+                wy: self.cache.wy,
+                wx: self.cache.wx,
+                tima: self.cache.tima,
+                tma: self.cache.tma,
+                tac: self.cache.tac,
+                ly: self.cache.ly,
+                vram: self.memory.vram(),
+                oam: self.memory.oam(),
+            },
+        ) {
+            self.pending_peripheral_cycles = PendingPeripheralCycles::default();
+            self.queued_peripheral_submitted_seq =
+                self.queued_peripheral_submitted_seq.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn try_sync_queued_shadow_state(&mut self, min_completed_seq: u32) -> bool {
+        if !self.queued_peripheral_pipeline
+            || self.queued_peripheral_applied_seq >= self.queued_peripheral_submitted_seq
         {
-            self.perf.record_apu(cyccnt().wrapping_sub(t0));
+            return false;
+        }
+
+        let Some(shadow) = self.peripherals.try_take_queued_shadow_state(min_completed_seq) else {
+            return false;
+        };
+        self.queued_peripheral_applied_seq = shadow
+            .completed_seq
+            .min(self.queued_peripheral_submitted_seq);
+        self.apply_queued_shadow_state(shadow);
+        true
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_peripherals_split(&mut self, ppu_cycles: u16, timer_cycles: u16, apu_cycles: u16) {
+        self.pending_peripheral_cycles
+            .add(ppu_cycles, timer_cycles, apu_cycles);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn flush_pending_peripherals(&mut self) {
+        if self.queued_peripheral_applied_seq != self.queued_peripheral_submitted_seq {
+            let next_needed = self.queued_peripheral_applied_seq.wrapping_add(1);
+            let _ = self.try_sync_queued_shadow_state(next_needed);
+        }
+
+        if self.queued_peripheral_pipeline {
+            let _ = self.try_submit_pending_peripherals(true);
+            return;
+        }
+
+        if !self.pending_peripheral_cycles.is_empty() {
+            let pending = self.pending_peripheral_cycles.take();
+        #[cfg(feature = "perf")]
+            let ppu_t0 = cyccnt();
+            let output = self.peripherals.advance(
+                pending.ppu,
+                pending.timer,
+                pending.apu,
+                PeripheralRegs {
+                    lcdc: self.cache.lcdc,
+                    stat: self.cache.stat,
+                    scy: self.cache.scy,
+                    scx: self.cache.scx,
+                    lyc: self.cache.lyc,
+                    bgp: self.cache.bgp,
+                    obp0: self.cache.obp0,
+                    obp1: self.cache.obp1,
+                    wy: self.cache.wy,
+                    wx: self.cache.wx,
+                    tima: self.cache.tima,
+                    tma: self.cache.tma,
+                    tac: self.cache.tac,
+                    ly: self.cache.ly,
+                    vram: self.memory.vram(),
+                    oam: self.memory.oam(),
+                },
+            );
+            self.apply_peripheral_output(output);
+            #[cfg(feature = "perf")]
+            {
+                let dt = cyccnt().wrapping_sub(ppu_t0);
+                self.perf.record_ppu(dt);
+                self.perf.record_timer(0);
+                self.perf.record_apu(0);
+            }
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn finish_tick(&mut self) -> u8 {
-        self.flush_pending_apu_cycles();
         let cycles = self.pending_cycle_counter as u8;
         self.cycle_counter = self
             .cycle_counter
@@ -977,7 +1132,8 @@ impl Sm83 {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn has_pending_interrupt(&self) -> bool {
+    fn has_pending_interrupt(&mut self) -> bool {
+        self.flush_pending_peripherals();
         let ie = self.memory.read_io(IE_ADDR);
         let if_val = self.memory.read_io(IF_ADDR);
         ie & if_val != 0
@@ -985,6 +1141,7 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn take_pending_interrupt(&mut self) -> Option<u8> {
+        self.flush_pending_peripherals();
         let ie = self.memory.read_io(IE_ADDR);
         let if_val = self.memory.read_io(IF_ADDR);
         let pending = ie & if_val;
@@ -1268,18 +1425,19 @@ impl Sm83 {
         };
         op.execute(self)?;
 
-        // Peripherals and bus events are already advanced per M-cycle
-        // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
-        self.flush_pending_apu_cycles();
-
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt() {
                 self.dispatch_interrupt(bit)?;
             }
         }
 
+        if !self.queued_peripheral_pipeline {
+            self.flush_pending_peripherals();
+        }
+
         #[cfg(feature = "trace")]
         if let Some(ref mut hook) = self.trace_hook {
+            self.flush_pending_peripherals();
             hook(TraceEvent {
                 pc: self.registers.pc,
                 registers: &self.registers,
@@ -3864,47 +4022,44 @@ mod tests {
     }
 
     #[test]
-    fn test_tick_returns_with_no_pending_apu_cycles() {
+    fn test_tick_returns_expected_cycles_without_pending_batches() {
         let mut cpu = make_test_cpu(vec![0x00]);
 
-        cpu.tick().unwrap();
-
-        assert!(cpu.pending_apu_cycles.is_empty());
+        let cycles = cpu.tick().unwrap();
+        assert_eq!(cycles, 4);
     }
 
     #[test]
-    fn test_halted_tick_returns_with_no_pending_apu_cycles() {
+    fn test_halted_tick_returns_expected_cycles_without_pending_batches() {
         let mut cpu = make_test_cpu(vec![0x76, 0x00]);
 
         cpu.tick().unwrap(); // HALT
-        cpu.tick().unwrap(); // halted early return
+        let cycles = cpu.tick().unwrap(); // halted early return
 
-        assert!(cpu.pending_apu_cycles.is_empty());
+        assert_eq!(cycles, 4);
     }
 
     #[test]
-    fn test_interrupt_dispatch_returns_with_no_pending_apu_cycles() {
+    fn test_interrupt_dispatch_returns_expected_cycles_without_pending_batches() {
         let mut cpu = make_test_cpu(vec![0xFB, 0x00, 0x00, 0x00]);
         cpu.memory.write_io(IE_ADDR, 0x01);
         cpu.memory.write_io(IF_ADDR, 0x01);
 
         cpu.tick().unwrap(); // EI
-        cpu.tick().unwrap(); // NOP + interrupt dispatch
+        let cycles = cpu.tick().unwrap(); // NOP + interrupt dispatch
 
-        assert!(cpu.pending_apu_cycles.is_empty());
+        assert_eq!(cycles, 24);
     }
 
     #[test]
-    fn test_tick_cycle_to_t3_flushes_prior_apu_batch() {
+    fn test_tick_cycle_to_t3_keeps_cycle_counter_monotonic() {
         let mut cpu = make_test_cpu(vec![0x00]);
 
         cpu.tick_cycle();
-        assert_eq!(cpu.pending_apu_cycles.cycles, 4);
         assert_eq!(cpu.cycle_counter(), 4);
 
         cpu.tick_cycle_to_t3();
 
-        assert_eq!(cpu.pending_apu_cycles.cycles, 3);
         assert_eq!(cpu.cycle_counter(), 8);
     }
 }

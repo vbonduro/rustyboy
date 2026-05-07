@@ -9,10 +9,10 @@
 //! Rgb565>` so the rendering logic can be exercised on the host with a
 //! framebuffer stub — see [`fb`].
 
-#[cfg(target_arch = "arm")]
-pub mod hw;
 #[cfg(any(not(target_arch = "arm"), feature = "std"))]
 pub mod fb;
+#[cfg(target_arch = "arm")]
+pub mod hw;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
@@ -127,17 +127,18 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
         );
         // buf stores big-endian u16s; swap back to native-endian before handing
         // to mipidsi, which handles its own byte ordering.
-        let _ = self.inner.fill_contiguous(&rect, buf.iter().map(|&v| Rgb565::from(RawU16::new(v.swap_bytes()))));
+        let _ = self.inner.fill_contiguous(
+            &rect,
+            buf.iter()
+                .map(|&v| Rgb565::from(RawU16::new(v.swap_bytes()))),
+        );
     }
 
     fn fill_bar(&mut self, y: i32, height: i32, color: Rgb565) {
         if height <= 0 {
             return;
         }
-        let rect = Rectangle::new(
-            Point::new(0, y),
-            Size::new(SCREEN_W as u32, height as u32),
-        );
+        let rect = Rectangle::new(Point::new(0, y), Size::new(SCREEN_W as u32, height as u32));
         let _ = self.inner.fill_contiguous(&rect, core::iter::repeat(color));
     }
 
@@ -235,7 +236,11 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
                     let gx = slot_x / 2;
                     let gy = ry / 2;
                     let row = font::GLYPHS[SEQUENCE[slot]][gy as usize];
-                    if (row >> (7 - gx)) & 1 == 1 { fg } else { bg }
+                    if (row >> (7 - gx)) & 1 == 1 {
+                        fg
+                    } else {
+                        bg
+                    }
                 } else {
                     bg
                 }
@@ -264,7 +269,11 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
         let colors = (y0..y1).flat_map(move |py2| {
             let row = bitmap[(py2 - py) as usize];
             (x0..x1).map(move |px2| {
-                if (row >> (7 - (px2 - px))) & 1 == 1 { fg } else { bg }
+                if (row >> (7 - (px2 - px))) & 1 == 1 {
+                    fg
+                } else {
+                    bg
+                }
             })
         });
         let _ = self.inner.fill_contiguous(&rect, colors);
@@ -331,8 +340,8 @@ mod font {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::fb::FbDisplay;
+    use super::*;
     use embedded_graphics::prelude::IntoStorage;
 
     fn make_display() -> Display<FbDisplay> {
@@ -360,7 +369,11 @@ mod tests {
         assert_eq!(fb_ref[0], C3, "top bar pixel should be C3");
         // Bottom bar: first pixel after scaled region
         let bot_start = ((Y_OFFSET + SCALED_H) * SCREEN_W) as usize;
-        assert_eq!(fb_ref[bot_start], Rgb565::BLACK, "bottom bar pixel should be black");
+        assert_eq!(
+            fb_ref[bot_start],
+            Rgb565::BLACK,
+            "bottom bar pixel should be black"
+        );
         // A pixel inside the scaled region should be C0
         let mid = (Y_OFFSET * SCREEN_W) as usize;
         assert_eq!(fb_ref[mid], C0, "game region pixel should be C0");
@@ -380,7 +393,10 @@ mod tests {
             pixels.iter().map(|p| p.into_storage()).collect();
         // All four DMG colours should appear
         for c in [C0, C1, C2, C3] {
-            assert!(colors_present.contains(&c.into_storage()), "missing palette entry");
+            assert!(
+                colors_present.contains(&c.into_storage()),
+                "missing palette entry"
+            );
         }
     }
 
@@ -390,11 +406,7 @@ mod tests {
         disp.splash_step(0);
         // Every pixel should be C1 (background) or C3 (logo above screen)
         for &px in disp.inner.as_ref() {
-            assert!(
-                px == C1 || px == C3,
-                "unexpected pixel {:?} on frame 0",
-                px
-            );
+            assert!(px == C1 || px == C3, "unexpected pixel {:?} on frame 0", px);
         }
     }
 
@@ -416,7 +428,11 @@ mod tests {
         let fb_ref = disp.inner.as_ref();
         assert_eq!(fb_ref[0], C3, "top bar should be C3");
         let bot_start = ((Y_OFFSET + SCALED_H) * SCREEN_W) as usize;
-        assert_eq!(fb_ref[bot_start], Rgb565::BLACK, "bottom bar should be black");
+        assert_eq!(
+            fb_ref[bot_start],
+            Rgb565::BLACK,
+            "bottom bar should be black"
+        );
     }
 
     #[test]

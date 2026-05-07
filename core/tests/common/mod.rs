@@ -215,6 +215,7 @@ pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
         let cycles = cpu.tick().unwrap() as u64;
         dots_elapsed += cycles;
     }
+    cpu.sync_peripherals();
 
     cpu.framebuffer().to_vec()
 }

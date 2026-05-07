@@ -100,7 +100,7 @@ fn test_save_state_pc_preserved() {
 #[test]
 fn test_save_state_wram_preserved() {
     let rom = make_rom(0x00, 0, 0);
-    let cpu = make_emulator(rom.clone());
+    let mut cpu = make_emulator(rom.clone());
 
     // Write known pattern into WRAM via the save-state blob.
     // WRAM occupies bytes [164..164+0x2000] in the blob.

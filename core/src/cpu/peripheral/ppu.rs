@@ -89,9 +89,30 @@ pub struct PpuOutput {
     pub stat_interrupt: bool,
 }
 
+pub trait PpuBackend {
+    fn tick(&mut self, cycles: u16, input: PpuInput<'_>) -> PpuOutput;
+    fn reset_ly(&mut self);
+    fn on_vram_write(&mut self, _offset: u16, _value: u8) {}
+    fn on_oam_write(&mut self, _offset: u16, _value: u8) {}
+    fn on_oam_dma_byte(&mut self, offset: u8, value: u8) {
+        self.on_oam_write(offset as u16, value);
+    }
+    fn sync_memory(&mut self, _vram: &[u8], _oam: &[u8]) {}
+    fn snapshot_framebuffer_into(&mut self, dst: &mut [u8; FRAMEBUFFER_SIZE]);
+    fn to_save_state(&self) -> crate::cpu::save_state::PpuState;
+    fn load_state(
+        &mut self,
+        state: crate::cpu::save_state::PpuState,
+        vram: &[u8],
+        oam: &[u8],
+    );
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> PpuPerfProfile;
+}
+
 /// Scanline-based PPU peripheral.
 #[cfg(feature = "perf")]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct PpuPerfProfile {
     pub render_bg: u32,
     pub render_window: u32,
@@ -125,6 +146,26 @@ impl PpuPeripheral {
             #[cfg(feature = "perf")]
             perf_profile: PpuPerfProfile::default(),
         }
+    }
+
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        core::ptr::addr_of_mut!((*dst).dot).write(0);
+        core::ptr::addr_of_mut!((*dst).ly).write(0);
+        core::ptr::addr_of_mut!((*dst).mode).write(PpuMode::OamScan);
+        core::ptr::addr_of_mut!((*dst).window_line_counter).write(0);
+        core::ptr::addr_of_mut!((*dst).prev_stat_line).write(false);
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!((*dst).framebuffer).cast::<u8>(),
+            0,
+            FRAMEBUFFER_SIZE,
+        );
+        core::ptr::write_bytes(
+            core::ptr::addr_of_mut!((*dst).bg_color_indices).cast::<u8>(),
+            0,
+            SCREEN_WIDTH,
+        );
+        #[cfg(feature = "perf")]
+        core::ptr::addr_of_mut!((*dst).perf_profile).write(PpuPerfProfile::default());
     }
 
     #[cfg(feature = "perf")]
@@ -480,6 +521,38 @@ impl PpuPeripheral {
 
             self.framebuffer[row_start + sx] = apply_palette(palette, color_index);
         }
+    }
+}
+
+impl PpuBackend for PpuPeripheral {
+    fn tick(&mut self, cycles: u16, input: PpuInput<'_>) -> PpuOutput {
+        Self::tick(self, cycles, input)
+    }
+
+    fn reset_ly(&mut self) {
+        Self::reset_ly(self);
+    }
+
+    fn snapshot_framebuffer_into(&mut self, dst: &mut [u8; FRAMEBUFFER_SIZE]) {
+        dst.copy_from_slice(self.framebuffer());
+    }
+
+    fn to_save_state(&self) -> crate::cpu::save_state::PpuState {
+        Self::to_save_state(self)
+    }
+
+    fn load_state(
+        &mut self,
+        state: crate::cpu::save_state::PpuState,
+        _vram: &[u8],
+        _oam: &[u8],
+    ) {
+        Self::load_state(self, state);
+    }
+
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> PpuPerfProfile {
+        Self::take_perf_profile(self)
     }
 }
 

@@ -9,8 +9,12 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use cortex_m_rt::ExceptionFrame;
 #[cortex_m_rt::exception]
 unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
-    defmt::error!("HardFault: PC=0x{:08x} LR=0x{:08x} PSR=0x{:08x}",
-        ef.pc(), ef.lr(), ef.xpsr());
+    defmt::error!(
+        "HardFault: PC=0x{:08x} LR=0x{:08x} PSR=0x{:08x}",
+        ef.pc(),
+        ef.lr(),
+        ef.xpsr()
+    );
     loop {}
 }
 
@@ -25,7 +29,9 @@ static HEAP: Heap = Heap::empty();
 use defmt::{error, info, warn};
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0, SPI1};
+use embassy_rp::peripherals::{
+    DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0, SPI1,
+};
 use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::spi::{self, Spi};
@@ -38,16 +44,16 @@ use {defmt_rtt as _, panic_probe as _};
 
 use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
+use rustyboy_core::cpu::peripheral::island::PeripheralBackend;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
 use rustyboy_core::memory::GameBoyMemory;
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
+use rustyboy_pico2w::core1::spawn_peripheral_core;
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::display::scale_to_rgb565;
-use rustyboy_pico2w::flash_rom::{
-    new_onboard_flash, probe_staged_rom, stage_rom_from_reader,
-};
+use rustyboy_pico2w::flash_rom::{new_onboard_flash, probe_staged_rom, stage_rom_from_reader};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 use rustyboy_pico2w::stack_probe;
@@ -58,8 +64,7 @@ const TARGET_SYS_HZ: u32 = 266_000_000;
 #[cfg(not(feature = "oc-266"))]
 const TARGET_SYS_HZ: u32 = 250_000_000;
 
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
-    embassy_rp::clocks::CoreVoltage::V1_20;
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_20;
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CYCLES_PER_FRAME: u64 = 70_224;
@@ -207,8 +212,10 @@ async fn main(_spawner: Spawner) {
     let memory = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
     info!("building OpCodeDecoder");
     let decoder = alloc::boxed::Box::new(OpCodeDecoder::new());
+    info!("spawning peripheral core");
+    let peripherals: alloc::boxed::Box<dyn PeripheralBackend> = spawn_peripheral_core(p.CORE1);
     info!("building Sm83 CPU");
-    let mut cpu = Sm83::new(alloc::boxed::Box::new(memory), decoder)
+    let mut cpu = Sm83::new_with_peripherals(alloc::boxed::Box::new(memory), decoder, peripherals)
         .with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),
@@ -251,10 +258,14 @@ async fn main(_spawner: Spawner) {
     // SAFETY: hw_disp was dropped above, SPI1 and all display pins are free.
     let mut game_disp = unsafe {
         GameDisplay::new_after_splash(
-            PIN_10::steal(), PIN_11::steal(),
-            PIN_9::steal(),  PIN_8::steal(),
-            PIN_12::steal(), PIN_13::steal(),
-            SPI1::steal(),   p.DMA_CH1,
+            PIN_10::steal(),
+            PIN_11::steal(),
+            PIN_9::steal(),
+            PIN_8::steal(),
+            PIN_12::steal(),
+            PIN_13::steal(),
+            SPI1::steal(),
+            p.DMA_CH1,
             Irqs,
         )
     };
@@ -298,6 +309,7 @@ async fn main(_spawner: Spawner) {
         while cpu.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
             let _ = cpu.tick();
         }
+        cpu.sync_peripherals();
 
         // Propagate button changes to the CPU.
         let (state, menu) = input.poll();

@@ -1,4 +1,5 @@
 pub mod apu;
+pub mod island;
 pub mod joypad;
 pub mod ppu;
 pub mod serial;
