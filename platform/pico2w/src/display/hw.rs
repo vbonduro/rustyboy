@@ -8,8 +8,8 @@ use defmt::{info, warn};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, SPI1};
 use embassy_rp::spi::{Async, Blocking, Config as SpiConfig, Spi};
-use embassy_rp::{dma, interrupt};
 use embassy_rp::Peri;
+use embassy_rp::{dma, interrupt};
 
 use display_interface_spi::SPIInterface;
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -130,9 +130,9 @@ impl<'d> GameDisplay<'d> {
         spi1: Peri<'d, SPI1>,
         dma: Peri<'d, DMA_CH1>,
         irqs: impl interrupt::typelevel::Binding<
-            interrupt::typelevel::DMA_IRQ_0,
-            dma::InterruptHandler<DMA_CH1>,
-        > + 'd,
+                interrupt::typelevel::DMA_IRQ_0,
+                dma::InterruptHandler<DMA_CH1>,
+            > + 'd,
     ) -> Self {
         // The DMA_IRQ_0 ISR now calls BOTH InterruptHandler<DMA_CH0> and
         // InterruptHandler<DMA_CH1> unconditionally (combined bind_interrupts!).
@@ -143,7 +143,9 @@ impl<'d> GameDisplay<'d> {
         if ahb_err {
             warn!("DMA CH1 ahb_error set before init — aborting to clear");
             // Write bit 1 to CHAN_ABORT to trigger a CH1 abort.
-            rp_pac::DMA.chan_abort().write_value(rp_pac::dma::regs::ChanAbort(1u32 << 1));
+            rp_pac::DMA
+                .chan_abort()
+                .write_value(rp_pac::dma::regs::ChanAbort(1u32 << 1));
             while rp_pac::DMA.chan_abort().read().chan_abort() & (1u16 << 1) != 0 {}
         }
         // Clear any pending CH1 interrupt flag in INTS0 (W1C: write 1 to clear).
@@ -159,7 +161,13 @@ impl<'d> GameDisplay<'d> {
         let bl = Output::new(bl_pin, Level::High);
 
         info!("display: async SPI re-initialised for game loop");
-        Self { spi, cs, dc, _rst: rst, _bl: bl }
+        Self {
+            spi,
+            cs,
+            dc,
+            _rst: rst,
+            _bl: bl,
+        }
     }
 
     /// Paint the static letterbox bars (top C3, bottom black) once before the
@@ -171,13 +179,16 @@ impl<'d> GameDisplay<'d> {
         // Top bar: rows 0..51, colour C3
         self.set_window(0, 0, DISPLAY_X_END, TOP_BAR_Y_END).await;
         self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE)
+            .await;
         info!("display: top bar done");
 
         // Bottom bar: rows 268..319, colour black
-        self.set_window(0, BOTTOM_BAR_Y_START, DISPLAY_X_END, DISPLAY_Y_END).await;
+        self.set_window(0, BOTTOM_BAR_Y_START, DISPLAY_X_END, DISPLAY_Y_END)
+            .await;
         self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE)
+            .await;
         info!("display: letterbox bars done");
     }
 
@@ -187,7 +198,8 @@ impl<'d> GameDisplay<'d> {
     /// [`super::scale_to_rgb565`]. Returns a future; `.await` it after doing
     /// other work to overlap the ~13 ms transfer with emulation.
     pub async fn send_frame_raw(&mut self, buf: &[u16; 51840]) {
-        self.set_window(0, GAME_Y_START, DISPLAY_X_END, GAME_Y_END).await;
+        self.set_window(0, GAME_Y_START, DISPLAY_X_END, GAME_Y_END)
+            .await;
         self.write_command(0x2C, &[]).await;
 
         self.dc.set_high();
@@ -223,7 +235,7 @@ impl<'d> GameDisplay<'d> {
         let mut row = [0u8; ROW_BYTES];
         let mut i = 0;
         while i < ROW_BYTES {
-            row[i]     = pixel_be[0];
+            row[i] = pixel_be[0];
             row[i + 1] = pixel_be[1];
             i += 2;
         }

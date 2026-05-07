@@ -46,9 +46,10 @@ fn run_frame(cpu: &mut Sm83) {
     while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
         let _ = cpu.tick();
     }
+    cpu.sync_peripherals();
 }
 
-fn dump_oam_summary(cpu: &Sm83) -> usize {
+fn dump_oam_summary(cpu: &mut Sm83) -> usize {
     let mut visible = 0;
     for i in 0..40 {
         let base = 0xFE00 + (i * 4) as u16;
@@ -547,7 +548,7 @@ fn trace_dkl2_level_lcdc() {
     let stat = cpu.read_memory(STAT_ADDR).unwrap_or(0);
     let lyc = cpu.read_memory(LYC_ADDR).unwrap_or(0);
     eprintln!("LCDC=0x{:02X} OBJ={} BGP=0x{:02X} STAT=0x{:02X} LYC={}", lcdc, (lcdc>>1)&1, bgp, stat, lyc);
-    let n = dump_oam_summary(&cpu);
+    let n = dump_oam_summary(&mut cpu);
     eprintln!("Active sprites: {}", n);
 
     // Mid-frame LCDC trace for final 3 frames

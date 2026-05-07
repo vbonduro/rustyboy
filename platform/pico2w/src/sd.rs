@@ -23,9 +23,9 @@ where
     <D as BlockDevice>::Error: core::fmt::Debug,
     T: TimeSource,
 {
-    mgr:    VolumeManager<D, T>,
+    mgr: VolumeManager<D, T>,
     volume: RawVolume,
-    file:   RawFile,
+    file: RawFile,
 }
 
 #[derive(Debug)]
@@ -50,7 +50,7 @@ where
     /// open it for sequential bank reads.
     pub fn new(mgr: VolumeManager<D, T>) -> Result<Self, SdError<D::Error>> {
         let volume = mgr.open_raw_volume(VolumeIdx(0))?;
-        let root   = mgr.open_root_dir(volume)?;
+        let root = mgr.open_root_dir(volume)?;
 
         if let Some(file) = find_rom_in_dir(&mgr, root)? {
             let _ = mgr.close_dir(root);
@@ -91,7 +91,9 @@ where
         let mut total = 0;
         while total < 0x4000 {
             let n = self.mgr.read(self.file, &mut buf[total..])?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             total += n;
         }
         Ok(())

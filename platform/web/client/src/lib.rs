@@ -59,6 +59,7 @@ impl EmulatorHandle {
         while self.cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
             let _ = self.cpu.tick();
         }
+        self.cpu.sync_peripherals();
     }
 
     /// Returns the framebuffer as an RGBA8 Vec for use in JS as Uint8ClampedArray.
@@ -81,13 +82,13 @@ impl EmulatorHandle {
     /// Returns a debug string with key PPU/interrupt state for on-screen display.
     /// Only available when compiled with the `debug-overlay` feature.
     #[cfg(feature = "debug-overlay")]
-    pub fn debug_state(&self) -> String {
-        let read = |a: u16| self.cpu.read_memory(a).unwrap_or(0);
-        let lcdc = read(0xFF40);
-        let stat = read(0xFF41);
-        let ly   = read(0xFF44);
-        let lyc  = read(0xFF45);
-        let scx  = read(0xFF43);
+    pub fn debug_state(&mut self) -> String {
+        let read = |cpu: &mut Sm83, a: u16| cpu.read_memory(a).unwrap_or(0);
+        let lcdc = read(&mut self.cpu, 0xFF40);
+        let stat = read(&mut self.cpu, 0xFF41);
+        let ly   = read(&mut self.cpu, 0xFF44);
+        let lyc  = read(&mut self.cpu, 0xFF45);
+        let scx  = read(&mut self.cpu, 0xFF43);
         let scy  = read(0xFF42);
         let if_  = read(0xFF0F);
         let ie   = read(0xFFFF);
@@ -110,7 +111,7 @@ impl EmulatorHandle {
     }
 
     /// Serialize the full emulator state to a byte blob (save state).
-    pub fn save_state(&self) -> Vec<u8> {
+    pub fn save_state(&mut self) -> Vec<u8> {
         self.cpu.save_state()
     }
 

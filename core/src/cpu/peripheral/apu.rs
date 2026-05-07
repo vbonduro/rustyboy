@@ -67,8 +67,20 @@ pub struct ApuOutput {
     pub nr52: u8,
 }
 
+pub trait ApuBackend {
+    fn read_register(&mut self, address: u16) -> u8;
+    fn write_register(&mut self, address: u16, value: u8);
+    fn read_wave_ram(&mut self, offset: u8) -> u8;
+    fn write_wave_ram(&mut self, offset: u8, value: u8);
+    fn tick(&mut self, cycles: u16, div_counter: u16) -> ApuOutput;
+    fn drain_samples(&mut self) -> alloc::vec::Vec<f32>;
+    fn clear_samples(&mut self);
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> ApuPerfProfile;
+}
+
 #[cfg(feature = "perf")]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct ApuPerfProfile {
     pub frame_seq: u32,
     pub pulse: u32,
@@ -1172,6 +1184,41 @@ impl ApuPeripheral {
             self.channel3.wave_ram[2] = self.channel3.wave_ram[block_start + 2];
             self.channel3.wave_ram[3] = self.channel3.wave_ram[block_start + 3];
         }
+    }
+}
+
+impl ApuBackend for ApuPeripheral {
+    fn read_register(&mut self, address: u16) -> u8 {
+        Self::read_register(self, address)
+    }
+
+    fn write_register(&mut self, address: u16, value: u8) {
+        Self::write_register(self, address, value);
+    }
+
+    fn read_wave_ram(&mut self, offset: u8) -> u8 {
+        Self::read_wave_ram(self, offset)
+    }
+
+    fn write_wave_ram(&mut self, offset: u8, value: u8) {
+        Self::write_wave_ram(self, offset, value);
+    }
+
+    fn tick(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
+        Self::tick(self, cycles, div_counter)
+    }
+
+    fn drain_samples(&mut self) -> alloc::vec::Vec<f32> {
+        Self::drain_samples(self)
+    }
+
+    fn clear_samples(&mut self) {
+        Self::clear_samples(self);
+    }
+
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> ApuPerfProfile {
+        Self::take_perf_profile(self)
     }
 }
 
