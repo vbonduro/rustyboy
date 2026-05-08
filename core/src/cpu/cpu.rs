@@ -41,6 +41,6 @@ impl From<MemoryError> for CpuError {
 
 pub trait Cpu {
     // Read the next instruction from the program and execute it.
-    // Returns the number of ticks from the instruction.
-    fn tick(&mut self) -> Result<u8, CpuError>;
+    // Returns the number of T-cycles from the instruction.
+    fn step(&mut self) -> Result<u8, CpuError>;
 }

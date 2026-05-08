@@ -65,26 +65,8 @@ impl Lcdc {
     }
 }
 
-/// Input snapshot passed to the PPU each tick.
-pub struct PpuInput<'a> {
-    pub lcdc: u8,
-    pub stat: u8,
-    pub scy: u8,
-    pub scx: u8,
-    pub lyc: u8,
-    pub bgp: u8,
-    pub obp0: u8,
-    pub obp1: u8,
-    pub wy: u8,
-    pub wx: u8,
-    pub vram: &'a [u8],
-    pub oam: &'a [u8],
-}
-
-/// Result of a PPU tick — CPU writes these back to IO registers.
+/// Result of a PPU tick.
 pub struct PpuOutput {
-    pub ly: u8,
-    pub stat: u8,
     pub vblank_interrupt: bool,
     pub stat_interrupt: bool,
 }
@@ -100,6 +82,18 @@ pub struct PpuPerfProfile {
 }
 
 pub struct PpuPeripheral {
+    // IO registers owned by the PPU
+    lcdc: u8,
+    stat: u8,
+    scy: u8,
+    scx: u8,
+    lyc: u8,
+    bgp: u8,
+    obp0: u8,
+    obp1: u8,
+    wy: u8,
+    wx: u8,
+    // Internal state
     dot: u16,
     ly: u8,
     mode: PpuMode,
@@ -115,6 +109,8 @@ pub struct PpuPeripheral {
 impl PpuPeripheral {
     pub fn new() -> Self {
         Self {
+            lcdc: 0, stat: 0, scy: 0, scx: 0, lyc: 0,
+            bgp: 0, obp0: 0, obp1: 0, wy: 0, wx: 0,
             dot: 0,
             ly: 0,
             mode: PpuMode::OamScan,
@@ -126,6 +122,31 @@ impl PpuPeripheral {
             perf_profile: PpuPerfProfile::default(),
         }
     }
+
+    // ── Register accessors ───────────────────────────────────────────────────
+
+    pub fn lcdc(&self) -> u8  { self.lcdc  }
+    pub fn stat(&self) -> u8  { self.stat  }
+    pub fn scy(&self)  -> u8  { self.scy   }
+    pub fn scx(&self)  -> u8  { self.scx   }
+    pub fn ly(&self)   -> u8  { self.ly    }
+    pub fn lyc(&self)  -> u8  { self.lyc   }
+    pub fn bgp(&self)  -> u8  { self.bgp   }
+    pub fn obp0(&self) -> u8  { self.obp0  }
+    pub fn obp1(&self) -> u8  { self.obp1  }
+    pub fn wy(&self)   -> u8  { self.wy    }
+    pub fn wx(&self)   -> u8  { self.wx    }
+
+    pub fn set_lcdc(&mut self, v: u8) { self.lcdc  = v; }
+    pub fn set_stat(&mut self, v: u8) { self.stat  = v; }
+    pub fn set_scy(&mut self,  v: u8) { self.scy   = v; }
+    pub fn set_scx(&mut self,  v: u8) { self.scx   = v; }
+    pub fn set_lyc(&mut self,  v: u8) { self.lyc   = v; }
+    pub fn set_bgp(&mut self,  v: u8) { self.bgp   = v; }
+    pub fn set_obp0(&mut self, v: u8) { self.obp0  = v; }
+    pub fn set_obp1(&mut self, v: u8) { self.obp1  = v; }
+    pub fn set_wy(&mut self,   v: u8) { self.wy    = v; }
+    pub fn set_wx(&mut self,   v: u8) { self.wx    = v; }
 
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> PpuPerfProfile {
@@ -143,6 +164,16 @@ impl PpuPeripheral {
             ly: self.ly,
             mode: self.mode,
             window_line_counter: self.window_line_counter,
+            lcdc: self.lcdc,
+            stat: self.stat,
+            scy: self.scy,
+            scx: self.scx,
+            lyc: self.lyc,
+            bgp: self.bgp,
+            obp0: self.obp0,
+            obp1: self.obp1,
+            wy: self.wy,
+            wx: self.wx,
         }
     }
 
@@ -152,22 +183,29 @@ impl PpuPeripheral {
         self.ly = state.ly;
         self.mode = state.mode;
         self.window_line_counter = state.window_line_counter;
+        self.lcdc = state.lcdc;
+        self.stat = state.stat;
+        self.scy = state.scy;
+        self.scx = state.scx;
+        self.lyc = state.lyc;
+        self.bgp = state.bgp;
+        self.obp0 = state.obp0;
+        self.obp1 = state.obp1;
+        self.wy = state.wy;
+        self.wx = state.wx;
     }
 
     /// Advance the PPU by `cycles` T-cycles.
+    ///
+    /// `vram` and `oam` are the shared memory regions owned by `GameBoyMemory`.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    pub fn tick(&mut self, cycles: u16, input: PpuInput) -> PpuOutput {
-        let lcdc = Lcdc(input.lcdc);
+    pub fn tick(&mut self, cycles: u16, vram: &[u8], oam: &[u8]) -> PpuOutput {
+        let lcdc = Lcdc(self.lcdc);
 
         if !lcdc.lcd_enabled() {
             self.reset_lcd();
-            let stat = (input.stat & 0x78) | (PpuMode::HBlank as u8);
-            return PpuOutput {
-                ly: 0,
-                stat,
-                vblank_interrupt: false,
-                stat_interrupt: false,
-            };
+            self.stat = (self.stat & 0x78) | (PpuMode::HBlank as u8);
+            return PpuOutput { vblank_interrupt: false, stat_interrupt: false };
         }
 
         let mut vblank_interrupt = false;
@@ -195,7 +233,7 @@ impl PpuPeripheral {
                 }
                 PpuMode::PixelTransfer => {
                     self.mode = PpuMode::HBlank;
-                    self.render_scanline(&input);
+                    self.render_scanline(vram, oam);
                 }
                 PpuMode::HBlank => {
                     self.dot = 0;
@@ -221,16 +259,11 @@ impl PpuPeripheral {
 
         #[cfg(feature = "perf")]
         let t0 = crate::cpu::perf::cyccnt();
-        let (stat, stat_interrupt) = self.build_stat(&input);
+        let stat_interrupt = self.build_stat();
         #[cfg(feature = "perf")]
         { self.perf_profile.build_stat = self.perf_profile.build_stat.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
 
-        PpuOutput {
-            ly: self.ly,
-            stat,
-            vblank_interrupt,
-            stat_interrupt,
-        }
+        PpuOutput { vblank_interrupt, stat_interrupt }
     }
 
     /// Reset LY to 0 (triggered by CPU write to LY register).
@@ -238,23 +271,23 @@ impl PpuPeripheral {
         self.ly = 0;
     }
 
-    /// Build the STAT register value and detect STAT interrupt rising edge.
+    /// Update STAT register and detect STAT interrupt rising edge.
+    /// Returns `true` if the interrupt should fire.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn build_stat(&mut self, input: &PpuInput) -> (u8, bool) {
-        let lyc_match = self.ly == input.lyc;
-        let stat = (input.stat & 0x78)
+    fn build_stat(&mut self) -> bool {
+        let lyc_match = self.ly == self.lyc;
+        self.stat = (self.stat & 0x78)
             | if lyc_match { 0x04 } else { 0x00 }
             | (self.mode as u8);
 
-        let stat_line = (lyc_match && (input.stat & 0x40 != 0))
-            || (self.mode == PpuMode::HBlank && (input.stat & 0x08 != 0))
-            || (self.mode == PpuMode::VBlank && (input.stat & 0x10 != 0))
-            || (self.mode == PpuMode::OamScan && (input.stat & 0x20 != 0));
+        let stat_line = (lyc_match && (self.stat & 0x40 != 0))
+            || (self.mode == PpuMode::HBlank && (self.stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank && (self.stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan && (self.stat & 0x20 != 0));
 
         let interrupt = stat_line && !self.prev_stat_line;
         self.prev_stat_line = stat_line;
-
-        (stat, interrupt)
+        interrupt
     }
 
     /// Reset all PPU state when the LCD is disabled.
@@ -268,8 +301,8 @@ impl PpuPeripheral {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_scanline(&mut self, input: &PpuInput) {
-        let lcdc = Lcdc(input.lcdc);
+    fn render_scanline(&mut self, vram: &[u8], oam: &[u8]) {
+        let lcdc = Lcdc(self.lcdc);
         let ly = self.ly as usize;
         if ly >= SCREEN_HEIGHT {
             return;
@@ -280,7 +313,7 @@ impl PpuPeripheral {
         if lcdc.bg_enabled() {
             #[cfg(feature = "perf")]
             let t0 = crate::cpu::perf::cyccnt();
-            self.render_bg_scanline(input, lcdc, row_start);
+            self.render_bg_scanline(vram, lcdc, row_start);
             #[cfg(feature = "perf")]
             { self.perf_profile.render_bg = self.perf_profile.render_bg.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
         } else {
@@ -293,7 +326,7 @@ impl PpuPeripheral {
         if lcdc.window_enabled() && lcdc.bg_enabled() {
             #[cfg(feature = "perf")]
             let t0 = crate::cpu::perf::cyccnt();
-            self.render_window_scanline(input, lcdc, row_start);
+            self.render_window_scanline(vram, lcdc, row_start);
             #[cfg(feature = "perf")]
             { self.perf_profile.render_window = self.perf_profile.render_window.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
         }
@@ -301,16 +334,16 @@ impl PpuPeripheral {
         if lcdc.obj_enabled() {
             #[cfg(feature = "perf")]
             let t0 = crate::cpu::perf::cyccnt();
-            self.render_sprite_scanline(input, lcdc, row_start);
+            self.render_sprite_scanline(vram, oam, lcdc, row_start);
             #[cfg(feature = "perf")]
             { self.perf_profile.render_sprites = self.perf_profile.render_sprites.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_bg_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
+    fn render_bg_scanline(&mut self, vram: &[u8], lcdc: Lcdc, row_start: usize) {
         let tilemap_base: usize = if lcdc.bg_tilemap_high() { 0x1C00 } else { 0x1800 };
-        let y = input.scy.wrapping_add(self.ly);
+        let y = self.scy.wrapping_add(self.ly);
         let tile_row = (y / 8) as usize;
         let fine_y = (y % 8) as usize;
 
@@ -319,28 +352,28 @@ impl PpuPeripheral {
         let mut hi = 0u8;
 
         for screen_x in 0..SCREEN_WIDTH {
-            let x = input.scx.wrapping_add(screen_x as u8);
+            let x = self.scx.wrapping_add(screen_x as u8);
             let tile_col = (x / 8) as usize;
             let fine_x = 7 - (x % 8);
 
             if tile_col != current_tile_col {
                 current_tile_col = tile_col;
                 let tilemap_addr = tilemap_base + tile_row * 32 + tile_col;
-                let tile_index = input.vram[tilemap_addr];
+                let tile_index = vram[tilemap_addr];
                 let tile_data_addr = tile_data_address(lcdc, tile_index, fine_y);
-                lo = input.vram[tile_data_addr];
-                hi = input.vram[tile_data_addr + 1];
+                lo = vram[tile_data_addr];
+                hi = vram[tile_data_addr + 1];
             }
 
             let color = decode_2bpp_pixel(lo, hi, fine_x);
             self.bg_color_indices[screen_x] = color;
-            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
+            self.framebuffer[row_start + screen_x] = apply_palette(self.bgp, color);
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_window_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
-        if self.ly < input.wy || input.wx > 166 {
+    fn render_window_scanline(&mut self, vram: &[u8], lcdc: Lcdc, row_start: usize) {
+        if self.ly < self.wy || self.wx > 166 {
             return;
         }
 
@@ -349,7 +382,7 @@ impl PpuPeripheral {
         let tile_row = win_y / 8;
         let fine_y = win_y % 8;
 
-        let screen_x_start = if input.wx < 7 { 0 } else { (input.wx - 7) as usize };
+        let screen_x_start = if self.wx < 7 { 0 } else { (self.wx - 7) as usize };
 
         let mut current_tile_col = usize::MAX;
         let mut lo = 0u8;
@@ -363,22 +396,22 @@ impl PpuPeripheral {
             if tile_col != current_tile_col {
                 current_tile_col = tile_col;
                 let tilemap_addr = tilemap_base + tile_row * 32 + tile_col;
-                let tile_index = input.vram[tilemap_addr];
+                let tile_index = vram[tilemap_addr];
                 let tile_data_addr = tile_data_address(lcdc, tile_index, fine_y);
-                lo = input.vram[tile_data_addr];
-                hi = input.vram[tile_data_addr + 1];
+                lo = vram[tile_data_addr];
+                hi = vram[tile_data_addr + 1];
             }
 
             let color = decode_2bpp_pixel(lo, hi, fine_x);
             self.bg_color_indices[screen_x] = color;
-            self.framebuffer[row_start + screen_x] = apply_palette(input.bgp, color);
+            self.framebuffer[row_start + screen_x] = apply_palette(self.bgp, color);
         }
 
         self.window_line_counter += 1;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_sprite_scanline(&mut self, input: &PpuInput, lcdc: Lcdc, row_start: usize) {
+    fn render_sprite_scanline(&mut self, vram: &[u8], oam: &[u8], lcdc: Lcdc, row_start: usize) {
         let sprite_height: u8 = if lcdc.obj_tall() { 16 } else { 8 };
         let ly = self.ly as i16;
 
@@ -391,10 +424,10 @@ impl PpuPeripheral {
                 break;
             }
             let oam_addr = i * 4;
-            let sprite_y = input.oam[oam_addr] as i16 - 16;
-            let sprite_x = input.oam[oam_addr + 1];
-            let tile = input.oam[oam_addr + 2];
-            let attrs = input.oam[oam_addr + 3];
+            let sprite_y = oam[oam_addr] as i16 - 16;
+            let sprite_x = oam[oam_addr + 1];
+            let tile = oam[oam_addr + 2];
+            let attrs = oam[oam_addr + 3];
 
             if ly >= sprite_y && ly < sprite_y + sprite_height as i16 {
                 sprites[count] = (sprite_y as u8, sprite_x, tile, attrs, i);
@@ -415,14 +448,15 @@ impl PpuPeripheral {
 
         // Draw in reverse priority order so higher-priority sprites overwrite
         for idx in (0..count).rev() {
-            self.draw_sprite(input, lcdc, row_start, sprite_height, &sprites[idx]);
+            self.draw_sprite(vram, oam, lcdc, row_start, sprite_height, &sprites[idx]);
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn draw_sprite(
         &mut self,
-        input: &PpuInput,
+        vram: &[u8],
+        oam: &[u8],
         lcdc: Lcdc,
         row_start: usize,
         sprite_height: u8,
@@ -430,13 +464,13 @@ impl PpuPeripheral {
     ) {
         let (_, sprite_x, tile, attrs, oam_index) = *sprite;
         let sprite_screen_x = sprite_x as i16 - 8;
-        let sprite_y_pos = (input.oam[oam_index * 4] as i16) - 16;
+        let sprite_y_pos = (oam[oam_index * 4] as i16) - 16;
         let ly = self.ly as i16;
 
         let y_flip = attrs & 0x40 != 0;
         let x_flip = attrs & 0x20 != 0;
         let bg_priority = attrs & 0x80 != 0;
-        let palette = if attrs & 0x10 != 0 { input.obp1 } else { input.obp0 };
+        let palette = if attrs & 0x10 != 0 { self.obp1 } else { self.obp0 };
 
         let mut row_in_sprite = (ly - sprite_y_pos) as u8;
         let tile_index = if lcdc.obj_tall() {
@@ -457,8 +491,8 @@ impl PpuPeripheral {
         };
 
         let tile_addr = (tile_index as usize) * 16 + (row_in_sprite as usize) * 2;
-        let lo = input.vram[tile_addr];
-        let hi = input.vram[tile_addr + 1];
+        let lo = vram[tile_addr];
+        let hi = vram[tile_addr + 1];
 
         for pixel in 0..8u8 {
             let screen_x = sprite_screen_x + pixel as i16;
@@ -512,94 +546,62 @@ fn apply_palette(palette: u8, color_index: u8) -> u8 {
 mod tests {
     use super::*;
 
-    fn default_input<'a>(vram: &'a [u8], oam: &'a [u8]) -> PpuInput<'a> {
-        PpuInput {
-            lcdc: 0x91, // LCD on, BG on, BG tile data unsigned
-            stat: 0x00,
-            scy: 0,
-            scx: 0,
-            lyc: 0xFF,
-            bgp: 0xE4, // standard palette: 3,2,1,0
-            obp0: 0xE4,
-            obp1: 0xE4,
-            wy: 0,
-            wx: 7,
-            vram,
-            oam,
-        }
+    fn default_ppu() -> PpuPeripheral {
+        let mut ppu = PpuPeripheral::new();
+        ppu.set_lcdc(0x91); // LCD on, BG on, BG tile data unsigned
+        ppu.set_lyc(0xFF);
+        ppu.set_bgp(0xE4);  // standard palette: 3,2,1,0
+        ppu.set_obp0(0xE4);
+        ppu.set_obp1(0xE4);
+        ppu.set_wx(7);
+        ppu
     }
 
-    fn tick_dots(ppu: &mut PpuPeripheral, dots: u32, input: &PpuInput) -> PpuOutput {
-        let mut output = PpuOutput {
-            ly: 0,
-            stat: 0,
-            vblank_interrupt: false,
-            stat_interrupt: false,
-        };
-        // Tick one at a time to get correct mode transitions
+    fn tick_dots(ppu: &mut PpuPeripheral, dots: u32, vram: &[u8], oam: &[u8]) -> PpuOutput {
+        let mut vblank = false;
+        let mut stat_irq = false;
         for _ in 0..dots {
-            let o = ppu.tick(1, PpuInput {
-                lcdc: input.lcdc,
-                stat: input.stat,
-                scy: input.scy,
-                scx: input.scx,
-                lyc: input.lyc,
-                bgp: input.bgp,
-                obp0: input.obp0,
-                obp1: input.obp1,
-                wy: input.wy,
-                wx: input.wx,
-                vram: input.vram,
-                oam: input.oam,
-            });
-            if o.vblank_interrupt {
-                output.vblank_interrupt = true;
-            }
-            if o.stat_interrupt {
-                output.stat_interrupt = true;
-            }
-            output.ly = o.ly;
-            output.stat = o.stat;
+            let o = ppu.tick(1, vram, oam);
+            vblank  |= o.vblank_interrupt;
+            stat_irq |= o.stat_interrupt;
         }
-        output
+        PpuOutput { vblank_interrupt: vblank, stat_interrupt: stat_irq }
     }
 
     #[test]
     fn test_mode_transitions_single_scanline() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         assert_eq!(ppu.mode, PpuMode::OamScan);
 
         // After 80 dots: transition to PixelTransfer
-        let output = tick_dots(&mut ppu, OAM_SCAN_DOTS as u32, &input);
+        tick_dots(&mut ppu, OAM_SCAN_DOTS as u32, &vram, &oam);
         assert_eq!(ppu.mode, PpuMode::PixelTransfer);
-        assert_eq!(output.ly, 0);
+        assert_eq!(ppu.ly(), 0);
 
         // After 172 more dots: transition to HBlank
-        let output = tick_dots(&mut ppu, PIXEL_TRANSFER_DOTS as u32, &input);
+        tick_dots(&mut ppu, PIXEL_TRANSFER_DOTS as u32, &vram, &oam);
         assert_eq!(ppu.mode, PpuMode::HBlank);
-        assert_eq!(output.ly, 0);
+        assert_eq!(ppu.ly(), 0);
 
         // After 204 more dots (456 total): transition to next scanline
-        let output = tick_dots(&mut ppu, (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32, &input);
+        tick_dots(&mut ppu, (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32, &vram, &oam);
         assert_eq!(ppu.mode, PpuMode::OamScan);
-        assert_eq!(output.ly, 1);
+        assert_eq!(ppu.ly(), 1);
     }
 
     #[test]
     fn test_ly_counts_to_vblank() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // Tick through 144 scanlines
-        let output = tick_dots(&mut ppu, VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(&mut ppu, VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert_eq!(ppu.mode, PpuMode::VBlank);
-        assert_eq!(output.ly, 144);
+        assert_eq!(ppu.ly(), 144);
         assert!(output.vblank_interrupt);
     }
 
@@ -607,81 +609,76 @@ mod tests {
     fn test_ly_wraps_after_frame() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // Full frame: 154 scanlines
-        let output = tick_dots(&mut ppu, TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &input);
+        tick_dots(&mut ppu, TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert_eq!(ppu.mode, PpuMode::OamScan);
-        assert_eq!(output.ly, 0);
+        assert_eq!(ppu.ly(), 0);
     }
 
     #[test]
     fn test_vblank_interrupt_fires_at_ly_144() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // Tick through 143 scanlines — no vblank yet
-        let output = tick_dots(&mut ppu, 143 * DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(&mut ppu, 143 * DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert!(!output.vblank_interrupt);
 
         // Tick through scanline 143 into 144 — vblank fires
-        let output = tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert!(output.vblank_interrupt);
-        assert_eq!(output.ly, 144);
+        assert_eq!(ppu.ly(), 144);
     }
 
     #[test]
     fn test_stat_lyc_interrupt() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
-        input.lyc = 5;
-        input.stat = 0x40; // LYC=LY interrupt enable
+        let mut ppu = default_ppu();
+        ppu.set_lyc(5);
+        ppu.set_stat(0x40); // LYC=LY interrupt enable
 
         // Tick to scanline 5
-        let output = tick_dots(&mut ppu, 5 * DOTS_PER_SCANLINE as u32, &input);
+        let output = tick_dots(&mut ppu, 5 * DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert!(output.stat_interrupt);
-        assert_eq!(output.stat & 0x04, 0x04); // LYC=LY flag set
+        assert_eq!(ppu.stat() & 0x04, 0x04); // LYC=LY flag set
     }
 
     #[test]
     fn test_stat_mode_bits() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // OAM scan = mode 2
-        let output = tick_dots(&mut ppu, 1, &input);
-        assert_eq!(output.stat & 0x03, 2);
+        tick_dots(&mut ppu, 1, &vram, &oam);
+        assert_eq!(ppu.stat() & 0x03, 2);
 
         // Pixel transfer = mode 3
-        let output = tick_dots(&mut ppu, 79, &input);
-        assert_eq!(output.stat & 0x03, 3);
+        tick_dots(&mut ppu, 79, &vram, &oam);
+        assert_eq!(ppu.stat() & 0x03, 3);
 
         // HBlank = mode 0
-        let output = tick_dots(&mut ppu, 172, &input);
-        assert_eq!(output.stat & 0x03, 0);
+        tick_dots(&mut ppu, 172, &vram, &oam);
+        assert_eq!(ppu.stat() & 0x03, 0);
     }
 
     #[test]
     fn test_lcd_disabled_resets_state() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // Advance to mid-frame
-        tick_dots(&mut ppu, 5 * DOTS_PER_SCANLINE as u32 + 100, &input);
+        tick_dots(&mut ppu, 5 * DOTS_PER_SCANLINE as u32 + 100, &vram, &oam);
 
         // Disable LCD
-        input.lcdc = 0x00;
-        let output = ppu.tick(1, input);
-        assert_eq!(output.ly, 0);
+        ppu.set_lcdc(0x00);
+        ppu.tick(1, &vram, &oam);
+        assert_eq!(ppu.ly(), 0);
         assert_eq!(ppu.mode, PpuMode::HBlank);
         assert_eq!(ppu.dot, 0);
     }
@@ -713,16 +710,15 @@ mod tests {
         // Set tilemap entry at (0,0) to tile 0
         vram[0x1800] = 0;
 
-        let mut ppu = PpuPeripheral::new();
-        let input = default_input(&vram, &oam);
+        let mut ppu = default_ppu();
 
         // Tick through one scanline (LY=0)
-        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &input);
+        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &vram, &oam);
 
         // First 8 pixels should be palette color 3
         for x in 0..8 {
             assert_eq!(
-                ppu.framebuffer[x],
+                ppu.framebuffer()[x],
                 apply_palette(0xE4, 3),
                 "pixel {} expected color 3",
                 x
@@ -745,16 +741,15 @@ mod tests {
         oam[2] = 1;
         oam[3] = 0;
 
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
-        input.lcdc = 0x93; // LCD on, BG on, OBJ on, unsigned tile data
+        let mut ppu = default_ppu();
+        ppu.set_lcdc(0x93); // LCD on, BG on, OBJ on, unsigned tile data
 
-        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &input);
+        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &vram, &oam);
 
         // First 8 pixels should be sprite color 1 (applied through OBP0)
         for x in 0..8 {
             assert_eq!(
-                ppu.framebuffer[x],
+                ppu.framebuffer()[x],
                 apply_palette(0xE4, 1),
                 "sprite pixel {} expected color 1",
                 x
@@ -781,16 +776,15 @@ mod tests {
         oam[2] = 1;
         oam[3] = 0;
 
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
-        input.lcdc = 0x93;
+        let mut ppu = default_ppu();
+        ppu.set_lcdc(0x93);
 
-        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &input);
+        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &vram, &oam);
 
         // Pixels where sprite is color 0 should show BG color 2
         // Pixels where sprite is color 1 should show sprite color 1
-        assert_eq!(ppu.framebuffer[0], apply_palette(0xE4, 1)); // sprite
-        assert_eq!(ppu.framebuffer[1], apply_palette(0xE4, 2)); // BG (transparent sprite)
+        assert_eq!(ppu.framebuffer()[0], apply_palette(0xE4, 1)); // sprite
+        assert_eq!(ppu.framebuffer()[1], apply_palette(0xE4, 2)); // BG (transparent sprite)
     }
 
     #[test]
@@ -805,18 +799,17 @@ mod tests {
         // Window tilemap at 0x1800 (LCDC bit 6 = 0), tile 0
         vram[0x1800] = 0;
 
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
-        input.lcdc = 0xB1; // LCD on, window on, BG on, unsigned, window tilemap low
-        input.wy = 0;
-        input.wx = 7; // window starts at screen X=0
+        let mut ppu = default_ppu();
+        ppu.set_lcdc(0xB1); // LCD on, window on, BG on, unsigned, window tilemap low
+        ppu.set_wy(0);
+        // wx already 7 from default_ppu
 
-        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &input);
+        tick_dots(&mut ppu, DOTS_PER_SCANLINE as u32, &vram, &oam);
 
         // First 8 pixels should be window color 1
         for x in 0..8 {
             assert_eq!(
-                ppu.framebuffer[x],
+                ppu.framebuffer()[x],
                 apply_palette(0xE4, 1),
                 "window pixel {} expected color 1",
                 x
@@ -828,16 +821,15 @@ mod tests {
     fn test_stat_rising_edge_only() {
         let vram = [0u8; 0x2000];
         let oam = [0u8; 0xA0];
-        let mut ppu = PpuPeripheral::new();
-        let mut input = default_input(&vram, &oam);
-        input.stat = 0x20; // Mode 2 (OAM scan) interrupt enable
+        let mut ppu = default_ppu();
+        ppu.set_stat(0x20); // Mode 2 (OAM scan) interrupt enable
 
         // First tick into OAM scan should fire STAT
-        let output = tick_dots(&mut ppu, 1, &input);
+        let output = tick_dots(&mut ppu, 1, &vram, &oam);
         assert!(output.stat_interrupt);
 
         // Subsequent ticks in same mode should NOT re-fire
-        let output = tick_dots(&mut ppu, 1, &input);
+        let output = tick_dots(&mut ppu, 1, &vram, &oam);
         assert!(!output.stat_interrupt);
     }
 

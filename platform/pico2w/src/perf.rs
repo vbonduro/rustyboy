@@ -1,6 +1,6 @@
 use defmt::info;
 use embassy_time::Instant;
-use rustyboy_core::cpu::sm83::Sm83;
+use rustyboy_core::GameBoy;
 
 /// Tracks FPS and (when `perf` is enabled) per-component cycle counts.
 /// Call `tick` once per game loop iteration.
@@ -37,7 +37,7 @@ impl PerfTracker {
         self.render_cycles += cycles as u64;
     }
 
-    pub fn tick(&mut self, cpu: &mut Sm83) {
+    pub fn tick(&mut self, cpu: &mut GameBoy) {
         self.frame_count += 1;
         if self.frame_count < 60 {
             return;

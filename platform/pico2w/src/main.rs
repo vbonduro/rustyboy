@@ -36,12 +36,8 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{SdCard, VolumeManager};
 use {defmt_rtt as _, panic_probe as _};
 
-use rustyboy_core::cpu::cpu::Cpu;
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
-use rustyboy_core::cpu::registers::{Flags, Registers};
-use rustyboy_core::cpu::sm83::Sm83;
-use rustyboy_core::memory::GameBoyMemory;
+use rustyboy_core::GameBoy;
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::display::scale_to_rgb565;
@@ -203,25 +199,8 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    info!("building GameBoyMemory");
-    let memory = GameBoyMemory::with_cartridge(alloc::boxed::Box::new(cart));
-    info!("building OpCodeDecoder");
-    let decoder = alloc::boxed::Box::new(OpCodeDecoder::new());
-    info!("building Sm83 CPU");
-    let mut cpu = Sm83::new(alloc::boxed::Box::new(memory), decoder)
-        .with_registers(Registers {
-            a: 0x01,
-            f: Flags::from_bits_truncate(0xB0),
-            b: 0x00,
-            c: 0x13,
-            d: 0x00,
-            e: 0xD8,
-            h: 0x01,
-            l: 0x4D,
-            pc: 0x0100,
-            sp: 0xFFFE,
-        })
-        .with_dmg_state();
+    info!("building GameBoy");
+    let mut cpu = GameBoy::with_cartridge(alloc::boxed::Box::new(cart));
     info!("ROM loaded, starting peripheral init");
 
     // I2S audio: GP14=BCLK  GP15=LRCLK  GP16=DIN  GP17=SD_MODE (MAX98357A).
@@ -278,7 +257,7 @@ async fn main(_spawner: Spawner) {
         // Pre-scale current frame into the buffer (~0.5 ms).
         #[cfg(feature = "perf")]
         let scale_start = perf::perf_cycle_read();
-        scale_to_rgb565(cpu.framebuffer(), frame_buf);
+        scale_to_rgb565(cpu.front_buffer(), frame_buf);
         #[cfg(feature = "perf")]
         tracker.record_scale(perf::perf_cycle_read().wrapping_sub(scale_start));
 
@@ -296,7 +275,7 @@ async fn main(_spawner: Spawner) {
         // Both DMAs run while the CPU emulates — display finishes at ~13 ms.
         let frame_start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
-            let _ = cpu.tick();
+            cpu.tick();
         }
 
         // Propagate button changes to the CPU.

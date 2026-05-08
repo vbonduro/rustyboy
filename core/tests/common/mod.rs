@@ -1,7 +1,6 @@
 //! Shared test harness utilities for integration tests.
 #![allow(dead_code)]
 
-use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::Registers;
 use rustyboy_core::cpu::sm83::Sm83;
@@ -37,7 +36,7 @@ pub fn run_blargg_rom(path: &str) -> String {
     const MAX_TICKS: u64 = 50_000_000;
     let mut ticks = 0u64;
     while ticks < MAX_TICKS {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
         ticks += 1;
         if ticks % 1024 == 0 {
             let bytes = cpu.serial_output();
@@ -81,7 +80,7 @@ pub fn run_blargg_mem_rom(path: &str) -> String {
     const MAX_TICKS: u64 = 50_000_000;
     let mut ticks = 0u64;
     while ticks < MAX_TICKS {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
         ticks += 1;
         if ticks % 1024 == 0 {
             // Check signature at 0xA001-0xA003
@@ -147,7 +146,7 @@ pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
             break;
         }
         prev_pc = pc;
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
         ticks += 1;
         if cpu.is_halted() {
             break;
@@ -212,7 +211,7 @@ pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
     let total_dots: u64 = frames as u64 * 70_224;
     let mut dots_elapsed: u64 = 0;
     while dots_elapsed < total_dots {
-        let cycles = cpu.tick().unwrap() as u64;
+        let cycles = cpu.step().unwrap() as u64;
         dots_elapsed += cycles;
     }
 

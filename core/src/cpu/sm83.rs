@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, format, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, vec::Vec};
 
 use super::cpu::{Cpu, CpuError};
 use super::instructions::adc::opcode::Adc;
@@ -36,12 +36,12 @@ use super::peripheral::apu::{
 use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
 use super::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
 use super::peripheral::ppu::{
-    PpuInput, PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
+    PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
     LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
     VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
 };
 use super::peripheral::timer::{
-    TimerInput, TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
+    TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
 };
 #[cfg(feature = "perf")]
 use super::perf::{cyccnt, Sm83PerfRecorder};
@@ -56,6 +56,62 @@ impl From<MemoryError> for InstructionError {
     fn from(error: MemoryError) -> Self {
         InstructionError::Failed(format!("Failed to access memory: {}", error))
     }
+}
+
+/// M-cycle operation returned by Sm83::tick(). GameBoy drives the bus.
+#[derive(Debug, PartialEq)]
+pub enum McycleOp {
+    /// CPU needs the byte at this address; deliver via tock().
+    Read(u16),
+    /// CPU wants to write this byte to this address; ack via tock(0).
+    Write(u16, u8),
+    /// Internal M-cycle; advance peripherals and call tock(0).
+    Internal,
+    /// Instruction (and any ISR dispatch) is complete.
+    Done,
+}
+
+/// Carry parameters for a Compute micro-op function.
+struct ComputeOp {
+    func: fn(&mut Sm83, u8, u8, u8),
+    p0: u8,
+    p1: u8,
+    p2: u8,
+}
+
+impl ComputeOp {
+    fn new0(func: fn(&mut Sm83, u8, u8, u8)) -> Self {
+        ComputeOp { func, p0: 0, p1: 0, p2: 0 }
+    }
+    fn new1(func: fn(&mut Sm83, u8, u8, u8), p0: u8) -> Self {
+        ComputeOp { func, p0, p1: 0, p2: 0 }
+    }
+    fn new2(func: fn(&mut Sm83, u8, u8, u8), p0: u8, p1: u8) -> Self {
+        ComputeOp { func, p0, p1, p2: 0 }
+    }
+    #[allow(dead_code)]
+    fn new3(func: fn(&mut Sm83, u8, u8, u8), p0: u8, p1: u8, p2: u8) -> Self {
+        ComputeOp { func, p0, p1, p2 }
+    }
+}
+
+enum MicroOp {
+    /// Bus read; tock stores result in temp[temp_idx++].
+    Read(u16),
+    /// Bus read at self.addr_temp; tock stores result.
+    ReadAddrTemp,
+    /// Bus write, fully static.
+    Write(u16, u8),
+    /// Bus write to self.addr_temp with self.val_temp.
+    WriteDyn,
+    /// Bus write to self.addr_temp, value = fn(cpu).
+    WriteAddrTempWith(fn(&Sm83) -> u8),
+    /// Internal M-cycle.
+    Internal,
+    /// Inline computation, no M-cycle emitted.
+    Compute(ComputeOp),
+    /// Marks end of instruction; tick() returns McycleOp::Done.
+    InstructionDone,
 }
 
 /// Interrupt Master Enable state. EI has a 1-instruction delay before IME becomes active.
@@ -87,62 +143,17 @@ pub struct TraceEvent<'a> {
 
 #[derive(Default)]
 pub struct Sm83Cache {
-    pub lcdc: u8,
-    pub stat: u8,
-    pub scy: u8,
-    pub scx: u8,
-    pub lyc: u8,
-    pub bgp: u8,
-    pub obp0: u8,
-    pub obp1: u8,
-    pub wy: u8,
-    pub wx: u8,
-    pub tima: u8,
-    pub tma: u8,
-    pub tac: u8,
-    pub ly: u8,
     pub nr52: u8,
-    pub div: u8,
 }
 
 impl Sm83Cache {
     pub fn sync(&mut self, mem: &GameBoyMemory) {
-        self.lcdc = mem.read_io(LCDC_ADDR);
-        self.stat = mem.read_io(STAT_ADDR);
-        self.scy  = mem.read_io(SCY_ADDR);
-        self.scx  = mem.read_io(SCX_ADDR);
-        self.lyc  = mem.read_io(LYC_ADDR);
-        self.bgp  = mem.read_io(BGP_ADDR);
-        self.obp0 = mem.read_io(OBP0_ADDR);
-        self.obp1 = mem.read_io(OBP1_ADDR);
-        self.wy   = mem.read_io(WY_ADDR);
-        self.wx   = mem.read_io(WX_ADDR);
-        self.tima = mem.read_io(TIMA_ADDR);
-        self.tma  = mem.read_io(TMA_ADDR);
-        self.tac  = mem.read_io(TAC_ADDR);
-        self.ly   = mem.read_io(LY_ADDR);
         self.nr52 = mem.read_io(NR52_ADDR);
-        self.div  = mem.read_io(DIV_ADDR);
     }
 
     pub fn read(&self, addr: u16) -> Option<u8> {
         match addr {
-            a if a == LCDC_ADDR => Some(self.lcdc),
-            a if a == STAT_ADDR => Some(self.stat),
-            a if a == SCY_ADDR  => Some(self.scy),
-            a if a == SCX_ADDR  => Some(self.scx),
-            a if a == LYC_ADDR  => Some(self.lyc),
-            a if a == BGP_ADDR  => Some(self.bgp),
-            a if a == OBP0_ADDR => Some(self.obp0),
-            a if a == OBP1_ADDR => Some(self.obp1),
-            a if a == WY_ADDR   => Some(self.wy),
-            a if a == WX_ADDR   => Some(self.wx),
-            a if a == TIMA_ADDR => Some(self.tima),
-            a if a == TMA_ADDR  => Some(self.tma),
-            a if a == TAC_ADDR  => Some(self.tac),
-            a if a == LY_ADDR   => Some(self.ly),
             a if a == NR52_ADDR => Some(self.nr52),
-            a if a == DIV_ADDR  => Some(self.div),
             _ => None,
         }
     }
@@ -213,6 +224,16 @@ pub struct Sm83 {
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
     #[cfg(feature = "perf")]
     perf: Sm83PerfRecorder,
+    /// Micro-op queue for the current/next instruction.
+    micro_ops: VecDeque<MicroOp>,
+    /// Temporary address for dynamic bus operations.
+    addr_temp: u16,
+    /// Temporary value for WriteDyn operations.
+    val_temp: u8,
+    /// Accumulates bytes from tock() calls; reset at instruction fetch.
+    temp: [u8; 4],
+    /// Next write index into temp[].
+    temp_idx: usize,
 }
 
 /// State for an in-progress OAM DMA transfer.
@@ -255,6 +276,11 @@ impl Sm83 {
             trace_hook: None,
             #[cfg(feature = "perf")]
             perf: Sm83PerfRecorder::default(),
+            micro_ops: VecDeque::new(),
+            addr_temp: 0,
+            val_temp: 0,
+            temp: [0u8; 4],
+            temp_idx: 0,
         };
         // Seed JOYP with no buttons pressed (all lines high).
         sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
@@ -402,6 +428,11 @@ impl Sm83 {
         self.halted        = state.cpu.halted;
         self.cycle_counter = state.cpu.cycle_counter;
         self.pending_cycle_counter = 0;
+        self.micro_ops.clear();
+        self.addr_temp = 0;
+        self.val_temp = 0;
+        self.temp = [0u8; 4];
+        self.temp_idx = 0;
         self.timer.load_state(state.timer);
         self.ppu.load_state(state.ppu);
         self.memory.load_state(&state);
@@ -420,12 +451,12 @@ impl Sm83 {
     /// Seed IO registers to their DMG post-boot-ROM state so games that poll
     /// LY or check LCDC before enabling the LCD work correctly without a boot ROM.
     pub fn with_dmg_state(mut self) -> Self {
-        // Post-boot IO register values (DMG, SGB, MGB verified against Pan Docs)
-        self.memory.write_io(LCDC_ADDR, 0x91); // LCD on, BG on, sprites off, window off
-        self.memory.write_io(STAT_ADDR, 0x85); // PPU in VBlank (mode 1), LYC=LY
-        self.memory.write_io(BGP_ADDR,  0xFC); // background palette: 3,3,3,0
-        self.memory.write_io(OBP0_ADDR, 0xFF); // obj palette 0
-        self.memory.write_io(OBP1_ADDR, 0xFF); // obj palette 1
+        // Post-boot PPU register values (DMG, SGB, MGB verified against Pan Docs)
+        self.ppu.set_lcdc(0x91); // LCD on, BG on, sprites off, window off
+        self.ppu.set_stat(0x85); // PPU in VBlank (mode 1), LYC=LY
+        self.ppu.set_bgp(0xFC);  // background palette: 3,3,3,0
+        self.ppu.set_obp0(0xFF); // obj palette 0
+        self.ppu.set_obp1(0xFF); // obj palette 1
         // APU post-boot state (Pan Docs)
         self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
         self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
@@ -459,7 +490,27 @@ impl Sm83 {
         self.tick_cycle();
         #[cfg(feature = "perf")]
         let t_read = cyccnt();
-        let value = self.memory.read_fast(addr);
+        let value = match addr {
+            a if a == DIV_ADDR  => self.timer.div(),
+            a if a == TIMA_ADDR => self.timer.tima(),
+            a if a == TMA_ADDR  => self.timer.tma(),
+            a if a == TAC_ADDR  => self.timer.tac(),
+            a if a == JOYP_ADDR => self.joypad.read(),
+            a if a == SB_ADDR   => self.serial.sb(),
+            a if a == SC_ADDR   => self.serial.sc(),
+            a if a == LCDC_ADDR => self.ppu.lcdc(),
+            a if a == STAT_ADDR => self.ppu.stat(),
+            a if a == SCY_ADDR  => self.ppu.scy(),
+            a if a == SCX_ADDR  => self.ppu.scx(),
+            a if a == LY_ADDR   => self.ppu.ly(),
+            a if a == LYC_ADDR  => self.ppu.lyc(),
+            a if a == BGP_ADDR  => self.ppu.bgp(),
+            a if a == OBP0_ADDR => self.ppu.obp0(),
+            a if a == OBP1_ADDR => self.ppu.obp1(),
+            a if a == WY_ADDR   => self.ppu.wy(),
+            a if a == WX_ADDR   => self.ppu.wx(),
+            _                   => self.memory.read_fast(addr),
+        };
         #[cfg(feature = "perf")]
         {
             let t1 = cyccnt();
@@ -652,14 +703,7 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_serial(&mut self, cycles: u16) {
-        let output = self.serial.tick(cycles);
-        if output.interrupt {
-            if let Some(sb) = output.sb {
-                self.memory.write_io(SB_ADDR, sb);
-            }
-            if let Some(sc) = output.sc {
-                self.memory.write_io(SC_ADDR, sc);
-            }
+        if self.serial.tick(cycles) {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << SERIAL_INTERRUPT_BIT));
         }
@@ -799,9 +843,9 @@ impl Sm83 {
                 self.joypad.write(value);
                 self.memory.write_io(JOYP_ADDR, self.joypad.read());
             }
+            a if a == SB_ADDR => self.serial.set_sb(value),
             a if a == SC_ADDR => {
-                let sb = self.memory.read_io(SB_ADDR);
-                self.serial.handle_sc_write(value, sb);
+                self.serial.handle_sc_write(value);
                 if self.serial.is_idle() {
                     self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
                 } else {
@@ -810,7 +854,6 @@ impl Sm83 {
             }
             a if a == DIV_ADDR => {
                 self.timer.reset_div();
-                self.cache.div = 0xFF;
             }
             a if a == LY_ADDR => self.ppu.reset_ly(),
             a if a == DMA_ADDR => {
@@ -821,19 +864,19 @@ impl Sm83 {
             // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
             a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
             a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
-            a if a == TIMA_ADDR => self.cache.tima = value,
-            a if a == TMA_ADDR  => self.cache.tma  = value,
-            a if a == TAC_ADDR  => self.cache.tac  = value,
-            a if a == LCDC_ADDR => self.cache.lcdc = value,
-            a if a == STAT_ADDR => self.cache.stat = value,
-            a if a == SCY_ADDR  => self.cache.scy  = value,
-            a if a == SCX_ADDR  => self.cache.scx  = value,
-            a if a == LYC_ADDR  => self.cache.lyc  = value,
-            a if a == BGP_ADDR  => self.cache.bgp  = value,
-            a if a == OBP0_ADDR => self.cache.obp0 = value,
-            a if a == OBP1_ADDR => self.cache.obp1 = value,
-            a if a == WY_ADDR   => self.cache.wy   = value,
-            a if a == WX_ADDR   => self.cache.wx   = value,
+            a if a == TIMA_ADDR => self.timer.set_tima(value),
+            a if a == TMA_ADDR  => self.timer.set_tma(value),
+            a if a == TAC_ADDR  => self.timer.set_tac(value),
+            a if a == LCDC_ADDR => self.ppu.set_lcdc(value),
+            a if a == STAT_ADDR => self.ppu.set_stat(value),
+            a if a == SCY_ADDR  => self.ppu.set_scy(value),
+            a if a == SCX_ADDR  => self.ppu.set_scx(value),
+            a if a == LYC_ADDR  => self.ppu.set_lyc(value),
+            a if a == BGP_ADDR  => self.ppu.set_bgp(value),
+            a if a == OBP0_ADDR => self.ppu.set_obp0(value),
+            a if a == OBP1_ADDR => self.ppu.set_obp1(value),
+            a if a == WY_ADDR   => self.ppu.set_wy(value),
+            a if a == WX_ADDR   => self.ppu.set_wx(value),
             _ => {}
         }
     }
@@ -864,31 +907,7 @@ impl Sm83 {
     fn advance_ppu(&mut self, cycles: u16) {
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
-        let output = self.ppu.tick(
-            cycles,
-            PpuInput {
-                lcdc: self.cache.lcdc,
-                stat: self.cache.stat,
-                scy: self.cache.scy,
-                scx: self.cache.scx,
-                lyc: self.cache.lyc,
-                bgp: self.cache.bgp,
-                obp0: self.cache.obp0,
-                obp1: self.cache.obp1,
-                wy: self.cache.wy,
-                wx: self.cache.wx,
-                vram: self.memory.vram(),
-                oam: self.memory.oam(),
-            },
-        );
-        if output.ly != self.cache.ly {
-            self.cache.ly = output.ly;
-            self.memory.write_io(LY_ADDR, output.ly);
-        }
-        if output.stat != self.cache.stat {
-            self.cache.stat = output.stat;
-            self.memory.write_io(STAT_ADDR, output.stat);
-        }
+        let output = self.ppu.tick(cycles, self.memory.vram(), self.memory.oam());
         if output.vblank_interrupt {
             // Snapshot the completed frame into the front buffer before the PPU
             // starts overwriting scanlines for the next frame.
@@ -910,23 +929,8 @@ impl Sm83 {
     fn advance_timer(&mut self, cycles: u16) {
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
-        let output = self.timer.tick(
-            cycles,
-            TimerInput {
-                tima: self.cache.tima,
-                tma: self.cache.tma,
-                tac: self.cache.tac,
-            },
-        );
-        if output.tima != self.cache.tima {
-            self.cache.tima = output.tima;
-            self.memory.write_io(TIMA_ADDR, output.tima);
-        }
-        if output.div != self.cache.div {
-            self.cache.div = output.div;
-            self.memory.write_io(DIV_ADDR, output.div);
-        }
-        if output.interrupt {
+        let interrupt = self.timer.tick(cycles);
+        if interrupt {
             let if_val = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
         }
@@ -1187,10 +1191,10 @@ impl Sm83 {
 
 impl Cpu for Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick(&mut self) -> Result<u8, CpuError> {
+    fn step(&mut self) -> Result<u8, CpuError> {
         #[cfg(feature = "perf")]
         let tick_t0 = cyccnt();
-        let result = self.tick_impl();
+        let result = self.step_impl();
         #[cfg(feature = "perf")]
         {
             self.perf.record_total(cyccnt().wrapping_sub(tick_t0));
@@ -1199,10 +1203,1181 @@ impl Cpu for Sm83 {
     }
 }
 
+// ── Standalone Compute functions ─────────────────────────────────────────────
+
+fn advance_ime_fn(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    cpu.advance_ime();
+}
+
+fn fetch_dispatch(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    let opcode = cpu.temp[0];
+    cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+    cpu.temp_idx = 0;
+    if opcode == 0xCB {
+        let pc = cpu.registers.pc;
+        cpu.micro_ops.push_back(MicroOp::Read(pc));
+        cpu.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(fetch_dispatch_cb)));
+    } else {
+        cpu.dispatch_opcode(opcode);
+    }
+    // Always add post-instruction handler at end
+    cpu.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(post_instr)));
+}
+
+fn fetch_dispatch_cb(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    let opcode = cpu.temp[0];
+    cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+    cpu.temp_idx = 0;
+    cpu.dispatch_cb_opcode(opcode);
+}
+
+fn post_instr(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    if cpu.ime == ImeState::Enabled {
+        if let Some(bit) = cpu.take_pending_interrupt() {
+            cpu.push_isr_micro_ops(bit);
+            return;
+        }
+    }
+    cpu.micro_ops.push_back(MicroOp::InstructionDone);
+}
+
+fn halt_check(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    if cpu.has_pending_interrupt() {
+        cpu.halted = false;
+        if cpu.ime == ImeState::Enabled {
+            if let Some(bit) = cpu.take_pending_interrupt() {
+                cpu.push_isr_micro_ops(bit);
+                return;
+            }
+        }
+        // IME=false: unhalt and fall through to execute next instruction in same step().
+        // Push advance_ime + fetch + post_instr to continue execution without returning Done.
+        let pc = cpu.registers.pc;
+        cpu.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(advance_ime_fn)));
+        cpu.micro_ops.push_back(MicroOp::Read(pc));
+        cpu.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(fetch_dispatch)));
+        return;
+    }
+    // Still halted: emit Done to end this tick (will loop next step() call)
+    cpu.micro_ops.push_back(MicroOp::InstructionDone);
+}
+
+fn isr_finish(cpu: &mut Sm83, bit: u8, _: u8, _: u8) {
+    cpu.registers.sp = cpu.registers.sp.wrapping_sub(2);
+    cpu.registers.pc = 0x0040u16.wrapping_add((bit as u16) * 8);
+}
+
+fn apply_jr_offset(cpu: &mut Sm83, e: u8, _: u8, _: u8) {
+    cpu.registers.pc = cpu.registers.pc.wrapping_add((e as i8 as i16) as u16);
+}
+
+fn ret_finish(cpu: &mut Sm83, _: u8, _: u8, _: u8) {
+    cpu.registers.pc = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+    cpu.registers.sp = cpu.registers.sp.wrapping_add(2);
+}
+
+// ── tick/tock interface ───────────────────────────────────────────────────────
+
+impl Sm83 {
+    /// Return the next M-cycle operation. GameBoy drives the bus.
+    pub fn tick(&mut self) -> McycleOp {
+        loop {
+            if self.micro_ops.is_empty() {
+                if self.halted {
+                    self.micro_ops.push_back(MicroOp::Internal);
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(halt_check)));
+                } else {
+                    let pc = self.registers.pc;
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(advance_ime_fn)));
+                    self.micro_ops.push_back(MicroOp::Read(pc));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(fetch_dispatch)));
+                }
+                continue;
+            }
+
+            match self.micro_ops.pop_front().unwrap() {
+                MicroOp::InstructionDone => return McycleOp::Done,
+                MicroOp::Compute(op) => {
+                    (op.func)(self, op.p0, op.p1, op.p2);
+                    continue;
+                }
+                MicroOp::Read(addr) => return McycleOp::Read(addr),
+                MicroOp::ReadAddrTemp => return McycleOp::Read(self.addr_temp),
+                MicroOp::Write(a, v) => return McycleOp::Write(a, v),
+                MicroOp::WriteDyn => return McycleOp::Write(self.addr_temp, self.val_temp),
+                MicroOp::WriteAddrTempWith(f) => return McycleOp::Write(self.addr_temp, f(self)),
+                MicroOp::Internal => return McycleOp::Internal,
+            }
+        }
+    }
+
+    /// Deliver the byte read by the last McycleOp::Read, or acknowledge a write/internal.
+    /// For Read operations, `data` is stored in temp[] and temp_idx is advanced.
+    /// For Write/Internal acknowledgements (`data` = 0), this is a no-op.
+    pub fn tock(&mut self, data: u8) {
+        if self.temp_idx < self.temp.len() {
+            self.temp[self.temp_idx] = data;
+            self.temp_idx += 1;
+        }
+        // For write/internal acks (data==0 when temp[] is full), silently ignore.
+    }
+
+    // ── step() helpers ────────────────────────────────────────────────────────
+
+    fn step_bus_read(&mut self, addr: u16) -> u8 {
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            self.tick_cycle_to_t3();
+            let offset = (addr - WAVE_RAM_START) as u8;
+            let value = self.apu.read_wave_ram(offset);
+            self.advance_timer(1);
+            self.queue_apu_cycles(1);
+            return value;
+        }
+        match addr {
+            a if a == DIV_ADDR  => self.timer.div(),
+            a if a == TIMA_ADDR => self.timer.tima(),
+            a if a == TMA_ADDR  => self.timer.tma(),
+            a if a == TAC_ADDR  => self.timer.tac(),
+            a if a == JOYP_ADDR => self.joypad.read(),
+            a if a == SB_ADDR   => self.serial.sb(),
+            a if a == SC_ADDR   => self.serial.sc(),
+            a if a == LCDC_ADDR => self.ppu.lcdc(),
+            a if a == STAT_ADDR => self.ppu.stat(),
+            a if a == SCY_ADDR  => self.ppu.scy(),
+            a if a == SCX_ADDR  => self.ppu.scx(),
+            a if a == LY_ADDR   => self.ppu.ly(),
+            a if a == LYC_ADDR  => self.ppu.lyc(),
+            a if a == BGP_ADDR  => self.ppu.bgp(),
+            a if a == OBP0_ADDR => self.ppu.obp0(),
+            a if a == OBP1_ADDR => self.ppu.obp1(),
+            a if a == WY_ADDR   => self.ppu.wy(),
+            a if a == WX_ADDR   => self.ppu.wx(),
+            _                   => self.memory.read_fast(addr),
+        }
+    }
+
+    fn step_bus_write(&mut self, addr: u16, val: u8) {
+        if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
+            // T3-sensitive write: tick_cycle_to_t3 was already called by step_advance_m_cycle
+            self.write_apu_register(addr, val);
+            self.advance_timer(1);
+            self.queue_apu_cycles(1);
+            return;
+        }
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            // T3-sensitive write: tick_cycle_to_t3 was already called by step_advance_m_cycle
+            self.write_wave_ram(addr, val);
+            self.advance_timer(1);
+            self.queue_apu_cycles(1);
+            return;
+        }
+        match addr {
+            0xFF00..=0xFF7F | 0xFFFF => {
+                self.memory.write_io(addr, val);
+                self.pending_bus_events.push(BusEvent { address: addr, value: val });
+                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
+            }
+            0xE000..=0xFDFF => {} // echo RAM: silently ignore writes
+            _ => {
+                self.memory.write_fast(addr, val);
+            }
+        }
+    }
+
+    fn step_advance_m_cycle(&mut self, addr: u16, is_write: bool) {
+        if is_write && ((NR10_ADDR..=NR52_ADDR).contains(&addr) || (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr)) {
+            // T3-sensitive APU/wave write: advance to T3 then caller will do the write and T4
+            self.tick_cycle_to_t3();
+            return;
+        }
+        if !is_write && (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            // T3-sensitive wave read: step_bus_read handles tick_cycle_to_t3 + T4 internally
+            return;
+        }
+        self.begin_m_cycle();
+        self.advance_peripherals(4);
+    }
+
+    fn step_advance_internal(&mut self) {
+        self.begin_m_cycle();
+        self.advance_peripherals(4);
+    }
+
+    /// Drive the micro-op queue to completion, advancing all peripherals on each M-cycle.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn step(&mut self) -> Result<u8, CpuError> {
+        // flush leftover cycle counter from previous step
+        if self.pending_cycle_counter != 0 {
+            self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
+            self.pending_cycle_counter = 0;
+        }
+        loop {
+            match self.tick() {
+                McycleOp::Done => {
+                    self.flush_pending_apu_cycles();
+                    let cycles = self.pending_cycle_counter as u8;
+                    self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
+                    self.pending_cycle_counter = 0;
+                    self.temp_idx = 0;
+                    return Ok(cycles);
+                }
+                McycleOp::Read(addr) => {
+                    self.step_advance_m_cycle(addr, false);
+                    let val = self.step_bus_read(addr);
+                    self.tock(val);
+                }
+                McycleOp::Write(addr, val) => {
+                    self.step_advance_m_cycle(addr, true);
+                    self.step_bus_write(addr, val);
+                    // Write ack: no temp[] update needed
+                }
+                McycleOp::Internal => {
+                    self.step_advance_internal();
+                    // Internal ack: no temp[] update needed
+                }
+            }
+        }
+    }
+
+    // ── ISR helper ────────────────────────────────────────────────────────────
+
+    fn push_isr_micro_ops(&mut self, bit: u8) {
+        self.ime = ImeState::Disabled;
+        let sp = self.registers.sp;
+        let pc = self.registers.pc;
+        self.micro_ops.push_back(MicroOp::Internal); // 2 internal M-cycles
+        self.micro_ops.push_back(MicroOp::Internal);
+        self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(1), (pc >> 8) as u8));
+        self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(2), pc as u8));
+        self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(isr_finish, bit)));
+        self.micro_ops.push_back(MicroOp::Internal); // load ISR address
+        self.micro_ops.push_back(MicroOp::InstructionDone);
+    }
+
+    // ── Register encoding helpers ─────────────────────────────────────────────
+
+    /// SM83 r8 encoding: 0=B 1=C 2=D 3=E 4=H 5=L 7=A (6=(HL) not handled here).
+    fn r8_get(&self, r: u8) -> u8 {
+        match r {
+            0 => self.registers.b, 1 => self.registers.c, 2 => self.registers.d,
+            3 => self.registers.e, 4 => self.registers.h, 5 => self.registers.l,
+            7 => self.registers.a, _ => unreachable!("r8_get invalid {}", r),
+        }
+    }
+
+    fn r8_set(&mut self, r: u8, v: u8) {
+        match r {
+            0 => self.registers.b = v, 1 => self.registers.c = v, 2 => self.registers.d = v,
+            3 => self.registers.e = v, 4 => self.registers.h = v, 5 => self.registers.l = v,
+            7 => self.registers.a = v, _ => unreachable!("r8_set invalid {}", r),
+        }
+    }
+
+    /// r16 pairs for data instructions: 0=BC 1=DE 2=HL 3=SP.
+    fn r16_get(&self, r: u8) -> u16 {
+        match r {
+            0 => self.registers.bc(), 1 => self.registers.de(),
+            2 => self.registers.hl(), 3 => self.registers.sp, _ => unreachable!(),
+        }
+    }
+
+    fn r16_set(&mut self, r: u8, v: u16) {
+        match r {
+            0 => self.registers.set_bc(v), 1 => self.registers.set_de(v),
+            2 => self.registers.set_hl(v), 3 => self.registers.sp = v, _ => unreachable!(),
+        }
+    }
+
+    /// r16 pairs for stack instructions: 0=BC 1=DE 2=HL 3=AF.
+    fn r16stk_get(&self, r: u8) -> u16 {
+        match r {
+            0 => self.registers.bc(), 1 => self.registers.de(),
+            2 => self.registers.hl(),
+            _ => {
+                let a = self.registers.a as u16;
+                let f = self.registers.f.bits() as u16;
+                (a << 8) | f
+            }
+        }
+    }
+
+    fn r16stk_set(&mut self, r: u8, v: u16) {
+        match r {
+            0 => self.registers.set_bc(v), 1 => self.registers.set_de(v),
+            2 => self.registers.set_hl(v),
+            _ => {
+                self.registers.a = (v >> 8) as u8;
+                self.registers.f = Flags::from_bits_truncate(v as u8);
+            }
+        }
+    }
+
+    /// Condition check: 0=NZ 1=Z 2=NC 3=C.
+    fn check_cond(&self, cc: u8) -> bool {
+        match cc {
+            0 => !self.registers.f.contains(Flags::Z),
+            1 =>  self.registers.f.contains(Flags::Z),
+            2 => !self.registers.f.contains(Flags::C),
+            3 =>  self.registers.f.contains(Flags::C),
+            _ => unreachable!(),
+        }
+    }
+
+    // ── ALU execute helper ────────────────────────────────────────────────────
+
+    fn alu_exec_val(&mut self, op: u8, val: u8) {
+        match op {
+            0 => { let (r, f) = add_u8(self.registers.a, val); self.registers.a = r; self.registers.f = f; }
+            1 => { let cy = self.registers.f.contains(Flags::C) as u8; let (r, f) = adc_u8(self.registers.a, val, cy); self.registers.a = r; self.registers.f = f; }
+            2 => { let (r, f) = sub_u8(self.registers.a, val); self.registers.a = r; self.registers.f = f; }
+            3 => { let cy = self.registers.f.contains(Flags::C) as u8; let (r, f) = sbc_u8(self.registers.a, val, cy); self.registers.a = r; self.registers.f = f; }
+            4 => { let (r, f) = and_u8(self.registers.a, val); self.registers.a = r; self.registers.f = f; }
+            5 => { let (r, f) = xor_u8(self.registers.a, val); self.registers.a = r; self.registers.f = f; }
+            6 => { let (r, f) = or_u8(self.registers.a, val); self.registers.a = r; self.registers.f = f; }
+            7 => { self.registers.f = cp_u8(self.registers.a, val); }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── dispatch_opcode: push micro-ops for opcode ────────────────────────────
+
+    fn dispatch_opcode(&mut self, opcode: u8) {
+        let pc = self.registers.pc;
+        match opcode {
+            // ── 0x00 NOP ─────────────────────────────────────────────────────
+            0x00 => {}
+
+            // ── 0x01/0x11/0x21/0x31 LD r16, d16 ─────────────────────────────
+            0x01 | 0x11 | 0x21 | 0x31 => {
+                let r = (opcode >> 4) & 3;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        let val = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        cpu.r16_set(r, val);
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(2);
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0x02/0x12/0x22/0x32 LD (r16mem), A ──────────────────────────
+            0x02 => {
+                let addr = self.registers.bc();
+                let a = self.registers.a;
+                self.micro_ops.push_back(MicroOp::Write(addr, a));
+            }
+            0x12 => {
+                let addr = self.registers.de();
+                let a = self.registers.a;
+                self.micro_ops.push_back(MicroOp::Write(addr, a));
+            }
+            0x22 => {
+                let addr = self.registers.hl();
+                let a = self.registers.a;
+                self.micro_ops.push_back(MicroOp::Write(addr, a));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { let hl = cpu.registers.hl(); cpu.registers.set_hl(hl.wrapping_add(1)); }
+                )));
+            }
+            0x32 => {
+                let addr = self.registers.hl();
+                let a = self.registers.a;
+                self.micro_ops.push_back(MicroOp::Write(addr, a));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { let hl = cpu.registers.hl(); cpu.registers.set_hl(hl.wrapping_sub(1)); }
+                )));
+            }
+
+            // ── 0x03/0x13/0x23/0x33 INC r16 ─────────────────────────────────
+            0x03 | 0x13 | 0x23 | 0x33 => {
+                let r = (opcode >> 4) & 3;
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| { let v = cpu.r16_get(r); cpu.r16_set(r, v.wrapping_add(1)); },
+                    r,
+                )));
+            }
+
+            // ── 0x04/0x0C/0x14/0x1C/0x24/0x2C/0x3C INC r8 ──────────────────
+            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x3C => {
+                let r = (opcode >> 3) & 7;
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        let (v, f) = inc_u8(cpu.r8_get(r), cpu.registers.f);
+                        cpu.r8_set(r, v);
+                        cpu.registers.f = f;
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0x34 INC (HL) ─────────────────────────────────────────────────
+            0x34 => {
+                let hl = self.registers.hl();
+                self.micro_ops.push_back(MicroOp::Read(hl));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        let (v, f) = inc_u8(cpu.temp[0], cpu.registers.f);
+                        cpu.registers.f = f;
+                        cpu.addr_temp = cpu.registers.hl();
+                        cpu.val_temp = v;
+                    },
+                )));
+                self.micro_ops.push_back(MicroOp::WriteDyn);
+            }
+
+            // ── 0x05/0x0D/0x15/0x1D/0x25/0x2D/0x3D DEC r8 ──────────────────
+            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x3D => {
+                let r = (opcode >> 3) & 7;
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        let (v, f) = dec_u8(cpu.r8_get(r), cpu.registers.f);
+                        cpu.r8_set(r, v);
+                        cpu.registers.f = f;
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0x35 DEC (HL) ─────────────────────────────────────────────────
+            0x35 => {
+                let hl = self.registers.hl();
+                self.micro_ops.push_back(MicroOp::Read(hl));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        let (v, f) = dec_u8(cpu.temp[0], cpu.registers.f);
+                        cpu.registers.f = f;
+                        cpu.addr_temp = cpu.registers.hl();
+                        cpu.val_temp = v;
+                    },
+                )));
+                self.micro_ops.push_back(MicroOp::WriteDyn);
+            }
+
+            // ── 0x06/0x0E/0x16/0x1E/0x26/0x2E/0x3E LD r8, d8 ───────────────
+            0x06 | 0x0E | 0x16 | 0x1E | 0x26 | 0x2E | 0x3E => {
+                let r = (opcode >> 3) & 7;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        cpu.r8_set(r, cpu.temp[0]);
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0x36 LD (HL), d8 ──────────────────────────────────────────────
+            0x36 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = cpu.registers.hl();
+                        cpu.val_temp = cpu.temp[0];
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                    },
+                )));
+                self.micro_ops.push_back(MicroOp::WriteDyn);
+            }
+
+            // ── 0x07/0x0F/0x17/0x1F/0x27/0x2F/0x37/0x3F accumulator ops ────
+            0x07 => { // RLCA
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let a = cpu.registers.a;
+                    let bit7 = a >> 7;
+                    cpu.registers.a = (a << 1) | bit7;
+                    cpu.registers.f = Flags::empty();
+                    cpu.registers.f.set(Flags::C, bit7 != 0);
+                })));
+            }
+            0x0F => { // RRCA
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let a = cpu.registers.a;
+                    let bit0 = a & 1;
+                    cpu.registers.a = (a >> 1) | (bit0 << 7);
+                    cpu.registers.f = Flags::empty();
+                    cpu.registers.f.set(Flags::C, bit0 != 0);
+                })));
+            }
+            0x17 => { // RLA
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let a = cpu.registers.a;
+                    let carry_in = cpu.registers.f.contains(Flags::C) as u8;
+                    let bit7 = a >> 7;
+                    cpu.registers.a = (a << 1) | carry_in;
+                    cpu.registers.f = Flags::empty();
+                    cpu.registers.f.set(Flags::C, bit7 != 0);
+                })));
+            }
+            0x1F => { // RRA
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let a = cpu.registers.a;
+                    let carry_in = cpu.registers.f.contains(Flags::C) as u8;
+                    let bit0 = a & 1;
+                    cpu.registers.a = (a >> 1) | (carry_in << 7);
+                    cpu.registers.f = Flags::empty();
+                    cpu.registers.f.set(Flags::C, bit0 != 0);
+                })));
+            }
+            0x27 => { // DAA
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let (r, f) = daa_u8(cpu.registers.a, cpu.registers.f);
+                    cpu.registers.a = r;
+                    cpu.registers.f = f;
+                })));
+            }
+            0x2F => { // CPL
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    cpu.registers.a = !cpu.registers.a;
+                    cpu.registers.f.insert(Flags::N);
+                    cpu.registers.f.insert(Flags::H);
+                })));
+            }
+            0x37 => { // SCF
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    cpu.registers.f.remove(Flags::N);
+                    cpu.registers.f.remove(Flags::H);
+                    cpu.registers.f.insert(Flags::C);
+                })));
+            }
+            0x3F => { // CCF
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    let c = cpu.registers.f.contains(Flags::C);
+                    cpu.registers.f.remove(Flags::N);
+                    cpu.registers.f.remove(Flags::H);
+                    cpu.registers.f.set(Flags::C, !c);
+                })));
+            }
+
+            // ── 0x08 LD (a16), SP ─────────────────────────────────────────────
+            0x08 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(2);
+                    },
+                )));
+                self.micro_ops.push_back(MicroOp::WriteAddrTempWith(|cpu| (cpu.registers.sp & 0xFF) as u8));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = cpu.addr_temp.wrapping_add(1);
+                        cpu.val_temp = (cpu.registers.sp >> 8) as u8;
+                    },
+                )));
+                self.micro_ops.push_back(MicroOp::WriteDyn);
+            }
+
+            // ── 0x09/0x19/0x29/0x39 ADD HL, r16 ─────────────────────────────
+            0x09 | 0x19 | 0x29 | 0x39 => {
+                let r = (opcode >> 4) & 3;
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        let v = cpu.r16_get(r);
+                        let (res, new_flags) = add_u16(cpu.registers.hl(), v);
+                        cpu.registers.f.set(Flags::N, false);
+                        cpu.registers.f.set(Flags::H, new_flags.contains(Flags::H));
+                        cpu.registers.f.set(Flags::C, new_flags.contains(Flags::C));
+                        cpu.registers.set_hl(res);
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0x0A/0x1A/0x2A/0x3A LD A, (r16mem) ──────────────────────────
+            0x0A => {
+                let addr = self.registers.bc();
+                self.micro_ops.push_back(MicroOp::Read(addr));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.a = cpu.temp[0]; }
+                )));
+            }
+            0x1A => {
+                let addr = self.registers.de();
+                self.micro_ops.push_back(MicroOp::Read(addr));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.a = cpu.temp[0]; }
+                )));
+            }
+            0x2A => {
+                let hl = self.registers.hl();
+                self.micro_ops.push_back(MicroOp::Read(hl));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.registers.a = cpu.temp[0];
+                        let hl = cpu.registers.hl();
+                        cpu.registers.set_hl(hl.wrapping_add(1));
+                    }
+                )));
+            }
+            0x3A => {
+                let hl = self.registers.hl();
+                self.micro_ops.push_back(MicroOp::Read(hl));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.registers.a = cpu.temp[0];
+                        let hl = cpu.registers.hl();
+                        cpu.registers.set_hl(hl.wrapping_sub(1));
+                    }
+                )));
+            }
+
+            // ── 0x0B/0x1B/0x2B/0x3B DEC r16 ─────────────────────────────────
+            0x0B | 0x1B | 0x2B | 0x3B => {
+                let r = (opcode >> 4) & 3;
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| { let v = cpu.r16_get(r); cpu.r16_set(r, v.wrapping_sub(1)); },
+                    r,
+                )));
+            }
+
+            // ── 0x10 STOP ─────────────────────────────────────────────────────
+            0x10 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.pc = cpu.registers.pc.wrapping_add(1); }
+                )));
+            }
+
+            // ── 0x18 JR e ─────────────────────────────────────────────────────
+            0x18 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        let e = cpu.temp[0] as i8 as i16;
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1).wrapping_add(e as u16);
+                    }
+                )));
+            }
+
+            // ── 0x20/0x28/0x30/0x38 JR cc, e ────────────────────────────────
+            0x20 | 0x28 | 0x30 | 0x38 => {
+                let cc = (opcode >> 3) & 3;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, cc, _, _| {
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                        let taken = cpu.check_cond(cc);
+                        if taken {
+                            let e = cpu.temp[0];
+                            cpu.micro_ops.push_front(MicroOp::Compute(ComputeOp::new1(apply_jr_offset, e)));
+                            cpu.micro_ops.push_front(MicroOp::Internal);
+                        }
+                    },
+                    cc,
+                )));
+            }
+
+            // ── 0x40-0x7F LD r8, r8 / HALT ───────────────────────────────────
+            0x40..=0x7F => {
+                let dst = (opcode >> 3) & 7;
+                let src = opcode & 7;
+                if opcode == 0x76 {
+                    // HALT
+                    self.halted = true;
+                } else if src == 6 {
+                    // LD dst, (HL)
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                        |cpu, dst, _, _| { cpu.r8_set(dst, cpu.temp[0]); },
+                        dst,
+                    )));
+                } else if dst == 6 {
+                    // LD (HL), src
+                    let hl = self.registers.hl();
+                    let v = self.r8_get(src);
+                    self.micro_ops.push_back(MicroOp::Write(hl, v));
+                } else {
+                    // LD dst, src
+                    let v = self.r8_get(src);
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, dst, v, _| { cpu.r8_set(dst, v); },
+                        dst, v,
+                    )));
+                }
+            }
+
+            // ── 0x80-0xBF ALU A, r8/(HL) ─────────────────────────────────────
+            0x80..=0xBF => {
+                let op = (opcode >> 3) & 7;
+                let src = opcode & 7;
+                if src == 6 {
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                        |cpu, op, _, _| { let v = cpu.temp[0]; cpu.alu_exec_val(op, v); },
+                        op,
+                    )));
+                } else {
+                    let v = self.r8_get(src);
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, op, v, _| { cpu.alu_exec_val(op, v); },
+                        op, v,
+                    )));
+                }
+            }
+
+            // ── 0xC6/0xCE/0xD6/0xDE/0xE6/0xEE/0xF6/0xFE ALU A, imm8 ─────────
+            0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => {
+                let op = (opcode >> 3) & 7;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, op, _, _| {
+                        let v = cpu.temp[0];
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                        cpu.alu_exec_val(op, v);
+                    },
+                    op,
+                )));
+            }
+
+            // ── 0xC3 JP a16 ───────────────────────────────────────────────────
+            0xC3 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.registers.pc = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                    }
+                )));
+            }
+
+            // ── 0xC2/0xCA/0xD2/0xDA JP cc, a16 ──────────────────────────────
+            0xC2 | 0xCA | 0xD2 | 0xDA => {
+                let cc = (opcode >> 3) & 3;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, cc, _, _| {
+                        let target = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        if cpu.check_cond(cc) {
+                            cpu.micro_ops.push_front(MicroOp::Compute(ComputeOp::new0(
+                                |cpu, _, _, _| { cpu.registers.pc = cpu.addr_temp; }
+                            )));
+                            cpu.micro_ops.push_front(MicroOp::Internal);
+                            cpu.addr_temp = target;
+                        } else {
+                            cpu.registers.pc = cpu.registers.pc.wrapping_add(2);
+                        }
+                    },
+                    cc,
+                )));
+            }
+
+            // ── 0xE9 JP (HL) ──────────────────────────────────────────────────
+            0xE9 => {
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.pc = cpu.registers.hl(); }
+                )));
+            }
+
+            // ── 0xCD CALL a16 ─────────────────────────────────────────────────
+            0xCD => {
+                let ret_addr = pc.wrapping_add(2);
+                let sp = self.registers.sp;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(1), (ret_addr >> 8) as u8));
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(2), ret_addr as u8));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.registers.sp = cpu.registers.sp.wrapping_sub(2);
+                        cpu.registers.pc = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                    }
+                )));
+            }
+
+            // ── 0xC4/0xCC/0xD4/0xDC CALL cc, a16 ────────────────────────────
+            // After fetch_dispatch sets pc = first operand address, 2 reads consume the
+            // lo/hi target bytes. registers.pc is still at the lo-byte address, so
+            // ret_addr = registers.pc + 2 at Compute time.
+            0xC4 | 0xCC | 0xD4 | 0xDC => {
+                let cc = (opcode >> 3) & 3;
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, cc, _, _| {
+                        let target = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        // registers.pc points to the lo-byte of the operand; ret_addr = pc + 2
+                        let computed_ret = cpu.registers.pc.wrapping_add(2);
+                        if cpu.check_cond(cc) {
+                            let sp = cpu.registers.sp;
+                            cpu.addr_temp = target;
+                            cpu.micro_ops.push_front(MicroOp::Compute(ComputeOp::new0(
+                                |cpu, _, _, _| {
+                                    cpu.registers.sp = cpu.registers.sp.wrapping_sub(2);
+                                    cpu.registers.pc = cpu.addr_temp;
+                                }
+                            )));
+                            cpu.micro_ops.push_front(MicroOp::Write(sp.wrapping_sub(2), computed_ret as u8));
+                            cpu.micro_ops.push_front(MicroOp::Write(sp.wrapping_sub(1), (computed_ret >> 8) as u8));
+                            cpu.micro_ops.push_front(MicroOp::Internal);
+                        } else {
+                            cpu.registers.pc = computed_ret;
+                        }
+                    },
+                    cc,
+                )));
+            }
+
+            // ── 0xC9 RET ──────────────────────────────────────────────────────
+            0xC9 => {
+                let sp = self.registers.sp;
+                self.micro_ops.push_back(MicroOp::Read(sp));
+                self.micro_ops.push_back(MicroOp::Read(sp.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(ret_finish)));
+            }
+
+            // ── 0xD9 RETI ─────────────────────────────────────────────────────
+            0xD9 => {
+                let sp = self.registers.sp;
+                self.micro_ops.push_back(MicroOp::Read(sp));
+                self.micro_ops.push_back(MicroOp::Read(sp.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(|cpu, _, _, _| {
+                    cpu.registers.pc = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                    cpu.registers.sp = cpu.registers.sp.wrapping_add(2);
+                    cpu.ime = ImeState::Enabled;
+                })));
+            }
+
+            // ── 0xC0/0xC8/0xD0/0xD8 RET cc ───────────────────────────────────
+            0xC0 | 0xC8 | 0xD0 | 0xD8 => {
+                let cc = (opcode >> 3) & 3;
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, cc, _, _| {
+                        if cpu.check_cond(cc) {
+                            let sp = cpu.registers.sp;
+                            cpu.micro_ops.push_front(MicroOp::Compute(ComputeOp::new0(ret_finish)));
+                            cpu.micro_ops.push_front(MicroOp::Internal);
+                            cpu.micro_ops.push_front(MicroOp::Read(sp.wrapping_add(1)));
+                            cpu.micro_ops.push_front(MicroOp::Read(sp));
+                        }
+                    },
+                    cc,
+                )));
+            }
+
+            // ── 0xC1/0xD1/0xE1/0xF1 POP r16 ─────────────────────────────────
+            0xC1 | 0xD1 | 0xE1 | 0xF1 => {
+                let r = (opcode >> 4) & 3;
+                let sp = self.registers.sp;
+                self.micro_ops.push_back(MicroOp::Read(sp));
+                self.micro_ops.push_back(MicroOp::Read(sp.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, r, _, _| {
+                        let val = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        cpu.r16stk_set(r, val);
+                        cpu.registers.sp = cpu.registers.sp.wrapping_add(2);
+                    },
+                    r,
+                )));
+            }
+
+            // ── 0xC5/0xD5/0xE5/0xF5 PUSH r16 ────────────────────────────────
+            0xC5 | 0xD5 | 0xE5 | 0xF5 => {
+                let r = (opcode >> 4) & 3;
+                let val = self.r16stk_get(r);
+                let sp = self.registers.sp;
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(1), (val >> 8) as u8));
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(2), val as u8));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.sp = cpu.registers.sp.wrapping_sub(2); }
+                )));
+            }
+
+            // ── 0xC7/0xCF/0xD7/0xDF/0xE7/0xEF/0xF7/0xFF RST ─────────────────
+            0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => {
+                let vec = opcode & 0x38;
+                let sp = self.registers.sp;
+                let ret_addr = self.registers.pc; // already past opcode
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(1), (ret_addr >> 8) as u8));
+                self.micro_ops.push_back(MicroOp::Write(sp.wrapping_sub(2), ret_addr as u8));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                    |cpu, v, _, _| {
+                        cpu.registers.sp = cpu.registers.sp.wrapping_sub(2);
+                        cpu.registers.pc = v as u16;
+                    },
+                    vec,
+                )));
+            }
+
+            // ── 0xE0 LDH (a8), A ──────────────────────────────────────────────
+            0xE0 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = 0xFF00 | cpu.temp[0] as u16;
+                        cpu.val_temp = cpu.registers.a;
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                    }
+                )));
+                self.micro_ops.push_back(MicroOp::WriteDyn);
+            }
+
+            // ── 0xE2 LD (C), A ────────────────────────────────────────────────
+            0xE2 => {
+                let addr = 0xFF00 | (self.registers.c as u16);
+                let a = self.registers.a;
+                self.micro_ops.push_back(MicroOp::Write(addr, a));
+            }
+
+            // ── 0xE8 ADD SP, r ────────────────────────────────────────────────
+            0xE8 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        let e = cpu.temp[0] as i8;
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                        let (res, flags) = add_sp_u16(cpu.registers.sp, e);
+                        cpu.registers.sp = res;
+                        cpu.registers.f = flags;
+                    }
+                )));
+            }
+
+            // ── 0xEA LD (a16), A ──────────────────────────────────────────────
+            0xEA => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(2);
+                    }
+                )));
+                self.micro_ops.push_back(MicroOp::WriteAddrTempWith(|cpu| cpu.registers.a));
+            }
+
+            // ── 0xF0 LDH A, (a8) ──────────────────────────────────────────────
+            0xF0 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = 0xFF00 | cpu.temp[0] as u16;
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                        cpu.temp_idx = 0; // reset so next read goes to temp[0]
+                    }
+                )));
+                self.micro_ops.push_back(MicroOp::ReadAddrTemp);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.a = cpu.temp[0]; }
+                )));
+            }
+
+            // ── 0xF2 LD A, (C) ────────────────────────────────────────────────
+            0xF2 => {
+                let addr = 0xFF00 | (self.registers.c as u16);
+                self.micro_ops.push_back(MicroOp::Read(addr));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.a = cpu.temp[0]; }
+                )));
+            }
+
+            // ── 0xF3 DI ───────────────────────────────────────────────────────
+            0xF3 => {
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.ime = ImeState::Disabled; }
+                )));
+            }
+
+            // ── 0xF8 LD HL, SP+r ──────────────────────────────────────────────
+            0xF8 => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        let e = cpu.temp[0] as i8;
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(1);
+                        let (res, flags) = add_sp_u16(cpu.registers.sp, e);
+                        cpu.registers.set_hl(res);
+                        cpu.registers.f = flags;
+                    }
+                )));
+            }
+
+            // ── 0xF9 LD SP, HL ────────────────────────────────────────────────
+            0xF9 => {
+                self.micro_ops.push_back(MicroOp::Internal);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.sp = cpu.registers.hl(); }
+                )));
+            }
+
+            // ── 0xFA LD A, (a16) ──────────────────────────────────────────────
+            0xFA => {
+                self.micro_ops.push_back(MicroOp::Read(pc));
+                self.micro_ops.push_back(MicroOp::Read(pc.wrapping_add(1)));
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| {
+                        cpu.addr_temp = u16::from_le_bytes([cpu.temp[0], cpu.temp[1]]);
+                        cpu.registers.pc = cpu.registers.pc.wrapping_add(2);
+                        cpu.temp_idx = 0;
+                    }
+                )));
+                self.micro_ops.push_back(MicroOp::ReadAddrTemp);
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.registers.a = cpu.temp[0]; }
+                )));
+            }
+
+            // ── 0xFB EI ───────────────────────────────────────────────────────
+            0xFB => {
+                self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new0(
+                    |cpu, _, _, _| { cpu.ime = ImeState::Pending; }
+                )));
+            }
+
+            // ── Undefined/illegal opcodes — treat as NOP ──────────────────────
+            0xD3 | 0xDB | 0xDD | 0xE3 | 0xE4 | 0xEB | 0xEC | 0xED | 0xF4 | 0xFC | 0xFD => {}
+
+            _ => {
+                // Any remaining unhandled opcode: treat as NOP
+            }
+        }
+    }
+
+    fn dispatch_cb_opcode(&mut self, opcode: u8) {
+        let op = (opcode >> 6) & 3;
+        let bit = (opcode >> 3) & 7;
+        let reg = opcode & 7;
+
+        match op {
+            0 => {
+                // Rotation/shift group: sub-op = bit field (0-7)
+                let sub_op = bit;
+                if reg == 6 {
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                        |cpu, sub_op, _, _| {
+                            let val = cpu.temp[0];
+                            let (result, flags) = cb_rot_exec(sub_op, val, cpu.registers.f);
+                            cpu.registers.f = flags;
+                            cpu.addr_temp = cpu.registers.hl();
+                            cpu.val_temp = result;
+                        },
+                        sub_op,
+                    )));
+                    self.micro_ops.push_back(MicroOp::WriteDyn);
+                } else {
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, sub_op, reg, _| {
+                            let val = cpu.r8_get(reg);
+                            let (result, flags) = cb_rot_exec(sub_op, val, cpu.registers.f);
+                            cpu.registers.f = flags;
+                            cpu.r8_set(reg, result);
+                        },
+                        sub_op, reg,
+                    )));
+                }
+            }
+            1 => {
+                // BIT
+                if reg == 6 {
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new1(
+                        |cpu, bit, _, _| {
+                            cpu.registers.f = bit_u8(cpu.temp[0], bit, cpu.registers.f);
+                        },
+                        bit,
+                    )));
+                } else {
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, bit, reg, _| {
+                            let val = cpu.r8_get(reg);
+                            cpu.registers.f = bit_u8(val, bit, cpu.registers.f);
+                        },
+                        bit, reg,
+                    )));
+                }
+            }
+            2 => {
+                // RES
+                if reg == 6 {
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, bit, _, _| {
+                            cpu.val_temp = res_u8(cpu.temp[0], bit);
+                            cpu.addr_temp = cpu.registers.hl();
+                        },
+                        bit, 0,
+                    )));
+                    self.micro_ops.push_back(MicroOp::WriteDyn);
+                } else {
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, bit, reg, _| {
+                            let val = res_u8(cpu.r8_get(reg), bit);
+                            cpu.r8_set(reg, val);
+                        },
+                        bit, reg,
+                    )));
+                }
+            }
+            3 => {
+                // SET
+                if reg == 6 {
+                    let hl = self.registers.hl();
+                    self.micro_ops.push_back(MicroOp::Read(hl));
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, bit, _, _| {
+                            cpu.val_temp = set_u8(cpu.temp[0], bit);
+                            cpu.addr_temp = cpu.registers.hl();
+                        },
+                        bit, 0,
+                    )));
+                    self.micro_ops.push_back(MicroOp::WriteDyn);
+                } else {
+                    self.micro_ops.push_back(MicroOp::Compute(ComputeOp::new2(
+                        |cpu, bit, reg, _| {
+                            let val = set_u8(cpu.r8_get(reg), bit);
+                            cpu.r8_set(reg, val);
+                        },
+                        bit, reg,
+                    )));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// CB rotation/shift helper: returns (result, new_flags).
+fn cb_rot_exec(sub_op: u8, val: u8, flags: Flags) -> (u8, Flags) {
+    match sub_op {
+        0 => rlc_u8(val),
+        1 => rrc_u8(val),
+        2 => rl_u8(val, flags.contains(Flags::C)),
+        3 => rr_u8(val, flags.contains(Flags::C)),
+        4 => sla_u8(val),
+        5 => sra_u8(val),
+        6 => swap_u8(val),
+        7 => srl_u8(val),
+        _ => unreachable!(),
+    }
+}
+
 impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn tick_impl(&mut self) -> Result<u8, CpuError> {
+    fn step_impl(&mut self) -> Result<u8, CpuError> {
         if self.pending_cycle_counter != 0 {
             self.cycle_counter = self
                 .cycle_counter
@@ -1284,10 +2459,10 @@ impl Sm83 {
                 pc: self.registers.pc,
                 registers: &self.registers,
                 ime: self.ime == ImeState::Enabled,
-                ly:   self.memory.read_io(LY_ADDR),
+                ly:   self.ppu.ly(),
                 if_:  self.memory.read_io(IF_ADDR),
                 ie:   self.memory.read_io(IE_ADDR),
-                lcdc: self.memory.read_io(LCDC_ADDR),
+                lcdc: self.ppu.lcdc(),
             });
         }
 
@@ -1861,7 +3036,7 @@ mod tests {
     #[test]
     fn test_add8_imm8_to_accumlator() {
         let mut cpu = make_test_cpu(vec![0xC6, 0x03]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x03);
@@ -1871,7 +3046,7 @@ mod tests {
     #[test]
     fn test_add8_imm8_to_accumlator_sum_zero() {
         let mut cpu = make_test_cpu(vec![0xC6, 0x00]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x00);
@@ -1885,7 +3060,7 @@ mod tests {
             b: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x05);
@@ -1904,7 +3079,7 @@ mod tests {
             l: 0x00,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0A);
@@ -1942,7 +3117,7 @@ mod tests {
         let num_instructions = rom_data.len();
         let mut cpu = make_test_cpu(rom_data).with_registers(registers.clone());
 
-        let total_cycles: u8 = (0..num_instructions).map(|_| cpu.tick().unwrap()).sum();
+        let total_cycles: u8 = (0..num_instructions).map(|_| cpu.step().unwrap()).sum();
 
         let mut expected_accumlator_value =
             registers.b + registers.c + registers.d + registers.e + registers.h + registers.l;
@@ -1958,7 +3133,7 @@ mod tests {
             a: 0x01,
             ..Default::default()
         }); // Add 0xFF to accumulator
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x00); // Accumulator should have rolled over to 0.
@@ -1971,7 +3146,7 @@ mod tests {
         registers.set_bc(0xbeef);
         let mut cpu = make_test_cpu(vec![0x09]).with_registers(registers);
 
-        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xbeef); // Expected value after adding BC to HL
     }
 
@@ -1981,7 +3156,7 @@ mod tests {
         registers.set_de(0xbeef);
         let mut cpu = make_test_cpu(vec![0x19]).with_registers(registers);
 
-        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xbeef); // Expected value after adding DE to HL
     }
 
@@ -1991,7 +3166,7 @@ mod tests {
         registers.set_hl(0xffff);
         let mut cpu = make_test_cpu(vec![0x29]).with_registers(registers);
 
-        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xfffe); // Expected value after adding HL to HL
         assert_eq!(cpu.registers().f, Flags::H | Flags::C);
     }
@@ -2002,7 +3177,7 @@ mod tests {
         registers.sp = 0xffff;
         let mut cpu = make_test_cpu(vec![0x39]).with_registers(registers);
 
-        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().hl(), 0xffff); // Expected value after adding SP to HL
     }
 
@@ -2025,7 +3200,7 @@ mod tests {
     fn test_add_sp16_imm8() {
         let mut cpu = make_test_cpu(vec![0xE8, 0x05]);
 
-        assert_eq!(cpu.tick().unwrap(), 16);
+        assert_eq!(cpu.step().unwrap(), 16);
         assert_eq!(cpu.registers().sp, 0x0005); // Expected value after adding signed immediate 8-bit value to SP
     }
 
@@ -2051,7 +3226,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding B to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2064,7 +3239,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding C to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2077,7 +3252,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding D to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2090,7 +3265,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding E to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2103,7 +3278,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding H to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2116,7 +3291,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding L to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2128,7 +3303,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 4);
+        assert_eq!(cpu.step().unwrap(), 4);
         assert_eq!(cpu.registers().a, 0x0A); // Expected value after adding A to A
         assert_eq!(cpu.registers().f, Flags::empty());
     }
@@ -2146,7 +3321,7 @@ mod tests {
             l: 0x01,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x09);
@@ -2160,7 +3335,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(cpu.tick().unwrap(), 8);
+        assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding immediate 8-bit value to A
     }
 
@@ -2184,7 +3359,7 @@ mod tests {
             a: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x02);
@@ -2197,7 +3372,7 @@ mod tests {
             a: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2211,7 +3386,7 @@ mod tests {
             b: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x0B);
@@ -2224,7 +3399,7 @@ mod tests {
             a: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0xF5);
@@ -2237,7 +3412,7 @@ mod tests {
             a: 0x10,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0F);
@@ -2250,7 +3425,7 @@ mod tests {
             a: 0x10,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0D);
@@ -2264,7 +3439,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0C);
@@ -2278,7 +3453,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2292,7 +3467,7 @@ mod tests {
             b: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x0B);
@@ -2305,7 +3480,7 @@ mod tests {
             a: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x05); // A register unchanged
@@ -2319,7 +3494,7 @@ mod tests {
             b: 0x10,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x05); // A register unchanged
@@ -2336,7 +3511,7 @@ mod tests {
             c: 0x42,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().b, 0x42);
@@ -2354,7 +3529,7 @@ mod tests {
             l: 0x00,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x55);
@@ -2378,7 +3553,7 @@ mod tests {
         });
 
         // Store A into (HL)
-        let cycles1 = cpu.tick().unwrap();
+        let cycles1 = cpu.step().unwrap();
         assert_eq!(cycles1, 8);
 
         // Zero out A (keep HL pointing to 0xC000) so we know the next tick loads from memory
@@ -2389,7 +3564,7 @@ mod tests {
         });
 
         // Load A from (HL) — should restore 0xCD from memory
-        let cycles2 = cpu.tick().unwrap();
+        let cycles2 = cpu.step().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0xCD);
     }
@@ -2399,7 +3574,7 @@ mod tests {
     #[test]
     fn test_ld8_b_imm8() {
         let mut cpu = make_test_cpu(vec![0x06, 0x7F]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().b, 0x7F);
@@ -2420,13 +3595,13 @@ mod tests {
         });
 
         // LD (HL), 0x99
-        let cycles1 = cpu.tick().unwrap();
+        let cycles1 = cpu.step().unwrap();
         assert_eq!(cycles1, 12);
 
         // LD A, (HL) — verify that 0x99 was stored
         let regs = cpu.registers();
         cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
-        let cycles2 = cpu.tick().unwrap();
+        let cycles2 = cpu.step().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x99);
     }
@@ -2449,7 +3624,7 @@ mod tests {
             ..Default::default()
         });
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x10);
@@ -2466,7 +3641,7 @@ mod tests {
             a: 0x80,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x01); // bit7 wraps to bit0
@@ -2481,7 +3656,7 @@ mod tests {
             a: 0x01,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x02);
@@ -2496,7 +3671,7 @@ mod tests {
             a: 0x00,
             ..Default::default()
         });
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert_eq!(cpu.registers().a, 0x00);
         assert_eq!(cpu.registers().f, Flags::empty()); // Z=0 even when result is 0
@@ -2511,7 +3686,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x01); // old carry goes to bit0
@@ -2526,7 +3701,7 @@ mod tests {
             a: 0x80,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2541,7 +3716,7 @@ mod tests {
             a: 0x01,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x80); // bit0 wraps to bit7
@@ -2556,7 +3731,7 @@ mod tests {
             a: 0x80,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x40);
@@ -2571,7 +3746,7 @@ mod tests {
             a: 0x01,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x00); // bit7 = old carry = 0
@@ -2587,7 +3762,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x80); // old carry goes to bit7
@@ -2602,7 +3777,7 @@ mod tests {
             a: 0x00,
             ..Default::default()
         });
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert_eq!(cpu.registers().a, 0x00);
         assert_eq!(cpu.registers().f, Flags::empty()); // Z=0 even when result is 0
@@ -2615,7 +3790,7 @@ mod tests {
     #[test]
     fn test_jp_nn_sets_pc() {
         let mut cpu = make_test_cpu(vec![0xC3, 0x05, 0x00]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().pc, 0x0005);
@@ -2629,7 +3804,7 @@ mod tests {
             l: 0x34,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().pc, 0x1234);
@@ -2642,7 +3817,7 @@ mod tests {
             f: Flags::Z,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().pc, 0x0008);
@@ -2655,7 +3830,7 @@ mod tests {
             f: Flags::empty(),
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().pc, 0x0003);
@@ -2666,7 +3841,7 @@ mod tests {
     #[test]
     fn test_jr_positive_offset() {
         let mut cpu = make_test_cpu(vec![0x18, 0x05]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().pc, 0x0007);
@@ -2676,7 +3851,7 @@ mod tests {
     #[test]
     fn test_jr_negative_offset() {
         let mut cpu = make_test_cpu(vec![0x18, 0xFE]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().pc, 0x0000);
@@ -2689,7 +3864,7 @@ mod tests {
             f: Flags::empty(),
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().pc, 0x0005);
@@ -2702,7 +3877,7 @@ mod tests {
             f: Flags::Z,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().pc, 0x0002);
@@ -2718,7 +3893,7 @@ mod tests {
             b: 0x0F,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x0F);
@@ -2732,7 +3907,7 @@ mod tests {
             a: 0x00,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2746,7 +3921,7 @@ mod tests {
             a: 0xF0,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x30);
@@ -2761,7 +3936,7 @@ mod tests {
             c: 0x0F,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0xFF);
@@ -2775,7 +3950,7 @@ mod tests {
             a: 0x00,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2789,7 +3964,7 @@ mod tests {
             a: 0x42,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x00);
@@ -2808,7 +3983,7 @@ mod tests {
             l: 0x00,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0xF0);
@@ -2821,7 +3996,7 @@ mod tests {
     #[test]
     fn test_ld16_bc_nn() {
         let mut cpu = make_test_cpu(vec![0x01, 0x34, 0x12]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().bc(), 0x1234);
@@ -2831,7 +4006,7 @@ mod tests {
     #[test]
     fn test_ld16_de_nn() {
         let mut cpu = make_test_cpu(vec![0x11, 0xEF, 0xBE]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().de(), 0xBEEF);
@@ -2841,7 +4016,7 @@ mod tests {
     #[test]
     fn test_ld16_hl_nn() {
         let mut cpu = make_test_cpu(vec![0x21, 0x00, 0xC0]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().hl(), 0xC000);
@@ -2851,7 +4026,7 @@ mod tests {
     #[test]
     fn test_ld16_sp_nn() {
         let mut cpu = make_test_cpu(vec![0x31, 0xFF, 0xFF]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().sp, 0xFFFF);
@@ -2865,7 +4040,7 @@ mod tests {
             sp: 0xBEEF,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 20);
         assert_eq!(cpu.memory.read(0xC000).unwrap(), 0xEF); // low byte
@@ -2878,7 +4053,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.set_hl(0xDEAD);
         let mut cpu = make_test_cpu(vec![0xF9]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().sp, 0xDEAD);
@@ -2891,7 +4066,7 @@ mod tests {
         registers.a = 0x42;
         registers.set_bc(0xC000);
         let mut cpu = make_test_cpu(vec![0x02]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.memory.read(0xC000).unwrap(), 0x42);
@@ -2906,7 +4081,7 @@ mod tests {
             |m| { m.write(0xC005, 0x77).unwrap(); },
             vec![0x1A],
         ).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x77);
@@ -2919,7 +4094,7 @@ mod tests {
         registers.a = 0xAB;
         registers.set_hl(0xC010);
         let mut cpu = make_test_cpu(vec![0x22]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.memory.read(0xC010).unwrap(), 0xAB);
@@ -2935,7 +4110,7 @@ mod tests {
             |m| { m.write(0xC020, 0x55).unwrap(); },
             vec![0x3A],
         ).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x55);
@@ -2948,7 +4123,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.a = 0xCC;
         let mut cpu = make_test_cpu(vec![0xEA, 0x30, 0xC0]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
         assert_eq!(cpu.memory.read(0xC030).unwrap(), 0xCC);
@@ -2961,7 +4136,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.a = 0x11;
         let mut cpu = make_test_cpu(vec![0xE0, 0x80]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.memory.read(0xFF80).unwrap(), 0x11);
@@ -2975,7 +4150,7 @@ mod tests {
         registers.a = 0x22;
         registers.c = 0x80;
         let mut cpu = make_test_cpu(vec![0xE2]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.memory.read(0xFF80).unwrap(), 0x22);
@@ -2989,7 +4164,7 @@ mod tests {
         let mut cpu = make_test_cpu(vec![0x00]).with_registers(Registers {
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().pc, 1);
@@ -3004,7 +4179,7 @@ mod tests {
             ..Default::default()
         });
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         let perf = cpu.take_perf_profile();
 
         assert_eq!(cycles, 4);
@@ -3027,7 +4202,7 @@ mod tests {
             ..Default::default()
         });
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         let perf = cpu.take_perf_profile();
 
         assert_eq!(cycles, 4);
@@ -3048,7 +4223,7 @@ mod tests {
         cpu.dma = Some(DmaState { source: 0x0000, progress: 0 });
         cpu.refresh_idle_m_cycle_fast_path_blockers();
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         let perf = cpu.take_perf_profile();
 
         assert_eq!(cycles, 4);
@@ -3072,7 +4247,7 @@ mod tests {
         });
         cpu.refresh_idle_m_cycle_fast_path_blockers();
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         let perf = cpu.take_perf_profile();
 
         assert_eq!(cycles, 4);
@@ -3088,7 +4263,7 @@ mod tests {
     #[test]
     fn test_halt_returns_cycles() {
         let mut cpu = make_test_cpu(vec![0x76]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
     }
@@ -3097,7 +4272,7 @@ mod tests {
     #[test]
     fn test_stop_consumes_next_byte() {
         let mut cpu = make_test_cpu(vec![0x10, 0x00]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8); // fetch + consume next byte
         assert_eq!(cpu.registers().pc, 2); // consumed both 0x10 and 0x00
@@ -3110,7 +4285,7 @@ mod tests {
             a: 0b10110011,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0b01001100);
@@ -3126,7 +4301,7 @@ mod tests {
             f: Flags::Z | Flags::C,
             ..Default::default()
         });
-        let _cycles = cpu.tick().unwrap();
+        let _cycles = cpu.step().unwrap();
 
         assert_eq!(cpu.registers().a, 0x00);
         assert!(cpu.registers().f.contains(Flags::Z));
@@ -3142,7 +4317,7 @@ mod tests {
             f: Flags::Z | Flags::N | Flags::H,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert!(cpu.registers().f.contains(Flags::C));
@@ -3158,7 +4333,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert!(!cpu.registers().f.contains(Flags::C));
@@ -3173,7 +4348,7 @@ mod tests {
             f: Flags::empty(),
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert!(cpu.registers().f.contains(Flags::C));
@@ -3190,8 +4365,8 @@ mod tests {
             b: 0x09,
             ..Default::default()
         });
-        cpu.tick().unwrap(); // ADD A, B -> A=0x11, H=1
-        let cycles = cpu.tick().unwrap(); // DAA
+        cpu.step().unwrap(); // ADD A, B -> A=0x11, H=1
+        let cycles = cpu.step().unwrap(); // DAA
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().a, 0x17); // 8+9=17 in BCD
@@ -3202,7 +4377,7 @@ mod tests {
     #[test]
     fn test_di_returns_cycles() {
         let mut cpu = make_test_cpu(vec![0xF3]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -3210,7 +4385,7 @@ mod tests {
     #[test]
     fn test_ei_returns_cycles() {
         let mut cpu = make_test_cpu(vec![0xFB]);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -3224,7 +4399,7 @@ mod tests {
             b: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().b, 0x06);
@@ -3239,7 +4414,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().b, 0x00);
@@ -3253,7 +4428,7 @@ mod tests {
             b: 0x0F,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().b, 0x10);
@@ -3268,7 +4443,7 @@ mod tests {
             c: 0x05,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().c, 0x04);
@@ -3282,7 +4457,7 @@ mod tests {
             c: 0x01,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().c, 0x00);
@@ -3296,7 +4471,7 @@ mod tests {
             c: 0x10,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().c, 0x0F);
@@ -3311,7 +4486,7 @@ mod tests {
             f: Flags::C,
             ..Default::default()
         });
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().c, 0x04);
@@ -3332,14 +4507,14 @@ mod tests {
             ..Default::default()
         });
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().f, Flags::empty());
 
         // Verify memory was updated by loading via LD A,(HL)
         let regs = cpu.registers();
         cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
-        let cycles2 = cpu.tick().unwrap();
+        let cycles2 = cpu.step().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x08);
     }
@@ -3357,14 +4532,14 @@ mod tests {
             ..Default::default()
         });
 
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().f, Flags::N);
 
         // Verify memory was updated by loading via LD A,(HL)
         let regs = cpu.registers();
         cpu = cpu.with_registers(Registers { a: 0x00, ..regs });
-        let cycles2 = cpu.tick().unwrap();
+        let cycles2 = cpu.step().unwrap();
         assert_eq!(cycles2, 8);
         assert_eq!(cpu.registers().a, 0x06);
     }
@@ -3377,7 +4552,7 @@ mod tests {
         registers.set_bc(0x00FF);
         registers.f = Flags::Z | Flags::N | Flags::H | Flags::C; // all flags set
         let mut cpu = make_test_cpu(vec![0x03]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().bc(), 0x0100);
@@ -3390,7 +4565,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.set_bc(0xFFFF);
         let mut cpu = make_test_cpu(vec![0x03]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().bc(), 0x0000);
@@ -3405,7 +4580,7 @@ mod tests {
         registers.sp = 0x0100;
         registers.f = Flags::Z | Flags::C;
         let mut cpu = make_test_cpu(vec![0x3B]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().sp, 0x00FF);
@@ -3418,7 +4593,7 @@ mod tests {
         let mut registers = Registers::default();
         registers.set_hl(0x1234);
         let mut cpu = make_test_cpu(vec![0x23]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().hl(), 0x1235);
@@ -3432,7 +4607,7 @@ mod tests {
         registers.set_hl(0x1234);
         registers.f = Flags::N | Flags::H;
         let mut cpu = make_test_cpu(vec![0x2B]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().hl(), 0x1233);
@@ -3449,10 +4624,10 @@ mod tests {
         // PUSH BC = 0xC5, then POP DE = 0xD1 to verify round-trip via registers
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xC5, 0xD1])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap(); // PUSH BC
+        let cycles = cpu.step().unwrap(); // PUSH BC
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().sp, 0xC00E);
-        cpu.tick().unwrap(); // POP DE
+        cpu.step().unwrap(); // POP DE
         assert_eq!(cpu.registers().de(), 0xABCD);
         assert_eq!(cpu.registers().sp, 0xC010);
     }
@@ -3466,7 +4641,7 @@ mod tests {
         // PUSH AF = 0xF5, then POP AF = 0xF1 round-trip
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xF5, 0xF1])
             .with_registers(registers);
-        cpu.tick().unwrap(); // PUSH AF
+        cpu.step().unwrap(); // PUSH AF
         assert_eq!(cpu.registers().sp, 0xC00E);
         // Clear A and F to confirm POP restores them
         let mut cleared = cpu.registers();
@@ -3474,7 +4649,7 @@ mod tests {
         cleared.f = Flags::empty();
         let cpu = cpu.with_registers(cleared);
         let mut cpu = cpu;
-        cpu.tick().unwrap(); // POP AF
+        cpu.step().unwrap(); // POP AF
         assert_eq!(cpu.registers().a, 0x12);
         assert_eq!(cpu.registers().f, Flags::Z | Flags::C);
     }
@@ -3488,8 +4663,8 @@ mod tests {
         // PUSH HL = 0xE5, POP BC = 0xC1
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xE5, 0xC1])
             .with_registers(registers);
-        cpu.tick().unwrap(); // PUSH HL
-        let cycles = cpu.tick().unwrap(); // POP BC
+        cpu.step().unwrap(); // PUSH HL
+        let cycles = cpu.step().unwrap(); // POP BC
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().sp, 0xC010);
@@ -3505,12 +4680,12 @@ mod tests {
         // PUSH AF = 0xF5, clear registers, POP AF = 0xF1
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xF5, 0xF1])
             .with_registers(registers);
-        cpu.tick().unwrap(); // PUSH AF
+        cpu.step().unwrap(); // PUSH AF
         let mut cleared = cpu.registers();
         cleared.a = 0x00;
         cleared.f = Flags::empty();
         let mut cpu = cpu.with_registers(cleared);
-        cpu.tick().unwrap(); // POP AF
+        cpu.step().unwrap(); // POP AF
 
         assert_eq!(cpu.registers().a, 0x42);
         assert_eq!(cpu.registers().f, Flags::Z | Flags::H);
@@ -3528,7 +4703,7 @@ mod tests {
             },
             vec![0xF1], // POP AF
         ).with_registers(registers);
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert_eq!(cpu.registers().f.bits() & 0x0F, 0x00);
     }
@@ -3541,8 +4716,8 @@ mod tests {
         // PUSH HL = 0xE5, POP BC = 0xC1
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xE5, 0xC1])
             .with_registers(registers);
-        cpu.tick().unwrap(); // PUSH HL
-        cpu.tick().unwrap(); // POP BC
+        cpu.step().unwrap(); // PUSH HL
+        cpu.step().unwrap(); // POP BC
 
         assert_eq!(cpu.registers().bc(), 0x1234);
         assert_eq!(cpu.registers().sp, 0xC010);
@@ -3559,7 +4734,7 @@ mod tests {
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCD, 0x50, 0x00])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 24);
         assert_eq!(cpu.registers().pc, 0x0050);
@@ -3579,9 +4754,9 @@ mod tests {
         registers.sp = 0xC010;
         let rom = vec![0xCD, 0x05, 0x00, 0x00, 0x00, 0xC9];
         let mut cpu = make_test_cpu_with_memory(|_| {}, rom).with_registers(registers);
-        cpu.tick().unwrap(); // CALL 0x0005 — PC becomes 0x0005
+        cpu.step().unwrap(); // CALL 0x0005 — PC becomes 0x0005
         assert_eq!(cpu.registers().pc, 0x0005);
-        cpu.tick().unwrap(); // RET — PC becomes 0x0003
+        cpu.step().unwrap(); // RET — PC becomes 0x0003
         assert_eq!(cpu.registers().pc, 0x0003);
         assert_eq!(cpu.registers().sp, 0xC010);
     }
@@ -3595,7 +4770,7 @@ mod tests {
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xC4, 0x50, 0x00])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.registers().pc, 0x0003); // advanced past operands
@@ -3611,7 +4786,7 @@ mod tests {
         registers.sp = 0xC010;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCC, 0x50, 0x00])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 24);
         assert_eq!(cpu.registers().pc, 0x0050);
@@ -3626,7 +4801,7 @@ mod tests {
         registers.sp = 0xC010;
         let mut cpu =
             make_test_cpu_with_memory(|_| {}, vec![0xC0]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().sp, 0xC010); // SP unchanged
@@ -3639,7 +4814,7 @@ mod tests {
         registers.sp = 0xC010;
         let mut cpu =
             make_test_cpu_with_memory(|_| {}, vec![0xCF]).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
         assert_eq!(cpu.registers().pc, 0x0008);
@@ -3653,7 +4828,7 @@ mod tests {
         registers.b = 0b10110001;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x00])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().b, 0b01100011);
@@ -3670,7 +4845,7 @@ mod tests {
         registers.b = 0;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x00])
             .with_registers(registers);
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert_eq!(cpu.registers().b, 0);
         assert!(cpu.registers().f.contains(Flags::Z));
@@ -3684,7 +4859,7 @@ mod tests {
         registers.a = 0xAB;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x37])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0xBA);
@@ -3701,7 +4876,7 @@ mod tests {
         registers.b = 0b11110111;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x58])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert!(cpu.registers().f.contains(Flags::Z));
@@ -3718,7 +4893,7 @@ mod tests {
         registers.b = 0b00001000;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x58])
             .with_registers(registers);
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert!(!cpu.registers().f.contains(Flags::Z));
         assert!(cpu.registers().f.contains(Flags::H));
@@ -3732,7 +4907,7 @@ mod tests {
         registers.b = 0xFF;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0x98])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().b, 0xF7);
@@ -3745,7 +4920,7 @@ mod tests {
         registers.b = 0x00;
         let mut cpu = make_test_cpu_with_memory(|_| {}, vec![0xCB, 0xD8])
             .with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().b, 0x08);
@@ -3760,7 +4935,7 @@ mod tests {
             |m| { m.write(0xC000, 0b10110001).unwrap(); },
             vec![0xCB, 0x06],
         ).with_registers(registers);
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
         assert_eq!(cpu.memory.read(0xC000).unwrap(), 0b01100011);
@@ -3780,8 +4955,8 @@ mod tests {
     fn test_di_clears_ime() {
         // DI = 0xF3
         let mut cpu = make_test_cpu(vec![0xFB, 0xF3]); // EI then DI
-        cpu.tick().unwrap(); // EI
-        cpu.tick().unwrap(); // DI
+        cpu.step().unwrap(); // EI
+        cpu.step().unwrap(); // DI
         assert!(!cpu.ime());
     }
 
@@ -3789,9 +4964,9 @@ mod tests {
     fn test_ei_sets_ime() {
         // EI = 0xFB, NOP = 0x00: IME becomes active after the instruction following EI
         let mut cpu = make_test_cpu(vec![0xFB, 0x00]);
-        cpu.tick().unwrap(); // EI — ime_pending set, IME still false
+        cpu.step().unwrap(); // EI — ime_pending set, IME still false
         assert!(!cpu.ime());
-        cpu.tick().unwrap(); // NOP — IME activates at start of this tick
+        cpu.step().unwrap(); // NOP — IME activates at start of this tick
         assert!(cpu.ime());
     }
 
@@ -3800,7 +4975,7 @@ mod tests {
         // HALT = 0x76
         let mut cpu = make_test_cpu(vec![0x76]);
         assert!(!cpu.is_halted());
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
         assert!(cpu.is_halted());
     }
 
@@ -3808,10 +4983,10 @@ mod tests {
     fn test_halted_cpu_returns_4_cycles_without_advancing_pc() {
         // HALT then NOP — halted CPU should not execute NOP
         let mut cpu = make_test_cpu(vec![0x76, 0x00]);
-        cpu.tick().unwrap(); // executes HALT, sets halted
+        cpu.step().unwrap(); // executes HALT, sets halted
         let pc_after_halt = cpu.registers().pc;
 
-        let cycles = cpu.tick().unwrap(); // should return early, not execute NOP
+        let cycles = cpu.step().unwrap(); // should return early, not execute NOP
         assert_eq!(cycles, 4);
         assert_eq!(cpu.registers().pc, pc_after_halt); // PC did not advance
     }
@@ -3822,9 +4997,9 @@ mod tests {
     fn test_ei_delays_one_instruction() {
         // EI (0xFB) then NOP (0x00): IME should NOT be set until after the NOP
         let mut cpu = make_test_cpu(vec![0xFB, 0x00]);
-        cpu.tick().unwrap(); // EI — ime_pending, but IME still false
+        cpu.step().unwrap(); // EI — ime_pending, but IME still false
         assert!(!cpu.ime()); // not yet
-        cpu.tick().unwrap(); // NOP — now IME becomes true
+        cpu.step().unwrap(); // NOP — now IME becomes true
         assert!(cpu.ime());
     }
 
@@ -3839,8 +5014,8 @@ mod tests {
         cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
         cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
 
-        cpu.tick().unwrap(); // EI — ime_pending=true
-        cpu.tick().unwrap(); // NOP — IME becomes true, interrupt dispatched after
+        cpu.step().unwrap(); // EI — ime_pending=true
+        cpu.step().unwrap(); // NOP — IME becomes true, interrupt dispatched after
 
         assert_eq!(cpu.registers().pc, 0x0040); // VBlank vector
         assert_eq!(cpu.registers().sp, 0xDFFC); // SP decremented by 2
@@ -3855,10 +5030,10 @@ mod tests {
         cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
         cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
 
-        cpu.tick().unwrap(); // HALT — sets halted=true
+        cpu.step().unwrap(); // HALT — sets halted=true
         assert!(cpu.is_halted()); // still halted after HALT instruction
         // Next tick: 1 halted M-cycle (4 T-cycles) then wakes (IE&IF!=0), executes NOP (4 T-cycles)
-        let cycles = cpu.tick().unwrap();
+        let cycles = cpu.step().unwrap();
         assert!(!cpu.is_halted());
         assert_eq!(cycles, 8); // halted M-cycle + NOP
     }
@@ -3867,7 +5042,7 @@ mod tests {
     fn test_tick_returns_with_no_pending_apu_cycles() {
         let mut cpu = make_test_cpu(vec![0x00]);
 
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
 
         assert!(cpu.pending_apu_cycles.is_empty());
     }
@@ -3876,8 +5051,8 @@ mod tests {
     fn test_halted_tick_returns_with_no_pending_apu_cycles() {
         let mut cpu = make_test_cpu(vec![0x76, 0x00]);
 
-        cpu.tick().unwrap(); // HALT
-        cpu.tick().unwrap(); // halted early return
+        cpu.step().unwrap(); // HALT
+        cpu.step().unwrap(); // halted early return
 
         assert!(cpu.pending_apu_cycles.is_empty());
     }
@@ -3888,8 +5063,8 @@ mod tests {
         cpu.memory.write_io(IE_ADDR, 0x01);
         cpu.memory.write_io(IF_ADDR, 0x01);
 
-        cpu.tick().unwrap(); // EI
-        cpu.tick().unwrap(); // NOP + interrupt dispatch
+        cpu.step().unwrap(); // EI
+        cpu.step().unwrap(); // NOP + interrupt dispatch
 
         assert!(cpu.pending_apu_cycles.is_empty());
     }

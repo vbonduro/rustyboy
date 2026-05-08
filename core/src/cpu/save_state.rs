@@ -36,12 +36,14 @@ const HALTED_SIZE:        usize = size_of::<u8>();
 const CYCLE_COUNTER_SIZE: usize = size_of::<u64>();
 const CPU_STATE_SIZE:     usize = CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE + CYCLE_COUNTER_SIZE;
 
-const TIMER_STATE_SIZE:   usize = size_of::<u16>();     // internal_counter
+const TIMER_STATE_SIZE:   usize = size_of::<u16>()      // internal_counter
+                                + 3 * size_of::<u8>(); // tima, tma, tac
 
 const PPU_STATE_SIZE:     usize = size_of::<u16>()      // dot
                                 + size_of::<u8>()       // ly
                                 + size_of::<u8>()       // mode
-                                + size_of::<u8>();      // window_line_counter
+                                + size_of::<u8>()       // window_line_counter
+                                + 10 * size_of::<u8>(); // lcdc stat scy scx lyc bgp obp0 obp1 wy wx
 
 const IO_REGS_SIZE:       usize = 0x80;
 const IE_SIZE:            usize = size_of::<u8>();
@@ -129,16 +131,25 @@ impl CpuState {
 #[derive(Debug, Clone, Copy)]
 pub struct TimerState {
     pub internal_counter: u16,
+    pub tima: u8,
+    pub tma: u8,
+    pub tac: u8,
 }
 
 impl TimerState {
     pub fn serialize(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.internal_counter.to_le_bytes());
+        out.push(self.tima);
+        out.push(self.tma);
+        out.push(self.tac);
     }
 
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
         let state = TimerState {
             internal_counter: u16::from_le_bytes([blob[offset], blob[offset + 1]]),
+            tima: blob[offset + 2],
+            tma:  blob[offset + 3],
+            tac:  blob[offset + 4],
         };
         (state, TIMER_STATE_SIZE)
     }
@@ -151,6 +162,16 @@ pub struct PpuState {
     pub ly: u8,
     pub mode: PpuMode,
     pub window_line_counter: u8,
+    pub lcdc: u8,
+    pub stat: u8,
+    pub scy: u8,
+    pub scx: u8,
+    pub lyc: u8,
+    pub bgp: u8,
+    pub obp0: u8,
+    pub obp1: u8,
+    pub wy: u8,
+    pub wx: u8,
 }
 
 impl PpuState {
@@ -159,6 +180,16 @@ impl PpuState {
         out.push(self.ly);
         out.push(self.mode as u8);
         out.push(self.window_line_counter);
+        out.push(self.lcdc);
+        out.push(self.stat);
+        out.push(self.scy);
+        out.push(self.scx);
+        out.push(self.lyc);
+        out.push(self.bgp);
+        out.push(self.obp0);
+        out.push(self.obp1);
+        out.push(self.wy);
+        out.push(self.wx);
     }
 
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
@@ -173,6 +204,16 @@ impl PpuState {
                 _ => PpuMode::PixelTransfer,
             },
             window_line_counter: b[4],
+            lcdc:  b[5],
+            stat:  b[6],
+            scy:   b[7],
+            scx:   b[8],
+            lyc:   b[9],
+            bgp:   b[10],
+            obp0:  b[11],
+            obp1:  b[12],
+            wy:    b[13],
+            wx:    b[14],
         };
         (state, PPU_STATE_SIZE)
     }

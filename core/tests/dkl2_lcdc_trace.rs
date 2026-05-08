@@ -3,7 +3,6 @@
 
 mod common;
 
-use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
@@ -44,7 +43,7 @@ fn build_cpu() -> Sm83 {
 fn run_frame(cpu: &mut Sm83) {
     let start = cpu.cycle_counter();
     while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-        let _ = cpu.tick();
+        let _ = cpu.step();
     }
 }
 
@@ -103,7 +102,7 @@ fn trace_dkl2_stat_interrupt_ffeb() {
     for frame_offset in 0..5u32 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let cur_if = cpu.read_memory(IF_ADDR).unwrap_or(0);
             let cur_ly = cpu.read_memory(LY_ADDR).unwrap_or(0);
@@ -179,7 +178,7 @@ fn trace_dkl2_ffeb_timeline() {
     for frame_offset in 0..10u32 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let ffeb = cpu.read_memory(FFEB_ADDR).unwrap_or(0);
             let ffe6 = cpu.read_memory(0xFFE6).unwrap_or(0);
@@ -250,7 +249,7 @@ fn trace_dkl2_isr_pc_trace() {
     for frame_offset in 0..3u32 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let cur_if = cpu.read_memory(IF_ADDR).unwrap_or(0);
             let pc = cpu.registers().pc;
@@ -340,7 +339,7 @@ fn trace_dkl2_level_entry_lyc() {
     for _ in 0..2 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
             let lyc = cpu.read_memory(LYC_ADDR).unwrap_or(0);
             let ffe6 = cpu.read_memory(0xFFE6).unwrap_or(0);
             let ffeb = cpu.read_memory(FFEB_ADDR).unwrap_or(0);
@@ -393,7 +392,7 @@ fn trace_dkl2_ime_timing() {
     for frame_offset in 0..3u32 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let cur_ime = cpu.ime();
             let ly = cpu.read_memory(LY_ADDR).unwrap_or(0);
@@ -458,7 +457,7 @@ fn trace_dkl2_ie_level_entry() {
         // Tick frame, watching every instruction
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let ie   = cpu.read_memory(IE_ADDR).unwrap_or(0);
             let lcdc = cpu.read_memory(LCDC_ADDR).unwrap_or(0);
@@ -556,7 +555,7 @@ fn trace_dkl2_level_lcdc() {
     for _ in 0..3 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
             let lcdc = cpu.read_memory(LCDC_ADDR).unwrap_or(0);
             let ly = cpu.read_memory(LY_ADDR).unwrap_or(0);
             if lcdc != prev {
@@ -614,7 +613,7 @@ fn trace_dkl2_ly_wait_b_register() {
     for frame_offset in 0..5u32 {
         let start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let pc = cpu.registers().pc;
             let b  = cpu.registers().b;
@@ -677,7 +676,7 @@ fn trace_dkl2_insn_trace() {
         let start = cpu.cycle_counter();
         let mut prev_pc = cpu.registers().pc;
         while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = cpu.tick();
+            let _ = cpu.step();
 
             let r   = cpu.registers();
             let pc  = r.pc;
