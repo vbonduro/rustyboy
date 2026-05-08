@@ -2,7 +2,6 @@
 
 mod common;
 
-use rustyboy_core::cpu::cpu::Cpu;
 use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::sm83::Sm83;
@@ -51,7 +50,7 @@ fn test_save_state_roundtrip_basic() {
 
     // Advance emulator state before saving
     for _ in 0..1000 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     let state = cpu.save_state();
@@ -83,7 +82,7 @@ fn test_save_state_pc_preserved() {
 
     // Run enough ticks that the PC has cycled through the NOP+JR loop a few times
     for _ in 0..500 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     let pc_before = cpu.registers().pc;
@@ -105,7 +104,7 @@ fn test_save_state_wram_preserved() {
     // Write known pattern into WRAM via the save-state blob.
     // WRAM occupies bytes [164..164+0x2000] in the blob.
     let mut state = cpu.save_state();
-    let wram_offset: usize = 164;
+    let wram_offset: usize = 177;
     let pattern: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67,
                               0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x20, 0x30, 0x40];
     state[wram_offset..wram_offset + 16].copy_from_slice(&pattern);
@@ -126,7 +125,7 @@ fn test_save_state_wram_preserved() {
 
 #[test]
 fn test_save_state_invalid_magic() {
-    let mut garbage = vec![0xFFu8; 16835];
+    let mut garbage = vec![0xFFu8; 16848];
     garbage[0] = b'X';
     garbage[1] = b'X';
     garbage[2] = b'X';
@@ -173,7 +172,7 @@ fn test_save_state_mbc1_bank_preserved() {
 
     // Run enough ticks to execute LD HL + LD (HL) = ~16 ticks total
     for _ in 0..30 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     // Bank 7 should now be mapped
@@ -220,7 +219,7 @@ fn test_save_state_mbc1_cart_ram_preserved() {
 
     // Run enough ticks to execute LD A + LD (nn) = ~24 ticks
     for _ in 0..40 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     // Write a known pattern into cart RAM via set_external_ram
@@ -258,7 +257,7 @@ fn test_save_state_struct_inspect_then_apply() {
     let mut cpu = make_emulator(rom.clone());
 
     for _ in 0..1000 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     let pc_before = cpu.registers().pc;
@@ -284,7 +283,7 @@ fn test_save_state_struct_inspect_then_apply() {
 
 #[test]
 fn test_save_state_from_blob_rejects_bad_magic() {
-    let mut blob = vec![0u8; 16835];
+    let mut blob = vec![0u8; 16848];
     blob[0..4].copy_from_slice(b"XXXX");
     assert!(SaveState::from_blob(blob).is_err());
 }
@@ -304,7 +303,7 @@ fn test_save_state_roundtrip_preserves_cycle_counter() {
 
     // Run a known number of ticks to accumulate cycles
     for _ in 0..2000 {
-        cpu.tick().unwrap();
+        cpu.step().unwrap();
     }
 
     let cycles_before = cpu.cycle_counter();
