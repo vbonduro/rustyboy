@@ -279,6 +279,9 @@ impl GameBoy {
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
         let output = self.ppu.tick(cycles, self.memory.vram(), self.memory.oam());
+        // Sync dynamic PPU registers so CPU reads see current state.
+        self.memory.write_io(LY_ADDR, self.ppu.ly());
+        self.memory.write_io(STAT_ADDR, self.ppu.stat());
         if output.vblank_interrupt {
             self.front_buffer.copy_from_slice(self.ppu.framebuffer());
             let if_ = self.memory.read_io(IF_ADDR);
@@ -298,6 +301,9 @@ impl GameBoy {
             let if_ = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_ | (1 << TIMER_INTERRUPT_BIT));
         }
+        // Sync dynamic timer registers so CPU reads see current state.
+        self.memory.write_io(DIV_ADDR, self.timer.div());
+        self.memory.write_io(TIMA_ADDR, self.timer.tima());
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
