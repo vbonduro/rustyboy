@@ -20,7 +20,7 @@ use crate::cpu::registers::{Flags, Registers};
 use crate::cpu::save_state::{CpuState, SaveState};
 use crate::cpu::sm83::Sm83;
 use crate::memory::cartridge::Cartridge;
-use crate::memory::memory::{Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
+use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
 
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
@@ -55,6 +55,8 @@ pub struct GameBoy {
     serial: SerialPort,
     dma: Option<DmaState>,
     front_buffer: [u8; FRAMEBUFFER_SIZE],
+    /// Reusable scratch buffer for draining bus events — avoids per-call heap allocation.
+    bus_event_buf: Vec<BusEvent>,
     /// Total committed T-cycles.
     cycle_counter: u64,
     #[cfg(feature = "perf")]
@@ -105,6 +107,7 @@ impl GameBoy {
             serial: SerialPort::new(),
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             #[cfg(feature = "perf")]
             perf_enabled: false,
@@ -166,6 +169,7 @@ impl GameBoy {
             serial: SerialPort::new(),
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             #[cfg(feature = "perf")]
             perf_enabled: false,
@@ -206,6 +210,7 @@ impl GameBoy {
             serial: SerialPort::new(),
             dma: None,
             front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             #[cfg(feature = "perf")]
             perf_enabled: false,
@@ -342,11 +347,17 @@ impl GameBoy {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn route_bus_events(&mut self) {
-        let mut events = alloc::vec::Vec::new();
-        self.memory.drain_into(&mut events);
-        for e in events {
-            self.handle_bus_event(e.address, e.value);
+        if !self.memory.has_events() { return; }
+        // mem::take swaps out the persistent buffer so we can borrow both
+        // self.memory and the buffer without aliasing. The Vec's allocation
+        // is retained across calls; only the pointer/len/cap are moved.
+        let mut buf = core::mem::take(&mut self.bus_event_buf);
+        self.memory.drain_into(&mut buf);
+        for i in 0..buf.len() {
+            self.handle_bus_event(buf[i].address, buf[i].value);
         }
+        buf.clear();
+        self.bus_event_buf = buf;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]

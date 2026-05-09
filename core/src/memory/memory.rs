@@ -453,6 +453,12 @@ impl GameBoyMemory {
         }
     }
 
+    /// Returns true if there are any pending bus events.
+    #[inline(always)]
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
     /// Drain pending bus events into an existing buffer, reusing its allocation.
     pub fn drain_into(&mut self, buf: &mut Vec<BusEvent>) {
         buf.extend(self.events.drain(..));
