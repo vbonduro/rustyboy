@@ -1,10 +1,8 @@
 //! Shared test harness utilities for integration tests.
 #![allow(dead_code)]
 
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::registers::Registers;
-use rustyboy_core::cpu::sm83::Sm83;
-use rustyboy_core::memory::memory::GameBoyMemory;
+use rustyboy_core::GameBoy;
 
 /// Resolve a ROM path relative to the workspace root.
 pub fn rom_path(relative: &str) -> std::path::PathBuf {
@@ -25,9 +23,7 @@ pub fn load_rom(path: &str) -> Vec<u8> {
 /// Returns the serial output as a string.
 pub fn run_blargg_rom(path: &str) -> String {
     let rom_data = load_rom(path);
-    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut gb = GameBoy::new(rom_data).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -36,17 +32,17 @@ pub fn run_blargg_rom(path: &str) -> String {
     const MAX_TICKS: u64 = 50_000_000;
     let mut ticks = 0u64;
     while ticks < MAX_TICKS {
-        cpu.step().unwrap();
+        gb.step().unwrap();
         ticks += 1;
         if ticks % 1024 == 0 {
-            let bytes = cpu.serial_output();
+            let bytes = gb.serial_output();
             if bytes.ends_with(b"Passed\n") || bytes.ends_with(b"Failed\n") {
                 break;
             }
         }
     }
 
-    String::from_utf8_lossy(cpu.serial_output()).into_owned()
+    String::from_utf8_lossy(gb.serial_output()).into_owned()
 }
 
 /// Assert that a Blargg ROM's serial output contains "Passed".
@@ -69,9 +65,7 @@ pub fn assert_blargg_passed(path: &str, name: &str) {
 /// Returns the text output as a string.
 pub fn run_blargg_mem_rom(path: &str) -> String {
     let rom_data = load_rom(path);
-    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut gb = GameBoy::new(rom_data).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -80,15 +74,15 @@ pub fn run_blargg_mem_rom(path: &str) -> String {
     const MAX_TICKS: u64 = 50_000_000;
     let mut ticks = 0u64;
     while ticks < MAX_TICKS {
-        cpu.step().unwrap();
+        gb.step().unwrap();
         ticks += 1;
         if ticks % 1024 == 0 {
             // Check signature at 0xA001-0xA003
-            let sig_ok = cpu.read_memory(0xA001).unwrap_or(0) == 0xDE
-                && cpu.read_memory(0xA002).unwrap_or(0) == 0xB0
-                && cpu.read_memory(0xA003).unwrap_or(0) == 0x61;
+            let sig_ok = gb.read_memory(0xA001).unwrap_or(0) == 0xDE
+                && gb.read_memory(0xA002).unwrap_or(0) == 0xB0
+                && gb.read_memory(0xA003).unwrap_or(0) == 0x61;
             if sig_ok {
-                let status = cpu.read_memory(0xA000).unwrap_or(0x80);
+                let status = gb.read_memory(0xA000).unwrap_or(0x80);
                 if status != 0x80 {
                     break;
                 }
@@ -99,7 +93,7 @@ pub fn run_blargg_mem_rom(path: &str) -> String {
     // Read text at 0xA004+
     let mut text = String::new();
     for addr in 0xA004u16.. {
-        match cpu.read_memory(addr) {
+        match gb.read_memory(addr) {
             Ok(0) | Err(_) => break,
             Ok(b) => text.push(b as char),
         }
@@ -126,9 +120,7 @@ pub fn assert_blargg_mem_passed(path: &str, name: &str) {
 /// Fail: B=0x42, C=0x42, D=0x42, E=0x42, H=0x42, L=0x42
 pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
     let rom_data = load_rom(path);
-    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut gb = GameBoy::new(rom_data).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -140,20 +132,20 @@ pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
     let mut ticks = 0u64;
     let mut prev_pc = 0u16;
     while ticks < MAX_TICKS {
-        let pc = cpu.registers().pc;
+        let pc = gb.registers().pc;
         // Detect `JR -2` (0x18 0xFE): PC loops back to itself each tick.
         if pc == prev_pc {
             break;
         }
         prev_pc = pc;
-        cpu.step().unwrap();
+        gb.step().unwrap();
         ticks += 1;
-        if cpu.is_halted() {
+        if gb.is_halted() {
             break;
         }
     }
 
-    let regs = cpu.registers();
+    let regs = gb.registers();
     if regs.b == 3 && regs.c == 5 && regs.d == 8 && regs.e == 13 && regs.h == 21 && regs.l == 34
     {
         MooneyeResult::Pass
@@ -197,9 +189,7 @@ pub fn assert_mooneye_passed(path: &str, name: &str) {
 /// One frame = 70,224 dots = ~17,556 CPU ticks (at 4 cycles per tick average).
 pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
     let rom_data = load_rom(path);
-    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    let mut cpu = Sm83::new(memory, decoder).with_registers(Registers {
+    let mut gb = GameBoy::new(rom_data).with_registers(Registers {
         pc: 0x0100,
         sp: 0xFFFE,
         ..Default::default()
@@ -211,11 +201,11 @@ pub fn run_rom_frames(path: &str, frames: u32) -> Vec<u8> {
     let total_dots: u64 = frames as u64 * 70_224;
     let mut dots_elapsed: u64 = 0;
     while dots_elapsed < total_dots {
-        let cycles = cpu.step().unwrap() as u64;
+        let cycles = gb.step().unwrap() as u64;
         dots_elapsed += cycles;
     }
 
-    cpu.framebuffer().to_vec()
+    gb.front_buffer().to_vec()
 }
 
 /// Load a reference PNG image and return the pixels as 2-bit shade values.

@@ -148,6 +148,18 @@ impl PpuPeripheral {
     pub fn set_wy(&mut self,   v: u8) { self.wy    = v; }
     pub fn set_wx(&mut self,   v: u8) { self.wx    = v; }
 
+    /// Sync `prev_stat_line` to the current STAT line state, preventing a
+    /// spurious rising-edge interrupt when seeding the PPU to a mid-frame
+    /// state (e.g. after DMG post-boot register initialization).
+    pub fn sync_prev_stat_line(&mut self) {
+        let lyc_match = self.ly == self.lyc;
+        let stat_line = (lyc_match && (self.stat & 0x40 != 0))
+            || (self.mode == PpuMode::HBlank  && (self.stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank   && (self.stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan  && (self.stat & 0x20 != 0));
+        self.prev_stat_line = stat_line;
+    }
+
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> PpuPerfProfile {
         core::mem::take(&mut self.perf_profile)

@@ -3,11 +3,9 @@
 
 mod common;
 
-use rustyboy_core::cpu::instructions::opcodes::OpCodeDecoder;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::registers::{Flags, Registers};
-use rustyboy_core::cpu::sm83::Sm83;
-use rustyboy_core::memory::GameBoyMemory;
+use rustyboy_core::GameBoy;
 
 const CYCLES_PER_FRAME: u32 = 70224;
 const LCDC_ADDR: u16 = 0xFF40;
@@ -19,12 +17,10 @@ const OBP0_ADDR: u16 = 0xFF48;
 const SCX_ADDR: u16 = 0xFF43;
 const SCY_ADDR: u16 = 0xFF42;
 
-fn build_cpu() -> Sm83 {
+fn build_cpu() -> GameBoy {
     let rom_path = "/home/vbonduro/roms/extracted/Donkey Kong Land 2 (USA, Europe) (SGB Enhanced).gb";
     let rom_data = std::fs::read(rom_path).expect("DKL2 ROM not found");
-    let memory = Box::new(GameBoyMemory::with_rom(rom_data));
-    let decoder = Box::new(OpCodeDecoder::new());
-    Sm83::new(memory, decoder)
+    GameBoy::new(rom_data)
         .with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),
@@ -40,14 +36,14 @@ fn build_cpu() -> Sm83 {
         .with_dmg_state()
 }
 
-fn run_frame(cpu: &mut Sm83) {
+fn run_frame(cpu: &mut GameBoy) {
     let start = cpu.cycle_counter();
     while cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
         let _ = cpu.step();
     }
 }
 
-fn dump_oam_summary(cpu: &Sm83) -> usize {
+fn dump_oam_summary(cpu: &GameBoy) -> usize {
     let mut visible = 0;
     for i in 0..40 {
         let base = 0xFE00 + (i * 4) as u16;
@@ -532,7 +528,7 @@ fn trace_dkl2_level_lcdc() {
             let lyc = cpu.read_memory(LYC_ADDR).unwrap_or(0);
             let scx = cpu.read_memory(SCX_ADDR).unwrap_or(0);
             let scy = cpu.read_memory(SCY_ADDR).unwrap_or(0);
-            let fb = cpu.framebuffer();
+            let fb = cpu.front_buffer();
             let dark = fb.iter().filter(|&&p| p > 0).count();
             eprintln!("Frame {:4}: LCDC=0x{:02X}(OBJ={}) BGP=0x{:02X} STAT=0x{:02X} LYC={:3} SCX={:3} SCY={:3} dark={}",
                 f, lcdc, (lcdc>>1)&1, bgp, stat, lyc, scx, scy, dark);
@@ -571,7 +567,7 @@ fn trace_dkl2_level_lcdc() {
     }
 
     // Show framebuffer
-    let fb = cpu.framebuffer();
+    let fb = cpu.front_buffer();
     eprintln!("\nFramebuffer:");
     for row in (0..144usize).step_by(2) {
         let row_str: String = fb[row*160..(row+1)*160].iter().map(|&p| match p {
