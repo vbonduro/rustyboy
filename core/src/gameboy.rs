@@ -6,8 +6,8 @@ use crate::cpu::peripheral::apu::{
 };
 use crate::cpu::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
 use crate::cpu::peripheral::ppu::{
-    PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
-    LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
+    PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR,
+    LY_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR,
     VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
 };
 use crate::cpu::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
@@ -227,14 +227,14 @@ impl GameBoy {
 
     /// Seed IO registers to DMG post-boot-ROM state.
     pub fn with_dmg_state(mut self) -> Self {
-        self.ppu.set_lcdc(0x91);
-        self.ppu.set_stat(0x85);
-        self.ppu.set_bgp(0xFC);
-        self.ppu.set_obp0(0xFF);
-        self.ppu.set_obp1(0xFF);
+        self.memory.write_io(LCDC_ADDR, 0x91);
+        self.memory.write_io(STAT_ADDR, 0x85);
+        self.memory.write_io(BGP_ADDR,  0xFC);
+        self.memory.write_io(OBP0_ADDR, 0xFF);
+        self.memory.write_io(OBP1_ADDR, 0xFF);
         // Sync prev_stat_line so the first PPU tick doesn't generate a spurious
         // rising-edge STAT interrupt from the seeded STAT/LY/LYC state.
-        self.ppu.sync_prev_stat_line();
+        self.ppu.sync_prev_stat_line(self.memory.io_slice());
         // APU post-boot state
         self.write_apu_register(0xFF26, 0xF1);
         self.write_apu_register(0xFF25, 0xF3);
@@ -283,10 +283,10 @@ impl GameBoy {
     fn advance_ppu(&mut self, cycles: u16) {
         #[cfg(feature = "perf")]
         let t0 = cyccnt();
-        let output = self.ppu.tick(cycles, self.memory.vram(), self.memory.oam());
-        // Sync dynamic PPU registers so CPU reads see current state.
-        self.memory.write_io(LY_ADDR, self.ppu.ly());
-        self.memory.write_io(STAT_ADDR, self.ppu.stat());
+        let output = {
+            let (io, vram, oam) = self.memory.ppu_tick_data();
+            self.ppu.tick(cycles, io, vram, oam)
+        };
         if output.vblank_interrupt {
             self.front_buffer.copy_from_slice(self.ppu.framebuffer());
             let if_ = self.memory.read_io(IF_ADDR);
@@ -388,16 +388,9 @@ impl GameBoy {
             a if a == TIMA_ADDR => self.timer.set_tima(value),
             a if a == TMA_ADDR  => self.timer.set_tma(value),
             a if a == TAC_ADDR  => self.timer.set_tac(value),
-            a if a == LCDC_ADDR => self.ppu.set_lcdc(value),
-            a if a == STAT_ADDR => self.ppu.set_stat(value),
-            a if a == SCY_ADDR  => self.ppu.set_scy(value),
-            a if a == SCX_ADDR  => self.ppu.set_scx(value),
-            a if a == LYC_ADDR  => self.ppu.set_lyc(value),
-            a if a == BGP_ADDR  => self.ppu.set_bgp(value),
-            a if a == OBP0_ADDR => self.ppu.set_obp0(value),
-            a if a == OBP1_ADDR => self.ppu.set_obp1(value),
-            a if a == WY_ADDR   => self.ppu.set_wy(value),
-            a if a == WX_ADDR   => self.ppu.set_wx(value),
+            // PPU config registers (LCDC, STAT, SCY, SCX, LYC, BGP, OBP0, OBP1, WY, WX) are
+            // already written to memory.io[] by Memory::write(). PPU reads them directly
+            // from io[] on each tick — no secondary copy to update.
             _ => {}
         }
     }
@@ -522,7 +515,7 @@ impl GameBoy {
             halted: self.cpu.halted,
             cycle_counter: self.cycle_counter(),
         };
-        SaveState::serialize(cpu_state, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
+        SaveState::serialize(cpu_state, self.timer.to_save_state(), self.ppu.to_save_state(self.memory.io_slice()), &self.memory)
     }
 
     /// Restore emulator state from a parsed [`SaveState`].
@@ -534,6 +527,8 @@ impl GameBoy {
         self.timer.load_state(state.timer);
         self.ppu.load_state(state.ppu);
         self.memory.load_state(&state);
+        // Sync PPU prev_stat_line to avoid spurious STAT interrupt on first tick.
+        self.ppu.sync_prev_stat_line(self.memory.io_slice());
         Ok(())
     }
 

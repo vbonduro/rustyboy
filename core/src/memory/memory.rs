@@ -453,6 +453,17 @@ impl GameBoyMemory {
         }
     }
 
+    /// Returns a read-only view of the IO register array (0xFF00–0xFF7F).
+    pub fn io_slice(&self) -> &[u8] {
+        &self.io
+    }
+
+    /// Split-borrow accessor: returns (io, vram, oam) as separate references so
+    /// callers can pass io as `&mut` to the PPU while holding read-only vram/oam.
+    pub fn ppu_tick_data(&mut self) -> (&mut [u8], &[u8], &[u8]) {
+        (&mut self.io, &self.vram, &self.oam)
+    }
+
     /// Returns true if there are any pending bus events.
     #[inline(always)]
     pub fn has_events(&self) -> bool {
