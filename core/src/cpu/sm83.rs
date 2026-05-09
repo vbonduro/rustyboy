@@ -1,27 +1,7 @@
-use alloc::{boxed::Box, collections::VecDeque, format, vec::Vec};
+use alloc::collections::VecDeque;
+#[cfg(feature = "trace")]
+use alloc::boxed::Box;
 
-use super::cpu::{Cpu, CpuError};
-use super::instructions::adc::opcode::Adc;
-use super::instructions::add::opcode::{Add16, Add8, AddSP16};
-use super::instructions::call::opcode::{Call, CallOp};
-use super::instructions::cb::opcode::{CbInstruction, CbOp, CbTarget};
-use super::instructions::cp::opcode::Cp8;
-use super::instructions::decoder::Decoder;
-use super::instructions::opcodes::OpCodeTable;
-use super::instructions::inc_dec::opcode::{Dec16, Dec8, Inc16, Inc8};
-use super::instructions::instructions::{Error as InstructionError, Instructions};
-use super::instructions::jump::opcode::{Condition, Jump, JumpOp};
-use super::instructions::ld::opcode::Ld8;
-use super::instructions::ld16::opcode::Ld16;
-use super::instructions::logic::opcode::{And8, Or8, Xor8};
-use super::instructions::misc::opcode::Misc;
-use super::instructions::operand::*;
-use super::instructions::ret::opcode::{Ret, RetOp};
-use super::instructions::rotate::opcode::{Rotate, RotateOp};
-use super::instructions::rst::opcode::Rst;
-use super::instructions::sbc::opcode::Sbc8;
-use super::instructions::stack::opcode::{Pop16, Push16};
-use super::instructions::sub::opcode::Sub8;
 use super::operations::add::*;
 use super::operations::cb::{
     bit_u8, res_u8, rl_u8, rlc_u8, rr_u8, rrc_u8, set_u8, sla_u8, sra_u8, srl_u8, swap_u8,
@@ -30,33 +10,14 @@ use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
-use super::peripheral::apu::{
-    ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
-};
-use super::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
-use super::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
-use super::peripheral::ppu::{
-    PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
-    LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
-    VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
-};
-use super::peripheral::timer::{
-    TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
-};
+use super::peripheral::apu::NR52_ADDR;
 #[cfg(feature = "perf")]
-use super::perf::{cyccnt, Sm83PerfRecorder};
+use super::perf::Sm83PerfRecorder;
 use super::registers::{Flags, Registers};
-use super::save_state::{CpuState, SaveState};
 
-use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryBus};
+use crate::memory::memory::GameBoyMemory;
 #[cfg(feature = "perf")]
 pub use super::perf::Sm83PerfProfile;
-
-impl From<MemoryError> for InstructionError {
-    fn from(error: MemoryError) -> Self {
-        InstructionError::Failed(format!("Failed to access memory: {}", error))
-    }
-}
 
 /// M-cycle operation returned by Sm83::tick(). GameBoy drives the bus.
 #[derive(Debug, PartialEq)]
@@ -72,7 +33,7 @@ pub enum McycleOp {
 }
 
 /// Carry parameters for a Compute micro-op function.
-struct ComputeOp {
+pub(crate) struct ComputeOp {
     func: fn(&mut Sm83, u8, u8, u8),
     p0: u8,
     p1: u8,
@@ -95,7 +56,7 @@ impl ComputeOp {
     }
 }
 
-enum MicroOp {
+pub(crate) enum MicroOp {
     /// Bus read; tock stores result in temp[temp_idx++].
     Read(u16),
     /// Bus read at self.addr_temp; tock stores result.
@@ -123,11 +84,6 @@ pub enum ImeState {
     Enabled,
 }
 
-const IF_ADDR: u16 = 0xFF0F;
-const DMA_ADDR: u16 = 0xFF46;
-const IE_ADDR: u16 = 0xFFFF;
-const SB_ADDR: u16 = 0xFF01;
-const SC_ADDR: u16 = 0xFF02;
 
 /// Snapshot of CPU and key hardware state passed to trace hooks.
 #[cfg(feature = "trace")]
@@ -159,164 +115,54 @@ impl Sm83Cache {
     }
 }
 
-#[derive(Default)]
-struct PendingApuCycles {
-    cycles: u16,
-}
-
-impl PendingApuCycles {
-    #[inline(always)]
-    fn queue(&mut self, cycles: u16) {
-        debug_assert!(cycles != 0);
-        debug_assert!(
-            self.cycles <= u16::MAX - cycles,
-            "pending APU cycle batch overflow"
-        );
-        self.cycles = self.cycles.wrapping_add(cycles);
-    }
-
-    #[inline(always)]
-    fn take(&mut self) -> u16 {
-        core::mem::take(&mut self.cycles)
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.cycles == 0
-    }
-}
-
 pub struct Sm83 {
-    memory: Box<GameBoyMemory>,
-    registers: Registers,
-    opcodes: OpCodeTable,
-    serial: SerialPort,
-    timer: TimerPeripheral,
-    ppu: PpuPeripheral,
-    apu: ApuPeripheral,
-    joypad: JoypadPeripheral,
-    ime: ImeState,
-    halted: bool,
-    /// Total committed T-cycles. Current-instruction M-cycles are batched in
-    /// `pending_cycle_counter` and flushed once per `tick()`.
-    cycle_counter: u64,
-    /// Unflushed T-cycles accrued inside the current instruction or direct
-    /// internal M-cycle helpers. This keeps the hot path on a small integer
-    /// add instead of touching the `u64` total on every M-cycle.
-    pending_cycle_counter: u16,
-    /// Pending OAM DMA transfer. When Some, holds the source page and number of
-    /// bytes already copied. Each M-cycle advances the transfer by one byte.
-    dma: Option<DmaState>,
-    /// Cached blockers for the idle M-cycle fast path so hot fetches do not
-    /// have to rescan DMA/serial/bus-event state on every call.
-    idle_m_cycle_blockers: u8,
-    /// Stable front buffer: snapshotted from the PPU at VBlank so callers always
-    /// read a fully-rendered frame rather than one mid-render.
-    front_buffer: [u8; FRAMEBUFFER_SIZE],
-    /// Accumulates APU T-cycles between timing-sensitive boundaries so normal
-    /// M-cycles can batch one `apu.tick(...)` per instruction instead of per cycle.
-    pending_apu_cycles: PendingApuCycles,
-    /// CPU MMIO writes are routed here and applied on the next M-cycle.
-    pending_bus_events: Vec<BusEvent>,
-    pub cache: Sm83Cache,
+    // ── Pure CPU state ───────────────────────────────────────────────────────
+    pub(crate) registers: Registers,
+    pub(crate) ime: ImeState,
+    pub(crate) halted: bool,
+    /// Micro-op queue for the current/next instruction.
+    pub(crate) micro_ops: VecDeque<MicroOp>,
+    /// Temporary address for dynamic bus operations.
+    pub(crate) addr_temp: u16,
+    /// Temporary value for WriteDyn operations.
+    pub(crate) val_temp: u8,
+    /// Accumulates bytes from tock() calls; reset at instruction fetch.
+    pub(crate) temp: [u8; 4],
+    /// Next write index into temp[].
+    pub(crate) temp_idx: usize,
+    // ── Interrupt shadows: set by GameBoy before each tick() call ────────────
+    /// IE register mirror; set by GameBoy from memory.ie() before each tick().
+    pub ie_shadow: u8,
+    /// IF register mirror; set by GameBoy before each tick(); may be cleared by
+    /// take_pending_interrupt() when an interrupt is dispatched.
+    pub if_shadow: u8,
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
     #[cfg(feature = "perf")]
-    perf: Sm83PerfRecorder,
-    /// Micro-op queue for the current/next instruction.
-    micro_ops: VecDeque<MicroOp>,
-    /// Temporary address for dynamic bus operations.
-    addr_temp: u16,
-    /// Temporary value for WriteDyn operations.
-    val_temp: u8,
-    /// Accumulates bytes from tock() calls; reset at instruction fetch.
-    temp: [u8; 4],
-    /// Next write index into temp[].
-    temp_idx: usize,
+    pub(crate) perf: Sm83PerfRecorder,
 }
-
-/// State for an in-progress OAM DMA transfer.
-struct DmaState {
-    /// Source base address (page << 8).
-    source: u16,
-    /// Number of bytes copied so far (0–159).
-    progress: u8,
-}
-
-const IDLE_M_CYCLE_BLOCK_BUS_EVENTS: u8 = 1 << 0;
-const IDLE_M_CYCLE_BLOCK_DMA: u8 = 1 << 1;
-const IDLE_M_CYCLE_BLOCK_SERIAL: u8 = 1 << 2;
-const IDLE_M_CYCLE_BLOCK_RTC: u8 = 1 << 3;
 
 impl Sm83 {
-    pub fn new(memory: Box<GameBoyMemory>, opcode_decoder: Box<dyn Decoder>) -> Self {
-        let joypad = JoypadPeripheral::new();
-        let opcodes = OpCodeTable::from_decoder(&*opcode_decoder);
-        let mut sm83 = Self {
-            memory,
+    /// Create a pure CPU state machine without peripheral state.
+    /// Used by `GameBoy` which owns the peripheral state itself.
+    pub(crate) fn new_pure() -> Self {
+        Self {
             registers: Registers::default(),
-            opcodes,
-            serial: SerialPort::new(),
-            timer: TimerPeripheral::new(),
-            ppu: PpuPeripheral::new(),
-            apu: ApuPeripheral::new(),
-            joypad,
             ime: ImeState::Disabled,
             halted: false,
-            cycle_counter: 0,
-            pending_cycle_counter: 0,
-            dma: None,
-            idle_m_cycle_blockers: 0,
-            front_buffer: [0u8; FRAMEBUFFER_SIZE],
-            pending_apu_cycles: PendingApuCycles::default(),
-            pending_bus_events: Vec::with_capacity(4),
-            cache: Sm83Cache::default(),
-            #[cfg(feature = "trace")]
-            trace_hook: None,
-            #[cfg(feature = "perf")]
-            perf: Sm83PerfRecorder::default(),
             micro_ops: VecDeque::new(),
             addr_temp: 0,
             val_temp: 0,
             temp: [0u8; 4],
             temp_idx: 0,
-        };
-        // Seed JOYP with no buttons pressed (all lines high).
-        sm83.memory.write_io(JOYP_ADDR, sm83.joypad.read());
-        // Seed IO memory with initial APU register read values so games
-        // reading registers before any write see correct masked values.
-        for addr in NR10_ADDR..=NR52_ADDR {
-            sm83.memory.write_io(addr, sm83.apu.read_register(addr));
+            ie_shadow: 0,
+            if_shadow: 0,
+            #[cfg(feature = "trace")]
+            trace_hook: None,
+            #[cfg(feature = "perf")]
+            perf: Sm83PerfRecorder::default(),
         }
-        // Unused APU addresses always read as 0xFF
-        for addr in 0xFF27u16..WAVE_RAM_START {
-            sm83.memory.write_io(addr, 0xFF);
-        }
-        for addr in WAVE_RAM_START..=WAVE_RAM_END {
-            let offset = (addr - WAVE_RAM_START) as u8;
-            sm83.memory.write_io(addr, sm83.apu.read_wave_ram(offset));
-        }
-        sm83.cache.sync(&sm83.memory);
-        sm83.refresh_idle_m_cycle_fast_path_blockers();
-        sm83
-    }
-
-    /// Press or release a button. Fires the joypad interrupt if the button is
-    /// newly pressed and its select line is active.
-    pub fn set_button(&mut self, button: Button, pressed: bool) {
-        let interrupt = self.joypad.set_button(button, pressed);
-        self.memory.write_io(JOYP_ADDR, self.joypad.read());
-        if interrupt {
-            let if_val = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_val | (1 << JOYPAD_INTERRUPT_BIT));
-        }
-    }
-
-    /// Subscribe a peripheral to receive bus events for the given address range.
-    /// Returns all bytes captured by the serial port (SB transfers via SC).
-    pub fn serial_output(&self) -> &[u8] {
-        self.serial.output()
     }
 
     // Retrieve a copy of the CPU registers.
@@ -344,446 +190,9 @@ impl Sm83 {
         self.trace_hook = Some(Box::new(hook));
     }
 
-    /// Read a byte from the memory bus (for test/debug access).
-    pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
-        self.memory.read(address)
-    }
-
-    /// Returns the currently mapped ROM bank for the switchable window (0x4000–0x7FFF).
-    pub fn current_rom_bank(&self) -> usize {
-        self.memory.current_rom_bank()
-    }
-
-    /// Returns a reference to the PPU framebuffer (160x144 pixels, 2-bit shade per pixel).
-    pub fn cycle_counter(&self) -> u64 {
-        self.cycle_counter
-            .wrapping_add(self.pending_cycle_counter as u64)
-    }
-
-    pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
-        &self.front_buffer
-    }
-
-    /// Drain accumulated PCM audio samples since the last call.
-    /// Returns interleaved stereo f32 samples [L, R, L, R, ...] at 48,000 Hz.
-    pub fn drain_audio_samples(&mut self) -> alloc::vec::Vec<f32> {
-        self.apu.drain_samples()
-    }
-
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
         self.perf.take_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_ppu_perf_profile(&mut self) -> super::peripheral::ppu::PpuPerfProfile {
-        self.ppu.take_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_apu_perf_profile(&mut self) -> super::peripheral::apu::ApuPerfProfile {
-        self.apu.take_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_cartridge_perf_profile(
-        &mut self,
-    ) -> crate::memory::cartridge::CartridgePerfProfile {
-        self.memory.take_cartridge_perf_profile()
-    }
-
-    /// Returns the cartridge external RAM (battery save data), or `None` if cart has no RAM.
-    pub fn external_ram(&self) -> Option<&[u8]> {
-        self.memory.external_ram()
-    }
-
-    /// Overwrites the cartridge external RAM with the provided data.
-    pub fn set_external_ram(&mut self, data: &[u8]) {
-        self.memory.set_external_ram(data);
-    }
-
-    /// Serialize the full emulator state to an RBSS v1 blob.
-    pub fn save_state(&self) -> alloc::vec::Vec<u8> {
-        let cpu = CpuState {
-            a: self.registers.a, b: self.registers.b, c: self.registers.c,
-            d: self.registers.d, e: self.registers.e, h: self.registers.h,
-            l: self.registers.l, f: self.registers.f,
-            sp: self.registers.sp, pc: self.registers.pc,
-            ime: self.ime,
-            halted: self.halted,
-            cycle_counter: self.cycle_counter(),
-        };
-        SaveState::serialize(cpu, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
-    }
-
-    /// Restore emulator state from a parsed [`SaveState`].
-    ///
-    /// The blob is fully validated before this is called (via
-    /// [`SaveState::from_blob`]), so applying here is infallible given a
-    /// well-formed `SaveState`. Returns `Ok(())` always; kept as `Result` for
-    /// call-site symmetry and future extensibility.
-    pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
-        self.registers     = state.cpu.to_registers();
-        self.ime           = state.cpu.ime;
-        self.halted        = state.cpu.halted;
-        self.cycle_counter = state.cpu.cycle_counter;
-        self.pending_cycle_counter = 0;
-        self.micro_ops.clear();
-        self.addr_temp = 0;
-        self.val_temp = 0;
-        self.temp = [0u8; 4];
-        self.temp_idx = 0;
-        self.timer.load_state(state.timer);
-        self.ppu.load_state(state.ppu);
-        self.memory.load_state(&state);
-        self.cache.sync(&self.memory);
-        self.refresh_idle_m_cycle_fast_path_blockers();
-        Ok(())
-    }
-
-    /// Builder method to set initial register state. Used to skip the boot ROM
-    /// by setting PC to 0x0100 and SP to 0xFFFE.
-    pub fn with_registers(mut self, registers: Registers) -> Self {
-        self.registers = registers;
-        self
-    }
-
-    /// Seed IO registers to their DMG post-boot-ROM state so games that poll
-    /// LY or check LCDC before enabling the LCD work correctly without a boot ROM.
-    pub fn with_dmg_state(mut self) -> Self {
-        // Post-boot PPU register values (DMG, SGB, MGB verified against Pan Docs)
-        self.ppu.set_lcdc(0x91); // LCD on, BG on, sprites off, window off
-        self.ppu.set_stat(0x85); // PPU in VBlank (mode 1), LYC=LY
-        self.ppu.set_bgp(0xFC);  // background palette: 3,3,3,0
-        self.ppu.set_obp0(0xFF); // obj palette 0
-        self.ppu.set_obp1(0xFF); // obj palette 1
-        // APU post-boot state (Pan Docs)
-        self.write_apu_register(0xFF26, 0xF1); // NR52: APU on, ch1 active
-        self.write_apu_register(0xFF25, 0xF3); // NR51: ch1-3 right, ch1-4 left
-        self.write_apu_register(0xFF24, 0x77); // NR50: max volume both sides
-        self.cache.sync(&self.memory);
-        self
-    }
-
-    // ── M-cycle–accurate bus access ─────────────────────────────────────────
-
-    /// Perform a bus read: advance all peripherals by one M-cycle (4 T-cycles),
-    /// process any pending bus events, then read from memory.
-    /// Wave RAM reads (0xFF30-0xFF3F) are routed through the APU so that
-    /// reads while ch3 is on return the current sample buffer.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn bus_read(&mut self, addr: u16) -> Result<u8, MemoryError> {
-        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            // Wave RAM reads require T-cycle precision. The sample is latched
-            // at T3 within the M-cycle on real hardware.
-            self.tick_cycle_to_t3();
-            let offset = (addr - WAVE_RAM_START) as u8;
-            let value = self.apu.read_wave_ram(offset);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return Ok(value);
-        }
-        #[cfg(feature = "perf")]
-        let nested0 = self.perf.nested_snapshot();
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        self.tick_cycle();
-        #[cfg(feature = "perf")]
-        let t_read = cyccnt();
-        let value = match addr {
-            a if a == DIV_ADDR  => self.timer.div(),
-            a if a == TIMA_ADDR => self.timer.tima(),
-            a if a == TMA_ADDR  => self.timer.tma(),
-            a if a == TAC_ADDR  => self.timer.tac(),
-            a if a == JOYP_ADDR => self.joypad.read(),
-            a if a == SB_ADDR   => self.serial.sb(),
-            a if a == SC_ADDR   => self.serial.sc(),
-            a if a == LCDC_ADDR => self.ppu.lcdc(),
-            a if a == STAT_ADDR => self.ppu.stat(),
-            a if a == SCY_ADDR  => self.ppu.scy(),
-            a if a == SCX_ADDR  => self.ppu.scx(),
-            a if a == LY_ADDR   => self.ppu.ly(),
-            a if a == LYC_ADDR  => self.ppu.lyc(),
-            a if a == BGP_ADDR  => self.ppu.bgp(),
-            a if a == OBP0_ADDR => self.ppu.obp0(),
-            a if a == OBP1_ADDR => self.ppu.obp1(),
-            a if a == WY_ADDR   => self.ppu.wy(),
-            a if a == WX_ADDR   => self.ppu.wx(),
-            _                   => self.memory.read_fast(addr),
-        };
-        #[cfg(feature = "perf")]
-        {
-            let t1 = cyccnt();
-            self.perf.record_mem_read(t1.wrapping_sub(t_read));
-            self.perf.record_bus_read(
-                t1.wrapping_sub(t0)
-                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
-            );
-        }
-        Ok(value)
-    }
-
-    /// Fast path for opcode/immediate fetches when `PC` is in cartridge ROM.
-    ///
-    /// This preserves the exact same M-cycle-side effects as `bus_read`,
-    /// but only for ROM fetches that still need the full generic M-cycle path.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn read_pc_rom_fast(&mut self, addr: u16) -> u8 {
-        self.tick_cycle();
-        #[cfg(feature = "perf")]
-        let t_read = cyccnt();
-        let value = self.read_pc_rom_byte_fast(addr);
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt().wrapping_sub(t_read);
-            self.perf.record_mem_read(dt);
-            self.perf.record_pc_fetch_rom_read(dt);
-        }
-        value
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn read_pc_rom_byte_fast(&self, addr: u16) -> u8 {
-        if addr <= 0x3FFF {
-            self.memory.read_rom_fixed_fast(addr)
-        } else {
-            self.memory.read_rom_banked_fast(addr)
-        }
-    }
-
-    /// Fused common-case ROM `PC` fetch. This collapses the hot idle-ROM path
-    /// into one straight-line helper so `read_next_pc()` does not pay another
-    /// layer of dispatch and bookkeeping on the overwhelmingly common case.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn read_next_pc_rom_idle_fast(&mut self, addr: u16) -> u8 {
-        #[cfg(feature = "perf")]
-        let nested0 = self.perf.nested_snapshot();
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        self.run_idle_m_cycle();
-        #[cfg(feature = "perf")]
-        let t_read = cyccnt();
-        let value = self.read_pc_rom_byte_fast(addr);
-        #[cfg(feature = "perf")]
-        let t_after_read = cyccnt();
-        self.registers.pc = self.registers.pc.wrapping_add(1);
-        #[cfg(feature = "perf")]
-        {
-            let t_after_pc = cyccnt();
-            let nested = self.perf.nested_cycles_since(nested0);
-            let rom_read_dt = t_after_read.wrapping_sub(t_read);
-            self.perf.record_mem_read(rom_read_dt);
-            self.perf.record_pc_fetch_rom_read(rom_read_dt);
-            self.perf.record_pc_fetch_rom_idle(
-                t_after_read.wrapping_sub(t0).wrapping_sub(nested),
-            );
-            self.perf
-                .record_pc_fetch_wrapper(t_after_pc.wrapping_sub(t_after_read));
-            self.perf
-                .record_pc_fetch(addr, t_after_pc.wrapping_sub(t0).wrapping_sub(nested));
-        }
-        value
-    }
-
-    /// Perform a bus write: advance all peripherals by one M-cycle (4 T-cycles),
-    /// process any pending bus events, then write to memory.
-    ///
-    /// APU register and wave RAM writes are applied at T3 within the M-cycle
-    /// for T-cycle accurate timing.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn bus_write(&mut self, addr: u16, value: u8) -> Result<(), MemoryError> {
-        if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
-            self.tick_cycle_to_t3();
-            self.write_apu_register(addr, value);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return Ok(());
-        }
-        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            self.tick_cycle_to_t3();
-            self.write_wave_ram(addr, value);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return Ok(());
-        }
-        self.tick_cycle();
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let result = match addr {
-            0xFF00..=0xFF7F | 0xFFFF => {
-                #[cfg(feature = "perf")]
-                let t_io = cyccnt();
-                self.memory.write_io(addr, value);
-                #[cfg(feature = "perf")]
-                {
-                    self.perf.record_mem_write_io(cyccnt().wrapping_sub(t_io));
-                }
-
-                #[cfg(feature = "perf")]
-                let t_enqueue = cyccnt();
-                self.pending_bus_events.push(BusEvent {
-                    address: addr,
-                    value,
-                });
-                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
-                #[cfg(feature = "perf")]
-                {
-                    self.perf.record_mem_write_enqueue(cyccnt().wrapping_sub(t_enqueue));
-                }
-                Ok(())
-            }
-            0xE000..=0xFDFF => Err(MemoryError::ReadOnly(addr)),
-            _ => {
-                #[cfg(feature = "perf")]
-                let t_fast = cyccnt();
-                self.memory.write_fast(addr, value);
-                #[cfg(feature = "perf")]
-                {
-                    self.perf.record_mem_write_fast(addr, cyccnt().wrapping_sub(t_fast));
-                }
-                Ok(())
-            }
-        };
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_mem_write(cyccnt().wrapping_sub(t0));
-        }
-        result
-    }
-
-    /// Advance peripherals by one M-cycle (4 T-cycles) without a bus access.
-    /// Used for internal M-cycles (e.g. ALU operations, SP adjustment).
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_cycle(&mut self) {
-        if self.can_use_idle_m_cycle_fast_path() {
-            self.run_idle_m_cycle();
-            return;
-        }
-        self.begin_m_cycle();
-        self.advance_peripherals(4);
-    }
-
-    /// Advance the OAM DMA transfer by one byte (one M-cycle).
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_dma(&mut self) {
-        let (source, progress) = match self.dma {
-            Some(ref d) => (d.source, d.progress),
-            None => return,
-        };
-        let byte = self.memory.read_fast(source + progress as u16);
-        self.memory.write_fast(0xFE00 + progress as u16, byte);
-        let next = progress + 1;
-        self.dma = if next < 160 {
-            Some(DmaState { source, progress: next })
-        } else {
-            None
-        };
-        if self.dma.is_some() {
-            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
-        } else {
-            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_peripherals(&mut self, cycles: u16) {
-        self.advance_ppu(cycles);
-        self.advance_timer(cycles);
-        self.queue_apu_cycles(cycles);
-        if self.memory.has_rtc() {
-            self.memory.tick_rtc(cycles as u32);
-        }
-        if !self.serial.is_idle() {
-            self.advance_serial(cycles);
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_serial(&mut self, cycles: u16) {
-        if self.serial.tick(cycles) {
-            let if_val = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_val | (1 << SERIAL_INTERRUPT_BIT));
-        }
-        if self.serial.is_idle() {
-            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
-        } else {
-            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
-        }
-    }
-
-    /// Tick peripherals through the first 3 T-cycles of an M-cycle (T1–T3),
-    /// stopping so the caller can perform a time-sensitive APU read or write at T3.
-    /// The caller must account for T4 afterwards with `advance_timer(1)` plus
-    /// one queued APU cycle.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_cycle_to_t3(&mut self) {
-        self.begin_t3_sensitive_m_cycle();
-        self.advance_ppu(4);
-        self.advance_timer(3);
-        self.queue_apu_cycles(3);
-    }
-
-    // ── Tick phase helpers ──────────────────────────────────────────────────
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn begin_m_cycle(&mut self) {
-        self.pending_cycle_counter += 4;
-        self.flush_apu_before_bus_events();
-        self.route_bus_events();
-        self.advance_dma();
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn can_use_idle_m_cycle_fast_path(&self) -> bool {
-        self.idle_m_cycle_blockers == 0
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn run_idle_m_cycle(&mut self) {
-        self.pending_cycle_counter += 4;
-        self.advance_ppu(4);
-        self.advance_timer(4);
-        self.queue_apu_cycles(4);
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn begin_t3_sensitive_m_cycle(&mut self) {
-        self.pending_cycle_counter += 4;
-        self.flush_pending_apu_cycles();
-        self.route_bus_events();
-        self.advance_dma();
-    }
-
-    #[inline(always)]
-    fn set_idle_m_cycle_blocker(&mut self, blocker: u8) {
-        self.idle_m_cycle_blockers |= blocker;
-    }
-
-    #[inline(always)]
-    fn clear_idle_m_cycle_blocker(&mut self, blocker: u8) {
-        self.idle_m_cycle_blockers &= !blocker;
-    }
-
-    fn refresh_idle_m_cycle_fast_path_blockers(&mut self) {
-        let mut blockers = 0;
-        if !self.pending_bus_events.is_empty() {
-            blockers |= IDLE_M_CYCLE_BLOCK_BUS_EVENTS;
-        }
-        if self.dma.is_some() {
-            blockers |= IDLE_M_CYCLE_BLOCK_DMA;
-        }
-        if !self.serial.is_idle() {
-            blockers |= IDLE_M_CYCLE_BLOCK_SERIAL;
-        }
-        if self.memory.has_rtc() {
-            blockers |= IDLE_M_CYCLE_BLOCK_RTC;
-        }
-        self.idle_m_cycle_blockers = blockers;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -794,412 +203,20 @@ impl Sm83 {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn flush_apu_before_bus_events(&mut self) {
-        if self.pending_apu_cycles.is_empty() || !self.pending_bus_events_require_apu_flush() {
-            return;
-        }
-        self.flush_pending_apu_cycles();
-    }
-
-    fn pending_bus_events_require_apu_flush(&self) -> bool {
-        self.pending_bus_events
-            .iter()
-            .copied()
-            .any(Self::bus_event_requires_apu_flush)
-    }
-
-    fn bus_event_requires_apu_flush(event: BusEvent) -> bool {
-        event.address == DIV_ADDR
-            || (NR10_ADDR..=NR52_ADDR).contains(&event.address)
-            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn route_bus_events(&mut self) {
-        if self.pending_bus_events.is_empty() {
-            return;
-        }
-
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        // Index-based loop: BusEvent is Copy, so each `e` is copied out before
-        // handle_bus_event borrows &mut self, avoiding a borrow conflict.
-        for i in 0..self.pending_bus_events.len() {
-            let e = self.pending_bus_events[i];
-            self.handle_bus_event(e.address, e.value);
-        }
-        self.pending_bus_events.clear();
-        self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_mem_write_route(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn handle_bus_event(&mut self, addr: u16, value: u8) {
-        match addr {
-            a if a == JOYP_ADDR => {
-                self.joypad.write(value);
-                self.memory.write_io(JOYP_ADDR, self.joypad.read());
-            }
-            a if a == SB_ADDR => self.serial.set_sb(value),
-            a if a == SC_ADDR => {
-                self.serial.handle_sc_write(value);
-                if self.serial.is_idle() {
-                    self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
-                } else {
-                    self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
-                }
-            }
-            a if a == DIV_ADDR => {
-                self.timer.reset_div();
-            }
-            a if a == LY_ADDR => self.ppu.reset_ly(),
-            a if a == DMA_ADDR => {
-                self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
-                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
-            }
-            a if (NR10_ADDR..=NR52_ADDR).contains(&a) => self.write_apu_register(a, value),
-            // Unused APU addresses 0xFF27-0xFF2F always read as 0xFF
-            a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
-            a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
-            a if a == TIMA_ADDR => self.timer.set_tima(value),
-            a if a == TMA_ADDR  => self.timer.set_tma(value),
-            a if a == TAC_ADDR  => self.timer.set_tac(value),
-            a if a == LCDC_ADDR => self.ppu.set_lcdc(value),
-            a if a == STAT_ADDR => self.ppu.set_stat(value),
-            a if a == SCY_ADDR  => self.ppu.set_scy(value),
-            a if a == SCX_ADDR  => self.ppu.set_scx(value),
-            a if a == LYC_ADDR  => self.ppu.set_lyc(value),
-            a if a == BGP_ADDR  => self.ppu.set_bgp(value),
-            a if a == OBP0_ADDR => self.ppu.set_obp0(value),
-            a if a == OBP1_ADDR => self.ppu.set_obp1(value),
-            a if a == WY_ADDR   => self.ppu.set_wy(value),
-            a if a == WX_ADDR   => self.ppu.set_wx(value),
-            _ => {}
-        }
-    }
-
-    /// Write an APU register and sync the masked read-back value to IO memory.
-    /// NR52 writes may power off all channels, so all registers are resynced.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn write_apu_register(&mut self, addr: u16, value: u8) {
-        self.apu.write_register(addr, value);
-        if addr == NR52_ADDR {
-            for a in NR10_ADDR..=NR52_ADDR {
-                self.memory.write_io(a, self.apu.read_register(a));
-            }
-        } else {
-            self.memory.write_io(addr, self.apu.read_register(addr));
-        }
-    }
-
-    /// Write to wave RAM through the APU and sync the result to IO memory.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn write_wave_ram(&mut self, addr: u16, value: u8) {
-        let offset = (addr - WAVE_RAM_START) as u8;
-        self.apu.write_wave_ram(offset, value);
-        self.memory.write_io(addr, self.apu.read_wave_ram(offset));
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_ppu(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let output = self.ppu.tick(cycles, self.memory.vram(), self.memory.oam());
-        if output.vblank_interrupt {
-            // Snapshot the completed frame into the front buffer before the PPU
-            // starts overwriting scanlines for the next frame.
-            self.front_buffer.copy_from_slice(self.ppu.framebuffer());
-            let if_val = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_val | (1 << VBLANK_INTERRUPT_BIT));
-        }
-        if output.stat_interrupt {
-            let if_val = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_val | (1 << STAT_INTERRUPT_BIT));
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_ppu(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn advance_timer(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let interrupt = self.timer.tick(cycles);
-        if interrupt {
-            let if_val = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_val | (1 << TIMER_INTERRUPT_BIT));
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_timer(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn queue_apu_cycles(&mut self, cycles: u16) {
-        self.pending_apu_cycles.queue(cycles);
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn flush_pending_apu_cycles(&mut self) {
-        let cycles = self.pending_apu_cycles.take();
-        if cycles == 0 {
-            return;
-        }
-        self.tick_apu(cycles);
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_apu(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let output = self.apu.tick(cycles, self.timer.internal_counter());
-        if output.nr52 != self.cache.nr52 {
-            self.cache.nr52 = output.nr52;
-            self.memory.write_io(NR52_ADDR, output.nr52);
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_apu(cyccnt().wrapping_sub(t0));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn finish_tick(&mut self) -> u8 {
-        self.flush_pending_apu_cycles();
-        let cycles = self.pending_cycle_counter as u8;
-        self.cycle_counter = self
-            .cycle_counter
-            .wrapping_add(self.pending_cycle_counter as u64);
-        self.pending_cycle_counter = 0;
-        cycles
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn has_pending_interrupt(&self) -> bool {
-        let ie = self.memory.read_io(IE_ADDR);
-        let if_val = self.memory.read_io(IF_ADDR);
-        ie & if_val != 0
+        self.ie_shadow & self.if_shadow != 0
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn take_pending_interrupt(&mut self) -> Option<u8> {
-        let ie = self.memory.read_io(IE_ADDR);
-        let if_val = self.memory.read_io(IF_ADDR);
-        let pending = ie & if_val;
+        let pending = self.ie_shadow & self.if_shadow;
         if pending == 0 {
             return None;
         }
         let bit = pending.trailing_zeros() as u8;
-        self.memory.write_io(IF_ADDR, if_val & !(1 << bit));
+        // Clear from shadow only; GameBoy owns memory and will sync IF.
+        self.if_shadow &= !(1 << bit);
         Some(bit)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn dispatch_interrupt(&mut self, bit: u8) -> Result<(), InstructionError> {
-        self.ime = ImeState::Disabled;
-        // Interrupt dispatch: 2 internal + push PC (2 writes) + 1 internal = 5 M-cycles
-        self.tick_cycle(); // internal
-        self.tick_cycle(); // internal
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, (self.registers.pc >> 8) as u8)?;
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, self.registers.pc as u8)?;
-        self.tick_cycle(); // internal — load ISR address
-        self.registers.pc = 0x0040 + (bit as u16) * 8;
-        Ok(())
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn read_next_pc(&mut self) -> Result<u8, MemoryError> {
-        let addr = self.registers.pc;
-        if addr <= 0x7FFF && self.can_use_idle_m_cycle_fast_path() {
-            return Ok(self.read_next_pc_rom_idle_fast(addr));
-        }
-        #[cfg(feature = "perf")]
-        let nested0 = self.perf.nested_snapshot();
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let byte = if addr <= 0x7FFF {
-            self.read_pc_rom_fast(addr)
-        } else {
-            self.bus_read(addr)?
-        };
-        #[cfg(feature = "perf")]
-        let t_after_fetch = cyccnt();
-        self.registers.pc = self.registers.pc.wrapping_add(1);
-        #[cfg(feature = "perf")]
-        {
-            let t_after_pc = cyccnt();
-            self.perf
-                .record_pc_fetch_wrapper(t_after_pc.wrapping_sub(t_after_fetch));
-            self.perf.record_pc_fetch(
-                addr,
-                t_after_pc
-                    .wrapping_sub(t0)
-                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
-            );
-        }
-        Ok(byte)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn get_8bit_operand(&mut self, operand: Operand) -> Result<u8, InstructionError> {
-        #[cfg(feature = "perf")]
-        let nested0 = self.perf.nested_snapshot();
-        #[cfg(feature = "perf")]
-        let t0 = cyccnt();
-        let result = match operand {
-            Operand::Register8(reg) => Ok(self.get_register8_operand(reg)),
-            Operand::Memory(Memory::HL) => {
-                let address = self.registers.hl();
-                Ok(self.bus_read(address)?)
-            }
-            Operand::Imm8 => Ok(self.read_next_pc()?),
-            _ => {
-                return Err(InstructionError::InvalidOperand(format!(
-                    "{} for instruction Add8",
-                    operand
-                )))
-            }
-        };
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_operand8(
-                cyccnt()
-                    .wrapping_sub(t0)
-                    .wrapping_sub(self.perf.nested_cycles_since(nested0)),
-            );
-        }
-        result
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn get_register8_operand(&self, operand: Register8) -> u8 {
-        match operand {
-            Register8::A => self.registers.a,
-            Register8::B => self.registers.b,
-            Register8::C => self.registers.c,
-            Register8::D => self.registers.d,
-            Register8::E => self.registers.e,
-            Register8::H => self.registers.h,
-            Register8::L => self.registers.l,
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn get_register16_operand(&self, operand: Register16) -> u16 {
-        match operand {
-            Register16::AF => self.registers.af(),
-            Register16::BC => self.registers.bc(),
-            Register16::DE => self.registers.de(),
-            Register16::HL => self.registers.hl(),
-            Register16::SP => self.registers.sp,
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn set_register8_operand(&mut self, operand: Register8, value: u8) {
-        match operand {
-            Register8::A => self.registers.a = value,
-            Register8::B => self.registers.b = value,
-            Register8::C => self.registers.c = value,
-            Register8::D => self.registers.d = value,
-            Register8::E => self.registers.e = value,
-            Register8::H => self.registers.h = value,
-            Register8::L => self.registers.l = value,
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn set_register16_operand(&mut self, operand: Register16, value: u16) {
-        match operand {
-            Register16::AF => self.registers.set_af(value),
-            Register16::BC => self.registers.set_bc(value),
-            Register16::DE => self.registers.set_de(value),
-            Register16::HL => self.registers.set_hl(value),
-            Register16::SP => self.registers.sp = value,
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn set_8bit_operand(&mut self, operand: Operand, value: u8) -> Result<(), InstructionError> {
-        match operand {
-            Operand::Register8(reg) => {
-                self.set_register8_operand(reg, value);
-                Ok(())
-            }
-            Operand::Memory(Memory::HL) => {
-                let address = self.registers.hl();
-                Ok(self.bus_write(address, value)?)
-            }
-            _ => Err(InstructionError::InvalidOperand(format!(
-                "{} for write operand",
-                operand
-            ))),
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn write_cb_target(&mut self, target: CbTarget, value: u8) -> Result<(), InstructionError> {
-        match target {
-            CbTarget::Reg(reg) => {
-                self.set_register8_operand(reg, value);
-                Ok(())
-            }
-            CbTarget::HLMem => {
-                self.bus_write(self.registers.hl(), value)?;
-                Ok(())
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn push_pc(&mut self) -> Result<(), MemoryError> {
-        let pc = self.registers.pc;
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, (pc >> 8) as u8)?;
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, (pc & 0xFF) as u8)?;
-        Ok(())
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn pop_pc(&mut self) -> Result<u16, MemoryError> {
-        let lo = self.bus_read(self.registers.sp)? as u16;
-        self.registers.sp = self.registers.sp.wrapping_add(1);
-        let hi = self.bus_read(self.registers.sp)? as u16;
-        self.registers.sp = self.registers.sp.wrapping_add(1);
-        Ok((hi << 8) | lo)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn check_condition(&self, cond: &Condition) -> bool {
-        match cond {
-            Condition::NZ => !self.registers.f.contains(Flags::Z),
-            Condition::Z => self.registers.f.contains(Flags::Z),
-            Condition::NC => !self.registers.f.contains(Flags::C),
-            Condition::C => self.registers.f.contains(Flags::C),
-        }
-    }
-}
-
-impl Cpu for Sm83 {
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn step(&mut self) -> Result<u8, CpuError> {
-        #[cfg(feature = "perf")]
-        let tick_t0 = cyccnt();
-        let result = self.step_impl();
-        #[cfg(feature = "perf")]
-        {
-            self.perf.record_total(cyccnt().wrapping_sub(tick_t0));
-        }
-        result
     }
 }
 
@@ -1320,123 +337,6 @@ impl Sm83 {
             self.temp_idx += 1;
         }
         // For write/internal acks (data==0 when temp[] is full), silently ignore.
-    }
-
-    // ── step() helpers ────────────────────────────────────────────────────────
-
-    fn step_bus_read(&mut self, addr: u16) -> u8 {
-        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            self.tick_cycle_to_t3();
-            let offset = (addr - WAVE_RAM_START) as u8;
-            let value = self.apu.read_wave_ram(offset);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return value;
-        }
-        match addr {
-            a if a == DIV_ADDR  => self.timer.div(),
-            a if a == TIMA_ADDR => self.timer.tima(),
-            a if a == TMA_ADDR  => self.timer.tma(),
-            a if a == TAC_ADDR  => self.timer.tac(),
-            a if a == JOYP_ADDR => self.joypad.read(),
-            a if a == SB_ADDR   => self.serial.sb(),
-            a if a == SC_ADDR   => self.serial.sc(),
-            a if a == LCDC_ADDR => self.ppu.lcdc(),
-            a if a == STAT_ADDR => self.ppu.stat(),
-            a if a == SCY_ADDR  => self.ppu.scy(),
-            a if a == SCX_ADDR  => self.ppu.scx(),
-            a if a == LY_ADDR   => self.ppu.ly(),
-            a if a == LYC_ADDR  => self.ppu.lyc(),
-            a if a == BGP_ADDR  => self.ppu.bgp(),
-            a if a == OBP0_ADDR => self.ppu.obp0(),
-            a if a == OBP1_ADDR => self.ppu.obp1(),
-            a if a == WY_ADDR   => self.ppu.wy(),
-            a if a == WX_ADDR   => self.ppu.wx(),
-            _                   => self.memory.read_fast(addr),
-        }
-    }
-
-    fn step_bus_write(&mut self, addr: u16, val: u8) {
-        if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
-            // T3-sensitive write: tick_cycle_to_t3 was already called by step_advance_m_cycle
-            self.write_apu_register(addr, val);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return;
-        }
-        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            // T3-sensitive write: tick_cycle_to_t3 was already called by step_advance_m_cycle
-            self.write_wave_ram(addr, val);
-            self.advance_timer(1);
-            self.queue_apu_cycles(1);
-            return;
-        }
-        match addr {
-            0xFF00..=0xFF7F | 0xFFFF => {
-                self.memory.write_io(addr, val);
-                self.pending_bus_events.push(BusEvent { address: addr, value: val });
-                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
-            }
-            0xE000..=0xFDFF => {} // echo RAM: silently ignore writes
-            _ => {
-                self.memory.write_fast(addr, val);
-            }
-        }
-    }
-
-    fn step_advance_m_cycle(&mut self, addr: u16, is_write: bool) {
-        if is_write && ((NR10_ADDR..=NR52_ADDR).contains(&addr) || (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr)) {
-            // T3-sensitive APU/wave write: advance to T3 then caller will do the write and T4
-            self.tick_cycle_to_t3();
-            return;
-        }
-        if !is_write && (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
-            // T3-sensitive wave read: step_bus_read handles tick_cycle_to_t3 + T4 internally
-            return;
-        }
-        self.begin_m_cycle();
-        self.advance_peripherals(4);
-    }
-
-    fn step_advance_internal(&mut self) {
-        self.begin_m_cycle();
-        self.advance_peripherals(4);
-    }
-
-    /// Drive the micro-op queue to completion, advancing all peripherals on each M-cycle.
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    pub fn step(&mut self) -> Result<u8, CpuError> {
-        // flush leftover cycle counter from previous step
-        if self.pending_cycle_counter != 0 {
-            self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
-            self.pending_cycle_counter = 0;
-        }
-        loop {
-            match self.tick() {
-                McycleOp::Done => {
-                    self.flush_pending_apu_cycles();
-                    let cycles = self.pending_cycle_counter as u8;
-                    self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
-                    self.pending_cycle_counter = 0;
-                    self.temp_idx = 0;
-                    return Ok(cycles);
-                }
-                McycleOp::Read(addr) => {
-                    self.step_advance_m_cycle(addr, false);
-                    let val = self.step_bus_read(addr);
-                    self.tock(val);
-                }
-                McycleOp::Write(addr, val) => {
-                    self.step_advance_m_cycle(addr, true);
-                    self.step_bus_write(addr, val);
-                    // Write ack: no temp[] update needed
-                }
-                McycleOp::Internal => {
-                    self.step_advance_internal();
-                    // Internal ack: no temp[] update needed
-                }
-            }
-        }
     }
 
     // ── ISR helper ────────────────────────────────────────────────────────────
@@ -2374,661 +1274,23 @@ fn cb_rot_exec(sub_op: u8, val: u8, flags: Flags) -> (u8, Flags) {
     }
 }
 
-impl Sm83 {
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn step_impl(&mut self) -> Result<u8, CpuError> {
-        if self.pending_cycle_counter != 0 {
-            self.cycle_counter = self
-                .cycle_counter
-                .wrapping_add(self.pending_cycle_counter as u64);
-            self.pending_cycle_counter = 0;
-        }
-
-        if self.halted {
-            self.tick_cycle(); // 1 M-cycle while halted
-            if self.has_pending_interrupt() {
-                self.halted = false;
-                // When IME=1, the interrupt is dispatched before resuming execution
-                // (the ISR runs; after RETI, execution continues at the instruction
-                // after HALT). This must happen before advance_ime so the EI delay
-                // does not interfere.
-                if self.ime == ImeState::Enabled {
-                    if let Some(bit) = self.take_pending_interrupt() {
-                        self.dispatch_interrupt(bit)?;
-                    }
-                    return Ok(self.finish_tick());
-                }
-            } else {
-                return Ok(self.finish_tick());
-            }
-        }
-
-        self.advance_ime();
-
-        // Opcode fetch is the first M-cycle (via bus_read inside read_next_pc)
-        let opcode = self.read_next_pc()?;
-        // Arc::clone releases the borrow of self.opcodes before execute() needs
-        // &mut self.  The atomic increment is ~10 cycles vs ~50 000 cycles for
-        // the previous Box::new() per instruction.
-        let op = if opcode == 0xCB {
-            #[cfg(feature = "perf")]
-            let nested0 = self.perf.nested_snapshot();
-            #[cfg(feature = "perf")]
-            let cb_t0 = cyccnt();
-            let cb_opcode = self.read_next_pc()?;
-            #[cfg(feature = "perf")]
-            let dispatch_t0 = cyccnt();
-            let op = self.opcodes.get_cb(cb_opcode)?;
-            #[cfg(feature = "perf")]
-            {
-                let t1 = cyccnt();
-                self.perf.record_opcode_dispatch(t1.wrapping_sub(dispatch_t0));
-                self.perf.record_cb_prefix(
-                    t1.wrapping_sub(cb_t0)
-                        .wrapping_sub(self.perf.nested_cycles_since(nested0)),
-                );
-            }
-            op
-        } else {
-            #[cfg(feature = "perf")]
-            let dispatch_t0 = cyccnt();
-            let op = self.opcodes.get(opcode)?;
-            #[cfg(feature = "perf")]
-            {
-                self.perf
-                    .record_opcode_dispatch(cyccnt().wrapping_sub(dispatch_t0));
-            }
-            op
-        };
-        op.execute(self)?;
-
-        // Peripherals and bus events are already advanced per M-cycle
-        // inside bus_read/bus_write/tick_cycle — no bulk advance needed.
-        self.flush_pending_apu_cycles();
-
-        if self.ime == ImeState::Enabled {
-            if let Some(bit) = self.take_pending_interrupt() {
-                self.dispatch_interrupt(bit)?;
-            }
-        }
-
-        #[cfg(feature = "trace")]
-        if let Some(ref mut hook) = self.trace_hook {
-            hook(TraceEvent {
-                pc: self.registers.pc,
-                registers: &self.registers,
-                ime: self.ime == ImeState::Enabled,
-                ly:   self.ppu.ly(),
-                if_:  self.memory.read_io(IF_ADDR),
-                ie:   self.memory.read_io(IE_ADDR),
-                lcdc: self.ppu.lcdc(),
-            });
-        }
-
-        Ok(self.finish_tick())
-    }
-}
-
-impl Instructions for Sm83 {
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn add8(&mut self, opcode: &Add8) -> Result<u8, InstructionError> {
-        (self.registers.a, self.registers.f) =
-            add_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn add16(&mut self, opcode: &Add16) -> Result<u8, InstructionError> {
-        let operand: u16 = match opcode.operand {
-            Operand::Register16(reg) => self.get_register16_operand(reg),
-            _ => {
-                return Err(InstructionError::InvalidOperand(format!(
-                    "{} for instruction Add16",
-                    opcode.operand
-                )))
-            }
-        };
-
-        let (hl, new_flags) = add_u16(self.registers.hl(), operand);
-        // ADD HL,rr preserves Z — merge new H/C/N flags into existing flags
-        self.registers.f.set(Flags::N, false);
-        self.registers.f.set(Flags::H, new_flags.contains(Flags::H));
-        self.registers.f.set(Flags::C, new_flags.contains(Flags::C));
-        self.registers.set_hl(hl);
-        self.tick_cycle(); // internal — 16-bit ALU
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, InstructionError> {
-        if opcode.operand != Operand::ImmSigned8 {
-            return Err(InstructionError::InvalidOperand(format!(
-                "{} for instruction AddSP16",
-                opcode.operand
-            )));
-        }
-
-        // fetch + read e8 + internal + internal = 4 M-cycles
-        let offset = self.read_next_pc()? as i8;
-        (self.registers.sp, self.registers.f) = add_sp_u16(self.registers.sp, offset);
-        self.tick_cycle(); // internal
-        self.tick_cycle(); // internal
-
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn adc(&mut self, opcode: &Adc) -> Result<u8, InstructionError> {
-        let carry: u8 = self.registers.f.contains(Flags::C) as u8;
-        (self.registers.a, self.registers.f) = adc_u8(
-            self.registers.a,
-            self.get_8bit_operand(opcode.operand)?,
-            carry,
-        );
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn sub8(&mut self, opcode: &Sub8) -> Result<u8, InstructionError> {
-        (self.registers.a, self.registers.f) =
-            sub_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, InstructionError> {
-        let carry: u8 = self.registers.f.contains(Flags::C) as u8;
-        (self.registers.a, self.registers.f) = sbc_u8(
-            self.registers.a,
-            self.get_8bit_operand(opcode.operand)?,
-            carry,
-        );
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn cp8(&mut self, opcode: &Cp8) -> Result<u8, InstructionError> {
-        self.registers.f = cp_u8(self.registers.a, self.get_8bit_operand(opcode.operand)?);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn ld8(&mut self, opcode: &Ld8) -> Result<u8, InstructionError> {
-        // Read the source value
-        let value = match opcode.src {
-            Operand::Register8(reg) => self.get_register8_operand(reg),
-            Operand::Memory(Memory::HL) => {
-                let address = self.registers.hl();
-                self.bus_read(address)?
-            }
-            Operand::Imm8 => self.read_next_pc()?,
-            _ => {
-                return Err(InstructionError::InvalidOperand(format!(
-                    "{} for instruction Ld8 src",
-                    opcode.src
-                )))
-            }
-        };
-
-        // Write to the destination
-        match opcode.dest {
-            Operand::Register8(reg) => self.set_register8_operand(reg, value),
-            Operand::Memory(Memory::HL) => {
-                let address = self.registers.hl();
-                self.bus_write(address, value)?;
-            }
-            _ => {
-                return Err(InstructionError::InvalidOperand(format!(
-                    "{} for instruction Ld8 dest",
-                    opcode.dest
-                )))
-            }
-        }
-
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn inc8(&mut self, opcode: &Inc8) -> Result<u8, InstructionError> {
-        let val = self.get_8bit_operand(opcode.operand)?;
-        let (result, flags) = inc_u8(val, self.registers.f);
-        self.registers.f = flags;
-        self.set_8bit_operand(opcode.operand, result)?;
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn dec8(&mut self, opcode: &Dec8) -> Result<u8, InstructionError> {
-        let val = self.get_8bit_operand(opcode.operand)?;
-        let (result, flags) = dec_u8(val, self.registers.f);
-        self.registers.f = flags;
-        self.set_8bit_operand(opcode.operand, result)?;
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn inc16(&mut self, opcode: &Inc16) -> Result<u8, InstructionError> {
-        let val = self.get_register16_operand(opcode.operand);
-        self.set_register16_operand(opcode.operand, val.wrapping_add(1));
-        self.tick_cycle(); // internal
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn dec16(&mut self, opcode: &Dec16) -> Result<u8, InstructionError> {
-        let val = self.get_register16_operand(opcode.operand);
-        self.set_register16_operand(opcode.operand, val.wrapping_sub(1));
-        self.tick_cycle(); // internal
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn rotate_accumulator(&mut self, opcode: &Rotate) -> Result<u8, InstructionError> {
-        let a = self.registers.a;
-        let carry_in = self.registers.f.contains(Flags::C) as u8;
-
-        let (result, carry_out) = match opcode.op {
-            RotateOp::Rlca => {
-                let bit7 = a >> 7;
-                ((a << 1) | bit7, bit7 != 0)
-            }
-            RotateOp::Rla => {
-                let bit7 = a >> 7;
-                ((a << 1) | carry_in, bit7 != 0)
-            }
-            RotateOp::Rrca => {
-                let bit0 = a & 1;
-                ((a >> 1) | (bit0 << 7), bit0 != 0)
-            }
-            RotateOp::Rra => {
-                let bit0 = a & 1;
-                ((a >> 1) | (carry_in << 7), bit0 != 0)
-            }
-        };
-
-        self.registers.a = result;
-        // Z=0, N=0, H=0 always; only C is affected
-        self.registers.f = Flags::empty();
-        self.registers.f.set(Flags::C, carry_out);
-
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn ld16(&mut self, opcode: &Ld16) -> Result<u8, InstructionError> {
-        use super::instructions::ld16::opcode::Ld16Op;
-        match &opcode.op {
-            Ld16Op::RrImm16 { dest } => {
-                // fetch + read lo + read hi = 3 M-cycles
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                let val = (hi << 8) | lo;
-                self.set_register16_operand(*dest, val);
-            }
-            Ld16Op::NnSp => {
-                // fetch + read lo + read hi + write lo + write hi = 5 M-cycles
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                let addr = (hi << 8) | lo;
-                let sp = self.registers.sp;
-                self.bus_write(addr, (sp & 0xFF) as u8)?;
-                self.bus_write(addr.wrapping_add(1), (sp >> 8) as u8)?;
-            }
-            Ld16Op::SpHl => {
-                // fetch + internal = 2 M-cycles
-                self.registers.sp = self.registers.hl();
-                self.tick_cycle(); // internal
-            }
-            Ld16Op::HlSpE => {
-                // fetch + read e8 + internal = 3 M-cycles
-                let offset = self.read_next_pc()? as i8;
-                let (result, flags) = add_sp_u16(self.registers.sp, offset);
-                self.registers.set_hl(result);
-                self.registers.f = flags;
-                self.tick_cycle(); // internal
-            }
-            Ld16Op::BcA => {
-                let addr = self.registers.bc();
-                self.bus_write(addr, self.registers.a)?;
-            }
-            Ld16Op::DeA => {
-                let addr = self.registers.de();
-                self.bus_write(addr, self.registers.a)?;
-            }
-            Ld16Op::ABc => {
-                let addr = self.registers.bc();
-                self.registers.a = self.bus_read(addr)?;
-            }
-            Ld16Op::ADe => {
-                let addr = self.registers.de();
-                self.registers.a = self.bus_read(addr)?;
-            }
-            Ld16Op::HliA => {
-                let addr = self.registers.hl();
-                self.bus_write(addr, self.registers.a)?;
-                self.registers.set_hl(addr.wrapping_add(1));
-            }
-            Ld16Op::HldA => {
-                let addr = self.registers.hl();
-                self.bus_write(addr, self.registers.a)?;
-                self.registers.set_hl(addr.wrapping_sub(1));
-            }
-            Ld16Op::AHli => {
-                let addr = self.registers.hl();
-                self.registers.a = self.bus_read(addr)?;
-                self.registers.set_hl(addr.wrapping_add(1));
-            }
-            Ld16Op::AHld => {
-                let addr = self.registers.hl();
-                self.registers.a = self.bus_read(addr)?;
-                self.registers.set_hl(addr.wrapping_sub(1));
-            }
-            Ld16Op::NnA => {
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                let addr = (hi << 8) | lo;
-                self.bus_write(addr, self.registers.a)?;
-            }
-            Ld16Op::ANn => {
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                let addr = (hi << 8) | lo;
-                self.registers.a = self.bus_read(addr)?;
-            }
-            Ld16Op::LdhNA => {
-                let offset = self.read_next_pc()? as u16;
-                let addr = 0xFF00 | offset;
-                self.bus_write(addr, self.registers.a)?;
-            }
-            Ld16Op::LdhAN => {
-                let offset = self.read_next_pc()? as u16;
-                let addr = 0xFF00 | offset;
-                self.registers.a = self.bus_read(addr)?;
-            }
-            Ld16Op::LdCA => {
-                let addr = 0xFF00 | (self.registers.c as u16);
-                self.bus_write(addr, self.registers.a)?;
-            }
-            Ld16Op::LdAC => {
-                let addr = 0xFF00 | (self.registers.c as u16);
-                self.registers.a = self.bus_read(addr)?;
-            }
-        }
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn jump(&mut self, opcode: &Jump) -> Result<u8, InstructionError> {
-        match &opcode.op {
-            JumpOp::Jp => {
-                // fetch + read lo + read hi + internal = 4 M-cycles
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                self.registers.pc = (hi << 8) | lo;
-                self.tick_cycle(); // internal — load new PC
-                Ok(opcode.cycles)
-            }
-            JumpOp::JpHl => {
-                // fetch only = 1 M-cycle
-                self.registers.pc = self.registers.hl();
-                Ok(opcode.cycles)
-            }
-            JumpOp::JpCc(cond) => {
-                // fetch + read lo + read hi [+ internal if taken] = 3 or 4 M-cycles
-                let lo = self.read_next_pc()? as u16;
-                let hi = self.read_next_pc()? as u16;
-                let target = (hi << 8) | lo;
-                if self.check_condition(cond) {
-                    self.registers.pc = target;
-                    self.tick_cycle(); // internal — branch taken
-                    Ok(opcode.cycles)
-                } else {
-                    Ok(12)
-                }
-            }
-            JumpOp::Jr => {
-                // fetch + read e8 + internal = 3 M-cycles
-                let offset = self.read_next_pc()? as i8 as i16;
-                self.registers.pc = self.registers.pc.wrapping_add(offset as u16);
-                self.tick_cycle(); // internal — apply offset
-                Ok(opcode.cycles)
-            }
-            JumpOp::JrCc(cond) => {
-                // fetch + read e8 [+ internal if taken] = 2 or 3 M-cycles
-                let offset = self.read_next_pc()? as i8 as i16;
-                if self.check_condition(cond) {
-                    self.registers.pc = self.registers.pc.wrapping_add(offset as u16);
-                    self.tick_cycle(); // internal — branch taken
-                    Ok(opcode.cycles)
-                } else {
-                    Ok(8)
-                }
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn and8(&mut self, opcode: &And8) -> Result<u8, InstructionError> {
-        let val = self.get_8bit_operand(opcode.operand)?;
-        (self.registers.a, self.registers.f) = and_u8(self.registers.a, val);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn or8(&mut self, opcode: &Or8) -> Result<u8, InstructionError> {
-        let val = self.get_8bit_operand(opcode.operand)?;
-        (self.registers.a, self.registers.f) = or_u8(self.registers.a, val);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn xor8(&mut self, opcode: &Xor8) -> Result<u8, InstructionError> {
-        let val = self.get_8bit_operand(opcode.operand)?;
-        (self.registers.a, self.registers.f) = xor_u8(self.registers.a, val);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn misc(&mut self, opcode: &Misc) -> Result<u8, InstructionError> {
-        use super::instructions::misc::opcode::MiscOp;
-        match opcode.op {
-            MiscOp::Nop => {
-                // No operation
-            }
-            MiscOp::Halt => {
-                self.halted = true;
-            }
-            MiscOp::Stop => {
-                // Consume the next byte (should be 0x00)
-                let _ = self.read_next_pc()?;
-            }
-            MiscOp::Daa => {
-                (self.registers.a, self.registers.f) = daa_u8(self.registers.a, self.registers.f);
-            }
-            MiscOp::Cpl => {
-                // Complement A: A = ~A, N=1, H=1, Z and C unchanged
-                self.registers.a = !self.registers.a;
-                self.registers.f.insert(Flags::N);
-                self.registers.f.insert(Flags::H);
-            }
-            MiscOp::Scf => {
-                // Set carry flag: N=0, H=0, C=1, Z unchanged
-                self.registers.f.remove(Flags::N);
-                self.registers.f.remove(Flags::H);
-                self.registers.f.insert(Flags::C);
-            }
-            MiscOp::Ccf => {
-                // Complement carry flag: N=0, H=0, C=!C, Z unchanged
-                let c = self.registers.f.contains(Flags::C);
-                self.registers.f.remove(Flags::N);
-                self.registers.f.remove(Flags::H);
-                self.registers.f.set(Flags::C, !c);
-            }
-            MiscOp::Di => {
-                self.ime = ImeState::Disabled;
-            }
-            MiscOp::Ei => {
-                self.ime = ImeState::Pending;
-            }
-        }
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn push16(&mut self, opcode: &Push16) -> Result<u8, InstructionError> {
-        // fetch + internal + write hi + write lo = 4 M-cycles
-        let value = self.get_register16_operand(opcode.operand);
-        self.tick_cycle(); // internal
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, (value >> 8) as u8)?;
-        self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.bus_write(self.registers.sp, (value & 0xFF) as u8)?;
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn pop16(&mut self, opcode: &Pop16) -> Result<u8, InstructionError> {
-        // fetch + read lo + read hi = 3 M-cycles
-        let lo = self.bus_read(self.registers.sp)? as u16;
-        self.registers.sp = self.registers.sp.wrapping_add(1);
-        let hi = self.bus_read(self.registers.sp)? as u16;
-        self.registers.sp = self.registers.sp.wrapping_add(1);
-        self.set_register16_operand(opcode.operand, (hi << 8) | lo);
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn call(&mut self, opcode: &Call) -> Result<u8, InstructionError> {
-        // fetch + read lo + read hi [+ internal + push hi + push lo] = 3 or 6 M-cycles
-        let lo = self.read_next_pc()? as u16;
-        let hi = self.read_next_pc()? as u16;
-        let target = (hi << 8) | lo;
-        match &opcode.op {
-            CallOp::Call => {
-                self.tick_cycle(); // internal
-                self.push_pc()?;  // 2 bus writes
-                self.registers.pc = target;
-                Ok(opcode.cycles)
-            }
-            CallOp::CallCc(cond) => {
-                if self.check_condition(cond) {
-                    self.tick_cycle(); // internal
-                    self.push_pc()?;  // 2 bus writes
-                    self.registers.pc = target;
-                    Ok(opcode.cycles)
-                } else {
-                    Ok(12)
-                }
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn ret(&mut self, opcode: &Ret) -> Result<u8, InstructionError> {
-        match &opcode.op {
-            RetOp::Ret => {
-                // fetch + pop lo + pop hi + internal = 4 M-cycles
-                self.registers.pc = self.pop_pc()?;
-                self.tick_cycle(); // internal
-                Ok(opcode.cycles)
-            }
-            RetOp::RetCc(cond) => {
-                // fetch + internal [+ pop lo + pop hi + internal] = 2 or 5 M-cycles
-                self.tick_cycle(); // internal — condition eval
-                if self.check_condition(cond) {
-                    self.registers.pc = self.pop_pc()?;
-                    self.tick_cycle(); // internal
-                    Ok(opcode.cycles)
-                } else {
-                    Ok(8)
-                }
-            }
-            RetOp::Reti => {
-                // fetch + pop lo + pop hi + internal = 4 M-cycles
-                self.registers.pc = self.pop_pc()?;
-                self.tick_cycle(); // internal
-                self.ime = ImeState::Enabled;
-                Ok(opcode.cycles)
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn rst(&mut self, opcode: &Rst) -> Result<u8, InstructionError> {
-        // fetch + internal + push hi + push lo = 4 M-cycles
-        self.tick_cycle(); // internal
-        self.push_pc()?;  // 2 bus writes
-        self.registers.pc = opcode.vector as u16;
-        Ok(opcode.cycles)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, InstructionError> {
-        let carry_in = self.registers.f.contains(Flags::C);
-
-        let val = match opcode.target {
-            CbTarget::Reg(reg) => self.get_register8_operand(reg),
-            CbTarget::HLMem => self.bus_read(self.registers.hl())?,
-        };
-
-        match opcode.op {
-            CbOp::Bit(bit) => {
-                self.registers.f = bit_u8(val, bit, self.registers.f);
-            }
-            CbOp::Res(bit) => {
-                let result = res_u8(val, bit);
-                self.write_cb_target(opcode.target, result)?;
-            }
-            CbOp::Set(bit) => {
-                let result = set_u8(val, bit);
-                self.write_cb_target(opcode.target, result)?;
-            }
-            _ => {
-                let (result, flags) = match opcode.op {
-                    CbOp::Rlc => rlc_u8(val),
-                    CbOp::Rrc => rrc_u8(val),
-                    CbOp::Rl => rl_u8(val, carry_in),
-                    CbOp::Rr => rr_u8(val, carry_in),
-                    CbOp::Sla => sla_u8(val),
-                    CbOp::Sra => sra_u8(val),
-                    CbOp::Swap => swap_u8(val),
-                    CbOp::Srl => srl_u8(val),
-                    _ => unreachable!(),
-                };
-                self.registers.f = flags;
-                self.write_cb_target(opcode.target, result)?;
-            }
-        }
-
-        Ok(opcode.cycles)
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloc::{boxed::Box, vec, vec::Vec};
-    use crate::cpu::instructions::opcodes::OpCodeDecoder;
-    use crate::cpu::registers::Flags;
+    use alloc::{vec, vec::Vec};
+    use crate::cpu::registers::{Flags, Registers};
+    use crate::gameboy::GameBoy;
+    use crate::memory::memory::{GameBoyMemory, Memory};
 
-    use crate::memory::memory::GameBoyMemory;
-
-    pub fn make_test_cpu(rom_data: Vec<u8>) -> Sm83 {
-        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::with_rom(rom_data));
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        Sm83::new(memory, decoder)
+    fn make_test_cpu(rom_data: Vec<u8>) -> GameBoy {
+        GameBoy::for_test(rom_data)
     }
 
-    pub fn make_test_cpu_with_memory(
+    fn make_test_cpu_with_memory(
         setup: impl FnOnce(&mut GameBoyMemory),
         rom_data: Vec<u8>,
-    ) -> Sm83 {
-        let mut mem = GameBoyMemory::with_rom(rom_data);
-        setup(&mut mem);
-        let decoder = Box::new(OpCodeDecoder::new());
-        Sm83::new(Box::new(mem), decoder)
+    ) -> GameBoy {
+        GameBoy::for_test_with_setup(setup, rom_data)
     }
 
     /// Add a constant to the accumulator register and expect the register's value to be the
@@ -3084,20 +1346,6 @@ mod tests {
         assert_eq!(cycles, 8);
         assert_eq!(cpu.registers().a, 0x0A);
         assert_eq!(cpu.registers().f, Flags::empty());
-    }
-
-    #[test]
-    fn test_add8_invalid_opcode() {
-        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
-        assert!(cpu
-            .add8(&Add8 {
-                operand: Operand::Imm16,
-                cycles: 4
-            })
-            .is_err());
     }
 
     // Load up all 8-bit registers with some test values, add them all to the accumulator register, the add the accumulator
@@ -3181,20 +1429,6 @@ mod tests {
         assert_eq!(cpu.registers().hl(), 0xffff); // Expected value after adding SP to HL
     }
 
-    #[test]
-    fn test_add16_invalid_opcode() {
-        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
-        assert!(cpu
-            .add16(&Add16 {
-                operand: Operand::Imm8,
-                cycles: 4
-            })
-            .is_err());
-    }
-
     // TODO: This is NOT a useful test. Will have to revisit later.
     #[test]
     fn test_add_sp16_imm8() {
@@ -3202,20 +1436,6 @@ mod tests {
 
         assert_eq!(cpu.step().unwrap(), 16);
         assert_eq!(cpu.registers().sp, 0x0005); // Expected value after adding signed immediate 8-bit value to SP
-    }
-
-    #[test]
-    fn test_add_sp16_invalid_opcode() {
-        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
-        assert!(cpu
-            .add_sp16(&AddSP16 {
-                operand: Operand::Imm8,
-                cycles: 4
-            })
-            .is_err());
     }
 
     #[test]
@@ -3337,20 +1557,6 @@ mod tests {
 
         assert_eq!(cpu.step().unwrap(), 8);
         assert_eq!(cpu.registers().a, 0x08); // Expected value after adding immediate 8-bit value to A
-    }
-
-    #[test]
-    fn test_adc_invalid_operand() {
-        let memory: Box<GameBoyMemory> = Box::new(GameBoyMemory::new());
-        let decoder = Box::new(OpCodeDecoder::new());
-
-        let mut cpu: Box<dyn Instructions> = Box::new(Sm83::new(memory, decoder));
-        assert!(cpu
-            .adc(&Adc {
-                operand: Operand::Register16(Register16::BC),
-                cycles: 4
-            })
-            .is_err());
     }
 
     #[test]
@@ -3543,9 +1749,7 @@ mod tests {
         // ROM: store A to (HL), then load A from (HL); HL=0xC000, A=0xCD
         // After tick 1 (LD (HL),A): memory[0xC000]=0xCD, cycles=8
         // After tick 2 (LD A,(HL)): A=0xCD, cycles=8
-        let memory = GameBoyMemory::with_rom(vec![0x77, 0x7E]);
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x77, 0x7E]).with_registers(Registers {
             a: 0xCD,
             h: 0xC0,
             l: 0x00,
@@ -3586,9 +1790,7 @@ mod tests {
     /// Tick 2: load A from (HL), expect A=0x99, 8 cycles.
     #[test]
     fn test_ld8_mem_hl_imm8() {
-        let memory = GameBoyMemory::with_rom(vec![0x36, 0x99, 0x7E]);
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = make_test_cpu(vec![0x36, 0x99, 0x7E]).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -3612,12 +1814,10 @@ mod tests {
     /// Expected: A = 0x10, H flag set (lower nibble overflow 1+F=10).
     #[test]
     fn test_integration_add8_memory_hl_gameboy_memory() {
-        let mut memory = GameBoyMemory::with_rom(vec![0x86]);
-        // Pre-populate the memory location HL will point to
-        memory.write(0xC010, 0x0F).unwrap();
-
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC010, 0x0F).unwrap(); },
+            vec![0x86],
+        ).with_registers(Registers {
             a: 0x01,
             h: 0xC0,
             l: 0x10,
@@ -4043,8 +2243,8 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 20);
-        assert_eq!(cpu.memory.read(0xC000).unwrap(), 0xEF); // low byte
-        assert_eq!(cpu.memory.read(0xC001).unwrap(), 0xBE); // high byte
+        assert_eq!(cpu.read_memory(0xC000).unwrap(), 0xEF); // low byte
+        assert_eq!(cpu.read_memory(0xC001).unwrap(), 0xBE); // high byte
     }
 
     /// LD SP, HL — opcode 0xF9, copy HL into SP.
@@ -4069,7 +2269,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
-        assert_eq!(cpu.memory.read(0xC000).unwrap(), 0x42);
+        assert_eq!(cpu.read_memory(0xC000).unwrap(), 0x42);
     }
 
     /// LD A, (DE) — opcode 0x1A, load A from memory at DE.
@@ -4097,7 +2297,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
-        assert_eq!(cpu.memory.read(0xC010).unwrap(), 0xAB);
+        assert_eq!(cpu.read_memory(0xC010).unwrap(), 0xAB);
         assert_eq!(cpu.registers().hl(), 0xC011);
     }
 
@@ -4126,7 +2326,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
-        assert_eq!(cpu.memory.read(0xC030).unwrap(), 0xCC);
+        assert_eq!(cpu.read_memory(0xC030).unwrap(), 0xCC);
     }
 
     /// LDH (n), A — opcode 0xE0, store A to 0xFF00+n.
@@ -4139,7 +2339,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 12);
-        assert_eq!(cpu.memory.read(0xFF80).unwrap(), 0x11);
+        assert_eq!(cpu.read_memory(0xFF80).unwrap(), 0x11);
     }
 
     /// LD (C), A — opcode 0xE2, store A to 0xFF00+C.
@@ -4153,7 +2353,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 8);
-        assert_eq!(cpu.memory.read(0xFF80).unwrap(), 0x22);
+        assert_eq!(cpu.read_memory(0xFF80).unwrap(), 0x22);
     }
 
     // --- Misc instruction integration tests ---
@@ -4498,10 +2698,10 @@ mod tests {
     /// Verify by reading back with LD A,(HL).
     #[test]
     fn test_inc8_mem_hl() {
-        let mut memory = GameBoyMemory::with_rom(vec![0x34, 0x7E]);
-        memory.write(0xC000, 0x07).unwrap();
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x07).unwrap(); },
+            vec![0x34, 0x7E],
+        ).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -4523,10 +2723,10 @@ mod tests {
     /// HL=0xC000, memory[0xC000]=0x07. Expected: memory[0xC000]=0x06, 12 cycles.
     #[test]
     fn test_dec8_mem_hl() {
-        let mut memory = GameBoyMemory::with_rom(vec![0x35, 0x7E]);
-        memory.write(0xC000, 0x07).unwrap();
-        let decoder = Box::new(OpCodeDecoder::new());
-        let mut cpu = Sm83::new(Box::new(memory), decoder).with_registers(Registers {
+        let mut cpu = make_test_cpu_with_memory(
+            |m| { m.write(0xC000, 0x07).unwrap(); },
+            vec![0x35, 0x7E],
+        ).with_registers(Registers {
             h: 0xC0,
             l: 0x00,
             ..Default::default()
@@ -4938,7 +3138,7 @@ mod tests {
         let cycles = cpu.step().unwrap();
 
         assert_eq!(cycles, 16);
-        assert_eq!(cpu.memory.read(0xC000).unwrap(), 0b01100011);
+        assert_eq!(cpu.read_memory(0xC000).unwrap(), 0b01100011);
         assert!(cpu.registers().f.contains(Flags::C));
         assert!(!cpu.registers().f.contains(Flags::Z));
     }
@@ -5011,15 +3211,15 @@ mod tests {
         let mut regs = Registers::default();
         regs.sp = 0xDFFE;
         cpu = cpu.with_registers(regs);
-        cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
-        cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
+        cpu.write_io(0xFFFF, 0x01); // IE: VBlank enabled
+        cpu.write_io(0xFF0F, 0x01); // IF: VBlank pending
 
         cpu.step().unwrap(); // EI — ime_pending=true
         cpu.step().unwrap(); // NOP — IME becomes true, interrupt dispatched after
 
         assert_eq!(cpu.registers().pc, 0x0040); // VBlank vector
         assert_eq!(cpu.registers().sp, 0xDFFC); // SP decremented by 2
-        assert_eq!(cpu.memory.read_io(IF_ADDR) & 0x01, 0); // IF bit 0 cleared
+        assert_eq!(cpu.read_io(0xFF0F) & 0x01, 0); // IF bit 0 cleared
         assert!(!cpu.ime()); // IME cleared during dispatch
     }
 
@@ -5027,8 +3227,8 @@ mod tests {
     fn test_halt_resumes_when_interrupt_pending() {
         // HALT with IE=1, IF=1 but IME=false: CPU wakes but doesn't dispatch
         let mut cpu = make_test_cpu(vec![0x76, 0x00]); // HALT, NOP
-        cpu.memory.write_io(IE_ADDR, 0x01); // IE: VBlank enabled
-        cpu.memory.write_io(IF_ADDR, 0x01); // IF: VBlank pending
+        cpu.write_io(0xFFFF, 0x01); // IE: VBlank enabled
+        cpu.write_io(0xFF0F, 0x01); // IF: VBlank pending
 
         cpu.step().unwrap(); // HALT — sets halted=true
         assert!(cpu.is_halted()); // still halted after HALT instruction
@@ -5038,48 +3238,4 @@ mod tests {
         assert_eq!(cycles, 8); // halted M-cycle + NOP
     }
 
-    #[test]
-    fn test_tick_returns_with_no_pending_apu_cycles() {
-        let mut cpu = make_test_cpu(vec![0x00]);
-
-        cpu.step().unwrap();
-
-        assert!(cpu.pending_apu_cycles.is_empty());
-    }
-
-    #[test]
-    fn test_halted_tick_returns_with_no_pending_apu_cycles() {
-        let mut cpu = make_test_cpu(vec![0x76, 0x00]);
-
-        cpu.step().unwrap(); // HALT
-        cpu.step().unwrap(); // halted early return
-
-        assert!(cpu.pending_apu_cycles.is_empty());
-    }
-
-    #[test]
-    fn test_interrupt_dispatch_returns_with_no_pending_apu_cycles() {
-        let mut cpu = make_test_cpu(vec![0xFB, 0x00, 0x00, 0x00]);
-        cpu.memory.write_io(IE_ADDR, 0x01);
-        cpu.memory.write_io(IF_ADDR, 0x01);
-
-        cpu.step().unwrap(); // EI
-        cpu.step().unwrap(); // NOP + interrupt dispatch
-
-        assert!(cpu.pending_apu_cycles.is_empty());
-    }
-
-    #[test]
-    fn test_tick_cycle_to_t3_flushes_prior_apu_batch() {
-        let mut cpu = make_test_cpu(vec![0x00]);
-
-        cpu.tick_cycle();
-        assert_eq!(cpu.pending_apu_cycles.cycles, 4);
-        assert_eq!(cpu.cycle_counter(), 4);
-
-        cpu.tick_cycle_to_t3();
-
-        assert_eq!(cpu.pending_apu_cycles.cycles, 3);
-        assert_eq!(cpu.cycle_counter(), 8);
-    }
 }

@@ -2,14 +2,11 @@ use wasm_bindgen::prelude::*;
 
 use rustyboy_core::{
     cpu::{
-        cpu::Cpu,
-        instructions::opcodes::OpCodeDecoder,
         peripheral::joypad::Button,
         registers::{Flags, Registers},
         save_state::SaveState,
-        sm83::Sm83,
     },
-    memory::GameBoyMemory,
+    GameBoy,
 };
 
 const CYCLES_PER_FRAME: u32 = 70224;
@@ -27,7 +24,7 @@ const PALETTE: [[u8; 4]; 4] = [
 
 #[wasm_bindgen]
 pub struct EmulatorHandle {
-    cpu: Sm83,
+    cpu: GameBoy,
     rgba_buf: Vec<u8>,
 }
 
@@ -35,10 +32,8 @@ pub struct EmulatorHandle {
 impl EmulatorHandle {
     #[wasm_bindgen(constructor)]
     pub fn new(rom: Vec<u8>) -> EmulatorHandle {
-        let memory = GameBoyMemory::with_rom(rom);
-        let decoder = Box::new(OpCodeDecoder::new());
         // Start at 0x100 with DMG post-boot-ROM state (skips boot ROM).
-        let cpu = Sm83::new(Box::new(memory), decoder)
+        let cpu = GameBoy::new(rom)
             .with_registers(Registers {
                 a: 0x01, f: Flags::from_bits_truncate(0xB0),
                 b: 0x00, c: 0x13,
@@ -57,13 +52,13 @@ impl EmulatorHandle {
     pub fn run_frame(&mut self) {
         let start = self.cpu.cycle_counter();
         while self.cpu.cycle_counter().wrapping_sub(start) < CYCLES_PER_FRAME as u64 {
-            let _ = self.cpu.tick();
+            self.cpu.tick();
         }
     }
 
     /// Returns the framebuffer as an RGBA8 Vec for use in JS as Uint8ClampedArray.
     pub fn framebuffer_rgba(&mut self) -> Vec<u8> {
-        let fb = self.cpu.framebuffer();
+        let fb = self.cpu.front_buffer();
         for (i, &pixel) in fb.iter().enumerate() {
             let color = PALETTE[(pixel & 3) as usize];
             self.rgba_buf[i * 4..i * 4 + 4].copy_from_slice(&color);

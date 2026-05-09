@@ -1,13 +1,68 @@
 use alloc::{boxed::Box, vec::Vec};
 
-use crate::cpu::instructions::opcodes::OpCodeDecoder;
-use crate::cpu::peripheral::joypad::Button;
-use crate::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
+use crate::cpu::cpu::CpuError;
+use crate::cpu::peripheral::apu::{
+    ApuPeripheral, NR10_ADDR, NR52_ADDR, WAVE_RAM_START, WAVE_RAM_END,
+};
+use crate::cpu::peripheral::joypad::{Button, JoypadPeripheral, JOYP_ADDR, JOYPAD_INTERRUPT_BIT};
+use crate::cpu::peripheral::ppu::{
+    PpuPeripheral, FRAMEBUFFER_SIZE, LCDC_ADDR, STAT_ADDR, SCY_ADDR, SCX_ADDR,
+    LY_ADDR, LYC_ADDR, BGP_ADDR, OBP0_ADDR, OBP1_ADDR, WY_ADDR, WX_ADDR,
+    VBLANK_INTERRUPT_BIT, STAT_INTERRUPT_BIT,
+};
+use crate::cpu::peripheral::serial::{SerialPort, SERIAL_INTERRUPT_BIT};
+use crate::cpu::peripheral::timer::{
+    TimerPeripheral, DIV_ADDR, TIMA_ADDR, TIMER_INTERRUPT_BIT, TMA_ADDR, TAC_ADDR,
+};
+#[cfg(feature = "perf")]
+use crate::cpu::perf::cyccnt;
 use crate::cpu::registers::{Flags, Registers};
-use crate::cpu::save_state::SaveState;
-use crate::cpu::sm83::Sm83;
+use crate::cpu::save_state::{CpuState, SaveState};
+use crate::cpu::sm83::{McycleOp, Sm83, Sm83Cache};
 use crate::memory::cartridge::Cartridge;
-use crate::memory::memory::GameBoyMemory;
+use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
+
+const IF_ADDR: u16 = 0xFF0F;
+const DMA_ADDR: u16 = 0xFF46;
+const SB_ADDR: u16 = 0xFF01;
+const SC_ADDR: u16 = 0xFF02;
+
+const IDLE_M_CYCLE_BLOCK_BUS_EVENTS: u8 = 1 << 0;
+const IDLE_M_CYCLE_BLOCK_DMA: u8 = 1 << 1;
+const IDLE_M_CYCLE_BLOCK_SERIAL: u8 = 1 << 2;
+const IDLE_M_CYCLE_BLOCK_RTC: u8 = 1 << 3;
+
+/// State for an in-progress OAM DMA transfer.
+pub(crate) struct DmaState {
+    /// Source base address (page << 8).
+    pub source: u16,
+    /// Number of bytes copied so far (0–159).
+    pub progress: u8,
+}
+
+/// Accumulates APU T-cycles between timing-sensitive boundaries.
+#[derive(Default)]
+struct PendingApuCycles {
+    cycles: u16,
+}
+
+impl PendingApuCycles {
+    #[inline(always)]
+    fn queue(&mut self, cycles: u16) {
+        debug_assert!(cycles != 0);
+        self.cycles = self.cycles.wrapping_add(cycles);
+    }
+
+    #[inline(always)]
+    fn take(&mut self) -> u16 {
+        core::mem::take(&mut self.cycles)
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.cycles == 0
+    }
+}
 
 /// Top-level Game Boy emulator coordinator.
 ///
@@ -18,7 +73,29 @@ use crate::memory::memory::GameBoyMemory;
 /// - [`GameBoy::new`]: load from raw ROM bytes (cart type auto-detected from header)
 /// - [`GameBoy::with_cartridge`]: for platform-specific cartridge impls (XIP flash, streaming, etc.)
 pub struct GameBoy {
+    // ── Pure CPU state machine ────────────────────────────────────────────────
     cpu: Sm83,
+    // ── Peripheral and memory state ───────────────────────────────────────────
+    memory: Box<GameBoyMemory>,
+    ppu: PpuPeripheral,
+    apu: ApuPeripheral,
+    timer: TimerPeripheral,
+    joypad: JoypadPeripheral,
+    serial: SerialPort,
+    dma: Option<DmaState>,
+    front_buffer: [u8; FRAMEBUFFER_SIZE],
+    pending_apu_cycles: PendingApuCycles,
+    pending_bus_events: Vec<BusEvent>,
+    idle_m_cycle_blockers: u8,
+    /// Total committed T-cycles. Current-instruction M-cycles are in
+    /// `pending_cycle_counter` and flushed once per instruction.
+    cycle_counter: u64,
+    pending_cycle_counter: u16,
+    /// IF register (interrupt flags). Kept in sync with memory.io[IF_ADDR].
+    if_: u8,
+    cache: Sm83Cache,
+    #[cfg(feature = "perf")]
+    perf_enabled: bool,
 }
 
 impl GameBoy {
@@ -35,31 +112,617 @@ impl GameBoy {
         Self::from_memory(memory)
     }
 
-    fn from_memory(memory: Box<GameBoyMemory>) -> Self {
-        let decoder = Box::new(OpCodeDecoder::new());
-        let cpu = Sm83::new(memory, decoder)
-            .with_registers(Registers {
-                a: 0x01,
-                f: Flags::from_bits_truncate(0xB0),
-                b: 0x00,
-                c: 0x13,
-                d: 0x00,
-                e: 0xD8,
-                h: 0x01,
-                l: 0x4D,
-                pc: 0x0100,
-                sp: 0xFFFE,
-            })
-            .with_dmg_state();
-        Self { cpu }
+    fn from_memory(mut memory: Box<GameBoyMemory>) -> Self {
+        let cpu = Sm83::new_pure();
+        let joypad = JoypadPeripheral::new();
+        let apu = ApuPeripheral::new();
+
+        // Seed JOYP with no buttons pressed (all lines high).
+        memory.write_io(JOYP_ADDR, joypad.read());
+        // Seed IO memory with initial APU register read values.
+        for addr in NR10_ADDR..=NR52_ADDR {
+            memory.write_io(addr, apu.read_register(addr));
+        }
+        // Unused APU addresses always read as 0xFF
+        for addr in 0xFF27u16..WAVE_RAM_START {
+            memory.write_io(addr, 0xFF);
+        }
+        for addr in WAVE_RAM_START..=WAVE_RAM_END {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            memory.write_io(addr, apu.read_wave_ram(offset));
+        }
+
+        let mut gb = Self {
+            cpu,
+            memory,
+            ppu: PpuPeripheral::new(),
+            apu,
+            timer: TimerPeripheral::new(),
+            joypad,
+            serial: SerialPort::new(),
+            dma: None,
+            front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            pending_apu_cycles: PendingApuCycles::default(),
+            pending_bus_events: Vec::with_capacity(4),
+            idle_m_cycle_blockers: 0,
+            cycle_counter: 0,
+            pending_cycle_counter: 0,
+            if_: 0,
+            cache: Sm83Cache::default(),
+            #[cfg(feature = "perf")]
+            perf_enabled: false,
+        };
+        gb.cache.nr52 = gb.memory.read_io(NR52_ADDR);
+        gb.refresh_idle_m_cycle_blockers();
+        // Apply default DMG register state
+        gb = gb.with_registers(Registers {
+            a: 0x01,
+            f: Flags::from_bits_truncate(0xB0),
+            b: 0x00,
+            c: 0x13,
+            d: 0x00,
+            e: 0xD8,
+            h: 0x01,
+            l: 0x4D,
+            pc: 0x0100,
+            sp: 0xFFFE,
+        }).with_dmg_state();
+        gb
+    }
+
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    /// Construct a minimal `GameBoy` for unit tests.
+    ///
+    /// - `rom_data`: raw bytes placed at the start of address space (PC=0).
+    /// - Registers start at `Registers::default()` (PC=0, SP=0, all zeros).
+    /// - No DMG state is applied — peripherals start at their hardware-reset
+    ///   defaults, which is appropriate for instruction-level unit tests.
+    ///
+    /// Available in all build configurations (not test-only) so that the
+    /// `#[cfg(test)]` module inside `sm83.rs` can use it.
+    pub fn for_test(rom_data: alloc::vec::Vec<u8>) -> Self {
+        let memory = Box::new(GameBoyMemory::with_rom(rom_data));
+        let cpu = Sm83::new_pure();
+        let joypad = JoypadPeripheral::new();
+        let apu = ApuPeripheral::new();
+
+        // Seed IO memory the same way from_memory() does
+        let mut mem = memory;
+        mem.write_io(JOYP_ADDR, joypad.read());
+        for addr in NR10_ADDR..=NR52_ADDR {
+            mem.write_io(addr, apu.read_register(addr));
+        }
+        for addr in 0xFF27u16..WAVE_RAM_START {
+            mem.write_io(addr, 0xFF);
+        }
+        for addr in WAVE_RAM_START..=WAVE_RAM_END {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            mem.write_io(addr, apu.read_wave_ram(offset));
+        }
+
+        let mut gb = Self {
+            cpu,
+            memory: mem,
+            ppu: PpuPeripheral::new(),
+            apu,
+            timer: TimerPeripheral::new(),
+            joypad,
+            serial: SerialPort::new(),
+            dma: None,
+            front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            pending_apu_cycles: PendingApuCycles::default(),
+            pending_bus_events: Vec::with_capacity(4),
+            idle_m_cycle_blockers: 0,
+            cycle_counter: 0,
+            pending_cycle_counter: 0,
+            if_: 0,
+            cache: Sm83Cache::default(),
+            #[cfg(feature = "perf")]
+            perf_enabled: false,
+        };
+        gb.cache.nr52 = gb.memory.read_io(NR52_ADDR);
+        gb.refresh_idle_m_cycle_blockers();
+        gb
+    }
+
+    /// Like `for_test()`, but also runs a setup closure on the raw memory
+    /// before the `GameBoy` is constructed.
+    pub fn for_test_with_setup(
+        setup: impl FnOnce(&mut GameBoyMemory),
+        rom_data: alloc::vec::Vec<u8>,
+    ) -> Self {
+        let mut mem = GameBoyMemory::with_rom(rom_data);
+        setup(&mut mem);
+        let cpu = Sm83::new_pure();
+        let joypad = JoypadPeripheral::new();
+        let apu = ApuPeripheral::new();
+
+        mem.write_io(JOYP_ADDR, joypad.read());
+        for addr in NR10_ADDR..=NR52_ADDR {
+            mem.write_io(addr, apu.read_register(addr));
+        }
+        for addr in 0xFF27u16..WAVE_RAM_START {
+            mem.write_io(addr, 0xFF);
+        }
+        for addr in WAVE_RAM_START..=WAVE_RAM_END {
+            let offset = (addr - WAVE_RAM_START) as u8;
+            mem.write_io(addr, apu.read_wave_ram(offset));
+        }
+
+        let mut gb = Self {
+            cpu,
+            memory: Box::new(mem),
+            ppu: PpuPeripheral::new(),
+            apu,
+            timer: TimerPeripheral::new(),
+            joypad,
+            serial: SerialPort::new(),
+            dma: None,
+            front_buffer: [0u8; FRAMEBUFFER_SIZE],
+            pending_apu_cycles: PendingApuCycles::default(),
+            pending_bus_events: Vec::with_capacity(4),
+            idle_m_cycle_blockers: 0,
+            cycle_counter: 0,
+            pending_cycle_counter: 0,
+            if_: 0,
+            cache: Sm83Cache::default(),
+            #[cfg(feature = "perf")]
+            perf_enabled: false,
+        };
+        gb.cache.nr52 = gb.memory.read_io(NR52_ADDR);
+        gb.refresh_idle_m_cycle_blockers();
+        gb
+    }
+
+    // ── Builder pattern ────────────────────────────────────────────────────────
+
+    /// Set initial register state.
+    pub fn with_registers(mut self, registers: Registers) -> Self {
+        self.cpu.registers = registers;
+        self
+    }
+
+    /// Seed IO registers to DMG post-boot-ROM state.
+    pub fn with_dmg_state(mut self) -> Self {
+        self.ppu.set_lcdc(0x91);
+        self.ppu.set_stat(0x85);
+        self.ppu.set_bgp(0xFC);
+        self.ppu.set_obp0(0xFF);
+        self.ppu.set_obp1(0xFF);
+        // Sync prev_stat_line so the first PPU tick doesn't generate a spurious
+        // rising-edge STAT interrupt from the seeded STAT/LY/LYC state.
+        self.ppu.sync_prev_stat_line();
+        // APU post-boot state
+        self.write_apu_register(0xFF26, 0xF1);
+        self.write_apu_register(0xFF25, 0xF3);
+        self.write_apu_register(0xFF24, 0x77);
+        self.cache.nr52 = self.memory.read_io(NR52_ADDR);
+        self
     }
 
     // ── Emulation loop ────────────────────────────────────────────────────────
 
-    /// Execute one complete SM83 instruction.
+    /// Execute one complete SM83 instruction (M-cycle accurate).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     pub fn tick(&mut self) {
-        let _ = self.cpu.step();
+        let _ = self.step();
+    }
+
+    /// Execute one complete SM83 instruction, returning the T-cycles elapsed.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn step(&mut self) -> Result<u8, CpuError> {
+        // Flush leftover cycle counter from previous instruction
+        if self.pending_cycle_counter != 0 {
+            self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
+            self.pending_cycle_counter = 0;
+        }
+
+        // Sync interrupt shadows before CPU sees them
+        self.cpu.ie_shadow = self.memory.ie();
+        self.cpu.if_shadow = self.if_;
+
+        loop {
+            // Remember if_shadow before tick() so we can detect what the CPU cleared
+            let if_before_tick = self.cpu.if_shadow;
+            let op = self.cpu.tick();
+
+            // Merge any bits cleared by CPU (interrupt dispatch) back into self.if_
+            // Only clear bits that the CPU explicitly cleared; don't change other bits.
+            let cpu_cleared_bits = if_before_tick & !self.cpu.if_shadow;
+            self.if_ &= !cpu_cleared_bits;
+
+            match op {
+                McycleOp::Done => {
+                    self.flush_pending_apu_cycles();
+                    let cycles = self.pending_cycle_counter as u8;
+                    self.cycle_counter = self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64);
+                    self.pending_cycle_counter = 0;
+                    self.cpu.temp_idx = 0;
+                    // Keep memory IF in sync
+                    self.memory.write_io(IF_ADDR, self.if_);
+                    return Ok(cycles);
+                }
+                McycleOp::Read(addr) => {
+                    if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+                        self.begin_t3_sensitive_m_cycle();
+                        let val = self.apu.read_wave_ram((addr - WAVE_RAM_START) as u8);
+                        self.cpu.tock(val);
+                        self.advance_timer(1);
+                        self.queue_apu_cycles(1);
+                    } else {
+                        self.begin_m_cycle();
+                        self.advance_peripherals(4);
+                        let val = self.bus_read_fast(addr);
+                        self.cpu.tock(val);
+                    }
+                }
+                McycleOp::Write(addr, val) => {
+                    if (NR10_ADDR..=NR52_ADDR).contains(&addr)
+                        || (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr)
+                    {
+                        // T3-sensitive APU/wave write
+                        self.begin_t3_sensitive_m_cycle();
+                        self.advance_ppu(4);
+                        self.advance_timer(3);
+                        self.queue_apu_cycles(3);
+                        self.bus_write_fast(addr, val);
+                        self.advance_timer(1);
+                        self.queue_apu_cycles(1);
+                    } else {
+                        self.begin_m_cycle();
+                        self.advance_peripherals(4);
+                        self.bus_write_fast(addr, val);
+                    }
+                }
+                McycleOp::Internal => {
+                    if self.can_use_idle_m_cycle_fast_path() {
+                        self.run_idle_m_cycle();
+                    } else {
+                        self.begin_m_cycle();
+                        self.advance_peripherals(4);
+                    }
+                }
+            }
+            // Sync shadows for next tick() call.
+            // self.if_ may have new bits from peripherals (advance_ppu, advance_timer, etc.)
+            // and cleared bits from CPU (interrupt dispatch handled above).
+            self.cpu.ie_shadow = self.memory.ie();
+            self.cpu.if_shadow = self.if_;
+        }
+    }
+
+    // ── M-cycle coordination helpers ─────────────────────────────────────────
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn begin_m_cycle(&mut self) {
+        self.pending_cycle_counter += 4;
+        self.flush_apu_before_bus_events();
+        self.route_bus_events();
+        self.advance_dma();
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn begin_t3_sensitive_m_cycle(&mut self) {
+        self.pending_cycle_counter += 4;
+        self.flush_pending_apu_cycles();
+        self.route_bus_events();
+        self.advance_dma();
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn can_use_idle_m_cycle_fast_path(&self) -> bool {
+        self.idle_m_cycle_blockers == 0
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn run_idle_m_cycle(&mut self) {
+        self.pending_cycle_counter += 4;
+        self.advance_ppu(4);
+        self.advance_timer(4);
+        self.queue_apu_cycles(4);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_peripherals(&mut self, cycles: u16) {
+        self.advance_ppu(cycles);
+        self.advance_timer(cycles);
+        self.queue_apu_cycles(cycles);
+        if self.memory.has_rtc() {
+            self.memory.tick_rtc(cycles as u32);
+        }
+        if !self.serial.is_idle() {
+            self.advance_serial(cycles);
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_ppu(&mut self, cycles: u16) {
+        #[cfg(feature = "perf")]
+        let t0 = cyccnt();
+        let output = self.ppu.tick(cycles, self.memory.vram(), self.memory.oam());
+        if output.vblank_interrupt {
+            self.front_buffer.copy_from_slice(self.ppu.framebuffer());
+            self.if_ |= 1 << VBLANK_INTERRUPT_BIT;
+            self.memory.write_io(IF_ADDR, self.if_);
+        }
+        if output.stat_interrupt {
+            self.if_ |= 1 << STAT_INTERRUPT_BIT;
+            self.memory.write_io(IF_ADDR, self.if_);
+        }
+        #[cfg(feature = "perf")]
+        { let _ = t0; }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_timer(&mut self, cycles: u16) {
+        if self.timer.tick(cycles) {
+            self.if_ |= 1 << TIMER_INTERRUPT_BIT;
+            self.memory.write_io(IF_ADDR, self.if_);
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_serial(&mut self, cycles: u16) {
+        if self.serial.tick(cycles) {
+            self.if_ |= 1 << SERIAL_INTERRUPT_BIT;
+            self.memory.write_io(IF_ADDR, self.if_);
+        }
+        if self.serial.is_idle() {
+            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+        } else {
+            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn queue_apu_cycles(&mut self, cycles: u16) {
+        self.pending_apu_cycles.queue(cycles);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn flush_pending_apu_cycles(&mut self) {
+        let cycles = self.pending_apu_cycles.take();
+        if cycles == 0 { return; }
+        self.tick_apu(cycles);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn tick_apu(&mut self, cycles: u16) {
+        let output = self.apu.tick(cycles, self.timer.internal_counter());
+        if output.nr52 != self.cache.nr52 {
+            self.cache.nr52 = output.nr52;
+            self.memory.write_io(NR52_ADDR, output.nr52);
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn advance_dma(&mut self) {
+        let (source, progress) = match self.dma {
+            Some(ref d) => (d.source, d.progress),
+            None => return,
+        };
+        let byte = self.memory.read_fast(source + progress as u16);
+        self.memory.write_fast(0xFE00 + progress as u16, byte);
+        let next = progress + 1;
+        self.dma = if next < 160 {
+            Some(DmaState { source, progress: next })
+        } else {
+            None
+        };
+        if self.dma.is_some() {
+            self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
+        } else {
+            self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn flush_apu_before_bus_events(&mut self) {
+        if self.pending_apu_cycles.is_empty()
+            || !self.pending_bus_events_require_apu_flush()
+        {
+            return;
+        }
+        self.flush_pending_apu_cycles();
+    }
+
+    fn pending_bus_events_require_apu_flush(&self) -> bool {
+        self.pending_bus_events
+            .iter()
+            .copied()
+            .any(Self::bus_event_requires_apu_flush)
+    }
+
+    fn bus_event_requires_apu_flush(event: BusEvent) -> bool {
+        event.address == DIV_ADDR
+            || (NR10_ADDR..=NR52_ADDR).contains(&event.address)
+            || (WAVE_RAM_START..=WAVE_RAM_END).contains(&event.address)
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn route_bus_events(&mut self) {
+        if self.pending_bus_events.is_empty() { return; }
+        for i in 0..self.pending_bus_events.len() {
+            let e = self.pending_bus_events[i];
+            self.handle_bus_event(e.address, e.value);
+        }
+        self.pending_bus_events.clear();
+        self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn handle_bus_event(&mut self, addr: u16, value: u8) {
+        match addr {
+            a if a == IF_ADDR => {
+                self.if_ = value;
+                // memory.io already updated by bus_write_fast
+            }
+            a if a == JOYP_ADDR => {
+                self.joypad.write(value);
+                self.memory.write_io(JOYP_ADDR, self.joypad.read());
+            }
+            a if a == SB_ADDR => self.serial.set_sb(value),
+            a if a == SC_ADDR => {
+                self.serial.handle_sc_write(value);
+                if self.serial.is_idle() {
+                    self.clear_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+                } else {
+                    self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_SERIAL);
+                }
+            }
+            a if a == DIV_ADDR => {
+                self.timer.reset_div();
+            }
+            a if a == LY_ADDR => self.ppu.reset_ly(),
+            a if a == DMA_ADDR => {
+                self.dma = Some(DmaState { source: (value as u16) << 8, progress: 0 });
+                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_DMA);
+            }
+            a if (NR10_ADDR..=NR52_ADDR).contains(&a) => self.write_apu_register(a, value),
+            a if (0xFF27u16..WAVE_RAM_START).contains(&a) => self.memory.write_io(a, 0xFF),
+            a if (WAVE_RAM_START..=WAVE_RAM_END).contains(&a) => self.write_wave_ram(a, value),
+            a if a == TIMA_ADDR => self.timer.set_tima(value),
+            a if a == TMA_ADDR  => self.timer.set_tma(value),
+            a if a == TAC_ADDR  => self.timer.set_tac(value),
+            a if a == LCDC_ADDR => self.ppu.set_lcdc(value),
+            a if a == STAT_ADDR => self.ppu.set_stat(value),
+            a if a == SCY_ADDR  => self.ppu.set_scy(value),
+            a if a == SCX_ADDR  => self.ppu.set_scx(value),
+            a if a == LYC_ADDR  => self.ppu.set_lyc(value),
+            a if a == BGP_ADDR  => self.ppu.set_bgp(value),
+            a if a == OBP0_ADDR => self.ppu.set_obp0(value),
+            a if a == OBP1_ADDR => self.ppu.set_obp1(value),
+            a if a == WY_ADDR   => self.ppu.set_wy(value),
+            a if a == WX_ADDR   => self.ppu.set_wx(value),
+            _ => {}
+        }
+    }
+
+    // ── Bus access helpers ────────────────────────────────────────────────────
+
+    /// Read from the bus without advancing peripherals (peripherals already advanced).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn bus_read_fast(&self, addr: u16) -> u8 {
+        match addr {
+            a if a == DIV_ADDR  => self.timer.div(),
+            a if a == TIMA_ADDR => self.timer.tima(),
+            a if a == TMA_ADDR  => self.timer.tma(),
+            a if a == TAC_ADDR  => self.timer.tac(),
+            a if a == JOYP_ADDR => self.joypad.read(),
+            a if a == SB_ADDR   => self.serial.sb(),
+            a if a == SC_ADDR   => self.serial.sc(),
+            a if a == LCDC_ADDR => self.ppu.lcdc(),
+            a if a == STAT_ADDR => self.ppu.stat(),
+            a if a == SCY_ADDR  => self.ppu.scy(),
+            a if a == SCX_ADDR  => self.ppu.scx(),
+            a if a == LY_ADDR   => self.ppu.ly(),
+            a if a == LYC_ADDR  => self.ppu.lyc(),
+            a if a == BGP_ADDR  => self.ppu.bgp(),
+            a if a == OBP0_ADDR => self.ppu.obp0(),
+            a if a == OBP1_ADDR => self.ppu.obp1(),
+            a if a == WY_ADDR   => self.ppu.wy(),
+            a if a == WX_ADDR   => self.ppu.wx(),
+            a if a == IF_ADDR   => self.if_,
+            _                   => self.memory.read_fast(addr),
+        }
+    }
+
+    /// Write to the bus (may enqueue bus event for MMIO).
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn bus_write_fast(&mut self, addr: u16, val: u8) {
+        if (NR10_ADDR..=NR52_ADDR).contains(&addr) {
+            self.write_apu_register(addr, val);
+            return;
+        }
+        if (WAVE_RAM_START..=WAVE_RAM_END).contains(&addr) {
+            self.write_wave_ram(addr, val);
+            return;
+        }
+        match addr {
+            a if a == IF_ADDR => {
+                // IF writes take effect immediately for interrupt detection.
+                // self.if_ is the authoritative store; memory is kept in sync.
+                // No bus event needed: handle_bus_event for IF_ADDR would only
+                // re-set self.if_ from a stale value, corrupting CPU-cleared bits.
+                self.if_ = val;
+                self.memory.write_io(addr, val);
+            }
+            0xFF00..=0xFF7F | 0xFFFF => {
+                self.memory.write_io(addr, val);
+                self.pending_bus_events.push(BusEvent { address: addr, value: val });
+                self.set_idle_m_cycle_blocker(IDLE_M_CYCLE_BLOCK_BUS_EVENTS);
+            }
+            0xE000..=0xFDFF => {} // echo RAM: silently ignore
+            _ => {
+                self.memory.write_fast(addr, val);
+            }
+        }
+    }
+
+    fn write_apu_register(&mut self, addr: u16, value: u8) {
+        self.apu.write_register(addr, value);
+        if addr == NR52_ADDR {
+            for a in NR10_ADDR..=NR52_ADDR {
+                self.memory.write_io(a, self.apu.read_register(a));
+            }
+        } else {
+            self.memory.write_io(addr, self.apu.read_register(addr));
+        }
+    }
+
+    fn write_wave_ram(&mut self, addr: u16, value: u8) {
+        let offset = (addr - WAVE_RAM_START) as u8;
+        self.apu.write_wave_ram(offset, value);
+        self.memory.write_io(addr, self.apu.read_wave_ram(offset));
+    }
+
+    #[inline(always)]
+    fn set_idle_m_cycle_blocker(&mut self, blocker: u8) {
+        self.idle_m_cycle_blockers |= blocker;
+    }
+
+    #[inline(always)]
+    fn clear_idle_m_cycle_blocker(&mut self, blocker: u8) {
+        self.idle_m_cycle_blockers &= !blocker;
+    }
+
+    fn refresh_idle_m_cycle_blockers(&mut self) {
+        let mut blockers = 0;
+        if !self.pending_bus_events.is_empty() {
+            blockers |= IDLE_M_CYCLE_BLOCK_BUS_EVENTS;
+        }
+        if self.dma.is_some() {
+            blockers |= IDLE_M_CYCLE_BLOCK_DMA;
+        }
+        if !self.serial.is_idle() {
+            blockers |= IDLE_M_CYCLE_BLOCK_SERIAL;
+        }
+        if self.memory.has_rtc() {
+            blockers |= IDLE_M_CYCLE_BLOCK_RTC;
+        }
+        self.idle_m_cycle_blockers = blockers;
+    }
+
+    // ── CPU state ─────────────────────────────────────────────────────────────
+
+    /// Returns a copy of the current CPU registers.
+    pub fn registers(&self) -> Registers {
+        self.cpu.registers.clone()
+    }
+
+    /// Returns true if the interrupt master enable flag is active.
+    pub fn ime(&self) -> bool {
+        self.cpu.ime()
+    }
+
+    /// Returns true if the CPU is halted (waiting for an interrupt).
+    pub fn is_halted(&self) -> bool {
+        self.cpu.is_halted()
     }
 
     // ── Output ────────────────────────────────────────────────────────────────
@@ -67,17 +730,44 @@ impl GameBoy {
     /// Returns the last fully-rendered frame.
     ///
     /// 160×144 pixels, one byte per pixel, 2-bit shade value (0=white, 3=black).
-    /// Snapshotted at VBlank so it always contains a complete frame.
     #[inline(always)]
     pub fn front_buffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
-        self.cpu.framebuffer()
+        &self.front_buffer
     }
 
     /// Drain accumulated PCM samples since the last call.
     ///
     /// Returns interleaved stereo f32 samples `[L, R, L, R, ...]` at 48,000 Hz.
     pub fn drain_audio_samples(&mut self) -> Vec<f32> {
-        self.cpu.drain_audio_samples()
+        self.apu.drain_samples()
+    }
+
+    /// Returns all bytes captured by the serial port (SB transfers via SC).
+    pub fn serial_output(&self) -> &[u8] {
+        self.serial.output()
+    }
+
+    // ── Memory access ─────────────────────────────────────────────────────────
+
+    /// Read a byte from the memory bus (for test/debug access).
+    pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
+        MemoryTrait::read(self.memory.as_ref(), address)
+    }
+
+    /// Write a byte to the IO region (0xFF00–0xFFFF). For tests and setup.
+    pub fn write_io(&mut self, address: u16, value: u8) {
+        if address == IF_ADDR {
+            self.if_ = value;
+        }
+        self.memory.write_io(address, value);
+    }
+
+    /// Read a byte from the IO region (0xFF00–0xFFFF). For tests and inspection.
+    pub fn read_io(&self, address: u16) -> u8 {
+        if address == IF_ADDR {
+            return self.if_;
+        }
+        self.memory.read_io(address)
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
@@ -85,7 +775,12 @@ impl GameBoy {
     /// Press or release a joypad button. Fires the joypad interrupt if the
     /// button is newly pressed and its select line is active.
     pub fn set_button(&mut self, btn: Button, pressed: bool) {
-        self.cpu.set_button(btn, pressed);
+        let interrupt = self.joypad.set_button(btn, pressed);
+        self.memory.write_io(JOYP_ADDR, self.joypad.read());
+        if interrupt {
+            self.if_ |= 1 << JOYPAD_INTERRUPT_BIT;
+            self.memory.write_io(IF_ADDR, self.if_);
+        }
     }
 
     // ── Timing ────────────────────────────────────────────────────────────────
@@ -93,19 +788,57 @@ impl GameBoy {
     /// Total T-cycles elapsed since power-on.
     #[inline(always)]
     pub fn cycle_counter(&self) -> u64 {
-        self.cpu.cycle_counter()
+        self.cycle_counter.wrapping_add(self.pending_cycle_counter as u64)
+    }
+
+    // ── Cart info ─────────────────────────────────────────────────────────────
+
+    /// Returns the currently mapped ROM bank for the switchable window (0x4000–0x7FFF).
+    pub fn current_rom_bank(&self) -> usize {
+        self.memory.current_rom_bank()
     }
 
     // ── Save state ────────────────────────────────────────────────────────────
 
     /// Serialize the full emulator state to an RBSS v1 blob.
     pub fn save_state(&self) -> Vec<u8> {
-        self.cpu.save_state()
+        let cpu_state = CpuState {
+            a: self.cpu.registers.a,
+            b: self.cpu.registers.b,
+            c: self.cpu.registers.c,
+            d: self.cpu.registers.d,
+            e: self.cpu.registers.e,
+            h: self.cpu.registers.h,
+            l: self.cpu.registers.l,
+            f: self.cpu.registers.f,
+            sp: self.cpu.registers.sp,
+            pc: self.cpu.registers.pc,
+            ime: self.cpu.ime,
+            halted: self.cpu.halted,
+            cycle_counter: self.cycle_counter(),
+        };
+        SaveState::serialize(cpu_state, self.timer.to_save_state(), self.ppu.to_save_state(), &self.memory)
     }
 
     /// Restore emulator state from a parsed [`SaveState`].
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
-        self.cpu.load_state(state)
+        self.cpu.registers = state.cpu.to_registers();
+        self.cpu.ime = state.cpu.ime;
+        self.cpu.halted = state.cpu.halted;
+        self.cycle_counter = state.cpu.cycle_counter;
+        self.pending_cycle_counter = 0;
+        self.cpu.micro_ops.clear();
+        self.cpu.addr_temp = 0;
+        self.cpu.val_temp = 0;
+        self.cpu.temp = [0u8; 4];
+        self.cpu.temp_idx = 0;
+        self.timer.load_state(state.timer);
+        self.ppu.load_state(state.ppu);
+        self.memory.load_state(&state);
+        self.if_ = self.memory.read_io(IF_ADDR);
+        self.cache.nr52 = self.memory.read_io(NR52_ADDR);
+        self.refresh_idle_m_cycle_blockers();
+        Ok(())
     }
 
     // ── Cart RAM (battery save) ───────────────────────────────────────────────
@@ -113,36 +846,36 @@ impl GameBoy {
     /// Returns the cartridge external RAM (battery save data), or `None` if the
     /// cartridge has no RAM.
     pub fn external_ram(&self) -> Option<&[u8]> {
-        self.cpu.external_ram()
+        self.memory.external_ram()
     }
 
     /// Overwrites the cartridge external RAM with the provided data. No-op if the
     /// cartridge has no external RAM.
     pub fn set_external_ram(&mut self, data: &[u8]) {
-        self.cpu.set_external_ram(data);
+        self.memory.set_external_ram(data);
     }
 
     // ── Perf profiling ────────────────────────────────────────────────────────
 
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> crate::cpu::sm83::Sm83PerfProfile {
-        self.cpu.take_perf_profile()
+        self.cpu.perf.take_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_ppu_perf_profile(&mut self) -> crate::cpu::peripheral::ppu::PpuPerfProfile {
-        self.cpu.take_ppu_perf_profile()
+        self.ppu.take_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_apu_perf_profile(&mut self) -> crate::cpu::peripheral::apu::ApuPerfProfile {
-        self.cpu.take_apu_perf_profile()
+        self.apu.take_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_cartridge_perf_profile(
         &mut self,
     ) -> crate::memory::cartridge::CartridgePerfProfile {
-        self.cpu.take_cartridge_perf_profile()
+        self.memory.take_cartridge_perf_profile()
     }
 }

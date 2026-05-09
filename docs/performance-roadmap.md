@@ -115,7 +115,18 @@ If PPU work stops paying off, APU is the next profiling target.
 1. Add APU-side counters around the remaining shell work that is not currently
    attributed.
 2. Re-profile on hardware.
-3. Only then decide whether more batching or mixer-side work is justified.
+3. If the APU still matters after that, first remove avoidable platform-side
+   overhead before considering multicore work. In particular, the Pico path
+   should stop doing an `i16 -> f32 -> i16` round-trip just to feed I2S.
+4. Only then decide whether more batching or mixer-side work is justified.
+
+### Guardrails
+
+- Do not move live `apu.tick()` execution to core 1. The APU is still tightly
+  coupled to DIV-edge timing, wave RAM access quirks, and MMIO ordering.
+- If any audio work ever moves off-core, limit it to the final platform-side
+  buffer formatting / I2S packing stage after the integer sample drain path is
+  in place.
 
 ---
 
@@ -125,13 +136,26 @@ If PPU work stops paying off, APU is the next profiling target.
 
 Display scaling is still about `247 ms / 60f`, but SPI transfer is already
 overlapped with emulation. The clean multicore candidate is framebuffer scaling,
-not CPU/PPU/APU execution.
+not CPU/PPU/APU execution. The important boundary is that the core already
+snapshots a stable front buffer at VBlank, and the Pico loop already treats
+scaling as a separate pre-DMA step.
 
 ### What to do
 
 1. Leave display scaling alone while CPU-side profiling is still yielding wins.
-2. If emulator-core gains flatten out, revisit a scaler worker on core 1.
-3. Do not try to split SM83/PPU/APU timing across cores.
+2. If emulator-core gains flatten out, revisit a scaler worker on core 1 using
+   the existing frame boundary:
+   - core 0 keeps ownership of SM83 execution, memory, and live PPU/APU timing
+   - core 0 publishes the completed 160×144 front buffer once per frame
+   - core 1 runs the existing framebuffer scale / palette conversion into a
+     double-buffered 240×216 RGB565 output buffer
+   - core 0 keeps ownership of display submission and SPI DMA
+3. Measure again after that before considering any deeper multicore split.
+4. If graphics work inside `core` is ever revisited, only consider immutable
+   scanline raster jobs prepared by core 0. Keep the PPU mode machine, LY/STAT
+   updates, VBlank/STAT interrupt generation, and framebuffer ownership on
+   core 0.
+5. Do not try to split live SM83/PPU/APU timing across cores.
 
 ---
 
@@ -141,6 +165,7 @@ not CPU/PPU/APU execution.
 - Another opcode-dispatch rewrite
 - Generic `bus_read()` tuning as a primary target
 - Reviving the old `build_stat` cache experiment
+- Offloading live PPU or APU timing/state-machine execution to core 1
 
 The reason is simple: those areas are no longer the largest or least-understood
 costs in the profile.
