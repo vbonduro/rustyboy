@@ -2,11 +2,19 @@
 
 # rustyboy
 
-A cycle-accurate Game Boy (DMG) emulator written in Rust.
+A Game Boy (DMG) emulator written in Rust, optimised for real-time performance on resource-constrained hardware.
+
+## Accuracy trade-off
+
+Peripherals (PPU, APU, timer, serial) are advanced once per complete SM83
+instruction rather than once per M-cycle. This cuts peripheral-advancement
+overhead roughly 4× compared to M-cycle granularity. The trade-off is that
+behaviour which depends on mid-instruction peripheral state — primarily
+wave-channel read/write-while-on quirks — is not reproduced accurately.
 
 ## Features
 
-- Cycle-accurate SM83 CPU (all official opcodes + CB-prefixed instructions)
+- SM83 CPU (all official opcodes + CB-prefixed instructions)
 - Scanline-based PPU with OAM DMA, sprites, window, and BG rendering
 - MBC1 / MBC1 Multicart / MBC3 / No-MBC cartridge support
 - APU with all four channels (pulse × 2, wave, noise) and frame sequencer
@@ -17,15 +25,15 @@ A cycle-accurate Game Boy (DMG) emulator written in Rust.
 
 ## Test coverage
 
-| Suite | Status |
-|---|---|
-| Blargg cpu_instrs (11/11) | ✅ |
-| Blargg instr_timing | ✅ |
-| Blargg mem_timing | ✅ |
-| Blargg dmg_sound (12/12) | ✅ |
-| dmg-acid2 (PPU) | ✅ |
-| Mooneye MBC1 (13/13) | ✅ |
-| Mooneye OAM DMA | ✅ |
+| Suite | Status | Notes |
+|---|---|---|
+| Blargg cpu_instrs (11/11) | ✅ | |
+| Blargg instr_timing | ✅ | |
+| Blargg mem_timing | ✅ | |
+| Blargg dmg_sound (9/12) | ⚠️ | Tests 09, 10, 12 skipped — wave channel mid-instruction quirks require M-cycle accuracy |
+| dmg-acid2 (PPU) | ✅ | |
+| Mooneye MBC1 (13/13) | ✅ | |
+| Mooneye OAM DMA | ✅ | |
 
 ## Repository layout
 
