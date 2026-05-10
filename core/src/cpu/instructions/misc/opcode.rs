@@ -1,5 +1,6 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
+use crate::memory::memory::GameBoyMemory;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum MiscOp {
@@ -20,7 +21,7 @@ pub struct Misc {
 }
 
 impl OpCode for Misc {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.misc(self)
     }
 }
@@ -29,6 +30,7 @@ impl OpCode for Misc {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_nop() {
@@ -36,7 +38,7 @@ mod tests {
             op: MiscOp::Nop,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -46,7 +48,7 @@ mod tests {
             op: MiscOp::Halt,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -56,7 +58,7 @@ mod tests {
             op: MiscOp::Stop,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -66,7 +68,7 @@ mod tests {
             op: MiscOp::Daa,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -76,7 +78,7 @@ mod tests {
             op: MiscOp::Cpl,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -86,7 +88,7 @@ mod tests {
             op: MiscOp::Scf,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -96,7 +98,7 @@ mod tests {
             op: MiscOp::Ccf,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -106,7 +108,7 @@ mod tests {
             op: MiscOp::Di,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -116,7 +118,7 @@ mod tests {
             op: MiscOp::Ei,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 }

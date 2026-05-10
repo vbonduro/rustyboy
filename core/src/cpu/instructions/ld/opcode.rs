@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Loads the value of src into dest.
 pub struct Ld8 {
@@ -10,8 +11,8 @@ pub struct Ld8 {
 }
 
 impl OpCode for Ld8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.ld8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.ld8(&self, memory)
     }
 }
 

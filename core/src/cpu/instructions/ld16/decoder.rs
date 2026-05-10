@@ -62,131 +62,132 @@ impl Decoder for Ld16Decoder {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_decode_ld_bc_nn() {
         let decoded = Ld16Decoder.decode(0x01).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_de_nn() {
         let decoded = Ld16Decoder.decode(0x11).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_hl_nn() {
         let decoded = Ld16Decoder.decode(0x21).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_sp_nn() {
         let decoded = Ld16Decoder.decode(0x31).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_nn_sp() {
         let decoded = Ld16Decoder.decode(0x08).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 20);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 20);
     }
 
     #[test]
     fn test_decode_ld_sp_hl() {
         let decoded = Ld16Decoder.decode(0xF9).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_hl_sp_e() {
         let decoded = Ld16Decoder.decode(0xF8).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_bc_a() {
         let decoded = Ld16Decoder.decode(0x02).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_de_a() {
         let decoded = Ld16Decoder.decode(0x12).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_a_bc() {
         let decoded = Ld16Decoder.decode(0x0A).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_a_de() {
         let decoded = Ld16Decoder.decode(0x1A).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_hli_a() {
         let decoded = Ld16Decoder.decode(0x22).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_hld_a() {
         let decoded = Ld16Decoder.decode(0x32).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_a_hli() {
         let decoded = Ld16Decoder.decode(0x2A).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_a_hld() {
         let decoded = Ld16Decoder.decode(0x3A).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_nn_a() {
         let decoded = Ld16Decoder.decode(0xEA).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 16);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 16);
     }
 
     #[test]
     fn test_decode_ld_a_nn() {
         let decoded = Ld16Decoder.decode(0xFA).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 16);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 16);
     }
 
     #[test]
     fn test_decode_ldh_n_a() {
         let decoded = Ld16Decoder.decode(0xE0).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ldh_a_n() {
         let decoded = Ld16Decoder.decode(0xF0).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 
     #[test]
     fn test_decode_ld_c_a() {
         let decoded = Ld16Decoder.decode(0xE2).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_ld_a_c() {
         let decoded = Ld16Decoder.decode(0xF2).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]

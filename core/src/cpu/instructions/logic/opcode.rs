@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// AND A, operand — bitwise AND of A with operand, result stored in A.
 /// Flags: Z = (result == 0), N = 0, H = 1, C = 0
@@ -10,8 +11,8 @@ pub struct And8 {
 }
 
 impl OpCode for And8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.and8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.and8(&self, memory)
     }
 }
 
@@ -23,8 +24,8 @@ pub struct Or8 {
 }
 
 impl OpCode for Or8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.or8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.or8(&self, memory)
     }
 }
 
@@ -36,8 +37,8 @@ pub struct Xor8 {
 }
 
 impl OpCode for Xor8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.xor8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.xor8(&self, memory)
     }
 }
 

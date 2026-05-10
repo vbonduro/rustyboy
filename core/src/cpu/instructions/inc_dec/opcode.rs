@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Increments an 8-bit register or memory location at (HL).
 /// Affects Z (set if result is 0), N=0, H (set if carry from bit 3). C is NOT affected.
@@ -10,8 +11,8 @@ pub struct Inc8 {
 }
 
 impl OpCode for Inc8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.inc8(self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.inc8(self, memory)
     }
 }
 
@@ -23,8 +24,8 @@ pub struct Dec8 {
 }
 
 impl OpCode for Dec8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.dec8(self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.dec8(self, memory)
     }
 }
 
@@ -35,7 +36,7 @@ pub struct Inc16 {
 }
 
 impl OpCode for Inc16 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.inc16(self)
     }
 }
@@ -47,7 +48,7 @@ pub struct Dec16 {
 }
 
 impl OpCode for Dec16 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.dec16(self)
     }
 }
@@ -56,6 +57,7 @@ impl OpCode for Dec16 {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     // --- Inc8 tests ---
 
@@ -192,7 +194,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 
@@ -204,7 +206,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 
@@ -216,7 +218,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 
@@ -228,7 +230,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 
@@ -242,7 +244,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 
@@ -254,7 +256,7 @@ mod tests {
             cycles: expected_cycles,
         };
         let mut cpu = FakeCpu::new();
-        let actual_cycles = opcode.execute(&mut cpu).unwrap();
+        let actual_cycles = opcode.execute(&mut cpu, &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, expected_cycles);
     }
 }

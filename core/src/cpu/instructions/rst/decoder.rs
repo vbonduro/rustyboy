@@ -27,12 +27,13 @@ impl Decoder for RstDecoder {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     fn cycles(opcode: u8) -> u8 {
         RstDecoder
             .decode(opcode)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap()
     }
 

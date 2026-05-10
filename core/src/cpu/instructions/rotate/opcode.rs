@@ -1,5 +1,6 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
+use crate::memory::memory::GameBoyMemory;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum RotateOp {
@@ -15,7 +16,7 @@ pub struct Rotate {
 }
 
 impl OpCode for Rotate {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.rotate_accumulator(self)
     }
 }
@@ -24,6 +25,7 @@ impl OpCode for Rotate {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_rlca() {
@@ -31,7 +33,7 @@ mod tests {
             op: RotateOp::Rlca,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -41,7 +43,7 @@ mod tests {
             op: RotateOp::Rla,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -51,7 +53,7 @@ mod tests {
             op: RotateOp::Rrca,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -61,7 +63,7 @@ mod tests {
             op: RotateOp::Rra,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 }

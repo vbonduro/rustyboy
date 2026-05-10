@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::jump::opcode::Condition;
 use crate::cpu::instructions::opcode::OpCode;
+use crate::memory::memory::GameBoyMemory;
 
 #[derive(Debug, PartialEq)]
 pub enum CallOp {
@@ -16,8 +17,8 @@ pub struct Call {
 }
 
 impl OpCode for Call {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.call(self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.call(self, memory)
     }
 }
 
@@ -25,6 +26,7 @@ impl OpCode for Call {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_call_dispatches() {
@@ -32,7 +34,7 @@ mod tests {
             op: CallOp::Call,
             cycles: 24,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new()).unwrap(), 24);
+        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 24);
     }
 
     #[test]
@@ -41,6 +43,6 @@ mod tests {
             op: CallOp::CallCc(Condition::Z),
             cycles: 24,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new()).unwrap(), 24);
+        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 24);
     }
 }

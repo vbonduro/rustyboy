@@ -65,9 +65,6 @@ pub struct Sm83 {
     pub(crate) halted: bool,
     /// Pre-decoded opcode table; built once at construction time.
     opcodes: OpCodeTable,
-    /// Thin raw pointer to GameBoyMemory, valid only during step().
-    /// Set to non-null at the start of step() and cleared before returning.
-    _memory: *mut GameBoyMemory,
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
@@ -84,7 +81,6 @@ impl Sm83 {
             ime: ImeState::Disabled,
             halted: false,
             opcodes: OpCodeTable::from_decoder(&OpCodeDecoder::new()),
-            _memory: core::ptr::null_mut(),
             #[cfg(feature = "trace")]
             trace_hook: None,
             #[cfg(feature = "perf")]
@@ -130,24 +126,21 @@ impl Sm83 {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn has_pending_interrupt(&self) -> bool {
-        let ie = unsafe { (*self._memory).ie() };
-        let if_ = unsafe { (*self._memory).read_io(0xFF0F) };
-        ie & if_ != 0
+    fn has_pending_interrupt(&self, memory: &GameBoyMemory) -> bool {
+        memory.ie() & memory.read_io(0xFF0F) != 0
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn take_pending_interrupt(&mut self) -> Option<u8> {
-        let ie = unsafe { (*self._memory).ie() };
-        let if_ = unsafe { (*self._memory).read_io(0xFF0F) };
+    fn take_pending_interrupt(&mut self, memory: &mut GameBoyMemory) -> Option<u8> {
+        let ie = memory.ie();
+        let if_ = memory.read_io(0xFF0F);
         let pending = ie & if_;
         if pending == 0 {
             return None;
         }
         let bit = pending.trailing_zeros() as u8;
-        // Clear the IF bit in memory
         let new_if = if_ & !(1 << bit);
-        unsafe { (*self._memory).write_io(0xFF0F, new_if); }
+        memory.write_io(0xFF0F, new_if);
         Some(bit)
     }
 
@@ -180,19 +173,19 @@ impl Sm83 {
     // ── Bus access helpers ────────────────────────────────────────────────────
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn bus_read(&self, addr: u16) -> u8 {
-        unsafe { (*self._memory).read_fast(addr) }
+    fn bus_read(&self, memory: &GameBoyMemory, addr: u16) -> u8 {
+        memory.read_fast(addr)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn bus_write(&mut self, addr: u16, val: u8) {
-        unsafe { (*self._memory).write(addr, val).ok(); }
+    fn bus_write(&mut self, memory: &mut GameBoyMemory, addr: u16, val: u8) {
+        memory.write(addr, val).ok();
     }
 
-    fn fetch_byte(&mut self) -> u8 {
+    fn fetch_byte(&mut self, memory: &mut GameBoyMemory) -> u8 {
         let addr = self.registers.pc;
         self.registers.pc = self.registers.pc.wrapping_add(1);
-        self.bus_read(addr)
+        self.bus_read(memory, addr)
     }
 
     // ── Instruction-level step interface ─────────────────────────────────────
@@ -200,22 +193,19 @@ impl Sm83 {
     /// Execute one complete instruction. Returns T-cycles elapsed.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn step(&mut self, memory: &mut GameBoyMemory) -> u32 {
-        self._memory = memory as *mut GameBoyMemory;
-        let t = self.step_inner();
-        self._memory = core::ptr::null_mut();
-        t
+        self.step_inner(memory)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn step_inner(&mut self) -> u32 {
+    fn step_inner(&mut self, memory: &mut GameBoyMemory) -> u32 {
         self.advance_ime();
 
         if self.halted {
-            if self.has_pending_interrupt() {
+            if self.has_pending_interrupt(memory) {
                 self.halted = false;
                 if self.ime == ImeState::Enabled {
-                    if let Some(bit) = self.take_pending_interrupt() {
-                        return self.dispatch_isr(bit);
+                    if let Some(bit) = self.take_pending_interrupt(memory) {
+                        return self.dispatch_isr(memory, bit);
                     }
                 }
                 // IME=false: unhalt, fall through to execute next instruction
@@ -224,17 +214,17 @@ impl Sm83 {
             }
         }
 
-        let opcode = self.fetch_byte();
+        let opcode = self.fetch_byte(memory);
         if opcode == 0xCB {
-            let cb_opcode = self.fetch_byte();
+            let cb_opcode = self.fetch_byte(memory);
             let handler = match self.opcodes.get_cb(cb_opcode) {
                 Ok(h) => h,
                 Err(_) => return 8,
             };
-            let cycles = handler.execute(self).unwrap_or(8) as u32;
+            let cycles = handler.execute(self, memory).unwrap_or(8) as u32;
             if self.ime == ImeState::Enabled {
-                if let Some(bit) = self.take_pending_interrupt() {
-                    return cycles + self.dispatch_isr(bit);
+                if let Some(bit) = self.take_pending_interrupt(memory) {
+                    return cycles + self.dispatch_isr(memory, bit);
                 }
             }
             return cycles;
@@ -244,11 +234,11 @@ impl Sm83 {
             Ok(h) => h,
             Err(_) => return 4,
         };
-        let cycles = handler.execute(self).unwrap_or(4) as u32;
+        let cycles = handler.execute(self, memory).unwrap_or(4) as u32;
         // Post-instruction: check for interrupt dispatch
         if self.ime == ImeState::Enabled {
-            if let Some(bit) = self.take_pending_interrupt() {
-                return cycles + self.dispatch_isr(bit);
+            if let Some(bit) = self.take_pending_interrupt(memory) {
+                return cycles + self.dispatch_isr(memory, bit);
             }
         }
         cycles
@@ -256,12 +246,12 @@ impl Sm83 {
 
     /// Dispatch an interrupt service routine. Returns T-cycles for the ISR dispatch (20).
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn dispatch_isr(&mut self, bit: u8) -> u32 {
+    fn dispatch_isr(&mut self, memory: &mut GameBoyMemory, bit: u8) -> u32 {
         self.ime = ImeState::Disabled;
         let sp = self.registers.sp;
         let pc = self.registers.pc;
-        self.bus_write(sp.wrapping_sub(1), (pc >> 8) as u8);
-        self.bus_write(sp.wrapping_sub(2), pc as u8);
+        self.bus_write(memory, sp.wrapping_sub(1), (pc >> 8) as u8);
+        self.bus_write(memory, sp.wrapping_sub(2), pc as u8);
         self.registers.sp = sp.wrapping_sub(2);
         self.registers.pc = 0x0040u16.wrapping_add((bit as u16) * 8);
         20 // 5 M-cycles = 20 T-cycles
@@ -320,61 +310,61 @@ impl Sm83 {
         }
     }
 
-    fn get_operand8(&mut self, op: &Operand) -> u8 {
+    fn get_operand8(&mut self, op: &Operand, memory: &mut GameBoyMemory) -> u8 {
         match op {
             Operand::Register8(r) => self.get_r8_enum(*r),
             Operand::Memory(Memory::HL) => {
                 let a = self.registers.hl();
-                self.bus_read(a)
+                self.bus_read(memory, a)
             }
             Operand::Memory(Memory::BC) => {
                 let a = self.registers.bc();
-                self.bus_read(a)
+                self.bus_read(memory, a)
             }
             Operand::Memory(Memory::DE) => {
                 let a = self.registers.de();
-                self.bus_read(a)
+                self.bus_read(memory, a)
             }
             Operand::Memory(Memory::HLI) => {
                 let a = self.registers.hl();
-                let v = self.bus_read(a);
+                let v = self.bus_read(memory, a);
                 self.registers.set_hl(a.wrapping_add(1));
                 v
             }
             Operand::Memory(Memory::HLD) => {
                 let a = self.registers.hl();
-                let v = self.bus_read(a);
+                let v = self.bus_read(memory, a);
                 self.registers.set_hl(a.wrapping_sub(1));
                 v
             }
-            Operand::Imm8 | Operand::ImmSigned8 => self.fetch_byte(),
+            Operand::Imm8 | Operand::ImmSigned8 => self.fetch_byte(memory),
             _ => panic!("get_operand8: unsupported {:?}", op),
         }
     }
 
-    fn set_operand8(&mut self, op: &Operand, val: u8) {
+    fn set_operand8(&mut self, op: &Operand, val: u8, memory: &mut GameBoyMemory) {
         match op {
             Operand::Register8(r) => self.set_r8_enum(*r, val),
             Operand::Memory(Memory::HL) => {
                 let a = self.registers.hl();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
             }
             Operand::Memory(Memory::BC) => {
                 let a = self.registers.bc();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
             }
             Operand::Memory(Memory::DE) => {
                 let a = self.registers.de();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
             }
             Operand::Memory(Memory::HLI) => {
                 let a = self.registers.hl();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
                 self.registers.set_hl(a.wrapping_add(1));
             }
             Operand::Memory(Memory::HLD) => {
                 let a = self.registers.hl();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
                 self.registers.set_hl(a.wrapping_sub(1));
             }
             _ => panic!("set_operand8: unsupported {:?}", op),
@@ -390,32 +380,32 @@ impl Sm83 {
         }
     }
 
-    fn pop16_inner(&mut self) -> u16 {
-        let lo = self.bus_read(self.registers.sp);
-        let hi = self.bus_read(self.registers.sp.wrapping_add(1));
+    fn pop16_inner(&mut self, memory: &mut GameBoyMemory) -> u16 {
+        let lo = self.bus_read(memory, self.registers.sp);
+        let hi = self.bus_read(memory, self.registers.sp.wrapping_add(1));
         self.registers.sp = self.registers.sp.wrapping_add(2);
         u16::from_le_bytes([lo, hi])
     }
 
-    fn push16_inner(&mut self, val: u16) {
+    fn push16_inner(&mut self, val: u16, memory: &mut GameBoyMemory) {
         self.registers.sp = self.registers.sp.wrapping_sub(2);
-        self.bus_write(self.registers.sp.wrapping_add(1), (val >> 8) as u8);
-        self.bus_write(self.registers.sp, val as u8);
+        self.bus_write(memory, self.registers.sp.wrapping_add(1), (val >> 8) as u8);
+        self.bus_write(memory, self.registers.sp, val as u8);
     }
 
     // ── CB helpers ────────────────────────────────────────────────────────────
 
-    fn set_cb_result(&mut self, target: CbTarget, val: u8, flags: Flags) {
-        self.write_cb_target(target, val);
+    fn set_cb_result(&mut self, target: CbTarget, val: u8, flags: Flags, memory: &mut GameBoyMemory) {
+        self.write_cb_target(target, val, memory);
         self.registers.f = flags;
     }
 
-    fn write_cb_target(&mut self, target: CbTarget, val: u8) {
+    fn write_cb_target(&mut self, target: CbTarget, val: u8, memory: &mut GameBoyMemory) {
         match target {
             CbTarget::Reg(r) => self.set_r8_enum(r, val),
             CbTarget::HLMem => {
                 let a = self.registers.hl();
-                self.bus_write(a, val);
+                self.bus_write(memory, a, val);
             }
         }
     }
@@ -424,8 +414,8 @@ impl Sm83 {
 // ── Instructions implementation ───────────────────────────────────────────────
 
 impl Instructions for Sm83 {
-    fn add8(&mut self, op: &Add8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn add8(&mut self, op: &Add8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = add_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
@@ -449,16 +439,16 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn add_sp16(&mut self, op: &AddSP16) -> Result<u8, InstructionError> {
-        let e = self.fetch_byte() as i8;
+    fn add_sp16(&mut self, op: &AddSP16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let e = self.fetch_byte(memory) as i8;
         let (res, flags) = add_sp_u16(self.registers.sp, e);
         self.registers.sp = res;
         self.registers.f = flags;
         Ok(op.cycles)
     }
 
-    fn adc(&mut self, op: &Adc) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn adc(&mut self, op: &Adc, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
         let (r, f) = adc_u8(self.registers.a, val, cy);
         self.registers.a = r;
@@ -466,16 +456,16 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn sub8(&mut self, op: &Sub8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn sub8(&mut self, op: &Sub8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = sub_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
         Ok(op.cycles)
     }
 
-    fn sbc8(&mut self, op: &Sbc8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn sbc8(&mut self, op: &Sbc8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
         let (r, f) = sbc_u8(self.registers.a, val, cy);
         self.registers.a = r;
@@ -483,111 +473,111 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn cp8(&mut self, op: &Cp8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn cp8(&mut self, op: &Cp8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         self.registers.f = cp_u8(self.registers.a, val);
         Ok(op.cycles)
     }
 
-    fn ld8(&mut self, op: &Ld8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.src);
-        self.set_operand8(&op.dest, val);
+    fn ld8(&mut self, op: &Ld8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.src, memory);
+        self.set_operand8(&op.dest, val, memory);
         Ok(op.cycles)
     }
 
-    fn ld16(&mut self, op: &Ld16) -> Result<u8, InstructionError> {
+    fn ld16(&mut self, op: &Ld16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             Ld16Op::RrImm16 { dest } => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 self.set_r16_enum(*dest, u16::from_le_bytes([lo, hi]));
             }
             Ld16Op::NnSp => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 let addr = u16::from_le_bytes([lo, hi]);
                 let sp = self.registers.sp;
-                self.bus_write(addr, sp as u8);
-                self.bus_write(addr.wrapping_add(1), (sp >> 8) as u8);
+                self.bus_write(memory, addr, sp as u8);
+                self.bus_write(memory, addr.wrapping_add(1), (sp >> 8) as u8);
             }
             Ld16Op::SpHl => {
                 self.registers.sp = self.registers.hl();
             }
             Ld16Op::HlSpE => {
-                let e = self.fetch_byte() as i8;
+                let e = self.fetch_byte(memory) as i8;
                 let (res, flags) = add_sp_u16(self.registers.sp, e);
                 self.registers.set_hl(res);
                 self.registers.f = flags;
             }
             Ld16Op::BcA => {
                 let a = self.registers.bc();
-                self.bus_write(a, self.registers.a);
+                self.bus_write(memory, a, self.registers.a);
             }
             Ld16Op::DeA => {
                 let a = self.registers.de();
-                self.bus_write(a, self.registers.a);
+                self.bus_write(memory, a, self.registers.a);
             }
             Ld16Op::ABc => {
                 let a = self.registers.bc();
-                self.registers.a = self.bus_read(a);
+                self.registers.a = self.bus_read(memory, a);
             }
             Ld16Op::ADe => {
                 let a = self.registers.de();
-                self.registers.a = self.bus_read(a);
+                self.registers.a = self.bus_read(memory, a);
             }
             Ld16Op::HliA => {
                 let a = self.registers.hl();
-                self.bus_write(a, self.registers.a);
+                self.bus_write(memory, a, self.registers.a);
                 self.registers.set_hl(a.wrapping_add(1));
             }
             Ld16Op::HldA => {
                 let a = self.registers.hl();
-                self.bus_write(a, self.registers.a);
+                self.bus_write(memory, a, self.registers.a);
                 self.registers.set_hl(a.wrapping_sub(1));
             }
             Ld16Op::AHli => {
                 let a = self.registers.hl();
-                self.registers.a = self.bus_read(a);
+                self.registers.a = self.bus_read(memory, a);
                 self.registers.set_hl(a.wrapping_add(1));
             }
             Ld16Op::AHld => {
                 let a = self.registers.hl();
-                self.registers.a = self.bus_read(a);
+                self.registers.a = self.bus_read(memory, a);
                 self.registers.set_hl(a.wrapping_sub(1));
             }
             Ld16Op::NnA => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 let addr = u16::from_le_bytes([lo, hi]);
-                self.bus_write(addr, self.registers.a);
+                self.bus_write(memory, addr, self.registers.a);
             }
             Ld16Op::ANn => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 let addr = u16::from_le_bytes([lo, hi]);
-                self.registers.a = self.bus_read(addr);
+                self.registers.a = self.bus_read(memory, addr);
             }
             Ld16Op::LdhNA => {
-                let n = self.fetch_byte();
-                self.bus_write(0xFF00 | (n as u16), self.registers.a);
+                let n = self.fetch_byte(memory);
+                self.bus_write(memory, 0xFF00 | (n as u16), self.registers.a);
             }
             Ld16Op::LdhAN => {
-                let n = self.fetch_byte();
-                self.registers.a = self.bus_read(0xFF00 | (n as u16));
+                let n = self.fetch_byte(memory);
+                self.registers.a = self.bus_read(memory, 0xFF00 | (n as u16));
             }
             Ld16Op::LdCA => {
                 let c = self.registers.c;
-                self.bus_write(0xFF00 | (c as u16), self.registers.a);
+                self.bus_write(memory, 0xFF00 | (c as u16), self.registers.a);
             }
             Ld16Op::LdAC => {
                 let c = self.registers.c;
-                self.registers.a = self.bus_read(0xFF00 | (c as u16));
+                self.registers.a = self.bus_read(memory, 0xFF00 | (c as u16));
             }
         }
         Ok(op.cycles)
     }
 
-    fn inc8(&mut self, op: &Inc8) -> Result<u8, InstructionError> {
+    fn inc8(&mut self, op: &Inc8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.operand {
             Operand::Register8(r) => {
                 let (v, f) = inc_u8(self.get_r8_enum(*r), self.registers.f);
@@ -596,9 +586,9 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
-                let old = self.bus_read(addr);
+                let old = self.bus_read(memory, addr);
                 let (v, f) = inc_u8(old, self.registers.f);
-                self.bus_write(addr, v);
+                self.bus_write(memory, addr, v);
                 self.registers.f = f;
             }
             _ => return Err(InstructionError::InvalidOperand(alloc::format!("{:?}", op.operand))),
@@ -606,7 +596,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn dec8(&mut self, op: &Dec8) -> Result<u8, InstructionError> {
+    fn dec8(&mut self, op: &Dec8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.operand {
             Operand::Register8(r) => {
                 let (v, f) = dec_u8(self.get_r8_enum(*r), self.registers.f);
@@ -615,9 +605,9 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
-                let old = self.bus_read(addr);
+                let old = self.bus_read(memory, addr);
                 let (v, f) = dec_u8(old, self.registers.f);
-                self.bus_write(addr, v);
+                self.bus_write(memory, addr, v);
                 self.registers.f = f;
             }
             _ => return Err(InstructionError::InvalidOperand(alloc::format!("{:?}", op.operand))),
@@ -665,43 +655,43 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn and8(&mut self, op: &And8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn and8(&mut self, op: &And8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = and_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
         Ok(op.cycles)
     }
 
-    fn or8(&mut self, op: &Or8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn or8(&mut self, op: &Or8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = or_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
         Ok(op.cycles)
     }
 
-    fn xor8(&mut self, op: &Xor8) -> Result<u8, InstructionError> {
-        let val = self.get_operand8(&op.operand);
+    fn xor8(&mut self, op: &Xor8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = xor_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
         Ok(op.cycles)
     }
 
-    fn jump(&mut self, op: &Jump) -> Result<u8, InstructionError> {
+    fn jump(&mut self, op: &Jump, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             JumpOp::Jp => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 self.registers.pc = u16::from_le_bytes([lo, hi]);
             }
             JumpOp::JpHl => {
                 self.registers.pc = self.registers.hl();
             }
             JumpOp::JpCc(cond) => {
-                let lo = self.fetch_byte();
-                let hi = self.fetch_byte();
+                let lo = self.fetch_byte(memory);
+                let hi = self.fetch_byte(memory);
                 if self.check_condition(cond) {
                     self.registers.pc = u16::from_le_bytes([lo, hi]);
                     return Ok(op.cycles); // taken: 16 cycles
@@ -709,11 +699,11 @@ impl Instructions for Sm83 {
                 return Ok(12); // not taken: 12 cycles
             }
             JumpOp::Jr => {
-                let e = self.fetch_byte() as i8 as i16 as u16;
+                let e = self.fetch_byte(memory) as i8 as i16 as u16;
                 self.registers.pc = self.registers.pc.wrapping_add(e);
             }
             JumpOp::JrCc(cond) => {
-                let e = self.fetch_byte() as i8 as i16 as u16;
+                let e = self.fetch_byte(memory) as i8 as i16 as u16;
                 if self.check_condition(cond) {
                     self.registers.pc = self.registers.pc.wrapping_add(e);
                     return Ok(op.cycles); // taken: 12 cycles
@@ -762,7 +752,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn push16(&mut self, op: &Push16) -> Result<u8, InstructionError> {
+    fn push16(&mut self, op: &Push16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let idx = match op.operand {
             Register16::BC => 0,
             Register16::DE => 1,
@@ -771,12 +761,12 @@ impl Instructions for Sm83 {
             Register16::SP => unreachable!("PUSH SP invalid"),
         };
         let val = self.r16stk_get(idx);
-        self.push16_inner(val);
+        self.push16_inner(val, memory);
         Ok(op.cycles)
     }
 
-    fn pop16(&mut self, op: &Pop16) -> Result<u8, InstructionError> {
-        let val = self.pop16_inner();
+    fn pop16(&mut self, op: &Pop16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let val = self.pop16_inner(memory);
         let idx = match op.operand {
             Register16::BC => 0,
             Register16::DE => 1,
@@ -788,9 +778,9 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn call(&mut self, op: &Call) -> Result<u8, InstructionError> {
-        let lo = self.fetch_byte();
-        let hi = self.fetch_byte();
+    fn call(&mut self, op: &Call, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+        let lo = self.fetch_byte(memory);
+        let hi = self.fetch_byte(memory);
         let target = u16::from_le_bytes([lo, hi]);
         let take = match &op.op {
             CallOp::Call => true,
@@ -798,7 +788,7 @@ impl Instructions for Sm83 {
         };
         if take {
             let ret = self.registers.pc;
-            self.push16_inner(ret);
+            self.push16_inner(ret, memory);
             self.registers.pc = target;
             Ok(op.cycles) // taken: 24 cycles
         } else {
@@ -806,22 +796,22 @@ impl Instructions for Sm83 {
         }
     }
 
-    fn ret(&mut self, op: &Ret) -> Result<u8, InstructionError> {
+    fn ret(&mut self, op: &Ret, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             RetOp::Ret => {
-                let addr = self.pop16_inner();
+                let addr = self.pop16_inner(memory);
                 self.registers.pc = addr;
             }
             RetOp::RetCc(cond) => {
                 if self.check_condition(cond) {
-                    let addr = self.pop16_inner();
+                    let addr = self.pop16_inner(memory);
                     self.registers.pc = addr;
                     return Ok(op.cycles); // taken: 20 cycles
                 }
                 return Ok(8); // not taken: 8 cycles
             }
             RetOp::Reti => {
-                let addr = self.pop16_inner();
+                let addr = self.pop16_inner(memory);
                 self.registers.pc = addr;
                 self.ime = ImeState::Enabled; // RETI re-enables immediately (no delay)
             }
@@ -829,31 +819,31 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn rst(&mut self, op: &Rst) -> Result<u8, InstructionError> {
+    fn rst(&mut self, op: &Rst, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let ret = self.registers.pc;
-        self.push16_inner(ret);
+        self.push16_inner(ret, memory);
         self.registers.pc = op.vector as u16;
         Ok(op.cycles)
     }
 
-    fn cb(&mut self, op: &CbInstruction) -> Result<u8, InstructionError> {
+    fn cb(&mut self, op: &CbInstruction, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = match op.target {
             CbTarget::Reg(r) => self.get_r8_enum(r),
             CbTarget::HLMem => {
                 let a = self.registers.hl();
-                self.bus_read(a)
+                self.bus_read(memory, a)
             }
         };
         let carry = self.registers.f.contains(Flags::C);
         match op.op {
-            CbOp::Rlc  => { let (r, f) = rlc_u8(val);       self.set_cb_result(op.target, r, f); }
-            CbOp::Rrc  => { let (r, f) = rrc_u8(val);       self.set_cb_result(op.target, r, f); }
-            CbOp::Rl   => { let (r, f) = rl_u8(val, carry); self.set_cb_result(op.target, r, f); }
-            CbOp::Rr   => { let (r, f) = rr_u8(val, carry); self.set_cb_result(op.target, r, f); }
-            CbOp::Sla  => { let (r, f) = sla_u8(val);       self.set_cb_result(op.target, r, f); }
-            CbOp::Sra  => { let (r, f) = sra_u8(val);       self.set_cb_result(op.target, r, f); }
-            CbOp::Swap => { let (r, f) = swap_u8(val);      self.set_cb_result(op.target, r, f); }
-            CbOp::Srl  => { let (r, f) = srl_u8(val);       self.set_cb_result(op.target, r, f); }
+            CbOp::Rlc  => { let (r, f) = rlc_u8(val);       self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Rrc  => { let (r, f) = rrc_u8(val);       self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Rl   => { let (r, f) = rl_u8(val, carry); self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Rr   => { let (r, f) = rr_u8(val, carry); self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Sla  => { let (r, f) = sla_u8(val);       self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Sra  => { let (r, f) = sra_u8(val);       self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Swap => { let (r, f) = swap_u8(val);      self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Srl  => { let (r, f) = srl_u8(val);       self.set_cb_result(op.target, r, f, memory); }
             CbOp::Bit(b) => {
                 // BIT does not write back; only updates flags
                 let f = bit_u8(val, b, self.registers.f);
@@ -861,11 +851,11 @@ impl Instructions for Sm83 {
             }
             CbOp::Res(b) => {
                 let r = res_u8(val, b);
-                self.write_cb_target(op.target, r);
+                self.write_cb_target(op.target, r, memory);
             }
             CbOp::Set(b) => {
                 let r = set_u8(val, b);
-                self.write_cb_target(op.target, r);
+                self.write_cb_target(op.target, r, memory);
             }
         }
         Ok(op.cycles)

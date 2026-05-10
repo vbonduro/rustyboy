@@ -24,32 +24,33 @@ impl Decoder for RotateDecoder {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_decode_rlca() {
         let decoded = RotateDecoder.decode(0x07).unwrap();
-        let actual_cycles = decoded.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
     #[test]
     fn test_decode_rla() {
         let decoded = RotateDecoder.decode(0x17).unwrap();
-        let actual_cycles = decoded.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
     #[test]
     fn test_decode_rrca() {
         let decoded = RotateDecoder.decode(0x0F).unwrap();
-        let actual_cycles = decoded.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
     #[test]
     fn test_decode_rra() {
         let decoded = RotateDecoder.decode(0x1F).unwrap();
-        let actual_cycles = decoded.execute(&mut FakeCpu::new()).unwrap();
+        let actual_cycles = decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
