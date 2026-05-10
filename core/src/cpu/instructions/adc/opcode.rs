@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Adds the value of the operand and the carry flag to the accumulator register (A).
 pub struct Adc {
@@ -9,8 +10,8 @@ pub struct Adc {
 }
 
 impl OpCode for Adc {
-    fn execute(&self, instruction: &mut dyn Instructions) -> Result<u8, Error> {
-        instruction.adc(&self)
+    fn execute(&self, instruction: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        instruction.adc(&self, memory)
     }
 }
 

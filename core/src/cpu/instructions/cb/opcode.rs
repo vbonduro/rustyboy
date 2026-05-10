@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::Register8;
+use crate::memory::memory::GameBoyMemory;
 
 /// The 8 register targets for CB-prefix instructions.
 /// HLMem means read/write through (HL).
@@ -32,8 +33,8 @@ pub struct CbInstruction {
 }
 
 impl OpCode for CbInstruction {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.cb(self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.cb(self, memory)
     }
 }
 
@@ -41,6 +42,7 @@ impl OpCode for CbInstruction {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_dispatches_to_cb() {
@@ -49,7 +51,7 @@ mod tests {
             target: CbTarget::Reg(Register8::B),
             cycles: 8,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
@@ -59,6 +61,6 @@ mod tests {
             target: CbTarget::HLMem,
             cycles: 12,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new()).unwrap(), 12);
+        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
     }
 }

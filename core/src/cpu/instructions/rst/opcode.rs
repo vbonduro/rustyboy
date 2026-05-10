@@ -1,5 +1,6 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
+use crate::memory::memory::GameBoyMemory;
 
 pub struct Rst {
     pub vector: u8,
@@ -7,8 +8,8 @@ pub struct Rst {
 }
 
 impl OpCode for Rst {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.rst(self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.rst(self, memory)
     }
 }
 
@@ -16,6 +17,7 @@ impl OpCode for Rst {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_rst_dispatches() {
@@ -23,6 +25,6 @@ mod tests {
             vector: 0x08,
             cycles: 16,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new()).unwrap(), 16);
+        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 16);
     }
 }

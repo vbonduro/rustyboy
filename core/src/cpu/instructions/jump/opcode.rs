@@ -1,5 +1,6 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
+use crate::memory::memory::GameBoyMemory;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Condition {
@@ -30,8 +31,8 @@ pub struct Jump {
 }
 
 impl OpCode for Jump {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.jump(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.jump(&self, memory)
     }
 }
 
@@ -39,6 +40,7 @@ impl OpCode for Jump {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_execute_jp_dispatches_to_jump() {
@@ -46,7 +48,7 @@ mod tests {
             op: JumpOp::Jp,
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -56,7 +58,7 @@ mod tests {
             op: JumpOp::JpHl,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -66,7 +68,7 @@ mod tests {
             op: JumpOp::JpCc(Condition::NZ),
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -76,7 +78,7 @@ mod tests {
             op: JumpOp::Jr,
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -86,7 +88,7 @@ mod tests {
             op: JumpOp::JrCc(Condition::Z),
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new()).unwrap();
+        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
         assert_eq!(cycles, 12);
     }
 }

@@ -69,13 +69,14 @@ impl Decoder for JumpDecoder {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_decode_jp_nn() {
         let cycles = JumpDecoder
             .decode(0xC3)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 16);
     }
@@ -85,7 +86,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0xE9)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 4);
     }
@@ -95,7 +96,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0xC2)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 16);
     }
@@ -105,7 +106,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0xCA)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 16);
     }
@@ -115,7 +116,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0xD2)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 16);
     }
@@ -125,7 +126,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0xDA)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 16);
     }
@@ -135,7 +136,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0x18)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 12);
     }
@@ -145,7 +146,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0x20)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 12);
     }
@@ -155,7 +156,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0x28)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 12);
     }
@@ -165,7 +166,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0x30)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 12);
     }
@@ -175,7 +176,7 @@ mod tests {
         let cycles = JumpDecoder
             .decode(0x38)
             .unwrap()
-            .execute(&mut FakeCpu::new())
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
             .unwrap();
         assert_eq!(cycles, 12);
     }

@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Compares the accumulator register (A) with the operand by performing A - operand.
 /// The result is discarded but flags are set as if the subtraction occurred.
@@ -10,8 +11,8 @@ pub struct Cp8 {
 }
 
 impl OpCode for Cp8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.cp8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.cp8(&self, memory)
     }
 }
 

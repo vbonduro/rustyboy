@@ -113,10 +113,11 @@ mod tests {
     #[test]
     fn test_all_misc_cycles_are_4() {
         use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
         let opcodes = [0x00u8, 0x10, 0x27, 0x2F, 0x37, 0x3F, 0x76, 0xF3, 0xFB];
         for &op in &opcodes {
             let decoded = MiscDecoder.decode(op).unwrap();
-            let cycles = decoded.execute(&mut FakeCpu::new()).unwrap();
+            let cycles = decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
             assert_eq!(cycles, 4, "opcode 0x{:02X} should be 4 cycles", op);
         }
     }

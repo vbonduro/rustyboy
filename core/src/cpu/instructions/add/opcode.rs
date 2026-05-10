@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Adds the value of the operand to the accumulator register (A).
 pub struct Add8 {
@@ -9,8 +10,8 @@ pub struct Add8 {
 }
 
 impl OpCode for Add8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.add8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.add8(&self, memory)
     }
 }
 
@@ -21,7 +22,7 @@ pub struct Add16 {
 }
 
 impl OpCode for Add16 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
+    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.add16(&self)
     }
 }
@@ -33,8 +34,8 @@ pub struct AddSP16 {
 }
 
 impl OpCode for AddSP16 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.add_sp16(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.add_sp16(&self, memory)
     }
 }
 

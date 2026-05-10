@@ -15,6 +15,7 @@ use super::rst::opcode::Rst;
 use super::sbc::opcode::Sbc8;
 use super::stack::opcode::{Pop16, Push16};
 use super::sub::opcode::Sub8;
+use crate::memory::memory::GameBoyMemory;
 use alloc::string::String;
 use core::fmt;
 
@@ -36,31 +37,33 @@ impl fmt::Display for Error {
 }
 /// This trait includes all of the various instructions that a Gameboy CPU must implement.
 pub trait Instructions {
-    fn add8(&mut self, opcode: &Add8) -> Result<u8, Error>;
+    // Bus-touching instructions receive memory as a parameter.
+    fn add8(&mut self, opcode: &Add8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn add_sp16(&mut self, opcode: &AddSP16, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn adc(&mut self, opcode: &Adc, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn sub8(&mut self, opcode: &Sub8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn sbc8(&mut self, opcode: &Sbc8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn cp8(&mut self, opcode: &Cp8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn ld8(&mut self, opcode: &Ld8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn ld16(&mut self, opcode: &Ld16, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn inc8(&mut self, opcode: &Inc8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn dec8(&mut self, opcode: &Dec8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn and8(&mut self, opcode: &And8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn or8(&mut self, opcode: &Or8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn xor8(&mut self, opcode: &Xor8, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn jump(&mut self, opcode: &Jump, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn push16(&mut self, opcode: &Push16, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn pop16(&mut self, opcode: &Pop16, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn call(&mut self, opcode: &Call, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn ret(&mut self, opcode: &Ret, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn rst(&mut self, opcode: &Rst, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    fn cb(&mut self, opcode: &CbInstruction, memory: &mut GameBoyMemory) -> Result<u8, Error>;
+    // Pure register — no memory access.
     fn add16(&mut self, opcode: &Add16) -> Result<u8, Error>;
-    fn add_sp16(&mut self, opcode: &AddSP16) -> Result<u8, Error>;
-    fn adc(&mut self, opcode: &Adc) -> Result<u8, Error>;
-    fn sub8(&mut self, opcode: &Sub8) -> Result<u8, Error>;
-    fn sbc8(&mut self, opcode: &Sbc8) -> Result<u8, Error>;
-    fn cp8(&mut self, opcode: &Cp8) -> Result<u8, Error>;
-    fn ld8(&mut self, opcode: &Ld8) -> Result<u8, Error>;
-    fn ld16(&mut self, opcode: &Ld16) -> Result<u8, Error>;
-    fn inc8(&mut self, opcode: &Inc8) -> Result<u8, Error>;
-    fn dec8(&mut self, opcode: &Dec8) -> Result<u8, Error>;
     fn inc16(&mut self, opcode: &Inc16) -> Result<u8, Error>;
     fn dec16(&mut self, opcode: &Dec16) -> Result<u8, Error>;
     fn rotate_accumulator(&mut self, opcode: &Rotate) -> Result<u8, Error>;
-    fn and8(&mut self, opcode: &And8) -> Result<u8, Error>;
-    fn or8(&mut self, opcode: &Or8) -> Result<u8, Error>;
-    fn xor8(&mut self, opcode: &Xor8) -> Result<u8, Error>;
-    fn jump(&mut self, opcode: &Jump) -> Result<u8, Error>;
     fn misc(&mut self, opcode: &Misc) -> Result<u8, Error>;
-    fn push16(&mut self, opcode: &Push16) -> Result<u8, Error>;
-    fn pop16(&mut self, opcode: &Pop16) -> Result<u8, Error>;
-    fn call(&mut self, opcode: &Call) -> Result<u8, Error>;
-    fn ret(&mut self, opcode: &Ret) -> Result<u8, Error>;
-    fn rst(&mut self, opcode: &Rst) -> Result<u8, Error>;
-    fn cb(&mut self, opcode: &CbInstruction) -> Result<u8, Error>;
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use crate::cpu::instructions::instructions::{Error, Instructions};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use crate::memory::memory::GameBoyMemory;
 
 /// Subtracts the value of the operand from the accumulator register (A).
 pub struct Sub8 {
@@ -9,8 +10,8 @@ pub struct Sub8 {
 }
 
 impl OpCode for Sub8 {
-    fn execute(&self, cpu: &mut dyn Instructions) -> Result<u8, Error> {
-        cpu.sub8(&self)
+    fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+        cpu.sub8(&self, memory)
     }
 }
 

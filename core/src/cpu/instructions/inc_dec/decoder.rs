@@ -77,6 +77,7 @@ impl Decoder for Dec16Decoder {
 mod tests {
     use super::*;
     use crate::cpu::instructions::test::util::FakeCpu;
+    use crate::memory::memory::GameBoyMemory;
 
     #[test]
     fn test_decode_inc8_b() {
@@ -171,25 +172,25 @@ mod tests {
     #[test]
     fn test_decode_inc16_bc() {
         let decoded = Inc16Decoder.decode(0x03).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_de() {
         let decoded = Inc16Decoder.decode(0x13).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_hl() {
         let decoded = Inc16Decoder.decode(0x23).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_inc16_sp() {
         let decoded = Inc16Decoder.decode(0x33).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
@@ -200,25 +201,25 @@ mod tests {
     #[test]
     fn test_decode_dec16_bc() {
         let decoded = Dec16Decoder.decode(0x0B).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_de() {
         let decoded = Dec16Decoder.decode(0x1B).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_hl() {
         let decoded = Dec16Decoder.decode(0x2B).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
     fn test_decode_dec16_sp() {
         let decoded = Dec16Decoder.decode(0x3B).unwrap();
-        assert_eq!(decoded.execute(&mut FakeCpu::new()).unwrap(), 8);
+        assert_eq!(decoded.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
     }
 
     #[test]
