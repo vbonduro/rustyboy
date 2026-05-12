@@ -12,58 +12,42 @@ use embassy_rp::peripherals::CORE1;
 use embassy_rp::Peri;
 use heapless::mpmc::MpMcQueue;
 use rustyboy_core::cpu::cpu::CpuError;
-use rustyboy_core::cpu::peripheral::joypad::Button;
-use rustyboy_core::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
-use rustyboy_core::cpu::registers::{Flags, Registers};
-use rustyboy_core::cpu::save_state::{PpuState, SaveState};
-use rustyboy_core::gameboy::{
-    GameBoyFrontend, GameBoyWorker, WorkerCommand, WorkerFrontendState, WorkerLink,
-};
-use rustyboy_core::memory::cartridge::Cartridge;
-use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
-
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::peripheral::apu::ApuPerfProfile;
+use rustyboy_core::cpu::peripheral::apu::ApuPeripheral;
+use rustyboy_core::cpu::peripheral::joypad::Button;
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::peripheral::ppu::PpuPerfProfile;
+use rustyboy_core::cpu::peripheral::ppu::{PpuPeripheral, FRAMEBUFFER_SIZE};
+use rustyboy_core::cpu::registers::{Flags, Registers};
+use rustyboy_core::cpu::save_state::{PpuState, SaveState};
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::sm83::Sm83PerfProfile;
 #[cfg(feature = "perf")]
 use rustyboy_core::gameboy::FrontendPerfProfile;
+use rustyboy_core::gameboy::{GameBoyFrontend, WorkerCommand, WorkerFrontendState, WorkerLink};
+use rustyboy_core::memory::cartridge::Cartridge;
 #[cfg(feature = "perf")]
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
+use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
 const CORE1_STACK_SIZE: usize = 8192;
-const COMMAND_QUEUE_CAPACITY: usize = 1024;
 const AUDIO_QUEUE_CAPACITY: usize = 4096;
-const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
+const APU_ADVANCE_BATCH_CYCLES: u16 = 256;
+const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
+const NR52_ADDR: u16 = 0xFF26;
+const LY_ADDR: u16 = 0xFF44;
+const STAT_ADDR: u16 = 0xFF41;
+const VBLANK_INTERRUPT_BIT: u8 = 0;
+const STAT_INTERRUPT_BIT: u8 = 1;
+const PPU_IO_LEN: usize = 0x80;
+const PPU_VRAM_LEN: usize = 0x2000;
+const PPU_OAM_LEN: usize = 0xA0;
+const LY_IO_OFFSET: usize = (LY_ADDR - 0xFF00) as usize;
+const STAT_IO_OFFSET: usize = (STAT_ADDR - 0xFF00) as usize;
 
-static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
-static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
 static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
-
-#[derive(Clone, Copy)]
-enum Core1Command {
-    Worker(WorkerCommand),
-    SyncApu {
-        ticket: u32,
-    },
-    SyncPpu {
-        ticket: u32,
-    },
-    LoadPpuState {
-        ticket: u32,
-        state: PpuState,
-    },
-    #[cfg(feature = "perf")]
-    TakeApuPerfProfile {
-        ticket: u32,
-    },
-    #[cfg(feature = "perf")]
-    TakePpuPerfProfile {
-        ticket: u32,
-    },
-}
+static SHARED_RUNTIME: SharedRuntime = SharedRuntime::new();
 
 #[derive(Clone, Copy, Default)]
 pub struct TransportProfile {
@@ -78,91 +62,160 @@ pub struct TransportProfile {
     pub audio_queue_drops: u32,
 }
 
-struct PpuSnapshot {
-    io: [u8; 0x80],
-    vram: [u8; 0x2000],
-    oam: [u8; 0xA0],
+struct SharedApuLive {
+    apu: ApuPeripheral,
 }
 
-impl PpuSnapshot {
-    const fn new() -> Self {
+impl SharedApuLive {
+    fn new() -> Self {
         Self {
-            io: [0; 0x80],
-            vram: [0; 0x2000],
-            oam: [0; 0xA0],
+            apu: ApuPeripheral::new(),
         }
+    }
+
+    fn read_nr52(&self) -> u8 {
+        self.apu.read_register(NR52_ADDR)
+    }
+
+    fn write_register(&mut self, addr: u16, value: u8) -> u8 {
+        self.apu.write_register(addr, value);
+        self.read_nr52()
+    }
+
+    fn write_wave_ram(&mut self, offset: u8, value: u8) {
+        self.apu.write_wave_ram(offset, value);
+    }
+
+    fn sync_from_io_snapshot(&mut self, io: &[u8]) -> u8 {
+        self.apu.sync_from_io_snapshot(io);
+        self.read_nr52()
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn advance(&mut self, cycles: u16, div_counter: u16, out: &mut Vec<i16>) -> u8 {
+        let output = self.apu.tick(cycles, div_counter);
+        self.apu.drain_samples_into(out);
+        output.nr52
+    }
+
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> ApuPerfProfile {
+        self.apu.take_perf_profile()
     }
 }
 
-struct SharedWorkerState {
-    sync_snapshot: Mutex<RefCell<PpuSnapshot>>,
-    live_ppu_snapshot: Mutex<RefCell<PpuSnapshot>>,
+#[derive(Clone, Copy)]
+struct SharedPpuAdvanceOutput {
+    ly: u8,
+    stat: u8,
+    if_bits: u8,
+    frame_ready: bool,
+}
+
+struct SharedPpuCore {
+    ppu: PpuPeripheral,
+}
+
+impl SharedPpuCore {
+    fn new() -> Self {
+        Self {
+            ppu: PpuPeripheral::new(),
+        }
+    }
+
+    fn sync_state(&mut self, io: &[u8]) -> u8 {
+        self.ppu.clear_framebuffer();
+        self.ppu.sync_prev_stat_line(io);
+        self.ppu.ly()
+    }
+
+    fn load_state(&mut self, state: PpuState, io: &[u8]) -> u8 {
+        self.ppu.load_state(state);
+        self.ppu.sync_prev_stat_line(io);
+        self.ppu.ly()
+    }
+
+    fn snapshot(&self, io: &[u8]) -> PpuState {
+        self.ppu.to_save_state(io)
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn advance(
+        &mut self,
+        cycles: u16,
+        io: &mut [u8; PPU_IO_LEN],
+        vram: &[u8; PPU_VRAM_LEN],
+        oam: &[u8; PPU_OAM_LEN],
+    ) -> SharedPpuAdvanceOutput {
+        let output = self.ppu.tick(cycles, io, vram, oam);
+        let mut if_bits = 0u8;
+        if output.vblank_interrupt {
+            if_bits |= 1 << VBLANK_INTERRUPT_BIT;
+        }
+        if output.stat_interrupt {
+            if_bits |= 1 << STAT_INTERRUPT_BIT;
+        }
+        SharedPpuAdvanceOutput {
+            ly: io[LY_IO_OFFSET],
+            stat: io[STAT_IO_OFFSET],
+            if_bits,
+            frame_ready: output.vblank_interrupt,
+        }
+    }
+
+    fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
+        self.ppu.framebuffer()
+    }
+
+    #[cfg(feature = "perf")]
+    fn take_perf_profile(&mut self) -> PpuPerfProfile {
+        self.ppu.take_perf_profile()
+    }
+}
+
+struct SharedRuntime {
+    apu: Mutex<RefCell<Option<SharedApuLive>>>,
+    ppu: Mutex<RefCell<Option<SharedPpuCore>>>,
+    ppu_io: Mutex<RefCell<[u8; PPU_IO_LEN]>>,
+    ppu_vram: Mutex<RefCell<[u8; PPU_VRAM_LEN]>>,
+    ppu_oam: Mutex<RefCell<[u8; PPU_OAM_LEN]>>,
     frame_slots: [Mutex<RefCell<[u8; FRAMEBUFFER_SIZE]>>; 2],
     published_frame: AtomicUsize,
     published_frame_seq: AtomicU32,
-    sync_complete: AtomicU32,
+    pending_apu_cycles: AtomicU32,
+    pending_apu_div_counter: AtomicU32,
+    pending_ppu_cycles: AtomicU32,
     audio_queue_drops: AtomicU32,
     apu_nr52: AtomicU8,
     ppu_ly: AtomicU8,
     ppu_stat: AtomicU8,
     pending_if_bits: AtomicU8,
-    ppu_render_version: AtomicU32,
-    ppu_state: Mutex<RefCell<PpuState>>,
-    #[cfg(feature = "perf")]
-    apu_perf: Mutex<RefCell<ApuPerfProfile>>,
-    #[cfg(feature = "perf")]
-    ppu_perf: Mutex<RefCell<PpuPerfProfile>>,
 }
 
-impl SharedWorkerState {
+impl SharedRuntime {
     const fn new() -> Self {
         Self {
-            sync_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
-            live_ppu_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
+            apu: Mutex::new(RefCell::new(None)),
+            ppu: Mutex::new(RefCell::new(None)),
+            ppu_io: Mutex::new(RefCell::new([0; PPU_IO_LEN])),
+            ppu_vram: Mutex::new(RefCell::new([0; PPU_VRAM_LEN])),
+            ppu_oam: Mutex::new(RefCell::new([0; PPU_OAM_LEN])),
             frame_slots: [
                 Mutex::new(RefCell::new([0; FRAMEBUFFER_SIZE])),
                 Mutex::new(RefCell::new([0; FRAMEBUFFER_SIZE])),
             ],
             published_frame: AtomicUsize::new(0),
             published_frame_seq: AtomicU32::new(0),
-            sync_complete: AtomicU32::new(0),
+            pending_apu_cycles: AtomicU32::new(0),
+            pending_apu_div_counter: AtomicU32::new(0),
+            pending_ppu_cycles: AtomicU32::new(0),
             audio_queue_drops: AtomicU32::new(0),
             apu_nr52: AtomicU8::new(0),
             ppu_ly: AtomicU8::new(0),
             ppu_stat: AtomicU8::new(0),
             pending_if_bits: AtomicU8::new(0),
-            ppu_render_version: AtomicU32::new(0),
-            ppu_state: Mutex::new(RefCell::new(PpuState {
-                dot: 0,
-                ly: 0,
-                mode: rustyboy_core::cpu::peripheral::ppu::PpuMode::OamScan,
-                window_line_counter: 0,
-                lcdc: 0,
-                stat: 0,
-                scy: 0,
-                scx: 0,
-                lyc: 0,
-                bgp: 0,
-                obp0: 0,
-                obp1: 0,
-                wy: 0,
-                wx: 0,
-            })),
-            #[cfg(feature = "perf")]
-            apu_perf: Mutex::new(RefCell::new(ApuPerfProfile {
-                frame_seq: 0,
-                pulse: 0,
-                wave: 0,
-                noise: 0,
-                mix: 0,
-            })),
-            #[cfg(feature = "perf")]
-            ppu_perf: Mutex::new(RefCell::new(PpuPerfProfile {
-                render_bg: 0,
-                render_window: 0,
-                render_sprites: 0,
-                build_stat: 0,
-            })),
         }
     }
 
@@ -174,15 +227,6 @@ impl SharedWorkerState {
         });
     }
 
-    fn publish_frame(&self, worker: &mut GameBoyWorker, slot: usize) {
-        critical_section::with(|cs| {
-            let mut frame = self.frame_slots[slot].borrow(cs).borrow_mut();
-            worker.copy_framebuffer(&mut *frame);
-        });
-        self.published_frame.store(slot, Ordering::Release);
-        self.published_frame_seq.fetch_add(1, Ordering::AcqRel);
-    }
-
     fn clear_published_frames(&self) {
         critical_section::with(|cs| {
             self.frame_slots[0].borrow(cs).borrow_mut().fill(0);
@@ -191,79 +235,27 @@ impl SharedWorkerState {
         self.published_frame.store(0, Ordering::Release);
         self.published_frame_seq.store(0, Ordering::Release);
     }
-
-    fn publish_frontend_state(&self, state: WorkerFrontendState) {
-        self.apu_nr52.store(state.apu_nr52, Ordering::Release);
-        self.ppu_ly.store(state.ppu_ly, Ordering::Release);
-        self.ppu_stat.store(state.ppu_stat, Ordering::Release);
-        if state.if_bits != 0 {
-            self.pending_if_bits
-                .fetch_or(state.if_bits, Ordering::AcqRel);
-        }
-    }
-
-    fn copy_live_ppu_snapshot(&self, io: &[u8], vram: &[u8], oam: &[u8]) {
-        critical_section::with(|cs| {
-            let mut snapshot = self.live_ppu_snapshot.borrow(cs).borrow_mut();
-            snapshot.io.copy_from_slice(&io[..0x80]);
-            snapshot.vram.copy_from_slice(&vram[..0x2000]);
-            snapshot.oam.copy_from_slice(&oam[..0xA0]);
-        });
-        self.ppu_render_version.store(0, Ordering::Release);
-    }
-
-    fn write_live_vram_range(&self, start_offset: u16, data: &[u8]) {
-        critical_section::with(|cs| {
-            let mut snapshot = self.live_ppu_snapshot.borrow(cs).borrow_mut();
-            let start = start_offset as usize;
-            let len = data.len().min(snapshot.vram.len().saturating_sub(start));
-            snapshot.vram[start..start + len].copy_from_slice(&data[..len]);
-        });
-        self.ppu_render_version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn write_live_oam_range(&self, start_offset: u16, data: &[u8]) {
-        critical_section::with(|cs| {
-            let mut snapshot = self.live_ppu_snapshot.borrow(cs).borrow_mut();
-            let start = start_offset as usize;
-            let len = data.len().min(snapshot.oam.len().saturating_sub(start));
-            snapshot.oam[start..start + len].copy_from_slice(&data[..len]);
-        });
-        self.ppu_render_version.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn write_live_ppu_register(&self, addr: u16, value: u8) {
-        if !(0xFF00..=0xFF7F).contains(&addr) {
-            return;
-        }
-        critical_section::with(|cs| {
-            self.live_ppu_snapshot.borrow(cs).borrow_mut().io[(addr - 0xFF00) as usize] = value;
-        });
-    }
-
-    fn snapshot_ppu_state(&self) -> PpuState {
-        critical_section::with(|cs| *self.ppu_state.borrow(cs).borrow())
-    }
 }
 
-#[derive(Clone, Copy)]
-struct PendingApuAdvance {
-    cycles: u16,
-    div_counter: u16,
-}
-
-#[derive(Clone, Copy)]
-struct PendingPpuAdvance {
-    cycles: u16,
+fn take_pending_cycles(counter: &AtomicU32, max_batch: u16) -> u16 {
+    loop {
+        let pending = counter.load(Ordering::Acquire);
+        if pending == 0 {
+            return 0;
+        }
+        let take = pending.min(max_batch as u32);
+        if counter
+            .compare_exchange_weak(pending, pending - take, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return take as u16;
+        }
+    }
 }
 
 struct Core1WorkerLink {
-    command_tx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
     audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
-    shared: &'static SharedWorkerState,
-    pending_apu: Option<PendingApuAdvance>,
-    pending_ppu: Option<PendingPpuAdvance>,
-    next_ticket: u32,
+    shared: &'static SharedRuntime,
     last_frame_seq: u32,
     last_profile_frame_seq: u32,
     transport_profile: TransportProfile,
@@ -271,150 +263,49 @@ struct Core1WorkerLink {
 
 impl Core1WorkerLink {
     fn new(core1: Peri<'static, CORE1>) -> Self {
-        let shared = &SHARED_WORKER_STATE;
-        let command_tx = &COMMAND_QUEUE;
+        let shared = &SHARED_RUNTIME;
         let audio_rx = &AUDIO_QUEUE;
         let core1_stack = Box::leak(Box::new(Stack::<CORE1_STACK_SIZE>::new()));
-        let worker = Box::leak(Box::new(GameBoyWorker::new()));
         let audio_scratch = Box::leak(Box::new(Vec::with_capacity(2048)));
+        let ppu_io_scratch = Box::leak(Box::new([0u8; PPU_IO_LEN]));
+        let ppu_vram_scratch = Box::leak(Box::new([0u8; PPU_VRAM_LEN]));
+        let ppu_oam_scratch = Box::leak(Box::new([0u8; PPU_OAM_LEN]));
+
+        while audio_rx.dequeue().is_some() {}
+        critical_section::with(|cs| {
+            *shared.apu.borrow(cs).borrow_mut() = Some(SharedApuLive::new());
+            *shared.ppu.borrow(cs).borrow_mut() = Some(SharedPpuCore::new());
+        });
+        shared.pending_apu_cycles.store(0, Ordering::Release);
+        shared.pending_apu_div_counter.store(0, Ordering::Release);
+        shared.pending_ppu_cycles.store(0, Ordering::Release);
+        shared.audio_queue_drops.store(0, Ordering::Release);
+        shared.apu_nr52.store(0, Ordering::Release);
+        shared.ppu_ly.store(0, Ordering::Release);
+        shared.ppu_stat.store(0, Ordering::Release);
+        shared.pending_if_bits.store(0, Ordering::Release);
+        shared.clear_published_frames();
 
         info!("spawning core1 worker");
         let shared_for_core1 = shared;
         multicore::spawn_core1(core1, core1_stack, move || {
             run_core1_worker(
-                command_tx,
                 audio_rx,
                 shared_for_core1,
-                worker,
                 audio_scratch,
+                ppu_io_scratch,
+                ppu_vram_scratch,
+                ppu_oam_scratch,
             )
         });
         info!("core1 worker spawned");
 
         Self {
-            command_tx,
             audio_rx,
             shared,
-            pending_apu: None,
-            pending_ppu: None,
-            next_ticket: 1,
             last_frame_seq: 0,
             last_profile_frame_seq: 0,
             transport_profile: TransportProfile::default(),
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn enqueue_blocking(&mut self, command: Core1Command) {
-        let mut command = command;
-        loop {
-            match self.command_tx.enqueue(command) {
-                Ok(()) => {
-                    self.transport_profile.command_enqueues =
-                        self.transport_profile.command_enqueues.wrapping_add(1);
-                    asm::sev();
-                    return;
-                }
-                Err(returned) => {
-                    command = returned;
-                    self.transport_profile.command_queue_spins =
-                        self.transport_profile.command_queue_spins.wrapping_add(1);
-                    core::hint::spin_loop();
-                }
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn flush_pending_apu(&mut self) {
-        if let Some(pending) = self.pending_apu.take() {
-            self.transport_profile.apu_commands =
-                self.transport_profile.apu_commands.wrapping_add(1);
-            self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvanceApu {
-                cycles: pending.cycles,
-                div_counter: pending.div_counter,
-            }));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn queue_pending_apu(&mut self, cycles: u16, div_counter: u16) {
-        match self.pending_apu {
-            Some(mut pending) => {
-                let total = pending.cycles as u32 + cycles as u32;
-                if total > u16::MAX as u32 {
-                    self.flush_pending_apu();
-                    self.pending_apu = Some(PendingApuAdvance {
-                        cycles,
-                        div_counter,
-                    });
-                } else {
-                    pending.cycles = total as u16;
-                    pending.div_counter = div_counter;
-                    self.pending_apu = Some(pending);
-                }
-            }
-            None => {
-                self.pending_apu = Some(PendingApuAdvance {
-                    cycles,
-                    div_counter,
-                });
-            }
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn flush_pending_ppu(&mut self) {
-        if let Some(pending) = self.pending_ppu.take() {
-            self.transport_profile.ppu_advance_commands =
-                self.transport_profile.ppu_advance_commands.wrapping_add(1);
-            self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvancePpu {
-                cycles: pending.cycles,
-            }));
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    #[inline(always)]
-    fn queue_pending_ppu(&mut self, cycles: u16) {
-        match self.pending_ppu {
-            Some(mut pending) => {
-                let total = pending.cycles as u32 + cycles as u32;
-                if total >= PPU_ADVANCE_BATCH_CYCLES as u32 || total > u16::MAX as u32 {
-                    self.flush_pending_ppu();
-                    self.pending_ppu = Some(PendingPpuAdvance { cycles });
-                } else {
-                    pending.cycles = total as u16;
-                    self.pending_ppu = Some(pending);
-                }
-            }
-            None => {
-                if cycles >= PPU_ADVANCE_BATCH_CYCLES {
-                    self.transport_profile.ppu_advance_commands =
-                        self.transport_profile.ppu_advance_commands.wrapping_add(1);
-                    self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvancePpu {
-                        cycles,
-                    }));
-                } else {
-                    self.pending_ppu = Some(PendingPpuAdvance { cycles });
-                }
-            }
-        }
-    }
-
-    fn issue_ticket(&mut self) -> u32 {
-        let ticket = self.next_ticket.max(1);
-        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
-        ticket
-    }
-
-    fn wait_for_ticket(&self, ticket: u32) {
-        while self.shared.sync_complete.load(Ordering::Acquire) != ticket {
-            core::hint::spin_loop();
         }
     }
 
@@ -436,23 +327,62 @@ impl WorkerLink for Core1WorkerLink {
             WorkerCommand::AdvanceApu {
                 cycles,
                 div_counter,
-            } => self.queue_pending_apu(cycles, div_counter),
-            WorkerCommand::AdvancePpu { cycles } => self.queue_pending_ppu(cycles),
-            WorkerCommand::WriteApuRegister { .. } | WorkerCommand::WriteWaveRam { .. } => {
-                self.flush_pending_apu();
+            } => {
+                self.shared
+                    .pending_apu_div_counter
+                    .store(div_counter as u32, Ordering::Release);
+                let prev_pending = self
+                    .shared
+                    .pending_apu_cycles
+                    .fetch_add(cycles as u32, Ordering::AcqRel);
                 self.transport_profile.apu_commands =
                     self.transport_profile.apu_commands.wrapping_add(1);
-                self.enqueue_blocking(Core1Command::Worker(command));
+                if prev_pending == 0 {
+                    asm::sev();
+                }
             }
-            WorkerCommand::WritePpuRegister { .. } => {
-                self.flush_pending_ppu();
-                self.transport_profile.ppu_register_writes =
-                    self.transport_profile.ppu_register_writes.wrapping_add(1);
-                self.enqueue_blocking(Core1Command::Worker(command));
+            WorkerCommand::AdvancePpu { cycles } => {
+                let prev_pending = self
+                    .shared
+                    .pending_ppu_cycles
+                    .fetch_add(cycles as u32, Ordering::AcqRel);
+                self.transport_profile.ppu_advance_commands =
+                    self.transport_profile.ppu_advance_commands.wrapping_add(1);
+                if prev_pending == 0 {
+                    asm::sev();
+                }
             }
-            _ => {
-                self.enqueue_blocking(Core1Command::Worker(command));
+            WorkerCommand::WriteApuRegister { addr, value } => {
+                critical_section::with(|cs| {
+                    let nr52 = self
+                        .shared
+                        .apu
+                        .borrow(cs)
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .write_register(addr, value);
+                    self.shared.apu_nr52.store(nr52, Ordering::Release);
+                });
+                self.transport_profile.apu_commands =
+                    self.transport_profile.apu_commands.wrapping_add(1);
             }
+            WorkerCommand::WriteWaveRam { offset, value } => {
+                critical_section::with(|cs| {
+                    self.shared
+                        .apu
+                        .borrow(cs)
+                        .borrow_mut()
+                        .as_mut()
+                        .unwrap()
+                        .write_wave_ram(offset, value);
+                });
+                self.transport_profile.apu_commands =
+                    self.transport_profile.apu_commands.wrapping_add(1);
+            }
+            WorkerCommand::WriteVram { offset, value } => self.write_vram_range(offset, &[value]),
+            WorkerCommand::WriteOam { offset, value } => self.write_oam_range(offset, &[value]),
+            WorkerCommand::WritePpuRegister { addr, value } => self.write_ppu_register(addr, value),
         }
     }
 
@@ -462,12 +392,16 @@ impl WorkerLink for Core1WorkerLink {
         if data.is_empty() {
             return;
         }
-        self.flush_pending_ppu();
-        self.shared.write_live_vram_range(start_offset, data);
+        let start = start_offset as usize;
+        let len = data.len().min(PPU_VRAM_LEN.saturating_sub(start));
+        critical_section::with(|cs| {
+            let mut vram = self.shared.ppu_vram.borrow(cs).borrow_mut();
+            vram[start..start + len].copy_from_slice(&data[..len]);
+        });
         self.transport_profile.ppu_vram_bytes = self
             .transport_profile
             .ppu_vram_bytes
-            .wrapping_add(data.len() as u32);
+            .wrapping_add(len as u32);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -476,25 +410,46 @@ impl WorkerLink for Core1WorkerLink {
         if data.is_empty() {
             return;
         }
-        self.flush_pending_ppu();
-        self.shared.write_live_oam_range(start_offset, data);
+        let start = start_offset as usize;
+        let len = data.len().min(PPU_OAM_LEN.saturating_sub(start));
+        critical_section::with(|cs| {
+            let mut oam = self.shared.ppu_oam.borrow(cs).borrow_mut();
+            oam[start..start + len].copy_from_slice(&data[..len]);
+        });
         self.transport_profile.ppu_oam_bytes = self
             .transport_profile
             .ppu_oam_bytes
-            .wrapping_add(data.len() as u32);
+            .wrapping_add(len as u32);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_ppu_register(&mut self, addr: u16, value: u8) {
-        self.flush_pending_ppu();
-        self.shared.write_live_ppu_register(addr, value);
+        if !(0xFF00..=0xFF7F).contains(&addr) {
+            return;
+        }
+        critical_section::with(|cs| {
+            if addr == LY_ADDR {
+                self.shared
+                    .ppu
+                    .borrow(cs)
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .ppu
+                    .reset_ly();
+                self.shared.ppu_io.borrow(cs).borrow_mut()[LY_IO_OFFSET] = 0;
+            } else {
+                self.shared.ppu_io.borrow(cs).borrow_mut()[(addr - 0xFF00) as usize] = value;
+            }
+        });
+        if addr == LY_ADDR {
+            self.shared.ppu_ly.store(0, Ordering::Release);
+        } else if addr == STAT_ADDR {
+            self.shared.ppu_stat.store(value, Ordering::Release);
+        }
         self.transport_profile.ppu_register_writes =
             self.transport_profile.ppu_register_writes.wrapping_add(1);
-        self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
-            addr,
-            value,
-        }));
     }
 
     fn drain_audio_samples(&mut self) -> Vec<f32> {
@@ -510,7 +465,6 @@ impl WorkerLink for Core1WorkerLink {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn drain_audio_samples_into_i16(&mut self, out: &mut Vec<i16>) {
-        self.flush_pending_apu();
         out.clear();
         while let Some(sample) = self.audio_rx.dequeue() {
             out.push(sample);
@@ -518,56 +472,97 @@ impl WorkerLink for Core1WorkerLink {
     }
 
     fn sync_apu_state(&mut self, io: &[u8]) {
-        self.flush_pending_apu();
+        self.shared.pending_apu_cycles.store(0, Ordering::Release);
         critical_section::with(|cs| {
-            self.shared
-                .sync_snapshot
+            let nr52 = self
+                .shared
+                .apu
                 .borrow(cs)
                 .borrow_mut()
-                .io
-                .copy_from_slice(&io[..0x80]);
+                .as_mut()
+                .unwrap()
+                .sync_from_io_snapshot(io);
+            self.shared.apu_nr52.store(nr52, Ordering::Release);
         });
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::SyncApu { ticket });
-        self.wait_for_ticket(ticket);
     }
 
     fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
-        self.flush_pending_ppu();
+        self.shared.pending_ppu_cycles.store(0, Ordering::Release);
         critical_section::with(|cs| {
-            let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
-            snapshots.io.copy_from_slice(&io[..0x80]);
-            snapshots.vram.copy_from_slice(&vram[..0x2000]);
-            snapshots.oam.copy_from_slice(&oam[..0xA0]);
+            self.shared
+                .ppu_io
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&io[..PPU_IO_LEN]);
+            self.shared
+                .ppu_vram
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&vram[..PPU_VRAM_LEN]);
+            self.shared
+                .ppu_oam
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&oam[..PPU_OAM_LEN]);
+            let mut ppu = self.shared.ppu.borrow(cs).borrow_mut();
+            let ppu = ppu.as_mut().unwrap();
+            let ly = ppu.sync_state(io);
+            self.shared.ppu_io.borrow(cs).borrow_mut()[LY_IO_OFFSET] = ly;
+            self.shared.ppu_ly.store(ly, Ordering::Release);
+            self.shared
+                .ppu_stat
+                .store(io[STAT_IO_OFFSET], Ordering::Release);
         });
-        self.shared.copy_live_ppu_snapshot(io, vram, oam);
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::SyncPpu { ticket });
-        self.wait_for_ticket(ticket);
+        self.shared.pending_if_bits.store(0, Ordering::Release);
         self.shared.clear_published_frames();
         self.last_frame_seq = 0;
         self.last_profile_frame_seq = 0;
     }
 
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
-        self.flush_pending_ppu();
+        self.shared.pending_ppu_cycles.store(0, Ordering::Release);
         critical_section::with(|cs| {
-            let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
-            snapshots.io.copy_from_slice(&io[..0x80]);
-            snapshots.vram.copy_from_slice(&vram[..0x2000]);
-            snapshots.oam.copy_from_slice(&oam[..0xA0]);
+            self.shared
+                .ppu_io
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&io[..PPU_IO_LEN]);
+            self.shared
+                .ppu_vram
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&vram[..PPU_VRAM_LEN]);
+            self.shared
+                .ppu_oam
+                .borrow(cs)
+                .borrow_mut()
+                .copy_from_slice(&oam[..PPU_OAM_LEN]);
+            let mut ppu = self.shared.ppu.borrow(cs).borrow_mut();
+            let ppu = ppu.as_mut().unwrap();
+            let ly = ppu.load_state(state, io);
+            let mut shared_io = self.shared.ppu_io.borrow(cs).borrow_mut();
+            shared_io[LY_IO_OFFSET] = ly;
+            shared_io[STAT_IO_OFFSET] = state.stat;
+            self.shared.ppu_ly.store(ly, Ordering::Release);
+            self.shared.ppu_stat.store(state.stat, Ordering::Release);
         });
-        self.shared.copy_live_ppu_snapshot(io, vram, oam);
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::LoadPpuState { ticket, state });
-        self.wait_for_ticket(ticket);
+        self.shared.pending_if_bits.store(0, Ordering::Release);
         self.shared.clear_published_frames();
         self.last_frame_seq = 0;
         self.last_profile_frame_seq = 0;
     }
 
     fn snapshot_ppu_state(&self, _io: &[u8]) -> PpuState {
-        self.shared.snapshot_ppu_state()
+        critical_section::with(|cs| {
+            let io = self.shared.ppu_io.borrow(cs).borrow();
+            self.shared
+                .ppu
+                .borrow(cs)
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .snapshot(&*io)
+        })
     }
 
     fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
@@ -588,23 +583,27 @@ impl WorkerLink for Core1WorkerLink {
 
     #[cfg(feature = "perf")]
     fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.flush_pending_apu();
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::TakeApuPerfProfile { ticket });
-        self.wait_for_ticket(ticket);
         critical_section::with(|cs| {
-            core::mem::take(&mut *self.shared.apu_perf.borrow(cs).borrow_mut())
+            self.shared
+                .apu
+                .borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .take_perf_profile()
         })
     }
 
     #[cfg(feature = "perf")]
     fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.flush_pending_ppu();
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::TakePpuPerfProfile { ticket });
-        self.wait_for_ticket(ticket);
         critical_section::with(|cs| {
-            core::mem::take(&mut *self.shared.ppu_perf.borrow(cs).borrow_mut())
+            self.shared
+                .ppu
+                .borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .take_perf_profile()
         })
     }
 }
@@ -712,110 +711,101 @@ impl PicoGameBoy {
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
-fn publish_worker_state(
-    shared: &'static SharedWorkerState,
-    worker: &mut GameBoyWorker,
-    publish_slot: &mut usize,
-) {
-    let state = worker.poll_frontend_state();
-    if state.frame_ready {
-        shared.publish_frame(worker, *publish_slot);
-        *publish_slot ^= 1;
-    }
-    shared.publish_frontend_state(state);
-    critical_section::with(|cs| {
-        *shared.ppu_state.borrow(cs).borrow_mut() = worker.snapshot_ppu_state();
-    });
-}
-
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn run_core1_worker(
-    command_rx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
     audio_tx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
-    shared: &'static SharedWorkerState,
-    mut worker: &'static mut GameBoyWorker,
+    shared: &'static SharedRuntime,
     mut audio_scratch: &'static mut Vec<i16>,
+    ppu_io_scratch: &'static mut [u8; PPU_IO_LEN],
+    ppu_vram_scratch: &'static mut [u8; PPU_VRAM_LEN],
+    ppu_oam_scratch: &'static mut [u8; PPU_OAM_LEN],
 ) -> ! {
     info!("core1 worker loop start");
     let mut publish_slot = 1usize;
-    let mut last_ppu_render_version = 0u32;
 
     loop {
-        let Some(command) = command_rx.dequeue() else {
-            asm::wfe();
-            continue;
-        };
+        let mut did_work = false;
 
-        match command {
-            Core1Command::Worker(worker_command) => {
-                if matches!(worker_command, WorkerCommand::AdvancePpu { .. }) {
-                    let render_version = shared.ppu_render_version.load(Ordering::Acquire);
-                    if render_version != last_ppu_render_version {
-                        critical_section::with(|cs| {
-                            let snapshot = shared.live_ppu_snapshot.borrow(cs).borrow();
-                            worker.update_ppu_render_state(&snapshot.vram, &snapshot.oam);
-                        });
-                        last_ppu_render_version = render_version;
-                    }
+        let ppu_cycles = take_pending_cycles(&shared.pending_ppu_cycles, PPU_ADVANCE_BATCH_CYCLES);
+        if ppu_cycles != 0 {
+            let slot = publish_slot;
+            critical_section::with(|cs| {
+                let io = shared.ppu_io.borrow(cs).borrow();
+                ppu_io_scratch.copy_from_slice(&*io);
+            });
+            critical_section::with(|cs| {
+                let vram = shared.ppu_vram.borrow(cs).borrow();
+                ppu_vram_scratch.copy_from_slice(&*vram);
+            });
+            critical_section::with(|cs| {
+                let oam = shared.ppu_oam.borrow(cs).borrow();
+                ppu_oam_scratch.copy_from_slice(&*oam);
+            });
+            let (output, frame_ready) = critical_section::with(|cs| {
+                let mut ppu = shared.ppu.borrow(cs).borrow_mut();
+                let ppu = ppu.as_mut().unwrap();
+                let output = ppu.advance(
+                    ppu_cycles,
+                    ppu_io_scratch,
+                    ppu_vram_scratch,
+                    ppu_oam_scratch,
+                );
+                if output.frame_ready {
+                    let mut frame = shared.frame_slots[slot].borrow(cs).borrow_mut();
+                    frame.copy_from_slice(ppu.framebuffer());
                 }
-                worker.send(worker_command);
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
+                (output, output.frame_ready)
+            });
+            critical_section::with(|cs| {
+                let mut io = shared.ppu_io.borrow(cs).borrow_mut();
+                io[LY_IO_OFFSET] = output.ly;
+                io[STAT_IO_OFFSET] = output.stat;
+            });
+
+            shared.ppu_ly.store(output.ly, Ordering::Release);
+            shared.ppu_stat.store(output.stat, Ordering::Release);
+            if output.if_bits != 0 {
+                shared
+                    .pending_if_bits
+                    .fetch_or(output.if_bits, Ordering::AcqRel);
             }
-            Core1Command::SyncApu { ticket } => {
-                critical_section::with(|cs| {
-                    let snapshots = shared.sync_snapshot.borrow(cs).borrow();
-                    worker.sync_apu_state(&snapshots.io);
-                });
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
-                info!("core1 sync apu {}", ticket);
-                shared.sync_complete.store(ticket, Ordering::Release);
+            if frame_ready {
+                shared.published_frame.store(slot, Ordering::Release);
+                shared.published_frame_seq.fetch_add(1, Ordering::AcqRel);
+                publish_slot ^= 1;
             }
-            Core1Command::SyncPpu { ticket } => {
-                critical_section::with(|cs| {
-                    let snapshots = shared.sync_snapshot.borrow(cs).borrow();
-                    worker.sync_ppu_state(&snapshots.io, &snapshots.vram, &snapshots.oam);
-                });
-                last_ppu_render_version = 0;
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
-                info!("core1 sync ppu {}", ticket);
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
-            Core1Command::LoadPpuState { ticket, state } => {
-                critical_section::with(|cs| {
-                    let snapshots = shared.sync_snapshot.borrow(cs).borrow();
-                    worker.load_ppu_state(state, &snapshots.io, &snapshots.vram, &snapshots.oam);
-                });
-                last_ppu_render_version = 0;
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
-            #[cfg(feature = "perf")]
-            Core1Command::TakeApuPerfProfile { ticket } => {
-                critical_section::with(|cs| {
-                    *shared.apu_perf.borrow(cs).borrow_mut() = worker.take_apu_perf_profile();
-                });
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
-            #[cfg(feature = "perf")]
-            Core1Command::TakePpuPerfProfile { ticket } => {
-                critical_section::with(|cs| {
-                    *shared.ppu_perf.borrow(cs).borrow_mut() = worker.take_ppu_perf_profile();
-                });
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
+            did_work = true;
         }
 
-        worker.drain_audio_samples_into_i16(&mut audio_scratch);
-        let mut dropped = 0u32;
-        for sample in audio_scratch.drain(..) {
-            if audio_tx.enqueue(sample).is_err() {
-                dropped = dropped.wrapping_add(1);
+        let apu_cycles = take_pending_cycles(&shared.pending_apu_cycles, APU_ADVANCE_BATCH_CYCLES);
+        if apu_cycles != 0 {
+            let div_counter = shared.pending_apu_div_counter.load(Ordering::Acquire) as u16;
+            let nr52 = critical_section::with(|cs| {
+                shared
+                    .apu
+                    .borrow(cs)
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .advance(apu_cycles, div_counter, &mut audio_scratch)
+            });
+            shared.apu_nr52.store(nr52, Ordering::Release);
+
+            let mut dropped = 0u32;
+            for sample in audio_scratch.drain(..) {
+                if audio_tx.enqueue(sample).is_err() {
+                    dropped = dropped.wrapping_add(1);
+                }
             }
+            if dropped != 0 {
+                shared
+                    .audio_queue_drops
+                    .fetch_add(dropped, Ordering::AcqRel);
+            }
+            did_work = true;
         }
-        if dropped != 0 {
-            shared
-                .audio_queue_drops
-                .fetch_add(dropped, Ordering::AcqRel);
+
+        if !did_work {
+            asm::wfe();
         }
     }
 }
