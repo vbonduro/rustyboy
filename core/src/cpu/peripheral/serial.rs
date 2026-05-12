@@ -28,13 +28,26 @@ pub struct SerialPort {
 
 impl SerialPort {
     pub fn new() -> Self {
-        Self { output: Vec::new(), sb: 0, sc: 0, cycles_remaining: None }
+        Self {
+            output: Vec::new(),
+            sb: 0,
+            sc: 0,
+            cycles_remaining: None,
+        }
     }
 
-    pub fn output(&self) -> &[u8] { &self.output }
-    pub fn sb(&self) -> u8 { self.sb }
-    pub fn sc(&self) -> u8 { self.sc }
-    pub fn set_sb(&mut self, v: u8) { self.sb = v; }
+    pub fn output(&self) -> &[u8] {
+        &self.output
+    }
+    pub fn sb(&self) -> u8 {
+        self.sb
+    }
+    pub fn sc(&self) -> u8 {
+        self.sc
+    }
+    pub fn set_sb(&mut self, v: u8) {
+        self.sb = v;
+    }
 
     #[inline(always)]
     pub fn is_idle(&self) -> bool {

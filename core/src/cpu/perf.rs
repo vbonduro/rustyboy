@@ -142,46 +142,42 @@ impl Sm83PerfRecorder {
                 self.profile.mem_write_fast_rom = self.profile.mem_write_fast_rom.wrapping_add(dt);
                 match addr {
                     0x0000..=0x1FFF => {
-                        self.profile.mem_write_fast_rom_0000_1fff = self
-                            .profile
-                            .mem_write_fast_rom_0000_1fff
-                            .wrapping_add(dt);
+                        self.profile.mem_write_fast_rom_0000_1fff =
+                            self.profile.mem_write_fast_rom_0000_1fff.wrapping_add(dt);
                     }
                     0x2000..=0x3FFF => {
-                        self.profile.mem_write_fast_rom_2000_3fff = self
-                            .profile
-                            .mem_write_fast_rom_2000_3fff
-                            .wrapping_add(dt);
+                        self.profile.mem_write_fast_rom_2000_3fff =
+                            self.profile.mem_write_fast_rom_2000_3fff.wrapping_add(dt);
                     }
                     0x4000..=0x5FFF => {
-                        self.profile.mem_write_fast_rom_4000_5fff = self
-                            .profile
-                            .mem_write_fast_rom_4000_5fff
-                            .wrapping_add(dt);
+                        self.profile.mem_write_fast_rom_4000_5fff =
+                            self.profile.mem_write_fast_rom_4000_5fff.wrapping_add(dt);
                     }
                     0x6000..=0x7FFF => {
-                        self.profile.mem_write_fast_rom_6000_7fff = self
-                            .profile
-                            .mem_write_fast_rom_6000_7fff
-                            .wrapping_add(dt);
+                        self.profile.mem_write_fast_rom_6000_7fff =
+                            self.profile.mem_write_fast_rom_6000_7fff.wrapping_add(dt);
                     }
                     _ => {}
                 }
             }
             0x8000..=0x9FFF => {
-                self.profile.mem_write_fast_vram = self.profile.mem_write_fast_vram.wrapping_add(dt);
+                self.profile.mem_write_fast_vram =
+                    self.profile.mem_write_fast_vram.wrapping_add(dt);
             }
             0xA000..=0xBFFF => {
-                self.profile.mem_write_fast_eram = self.profile.mem_write_fast_eram.wrapping_add(dt);
+                self.profile.mem_write_fast_eram =
+                    self.profile.mem_write_fast_eram.wrapping_add(dt);
             }
             0xC000..=0xDFFF => {
-                self.profile.mem_write_fast_wram = self.profile.mem_write_fast_wram.wrapping_add(dt);
+                self.profile.mem_write_fast_wram =
+                    self.profile.mem_write_fast_wram.wrapping_add(dt);
             }
             0xFE00..=0xFE9F => {
                 self.profile.mem_write_fast_oam = self.profile.mem_write_fast_oam.wrapping_add(dt);
             }
             0xFF80..=0xFFFE => {
-                self.profile.mem_write_fast_hram = self.profile.mem_write_fast_hram.wrapping_add(dt);
+                self.profile.mem_write_fast_hram =
+                    self.profile.mem_write_fast_hram.wrapping_add(dt);
             }
             _ => {
                 self.profile.mem_write_fast_unmapped =

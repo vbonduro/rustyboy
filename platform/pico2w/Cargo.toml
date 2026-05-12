@@ -58,6 +58,8 @@ embassy-time = { git = "https://github.com/embassy-rs/embassy", features = [
 
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
+critical-section = "1.2"
+heapless = { version = "0.8", default-features = false, features = ["mpmc_large"] }
 rp-pac = { git = "https://github.com/embassy-rs/rp-pac", rev = "c2e27609b021c444f634673155318977d7f0bdf6" }
 
 defmt = "1"

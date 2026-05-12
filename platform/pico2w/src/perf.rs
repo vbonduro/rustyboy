@@ -1,6 +1,11 @@
 use defmt::info;
 use embassy_time::Instant;
-use rustyboy_core::GameBoy;
+use rustyboy_pico2w::multicore::PicoGameBoy;
+
+#[cfg(all(feature = "perf", feature = "oc-266"))]
+const CYCLES_PER_MS: u64 = 266_000;
+#[cfg(all(feature = "perf", not(feature = "oc-266")))]
+const CYCLES_PER_MS: u64 = 250_000;
 
 /// Tracks FPS and (when `perf` is enabled) per-component cycle counts.
 /// Call `tick` once per game loop iteration.
@@ -10,7 +15,11 @@ pub struct PerfTracker {
     #[cfg(feature = "perf")]
     scale_cycles: u64,
     #[cfg(feature = "perf")]
+    emulate_cycles: u64,
+    #[cfg(feature = "perf")]
     render_cycles: u64,
+    #[cfg(feature = "perf")]
+    audio_wait_cycles: u64,
 }
 
 impl PerfTracker {
@@ -21,7 +30,11 @@ impl PerfTracker {
             #[cfg(feature = "perf")]
             scale_cycles: 0,
             #[cfg(feature = "perf")]
+            emulate_cycles: 0,
+            #[cfg(feature = "perf")]
             render_cycles: 0,
+            #[cfg(feature = "perf")]
+            audio_wait_cycles: 0,
         }
     }
 
@@ -31,13 +44,23 @@ impl PerfTracker {
         self.scale_cycles += cycles as u64;
     }
 
+    #[cfg(feature = "perf")]
+    pub fn record_emulate(&mut self, cycles: u32) {
+        self.emulate_cycles += cycles as u64;
+    }
+
     /// Accumulate DWT cycles spent in `render_game_only_scaled` for one frame.
     #[cfg(feature = "perf")]
     pub fn record_render(&mut self, cycles: u32) {
         self.render_cycles += cycles as u64;
     }
 
-    pub fn tick(&mut self, cpu: &mut GameBoy) {
+    #[cfg(feature = "perf")]
+    pub fn record_audio_wait(&mut self, cycles: u32) {
+        self.audio_wait_cycles += cycles as u64;
+    }
+
+    pub fn tick(&mut self, cpu: &mut PicoGameBoy) {
         self.frame_count += 1;
         if self.frame_count < 60 {
             return;
@@ -49,70 +72,56 @@ impl PerfTracker {
 
         #[cfg(feature = "perf")]
         {
+            let transport = cpu.take_transport_profile();
+            info!(
+                "core1 transport/60f — enq={} spins={} apu_cmds={} ppu_adv={} frame_pub={} vram_bytes={} oam_bytes={} regs={} audio_drops={}",
+                transport.command_enqueues,
+                transport.command_queue_spins,
+                transport.apu_commands,
+                transport.ppu_advance_commands,
+                transport.frame_publishes,
+                transport.ppu_vram_bytes,
+                transport.ppu_oam_bytes,
+                transport.ppu_register_writes,
+                transport.audio_queue_drops,
+            );
+
+            let fp = cpu.take_frontend_perf_profile();
+            info!(
+                "frontend/60f — total={}ms cpu={}ms route={}ms ppu_timing={}ms ppu_sync={}ms timer={}ms apu_state={}ms apu_send={}ms rtc={}ms serial={}ms dma={}ms steps={} events={} scanlines={} dma_bytes={}",
+                fp.step_total as u64 / CYCLES_PER_MS,
+                fp.cpu_step as u64 / CYCLES_PER_MS,
+                fp.route_bus_events as u64 / CYCLES_PER_MS,
+                fp.ppu_timing as u64 / CYCLES_PER_MS,
+                fp.ppu_sync as u64 / CYCLES_PER_MS,
+                fp.timer as u64 / CYCLES_PER_MS,
+                fp.apu_state as u64 / CYCLES_PER_MS,
+                fp.apu_send as u64 / CYCLES_PER_MS,
+                fp.rtc as u64 / CYCLES_PER_MS,
+                fp.serial as u64 / CYCLES_PER_MS,
+                fp.dma as u64 / CYCLES_PER_MS,
+                fp.steps,
+                fp.bus_events,
+                fp.render_scanlines,
+                fp.dma_bytes,
+            );
+
             let p = cpu.take_perf_profile();
-            let cpu_exec = p
-                .total
-                .wrapping_sub(p.ppu)
-                .wrapping_sub(p.timer)
-                .wrapping_sub(p.apu);
-            let decode = cpu_exec.wrapping_sub(p.mem_read).wrapping_sub(p.mem_write);
             let mem_write_other = p
                 .mem_write
                 .wrapping_sub(p.mem_write_fast)
                 .wrapping_sub(p.mem_write_io)
                 .wrapping_sub(p.mem_write_enqueue);
             info!(
-                "cycles/60f — total={} ppu={} timer={} apu={} cpu_exec={} (mem_r={} mem_w={} decode={})",
-                p.total, p.ppu, p.timer, p.apu, cpu_exec, p.mem_read, p.mem_write, decode
-            );
-            info!(
-                "decode hotspots/60f (nested) — pc_fetch={} pc_fetch_wrapper={} rom_pc_fetch={} rom_pc_fetch_idle={} rom_pc_fetch_read={} bus_read={} opcode={} cb_prefix={} operand8={}",
-                p.pc_fetch,
-                p.pc_fetch_wrapper,
-                p.pc_fetch_rom,
-                p.pc_fetch_rom_idle,
-                p.pc_fetch_rom_read,
-                p.bus_read,
-                p.opcode_dispatch,
-                p.cb_prefix,
-                p.operand8
-            );
-            info!(
-                "decode hotspot calls/60f — pc_fetch={} pc_fetch_wrapper={} rom_pc_fetch={} rom_pc_fetch_idle={} rom_pc_fetch_read={} bus_read={} opcode={} cb_prefix={} operand8={}",
-                p.pc_fetch_calls,
-                p.pc_fetch_wrapper_calls,
-                p.pc_fetch_rom_calls,
-                p.pc_fetch_rom_idle_calls,
-                p.pc_fetch_rom_read_calls,
-                p.bus_read_calls,
-                p.opcode_dispatch_calls,
-                p.cb_prefix_calls,
-                p.operand8_calls
-            );
-            info!(
-                "mem_write breakdown — fast={} io={} enqueue={} other={} route={}",
+                "legacy sm83/60f — total={} mem_r={} mem_w={} route={} fast={} io={} enqueue={} other={}",
+                p.total,
+                p.mem_read,
+                p.mem_write,
+                p.mem_write_route,
                 p.mem_write_fast,
                 p.mem_write_io,
                 p.mem_write_enqueue,
                 mem_write_other,
-                p.mem_write_route
-            );
-            info!(
-                "mem_write fast breakdown — rom={} eram={} vram={} wram={} oam={} hram={} unmapped={}",
-                p.mem_write_fast_rom,
-                p.mem_write_fast_eram,
-                p.mem_write_fast_vram,
-                p.mem_write_fast_wram,
-                p.mem_write_fast_oam,
-                p.mem_write_fast_hram,
-                p.mem_write_fast_unmapped
-            );
-            info!(
-                "mem_write rom breakdown — 0000-1fff={} 2000-3fff={} 4000-5fff={} 6000-7fff={}",
-                p.mem_write_fast_rom_0000_1fff,
-                p.mem_write_fast_rom_2000_3fff,
-                p.mem_write_fast_rom_4000_5fff,
-                p.mem_write_fast_rom_6000_7fff
             );
 
             let pp = cpu.take_ppu_perf_profile();
@@ -145,13 +154,21 @@ impl PerfTracker {
             let display_total = self.scale_cycles + self.render_cycles;
             info!(
                 "display/60f — {}ms total (scale={}ms fill={}ms) avg {}ms/frame",
-                display_total / 250_000,
-                self.scale_cycles / 250_000,
-                self.render_cycles / 250_000,
-                display_total / 250_000 / 60,
+                display_total / CYCLES_PER_MS,
+                self.scale_cycles / CYCLES_PER_MS,
+                self.render_cycles / CYCLES_PER_MS,
+                display_total / CYCLES_PER_MS / 60,
+            );
+            info!(
+                "loop/60f — emulate={}ms audio_wait={}ms avg emulate={}ms/frame",
+                self.emulate_cycles / CYCLES_PER_MS,
+                self.audio_wait_cycles / CYCLES_PER_MS,
+                self.emulate_cycles / CYCLES_PER_MS / 60,
             );
             self.scale_cycles = 0;
+            self.emulate_cycles = 0;
             self.render_cycles = 0;
+            self.audio_wait_cycles = 0;
         }
 
         // Suppress unused-variable warning when only `fps` (not `perf`) is enabled.

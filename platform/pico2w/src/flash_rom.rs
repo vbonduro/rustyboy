@@ -37,10 +37,7 @@ pub enum FlashRomStageError<E: Debug> {
     Reader(E),
     Flash(FlashError),
     InvalidRomSizeCode(u8),
-    TooLarge {
-        bytes: usize,
-        capacity: usize,
-    },
+    TooLarge { bytes: usize, capacity: usize },
 }
 
 pub struct FlashRomReader<'d> {
@@ -57,7 +54,11 @@ impl<'d> FlashRomReader<'d> {
 impl RomReader for FlashRomReader<'_> {
     type Error = FlashRomReadError;
 
-    fn read_bank(&mut self, bank: usize, buf: &mut [u8; ROM_BANK_BYTES]) -> Result<(), Self::Error> {
+    fn read_bank(
+        &mut self,
+        bank: usize,
+        buf: &mut [u8; ROM_BANK_BYTES],
+    ) -> Result<(), Self::Error> {
         if bank >= self.info.bank_count {
             buf.fill(0xFF);
             return Err(FlashRomReadError::OutOfBounds);
