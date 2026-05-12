@@ -12,15 +12,15 @@ pub(crate) const STAT_INTERRUPT_BIT: u8 = 1;
 /// IO array offsets (io[i] = memory at 0xFF00 + i).
 const LCDC_IO: usize = 0x40;
 const STAT_IO: usize = 0x41;
-const SCY_IO:  usize = 0x42;
-const SCX_IO:  usize = 0x43;
-const LY_IO:   usize = 0x44;
-const LYC_IO:  usize = 0x45;
-const BGP_IO:  usize = 0x47;
+const SCY_IO: usize = 0x42;
+const SCX_IO: usize = 0x43;
+const LY_IO: usize = 0x44;
+const LYC_IO: usize = 0x45;
+const BGP_IO: usize = 0x47;
 const OBP0_IO: usize = 0x48;
 const OBP1_IO: usize = 0x49;
-const WY_IO:   usize = 0x4A;
-const WX_IO:   usize = 0x4B;
+const WY_IO: usize = 0x4A;
+const WX_IO: usize = 0x4B;
 
 const DOTS_PER_SCANLINE: u16 = 456;
 const OAM_SCAN_DOTS: u16 = 80;
@@ -47,20 +47,49 @@ pub enum PpuMode {
 struct Lcdc(u8);
 
 impl Lcdc {
-    fn lcd_enabled(self) -> bool         { self.0 & 0x80 != 0 }
-    fn window_tilemap_high(self) -> bool { self.0 & 0x40 != 0 }
-    fn window_enabled(self) -> bool      { self.0 & 0x20 != 0 }
-    fn bg_tile_data_unsigned(self) -> bool { self.0 & 0x10 != 0 }
-    fn bg_tilemap_high(self) -> bool     { self.0 & 0x08 != 0 }
-    fn obj_tall(self) -> bool            { self.0 & 0x04 != 0 }
-    fn obj_enabled(self) -> bool         { self.0 & 0x02 != 0 }
-    fn bg_enabled(self) -> bool          { self.0 & 0x01 != 0 }
+    fn lcd_enabled(self) -> bool {
+        self.0 & 0x80 != 0
+    }
+    fn window_tilemap_high(self) -> bool {
+        self.0 & 0x40 != 0
+    }
+    fn window_enabled(self) -> bool {
+        self.0 & 0x20 != 0
+    }
+    fn bg_tile_data_unsigned(self) -> bool {
+        self.0 & 0x10 != 0
+    }
+    fn bg_tilemap_high(self) -> bool {
+        self.0 & 0x08 != 0
+    }
+    fn obj_tall(self) -> bool {
+        self.0 & 0x04 != 0
+    }
+    fn obj_enabled(self) -> bool {
+        self.0 & 0x02 != 0
+    }
+    fn bg_enabled(self) -> bool {
+        self.0 & 0x01 != 0
+    }
 }
 
 /// Result of a PPU tick.
 pub struct PpuOutput {
     pub vblank_interrupt: bool,
     pub stat_interrupt: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PpuRasterRequest {
+    pub ly: u8,
+    pub window_line_counter: u8,
+}
+
+pub struct PpuTimingOutput {
+    pub vblank_interrupt: bool,
+    pub stat_interrupt: bool,
+    pub render_scanline: Option<PpuRasterRequest>,
+    pub lcd_reset: bool,
 }
 
 #[cfg(feature = "perf")]
@@ -106,7 +135,9 @@ impl PpuPeripheral {
         }
     }
 
-    pub fn ly(&self) -> u8 { self.ly }
+    pub fn ly(&self) -> u8 {
+        self.ly
+    }
 
     /// Sync `prev_stat_line` to the current STAT line state, preventing a
     /// spurious rising-edge interrupt when seeding the PPU to a mid-frame
@@ -116,9 +147,9 @@ impl PpuPeripheral {
         let stat = io[STAT_IO];
         let lyc_match = self.ly == lyc;
         let stat_line = (lyc_match && (stat & 0x40 != 0))
-            || (self.mode == PpuMode::HBlank  && (stat & 0x08 != 0))
-            || (self.mode == PpuMode::VBlank   && (stat & 0x10 != 0))
-            || (self.mode == PpuMode::OamScan  && (stat & 0x20 != 0));
+            || (self.mode == PpuMode::HBlank && (stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank && (stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan && (stat & 0x20 != 0));
         self.prev_stat_line = stat_line;
     }
 
@@ -131,6 +162,11 @@ impl PpuPeripheral {
         &self.framebuffer
     }
 
+    pub fn clear_framebuffer(&mut self) {
+        self.framebuffer = [0u8; FRAMEBUFFER_SIZE];
+        self.bg_color_indices = [0u8; SCREEN_WIDTH];
+    }
+
     /// Extract PPU state for serialization. Reads config registers from `io`.
     pub fn to_save_state(&self, io: &[u8]) -> crate::cpu::save_state::PpuState {
         crate::cpu::save_state::PpuState {
@@ -140,14 +176,14 @@ impl PpuPeripheral {
             window_line_counter: self.window_line_counter,
             lcdc: io[LCDC_IO],
             stat: io[STAT_IO],
-            scy:  io[SCY_IO],
-            scx:  io[SCX_IO],
-            lyc:  io[LYC_IO],
-            bgp:  io[BGP_IO],
+            scy: io[SCY_IO],
+            scx: io[SCX_IO],
+            lyc: io[LYC_IO],
+            bgp: io[BGP_IO],
             obp0: io[OBP0_IO],
             obp1: io[OBP1_IO],
-            wy:   io[WY_IO],
-            wx:   io[WX_IO],
+            wy: io[WY_IO],
+            wx: io[WX_IO],
         }
     }
 
@@ -165,6 +201,19 @@ impl PpuPeripheral {
         self.ly = 0;
     }
 
+    pub fn render_scanline_from_snapshot(
+        &mut self,
+        io: &[u8],
+        vram: &[u8],
+        oam: &[u8],
+        ly: u8,
+        window_line_counter: u8,
+    ) {
+        self.ly = ly;
+        self.window_line_counter = window_line_counter;
+        self.render_scanline(io, vram, oam);
+    }
+
     /// Advance the PPU by `cycles` T-cycles.
     ///
     /// `io` is the IO register slice (0xFF00–0xFF7F). Config registers are read
@@ -175,7 +224,10 @@ impl PpuPeripheral {
 
         if !lcdc.lcd_enabled() {
             self.reset_lcd(io);
-            return PpuOutput { vblank_interrupt: false, stat_interrupt: false };
+            return PpuOutput {
+                vblank_interrupt: false,
+                stat_interrupt: false,
+            };
         }
 
         let mut vblank_interrupt = false;
@@ -231,11 +283,100 @@ impl PpuPeripheral {
         let t0 = crate::cpu::perf::cyccnt();
         let stat_interrupt = self.build_stat(io);
         #[cfg(feature = "perf")]
-        { self.perf_profile.build_stat = self.perf_profile.build_stat.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+        {
+            self.perf_profile.build_stat = self
+                .perf_profile
+                .build_stat
+                .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+        }
 
         io[LY_IO] = self.ly;
 
-        PpuOutput { vblank_interrupt, stat_interrupt }
+        PpuOutput {
+            vblank_interrupt,
+            stat_interrupt,
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn tick_timing_only(&mut self, cycles: u16, io: &mut [u8]) -> PpuTimingOutput {
+        let lcdc = Lcdc(io[LCDC_IO]);
+
+        if !lcdc.lcd_enabled() {
+            self.reset_lcd(io);
+            return PpuTimingOutput {
+                vblank_interrupt: false,
+                stat_interrupt: false,
+                render_scanline: None,
+                lcd_reset: true,
+            };
+        }
+
+        let mut vblank_interrupt = false;
+        let mut render_scanline = None;
+        let mut remaining = cycles;
+
+        while remaining > 0 {
+            let threshold = match self.mode {
+                PpuMode::OamScan => OAM_SCAN_DOTS,
+                PpuMode::PixelTransfer => OAM_SCAN_DOTS + PIXEL_TRANSFER_DOTS,
+                PpuMode::HBlank | PpuMode::VBlank => DOTS_PER_SCANLINE,
+            };
+            let dots_to_threshold = threshold.saturating_sub(self.dot);
+
+            if dots_to_threshold > 0 && remaining < dots_to_threshold {
+                self.dot += remaining;
+                break;
+            }
+
+            self.dot += dots_to_threshold;
+            remaining -= dots_to_threshold;
+
+            match self.mode {
+                PpuMode::OamScan => {
+                    self.mode = PpuMode::PixelTransfer;
+                }
+                PpuMode::PixelTransfer => {
+                    self.mode = PpuMode::HBlank;
+                    render_scanline = Some(PpuRasterRequest {
+                        ly: self.ly,
+                        window_line_counter: self.window_line_counter,
+                    });
+                    if self.window_participates_on_current_line(io) {
+                        self.window_line_counter = self.window_line_counter.wrapping_add(1);
+                    }
+                }
+                PpuMode::HBlank => {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= VISIBLE_SCANLINES {
+                        self.mode = PpuMode::VBlank;
+                        vblank_interrupt = true;
+                    } else {
+                        self.mode = PpuMode::OamScan;
+                    }
+                }
+                PpuMode::VBlank => {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= TOTAL_SCANLINES {
+                        self.ly = 0;
+                        self.mode = PpuMode::OamScan;
+                        self.window_line_counter = 0;
+                    }
+                }
+            }
+        }
+
+        let stat_interrupt = self.build_stat(io);
+        io[LY_IO] = self.ly;
+
+        PpuTimingOutput {
+            vblank_interrupt,
+            stat_interrupt,
+            render_scanline,
+            lcd_reset: false,
+        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -254,9 +395,8 @@ impl PpuPeripheral {
     fn build_stat(&mut self, io: &mut [u8]) -> bool {
         let lyc = io[LYC_IO];
         let lyc_match = self.ly == lyc;
-        let new_stat = (io[STAT_IO] & 0x78)
-            | if lyc_match { 0x04 } else { 0x00 }
-            | (self.mode as u8);
+        let new_stat =
+            (io[STAT_IO] & 0x78) | if lyc_match { 0x04 } else { 0x00 } | (self.mode as u8);
         io[STAT_IO] = new_stat;
 
         let stat_line = (lyc_match && (new_stat & 0x40 != 0))
@@ -278,20 +418,25 @@ impl PpuPeripheral {
         }
 
         let row_start = ly * SCREEN_WIDTH;
-        let scy  = io[SCY_IO];
-        let scx  = io[SCX_IO];
-        let bgp  = io[BGP_IO];
+        let scy = io[SCY_IO];
+        let scx = io[SCX_IO];
+        let bgp = io[BGP_IO];
         let obp0 = io[OBP0_IO];
         let obp1 = io[OBP1_IO];
-        let wy   = io[WY_IO];
-        let wx   = io[WX_IO];
+        let wy = io[WY_IO];
+        let wx = io[WX_IO];
 
         if lcdc.bg_enabled() {
             #[cfg(feature = "perf")]
             let t0 = crate::cpu::perf::cyccnt();
             self.render_bg_scanline(vram, lcdc, row_start, scy, scx, bgp);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_bg = self.perf_profile.render_bg.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_bg = self
+                    .perf_profile
+                    .render_bg
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         } else {
             for x in 0..SCREEN_WIDTH {
                 self.framebuffer[row_start + x] = 0;
@@ -304,7 +449,12 @@ impl PpuPeripheral {
             let t0 = crate::cpu::perf::cyccnt();
             self.render_window_scanline(vram, lcdc, row_start, wy, wx, bgp);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_window = self.perf_profile.render_window.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_window = self
+                    .perf_profile
+                    .render_window
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         }
 
         if lcdc.obj_enabled() {
@@ -312,13 +462,39 @@ impl PpuPeripheral {
             let t0 = crate::cpu::perf::cyccnt();
             self.render_sprite_scanline(vram, oam, lcdc, row_start, obp0, obp1);
             #[cfg(feature = "perf")]
-            { self.perf_profile.render_sprites = self.perf_profile.render_sprites.wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0)); }
+            {
+                self.perf_profile.render_sprites = self
+                    .perf_profile
+                    .render_sprites
+                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
+            }
         }
     }
 
+    fn window_participates_on_current_line(&self, io: &[u8]) -> bool {
+        let lcdc = Lcdc(io[LCDC_IO]);
+        lcdc.window_enabled()
+            && lcdc.bg_enabled()
+            && self.ly < SCREEN_HEIGHT as u8
+            && self.ly >= io[WY_IO]
+            && io[WX_IO] <= 166
+    }
+
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_bg_scanline(&mut self, vram: &[u8], lcdc: Lcdc, row_start: usize, scy: u8, scx: u8, bgp: u8) {
-        let tilemap_base: usize = if lcdc.bg_tilemap_high() { 0x1C00 } else { 0x1800 };
+    fn render_bg_scanline(
+        &mut self,
+        vram: &[u8],
+        lcdc: Lcdc,
+        row_start: usize,
+        scy: u8,
+        scx: u8,
+        bgp: u8,
+    ) {
+        let tilemap_base: usize = if lcdc.bg_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
+        };
         let y = scy.wrapping_add(self.ly);
         let tile_row = (y / 8) as usize;
         let fine_y = (y % 8) as usize;
@@ -348,12 +524,24 @@ impl PpuPeripheral {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_window_scanline(&mut self, vram: &[u8], lcdc: Lcdc, row_start: usize, wy: u8, wx: u8, bgp: u8) {
+    fn render_window_scanline(
+        &mut self,
+        vram: &[u8],
+        lcdc: Lcdc,
+        row_start: usize,
+        wy: u8,
+        wx: u8,
+        bgp: u8,
+    ) {
         if self.ly < wy || wx > 166 {
             return;
         }
 
-        let tilemap_base: usize = if lcdc.window_tilemap_high() { 0x1C00 } else { 0x1800 };
+        let tilemap_base: usize = if lcdc.window_tilemap_high() {
+            0x1C00
+        } else {
+            0x1800
+        };
         let win_y = self.window_line_counter as usize;
         let tile_row = win_y / 8;
         let fine_y = win_y % 8;
@@ -387,7 +575,15 @@ impl PpuPeripheral {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn render_sprite_scanline(&mut self, vram: &[u8], oam: &[u8], lcdc: Lcdc, row_start: usize, obp0: u8, obp1: u8) {
+    fn render_sprite_scanline(
+        &mut self,
+        vram: &[u8],
+        oam: &[u8],
+        lcdc: Lcdc,
+        row_start: usize,
+        obp0: u8,
+        obp1: u8,
+    ) {
         let sprite_height: u8 = if lcdc.obj_tall() { 16 } else { 8 };
         let ly = self.ly as i16;
 
@@ -395,7 +591,9 @@ impl PpuPeripheral {
         let mut count = 0usize;
 
         for i in 0..40 {
-            if count >= 10 { break; }
+            if count >= 10 {
+                break;
+            }
             let oam_addr = i * 4;
             let sprite_y = oam[oam_addr] as i16 - 16;
             let sprite_x = oam[oam_addr + 1];
@@ -419,7 +617,16 @@ impl PpuPeripheral {
         }
 
         for idx in (0..count).rev() {
-            self.draw_sprite(vram, oam, lcdc, row_start, sprite_height, &sprites[idx], obp0, obp1);
+            self.draw_sprite(
+                vram,
+                oam,
+                lcdc,
+                row_start,
+                sprite_height,
+                &sprites[idx],
+                obp0,
+                obp1,
+            );
         }
     }
 
@@ -486,7 +693,6 @@ impl PpuPeripheral {
     }
 }
 
-
 /// Decode a single pixel from a 2bpp tile row.
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn decode_2bpp_pixel(lo: u8, hi: u8, bit: u8) -> u8 {
@@ -521,24 +727,33 @@ mod tests {
 
     fn default_io() -> [u8; 0x80] {
         let mut io = [0u8; 0x80];
-        io[LCDC_IO]  = 0x91; // LCD on, BG on, BG tile data unsigned
-        io[LYC_IO]   = 0xFF;
-        io[BGP_IO]   = 0xE4; // standard palette: 3,2,1,0
-        io[OBP0_IO]  = 0xE4;
-        io[OBP1_IO]  = 0xE4;
-        io[WX_IO]    = 7;
+        io[LCDC_IO] = 0x91; // LCD on, BG on, BG tile data unsigned
+        io[LYC_IO] = 0xFF;
+        io[BGP_IO] = 0xE4; // standard palette: 3,2,1,0
+        io[OBP0_IO] = 0xE4;
+        io[OBP1_IO] = 0xE4;
+        io[WX_IO] = 7;
         io
     }
 
-    fn tick_dots(ppu: &mut PpuPeripheral, io: &mut [u8], dots: u32, vram: &[u8], oam: &[u8]) -> PpuOutput {
+    fn tick_dots(
+        ppu: &mut PpuPeripheral,
+        io: &mut [u8],
+        dots: u32,
+        vram: &[u8],
+        oam: &[u8],
+    ) -> PpuOutput {
         let mut vblank = false;
         let mut stat_irq = false;
         for _ in 0..dots {
             let o = ppu.tick(1, io, vram, oam);
-            vblank   |= o.vblank_interrupt;
+            vblank |= o.vblank_interrupt;
             stat_irq |= o.stat_interrupt;
         }
-        PpuOutput { vblank_interrupt: vblank, stat_interrupt: stat_irq }
+        PpuOutput {
+            vblank_interrupt: vblank,
+            stat_interrupt: stat_irq,
+        }
     }
 
     #[test]
@@ -558,7 +773,13 @@ mod tests {
         assert_eq!(ppu.mode, PpuMode::HBlank);
         assert_eq!(ppu.ly(), 0);
 
-        tick_dots(&mut ppu, &mut io, (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32, &vram, &oam);
+        tick_dots(
+            &mut ppu,
+            &mut io,
+            (DOTS_PER_SCANLINE - OAM_SCAN_DOTS - PIXEL_TRANSFER_DOTS) as u32,
+            &vram,
+            &oam,
+        );
         assert_eq!(ppu.mode, PpuMode::OamScan);
         assert_eq!(ppu.ly(), 1);
     }
@@ -570,7 +791,13 @@ mod tests {
         let mut ppu = default_ppu();
         let mut io = default_io();
 
-        let output = tick_dots(&mut ppu, &mut io, VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &vram, &oam);
+        let output = tick_dots(
+            &mut ppu,
+            &mut io,
+            VISIBLE_SCANLINES as u32 * DOTS_PER_SCANLINE as u32,
+            &vram,
+            &oam,
+        );
         assert_eq!(ppu.mode, PpuMode::VBlank);
         assert_eq!(ppu.ly(), 144);
         assert!(output.vblank_interrupt);
@@ -583,7 +810,13 @@ mod tests {
         let mut ppu = default_ppu();
         let mut io = default_io();
 
-        tick_dots(&mut ppu, &mut io, TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32, &vram, &oam);
+        tick_dots(
+            &mut ppu,
+            &mut io,
+            TOTAL_SCANLINES as u32 * DOTS_PER_SCANLINE as u32,
+            &vram,
+            &oam,
+        );
         assert_eq!(ppu.mode, PpuMode::OamScan);
         assert_eq!(ppu.ly(), 0);
     }
@@ -595,7 +828,13 @@ mod tests {
         let mut ppu = default_ppu();
         let mut io = default_io();
 
-        let output = tick_dots(&mut ppu, &mut io, 143 * DOTS_PER_SCANLINE as u32, &vram, &oam);
+        let output = tick_dots(
+            &mut ppu,
+            &mut io,
+            143 * DOTS_PER_SCANLINE as u32,
+            &vram,
+            &oam,
+        );
         assert!(!output.vblank_interrupt);
 
         let output = tick_dots(&mut ppu, &mut io, DOTS_PER_SCANLINE as u32, &vram, &oam);
@@ -609,7 +848,7 @@ mod tests {
         let oam = [0u8; 0xA0];
         let mut ppu = default_ppu();
         let mut io = default_io();
-        io[LYC_IO]  = 5;
+        io[LYC_IO] = 5;
         io[STAT_IO] = 0x40; // LYC=LY interrupt enable
 
         let output = tick_dots(&mut ppu, &mut io, 5 * DOTS_PER_SCANLINE as u32, &vram, &oam);
@@ -641,7 +880,13 @@ mod tests {
         let mut ppu = default_ppu();
         let mut io = default_io();
 
-        tick_dots(&mut ppu, &mut io, 5 * DOTS_PER_SCANLINE as u32 + 100, &vram, &oam);
+        tick_dots(
+            &mut ppu,
+            &mut io,
+            5 * DOTS_PER_SCANLINE as u32 + 100,
+            &vram,
+            &oam,
+        );
 
         io[LCDC_IO] = 0x00;
         ppu.tick(1, &mut io, &vram, &oam);
@@ -755,7 +1000,7 @@ mod tests {
         let mut ppu = default_ppu();
         let mut io = default_io();
         io[LCDC_IO] = 0xB1; // LCD on, window on, BG on, unsigned, window tilemap low
-        io[WY_IO]   = 0;
+        io[WY_IO] = 0;
         // WX already 7 from default_io()
 
         tick_dots(&mut ppu, &mut io, DOTS_PER_SCANLINE as u32, &vram, &oam);

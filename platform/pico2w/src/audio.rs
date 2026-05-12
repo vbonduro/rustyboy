@@ -56,6 +56,12 @@ impl AudioBuffers {
         self.use_a_as_front = !self.use_a_as_front;
         self.front_n = back_n;
     }
+
+    pub fn queue_next_frame_i16(&mut self, samples: &[i16], back_buf: &mut [u32]) {
+        let back_n = samples_i16_to_i2s(samples, back_buf);
+        self.use_a_as_front = !self.use_a_as_front;
+        self.front_n = back_n;
+    }
 }
 
 /// Pack interleaved stereo f32 samples [L, R, L, R …] into I2S u32 words.
@@ -67,6 +73,16 @@ fn samples_to_i2s(samples: &[f32], buf: &mut [u32]) -> usize {
     for i in 0..pairs {
         let l = (samples[i * 2] * 32767.0) as i16;
         let r = (samples[i * 2 + 1] * 32767.0) as i16;
+        buf[i] = ((l as u16 as u32) << 16) | (r as u16 as u32);
+    }
+    pairs
+}
+
+fn samples_i16_to_i2s(samples: &[i16], buf: &mut [u32]) -> usize {
+    let pairs = (samples.len() / 2).min(buf.len());
+    for i in 0..pairs {
+        let l = samples[i * 2];
+        let r = samples[i * 2 + 1];
         buf[i] = ((l as u16 as u32) << 16) | (r as u16 as u32);
     }
     pairs

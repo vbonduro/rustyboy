@@ -21,42 +21,50 @@ use crate::memory::memory::GameBoyMemory;
 // ── Format constants ──────────────────────────────────────────────────────────
 
 pub const MAGIC: &[u8; 4] = b"RBSS";
-pub const VERSION: u16     = 1;
+pub const VERSION: u16 = 1;
 
-const MAGIC_SIZE:         usize = 4;
-const VERSION_SIZE:       usize = size_of::<u16>();
-const HEADER_SIZE:        usize = MAGIC_SIZE + VERSION_SIZE;
+const MAGIC_SIZE: usize = 4;
+const VERSION_SIZE: usize = size_of::<u16>();
+const HEADER_SIZE: usize = MAGIC_SIZE + VERSION_SIZE;
 
-const CPU_REGS_SIZE:      usize = 7 * size_of::<u8>()  // A B C D E H L
+const CPU_REGS_SIZE: usize = 7 * size_of::<u8>()  // A B C D E H L
                                 + size_of::<u8>()       // F (flags)
                                 + size_of::<u16>()      // SP
-                                + size_of::<u16>();     // PC
-const IME_SIZE:           usize = size_of::<u8>();
-const HALTED_SIZE:        usize = size_of::<u8>();
+                                + size_of::<u16>(); // PC
+const IME_SIZE: usize = size_of::<u8>();
+const HALTED_SIZE: usize = size_of::<u8>();
 const CYCLE_COUNTER_SIZE: usize = size_of::<u64>();
-const CPU_STATE_SIZE:     usize = CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE + CYCLE_COUNTER_SIZE;
+const CPU_STATE_SIZE: usize = CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE + CYCLE_COUNTER_SIZE;
 
-const TIMER_STATE_SIZE:   usize = size_of::<u16>()      // internal_counter
+const TIMER_STATE_SIZE: usize = size_of::<u16>()      // internal_counter
                                 + 3 * size_of::<u8>(); // tima, tma, tac
 
-const PPU_STATE_SIZE:     usize = size_of::<u16>()      // dot
+const PPU_STATE_SIZE: usize = size_of::<u16>()      // dot
                                 + size_of::<u8>()       // ly
                                 + size_of::<u8>()       // mode
                                 + size_of::<u8>()       // window_line_counter
                                 + 10 * size_of::<u8>(); // lcdc stat scy scx lyc bgp obp0 obp1 wy wx
 
-const IO_REGS_SIZE:       usize = 0x80;
-const IE_SIZE:            usize = size_of::<u8>();
-const WRAM_SIZE:          usize = 0x2000;
-const HRAM_SIZE:          usize = 0x7F;
-const VRAM_SIZE:          usize = 0x2000;
-const OAM_SIZE:           usize = 0xA0;
-const MBC_SIZE:           usize = 4 * size_of::<u8>(); // rom_bank_lo upper_bits ram_mode ram_enabled
-const CART_RAM_LEN_SIZE:  usize = size_of::<u16>();
+const IO_REGS_SIZE: usize = 0x80;
+const IE_SIZE: usize = size_of::<u8>();
+const WRAM_SIZE: usize = 0x2000;
+const HRAM_SIZE: usize = 0x7F;
+const VRAM_SIZE: usize = 0x2000;
+const OAM_SIZE: usize = 0xA0;
+const MBC_SIZE: usize = 4 * size_of::<u8>(); // rom_bank_lo upper_bits ram_mode ram_enabled
+const CART_RAM_LEN_SIZE: usize = size_of::<u16>();
 
 /// Minimum valid blob length: everything up through OAM, without optional MBC/cart RAM.
-pub const MIN_BLOB_SIZE: usize = HEADER_SIZE + CPU_STATE_SIZE + TIMER_STATE_SIZE
-    + PPU_STATE_SIZE + IO_REGS_SIZE + IE_SIZE + WRAM_SIZE + HRAM_SIZE + VRAM_SIZE + OAM_SIZE;
+pub const MIN_BLOB_SIZE: usize = HEADER_SIZE
+    + CPU_STATE_SIZE
+    + TIMER_STATE_SIZE
+    + PPU_STATE_SIZE
+    + IO_REGS_SIZE
+    + IE_SIZE
+    + WRAM_SIZE
+    + HRAM_SIZE
+    + VRAM_SIZE
+    + OAM_SIZE;
 
 // ── Component state structs ───────────────────────────────────────────────────
 
@@ -80,15 +88,20 @@ pub struct CpuState {
 
 impl CpuState {
     pub fn serialize(&self, out: &mut Vec<u8>) {
-        out.push(self.a); out.push(self.b); out.push(self.c); out.push(self.d);
-        out.push(self.e); out.push(self.h); out.push(self.l);
+        out.push(self.a);
+        out.push(self.b);
+        out.push(self.c);
+        out.push(self.d);
+        out.push(self.e);
+        out.push(self.h);
+        out.push(self.l);
         out.push(self.f.bits());
         out.extend_from_slice(&self.sp.to_le_bytes());
         out.extend_from_slice(&self.pc.to_le_bytes());
         out.push(match self.ime {
             ImeState::Disabled => 0,
-            ImeState::Pending  => 1,
-            ImeState::Enabled  => 2,
+            ImeState::Pending => 1,
+            ImeState::Enabled => 2,
         });
         out.push(self.halted as u8);
         out.extend_from_slice(&self.cycle_counter.to_le_bytes());
@@ -102,17 +115,23 @@ impl CpuState {
             _ => ImeState::Disabled,
         };
         let state = CpuState {
-            a:  b[0], b: b[1], c: b[2], d: b[3],
-            e:  b[4], h: b[5], l: b[6],
-            f:  Flags::from_bits_truncate(b[7]),
-            sp: u16::from_le_bytes([b[8],  b[9]]),
+            a: b[0],
+            b: b[1],
+            c: b[2],
+            d: b[3],
+            e: b[4],
+            h: b[5],
+            l: b[6],
+            f: Flags::from_bits_truncate(b[7]),
+            sp: u16::from_le_bytes([b[8], b[9]]),
             pc: u16::from_le_bytes([b[10], b[11]]),
             ime,
-            halted:        b[CPU_REGS_SIZE + IME_SIZE] != 0,
+            halted: b[CPU_REGS_SIZE + IME_SIZE] != 0,
             cycle_counter: u64::from_le_bytes(
                 b[CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE
-                ..CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE + CYCLE_COUNTER_SIZE]
-                    .try_into().unwrap()
+                    ..CPU_REGS_SIZE + IME_SIZE + HALTED_SIZE + CYCLE_COUNTER_SIZE]
+                    .try_into()
+                    .unwrap(),
             ),
         };
         (state, CPU_STATE_SIZE)
@@ -120,9 +139,16 @@ impl CpuState {
 
     pub fn to_registers(self) -> Registers {
         Registers {
-            a: self.a, b: self.b, c: self.c, d: self.d,
-            e: self.e, h: self.h, l: self.l, f: self.f,
-            sp: self.sp, pc: self.pc,
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            d: self.d,
+            e: self.e,
+            h: self.h,
+            l: self.l,
+            f: self.f,
+            sp: self.sp,
+            pc: self.pc,
         }
     }
 }
@@ -148,8 +174,8 @@ impl TimerState {
         let state = TimerState {
             internal_counter: u16::from_le_bytes([blob[offset], blob[offset + 1]]),
             tima: blob[offset + 2],
-            tma:  blob[offset + 3],
-            tac:  blob[offset + 4],
+            tma: blob[offset + 3],
+            tac: blob[offset + 4],
         };
         (state, TIMER_STATE_SIZE)
     }
@@ -195,8 +221,8 @@ impl PpuState {
     fn parse(blob: &[u8], offset: usize) -> (Self, usize) {
         let b = &blob[offset..];
         let state = PpuState {
-            dot:                 u16::from_le_bytes([b[0], b[1]]),
-            ly:                  b[2],
+            dot: u16::from_le_bytes([b[0], b[1]]),
+            ly: b[2],
             mode: match b[3] {
                 0 => PpuMode::HBlank,
                 1 => PpuMode::VBlank,
@@ -204,16 +230,16 @@ impl PpuState {
                 _ => PpuMode::PixelTransfer,
             },
             window_line_counter: b[4],
-            lcdc:  b[5],
-            stat:  b[6],
-            scy:   b[7],
-            scx:   b[8],
-            lyc:   b[9],
-            bgp:   b[10],
-            obp0:  b[11],
-            obp1:  b[12],
-            wy:    b[13],
-            wx:    b[14],
+            lcdc: b[5],
+            stat: b[6],
+            scy: b[7],
+            scx: b[8],
+            lyc: b[9],
+            bgp: b[10],
+            obp0: b[11],
+            obp1: b[12],
+            wy: b[13],
+            wx: b[14],
         };
         (state, PPU_STATE_SIZE)
     }
@@ -233,8 +259,8 @@ impl MbcState {
         let b = &blob[offset..];
         let state = MbcState {
             rom_bank_lo: b[0].max(1),
-            upper_bits:  b[1] & 0x03,
-            ram_mode:    b[2] != 0,
+            upper_bits: b[1] & 0x03,
+            ram_mode: b[2] != 0,
             ram_enabled: b[3] != 0,
         };
         (state, MBC_SIZE)
@@ -251,17 +277,17 @@ impl MbcState {
 pub struct SaveState {
     blob: Vec<u8>,
 
-    pub cpu:   CpuState,
+    pub cpu: CpuState,
     pub timer: TimerState,
-    pub ppu:   PpuState,
-    mbc:       Option<MbcState>,
+    pub ppu: PpuState,
+    mbc: Option<MbcState>,
 
-    io_range:       Range<usize>,
-    ie_offset:      usize,
-    wram_range:     Range<usize>,
-    hram_range:     Range<usize>,
-    vram_range:     Range<usize>,
-    oam_range:      Range<usize>,
+    io_range: Range<usize>,
+    ie_offset: usize,
+    wram_range: Range<usize>,
+    hram_range: Range<usize>,
+    vram_range: Range<usize>,
+    oam_range: Range<usize>,
     cart_ram_range: Option<Range<usize>>,
 }
 
@@ -270,7 +296,12 @@ impl SaveState {
     ///
     /// Called by `Sm83::save_state` which constructs the typed state structs
     /// from its own fields and passes them here. This function owns the format.
-    pub fn serialize(cpu: CpuState, timer: TimerState, ppu: PpuState, memory: &GameBoyMemory) -> Vec<u8> {
+    pub fn serialize(
+        cpu: CpuState,
+        timer: TimerState,
+        ppu: PpuState,
+        memory: &GameBoyMemory,
+    ) -> Vec<u8> {
         let mut out = Vec::with_capacity(MIN_BLOB_SIZE);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
@@ -299,19 +330,29 @@ impl SaveState {
 
         let mut cur = HEADER_SIZE;
 
-        let (cpu,   n) = CpuState::parse(&blob, cur);   cur += n;
-        let (timer, n) = TimerState::parse(&blob, cur);  cur += n;
-        let (ppu,   n) = PpuState::parse(&blob, cur);    cur += n;
+        let (cpu, n) = CpuState::parse(&blob, cur);
+        cur += n;
+        let (timer, n) = TimerState::parse(&blob, cur);
+        cur += n;
+        let (ppu, n) = PpuState::parse(&blob, cur);
+        cur += n;
 
-        let io_range  = cur..cur + IO_REGS_SIZE;          cur += IO_REGS_SIZE;
-        let ie_offset = cur;                              cur += IE_SIZE;
-        let wram_range = cur..cur + WRAM_SIZE;            cur += WRAM_SIZE;
-        let hram_range = cur..cur + HRAM_SIZE;            cur += HRAM_SIZE;
-        let vram_range = cur..cur + VRAM_SIZE;            cur += VRAM_SIZE;
-        let oam_range  = cur..cur + OAM_SIZE;             cur += OAM_SIZE;
+        let io_range = cur..cur + IO_REGS_SIZE;
+        cur += IO_REGS_SIZE;
+        let ie_offset = cur;
+        cur += IE_SIZE;
+        let wram_range = cur..cur + WRAM_SIZE;
+        cur += WRAM_SIZE;
+        let hram_range = cur..cur + HRAM_SIZE;
+        cur += HRAM_SIZE;
+        let vram_range = cur..cur + VRAM_SIZE;
+        cur += VRAM_SIZE;
+        let oam_range = cur..cur + OAM_SIZE;
+        cur += OAM_SIZE;
 
         let mbc = if cur + MBC_SIZE <= blob.len() {
-            let (m, n) = MbcState::parse(&blob, cur);    cur += n;
+            let (m, n) = MbcState::parse(&blob, cur);
+            cur += n;
             Some(m)
         } else {
             None
@@ -330,22 +371,45 @@ impl SaveState {
         };
 
         Ok(SaveState {
-            blob, cpu, timer, ppu, mbc,
-            io_range, ie_offset, wram_range, hram_range, vram_range, oam_range,
+            blob,
+            cpu,
+            timer,
+            ppu,
+            mbc,
+            io_range,
+            ie_offset,
+            wram_range,
+            hram_range,
+            vram_range,
+            oam_range,
             cart_ram_range,
         })
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
 
-    pub fn mbc(&self) -> Option<&MbcState>  { self.mbc.as_ref() }
+    pub fn mbc(&self) -> Option<&MbcState> {
+        self.mbc.as_ref()
+    }
 
-    pub fn io_registers(&self) -> &[u8]     { &self.blob[self.io_range.clone()] }
-    pub fn ie(&self) -> u8                  { self.blob[self.ie_offset] }
-    pub fn wram(&self) -> &[u8]             { &self.blob[self.wram_range.clone()] }
-    pub fn hram(&self) -> &[u8]             { &self.blob[self.hram_range.clone()] }
-    pub fn vram(&self) -> &[u8]             { &self.blob[self.vram_range.clone()] }
-    pub fn oam(&self)  -> &[u8]             { &self.blob[self.oam_range.clone()] }
+    pub fn io_registers(&self) -> &[u8] {
+        &self.blob[self.io_range.clone()]
+    }
+    pub fn ie(&self) -> u8 {
+        self.blob[self.ie_offset]
+    }
+    pub fn wram(&self) -> &[u8] {
+        &self.blob[self.wram_range.clone()]
+    }
+    pub fn hram(&self) -> &[u8] {
+        &self.blob[self.hram_range.clone()]
+    }
+    pub fn vram(&self) -> &[u8] {
+        &self.blob[self.vram_range.clone()]
+    }
+    pub fn oam(&self) -> &[u8] {
+        &self.blob[self.oam_range.clone()]
+    }
     pub fn cart_ram(&self) -> Option<&[u8]> {
         self.cart_ram_range.as_ref().map(|r| &self.blob[r.clone()])
     }

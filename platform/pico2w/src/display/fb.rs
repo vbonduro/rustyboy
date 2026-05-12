@@ -40,21 +40,25 @@ impl FbDisplay {
         let mut encoder = png::Encoder::new(w, self.width, self.height);
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })?;
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        let data: Vec<u8> = self.pixels.iter().flat_map(|p| {
-            // Expand Rgb565 → 8-bit RGB
-            let r = (p.r() << 3) | (p.r() >> 2);
-            let g = (p.g() << 2) | (p.g() >> 4);
-            let b = (p.b() << 3) | (p.b() >> 2);
-            [r, g, b]
-        }).collect();
+        let data: Vec<u8> = self
+            .pixels
+            .iter()
+            .flat_map(|p| {
+                // Expand Rgb565 → 8-bit RGB
+                let r = (p.r() << 3) | (p.r() >> 2);
+                let g = (p.g() << 2) | (p.g() >> 4);
+                let b = (p.b() << 3) | (p.b() >> 2);
+                [r, g, b]
+            })
+            .collect();
 
-        writer.write_image_data(&data).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-        })
+        writer
+            .write_image_data(&data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 }
 

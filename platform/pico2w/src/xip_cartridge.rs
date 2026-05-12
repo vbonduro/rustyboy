@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
 
-use rustyboy_core::memory::cartridge::{Cartridge, CartridgeRomWindows};
 #[cfg(feature = "perf")]
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
+use rustyboy_core::memory::cartridge::{Cartridge, CartridgeRomWindows};
 
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::perf::cyccnt;

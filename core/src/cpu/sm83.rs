@@ -33,9 +33,9 @@ use super::operations::sub::*;
 use super::perf::Sm83PerfRecorder;
 use super::registers::{Flags, Registers};
 
-use crate::memory::memory::{GameBoyMemory, Memory as MemoryTrait};
 #[cfg(feature = "perf")]
 pub use super::perf::Sm83PerfProfile;
+use crate::memory::memory::{GameBoyMemory, Memory as MemoryTrait};
 
 /// Interrupt Master Enable state. EI has a 1-instruction delay before IME becomes active.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -149,7 +149,8 @@ impl Sm83 {
     /// r16 pairs for stack instructions: 0=BC 1=DE 2=HL 3=AF.
     fn r16stk_get(&self, r: u8) -> u16 {
         match r {
-            0 => self.registers.bc(), 1 => self.registers.de(),
+            0 => self.registers.bc(),
+            1 => self.registers.de(),
             2 => self.registers.hl(),
             _ => {
                 let a = self.registers.a as u16;
@@ -161,7 +162,8 @@ impl Sm83 {
 
     fn r16stk_set(&mut self, r: u8, v: u16) {
         match r {
-            0 => self.registers.set_bc(v), 1 => self.registers.set_de(v),
+            0 => self.registers.set_bc(v),
+            1 => self.registers.set_de(v),
             2 => self.registers.set_hl(v),
             _ => {
                 self.registers.a = (v >> 8) as u8;
@@ -374,9 +376,9 @@ impl Sm83 {
     fn check_condition(&self, cond: &Condition) -> bool {
         match cond {
             Condition::NZ => !self.registers.f.contains(Flags::Z),
-            Condition::Z  =>  self.registers.f.contains(Flags::Z),
+            Condition::Z => self.registers.f.contains(Flags::Z),
             Condition::NC => !self.registers.f.contains(Flags::C),
-            Condition::C  =>  self.registers.f.contains(Flags::C),
+            Condition::C => self.registers.f.contains(Flags::C),
         }
     }
 
@@ -395,7 +397,13 @@ impl Sm83 {
 
     // ── CB helpers ────────────────────────────────────────────────────────────
 
-    fn set_cb_result(&mut self, target: CbTarget, val: u8, flags: Flags, memory: &mut GameBoyMemory) {
+    fn set_cb_result(
+        &mut self,
+        target: CbTarget,
+        val: u8,
+        flags: Flags,
+        memory: &mut GameBoyMemory,
+    ) {
         self.write_cb_target(target, val, memory);
         self.registers.f = flags;
     }
@@ -425,7 +433,11 @@ impl Instructions for Sm83 {
     fn add16(&mut self, op: &Add16) -> Result<u8, InstructionError> {
         let rr = match op.operand {
             Operand::Register16(r) => self.get_r16_enum(r),
-            _ => return Err(InstructionError::InvalidOperand(alloc::format!("{:?}", op.operand))),
+            _ => {
+                return Err(InstructionError::InvalidOperand(alloc::format!(
+                    "{:?}", op.operand
+                )))
+            }
         };
         let hl = self.registers.hl();
         let (new_hl, new_flags) = add_u16(hl, rr);
@@ -439,7 +451,11 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn add_sp16(&mut self, op: &AddSP16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+    fn add_sp16(
+        &mut self,
+        op: &AddSP16,
+        memory: &mut GameBoyMemory,
+    ) -> Result<u8, InstructionError> {
         let e = self.fetch_byte(memory) as i8;
         let (res, flags) = add_sp_u16(self.registers.sp, e);
         self.registers.sp = res;
@@ -591,7 +607,11 @@ impl Instructions for Sm83 {
                 self.bus_write(memory, addr, v);
                 self.registers.f = f;
             }
-            _ => return Err(InstructionError::InvalidOperand(alloc::format!("{:?}", op.operand))),
+            _ => {
+                return Err(InstructionError::InvalidOperand(alloc::format!(
+                    "{:?}", op.operand
+                )))
+            }
         }
         Ok(op.cycles)
     }
@@ -610,7 +630,11 @@ impl Instructions for Sm83 {
                 self.bus_write(memory, addr, v);
                 self.registers.f = f;
             }
-            _ => return Err(InstructionError::InvalidOperand(alloc::format!("{:?}", op.operand))),
+            _ => {
+                return Err(InstructionError::InvalidOperand(alloc::format!(
+                    "{:?}", op.operand
+                )))
+            }
         }
         Ok(op.cycles)
     }
@@ -826,7 +850,11 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
-    fn cb(&mut self, op: &CbInstruction, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
+    fn cb(
+        &mut self,
+        op: &CbInstruction,
+        memory: &mut GameBoyMemory,
+    ) -> Result<u8, InstructionError> {
         let val = match op.target {
             CbTarget::Reg(r) => self.get_r8_enum(r),
             CbTarget::HLMem => {
@@ -836,14 +864,38 @@ impl Instructions for Sm83 {
         };
         let carry = self.registers.f.contains(Flags::C);
         match op.op {
-            CbOp::Rlc  => { let (r, f) = rlc_u8(val);       self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Rrc  => { let (r, f) = rrc_u8(val);       self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Rl   => { let (r, f) = rl_u8(val, carry); self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Rr   => { let (r, f) = rr_u8(val, carry); self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Sla  => { let (r, f) = sla_u8(val);       self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Sra  => { let (r, f) = sra_u8(val);       self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Swap => { let (r, f) = swap_u8(val);      self.set_cb_result(op.target, r, f, memory); }
-            CbOp::Srl  => { let (r, f) = srl_u8(val);       self.set_cb_result(op.target, r, f, memory); }
+            CbOp::Rlc => {
+                let (r, f) = rlc_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Rrc => {
+                let (r, f) = rrc_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Rl => {
+                let (r, f) = rl_u8(val, carry);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Rr => {
+                let (r, f) = rr_u8(val, carry);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Sla => {
+                let (r, f) = sla_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Sra => {
+                let (r, f) = sra_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Swap => {
+                let (r, f) = swap_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
+            CbOp::Srl => {
+                let (r, f) = srl_u8(val);
+                self.set_cb_result(op.target, r, f, memory);
+            }
             CbOp::Bit(b) => {
                 // BIT does not write back; only updates flags
                 let f = bit_u8(val, b, self.registers.f);
@@ -864,10 +916,10 @@ impl Instructions for Sm83 {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
     use crate::cpu::registers::{Flags, Registers};
     use crate::gameboy::GameBoy;
     use crate::memory::memory::{GameBoyMemory, Memory};
+    use alloc::{vec, vec::Vec};
 
     fn make_test_cpu(rom_data: Vec<u8>) -> GameBoy {
         GameBoy::for_test(rom_data)
@@ -920,9 +972,12 @@ mod tests {
     #[test]
     fn test_add8_memory_hl_to_accumulator() {
         let mut cpu = make_test_cpu_with_memory(
-            |m| { m.write(0xC000, 0x07).unwrap(); },
+            |m| {
+                m.write(0xC000, 0x07).unwrap();
+            },
             vec![0x86],
-        ).with_registers(Registers {
+        )
+        .with_registers(Registers {
             a: 0x03,
             h: 0xC0,
             l: 0x00,
