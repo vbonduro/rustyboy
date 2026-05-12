@@ -7,7 +7,7 @@ use crate::cpu::peripheral::ppu::PpuPerfProfile;
 use crate::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 use crate::cpu::save_state::PpuState;
 
-use super::protocol::{WorkerCommand, WorkerFrontendState, WorkerLink};
+use super::protocol::{WorkerCommand, WorkerLink};
 use super::worker::GameBoyWorker;
 
 pub struct InlineWorkerLink {
@@ -63,12 +63,24 @@ impl WorkerLink for InlineWorkerLink {
         self.worker.snapshot_ppu_state()
     }
 
-    fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
-        let state = self.worker.poll_frontend_state();
-        if state.frame_ready {
-            self.worker.copy_framebuffer(out);
-        }
-        state
+    fn read_apu_nr52(&self) -> u8 {
+        self.worker.read_apu_nr52()
+    }
+
+    fn read_ppu_ly(&self) -> u8 {
+        self.worker.read_ppu_ly()
+    }
+
+    fn read_ppu_stat(&self) -> u8 {
+        self.worker.read_ppu_stat()
+    }
+
+    fn take_pending_if_bits(&mut self) -> u8 {
+        self.worker.take_pending_if_bits()
+    }
+
+    fn copy_front_buffer_if_ready(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> bool {
+        self.worker.copy_framebuffer_if_ready(out)
     }
 
     #[cfg(feature = "perf")]

@@ -497,13 +497,16 @@ impl GameBoyFrontend {
     fn sync_worker_frontend_state(&mut self, link: &mut impl WorkerLink) {
         #[cfg(feature = "perf")]
         let sync_start = cyccnt();
-        let state = link.poll_frontend_state(&mut self.front_buffer);
-        self.memory.write_io(NR52_ADDR, state.apu_nr52);
-        self.memory.write_io(LY_ADDR, state.ppu_ly);
-        self.memory.write_io(STAT_ADDR, state.ppu_stat);
-        if state.if_bits != 0 {
+        let frame_ready = link.copy_front_buffer_if_ready(&mut self.front_buffer);
+        #[cfg(not(feature = "perf"))]
+        let _ = frame_ready;
+        self.memory.write_io(NR52_ADDR, link.read_apu_nr52());
+        self.memory.write_io(LY_ADDR, link.read_ppu_ly());
+        self.memory.write_io(STAT_ADDR, link.read_ppu_stat());
+        let if_bits = link.take_pending_if_bits();
+        if if_bits != 0 {
             let if_ = self.memory.read_io(IF_ADDR);
-            self.memory.write_io(IF_ADDR, if_ | state.if_bits);
+            self.memory.write_io(IF_ADDR, if_ | if_bits);
         }
         #[cfg(feature = "perf")]
         {
@@ -511,7 +514,7 @@ impl GameBoyFrontend {
                 .perf_profile
                 .ppu_sync
                 .wrapping_add(cyccnt().wrapping_sub(sync_start));
-            if state.frame_ready {
+            if frame_ready {
                 self.perf_profile.render_scanlines =
                     self.perf_profile.render_scanlines.wrapping_add(144);
             }

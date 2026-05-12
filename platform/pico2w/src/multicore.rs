@@ -25,7 +25,7 @@ use rustyboy_core::cpu::save_state::{PpuState, SaveState};
 use rustyboy_core::cpu::sm83::Sm83PerfProfile;
 #[cfg(feature = "perf")]
 use rustyboy_core::gameboy::FrontendPerfProfile;
-use rustyboy_core::gameboy::{GameBoyFrontend, WorkerCommand, WorkerFrontendState, WorkerLink};
+use rustyboy_core::gameboy::{GameBoyFrontend, WorkerCommand, WorkerLink};
 use rustyboy_core::memory::cartridge::Cartridge;
 #[cfg(feature = "perf")]
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
@@ -565,20 +565,30 @@ impl WorkerLink for Core1WorkerLink {
         })
     }
 
-    fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
+    fn read_apu_nr52(&self) -> u8 {
+        self.shared.apu_nr52.load(Ordering::Acquire)
+    }
+
+    fn read_ppu_ly(&self) -> u8 {
+        self.shared.ppu_ly.load(Ordering::Acquire)
+    }
+
+    fn read_ppu_stat(&self) -> u8 {
+        self.shared.ppu_stat.load(Ordering::Acquire)
+    }
+
+    fn take_pending_if_bits(&mut self) -> u8 {
+        self.shared.pending_if_bits.swap(0, Ordering::AcqRel)
+    }
+
+    fn copy_front_buffer_if_ready(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> bool {
         let frame_seq = self.shared.published_frame_seq.load(Ordering::Acquire);
         let frame_ready = frame_seq != self.last_frame_seq;
         if frame_ready {
             self.shared.copy_published_frame(out);
             self.last_frame_seq = frame_seq;
         }
-        WorkerFrontendState {
-            apu_nr52: self.shared.apu_nr52.load(Ordering::Acquire),
-            ppu_ly: self.shared.ppu_ly.load(Ordering::Acquire),
-            ppu_stat: self.shared.ppu_stat.load(Ordering::Acquire),
-            if_bits: self.shared.pending_if_bits.swap(0, Ordering::AcqRel),
-            frame_ready,
-        }
+        frame_ready
     }
 
     #[cfg(feature = "perf")]

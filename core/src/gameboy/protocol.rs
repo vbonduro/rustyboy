@@ -18,15 +18,6 @@ pub enum WorkerCommand {
     WritePpuRegister { addr: u16, value: u8 },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct WorkerFrontendState {
-    pub apu_nr52: u8,
-    pub ppu_ly: u8,
-    pub ppu_stat: u8,
-    pub if_bits: u8,
-    pub frame_ready: bool,
-}
-
 pub trait WorkerLink {
     fn send(&mut self, command: WorkerCommand);
     fn write_vram_range(&mut self, start_offset: u16, data: &[u8]);
@@ -38,7 +29,11 @@ pub trait WorkerLink {
     fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]);
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]);
     fn snapshot_ppu_state(&self, io: &[u8]) -> PpuState;
-    fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState;
+    fn read_apu_nr52(&self) -> u8;
+    fn read_ppu_ly(&self) -> u8;
+    fn read_ppu_stat(&self) -> u8;
+    fn take_pending_if_bits(&mut self) -> u8;
+    fn copy_front_buffer_if_ready(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> bool;
     #[cfg(feature = "perf")]
     fn take_apu_perf_profile(&mut self) -> ApuPerfProfile;
     #[cfg(feature = "perf")]

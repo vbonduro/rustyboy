@@ -17,7 +17,7 @@ use crate::memory::memory::{Error as MemoryError, GameBoyMemory};
 pub use frontend::FrontendPerfProfile;
 pub use frontend::GameBoyFrontend;
 pub use inline::InlineWorkerLink;
-pub use protocol::{WorkerCommand, WorkerFrontendState, WorkerLink};
+pub use protocol::{WorkerCommand, WorkerLink};
 pub use worker::GameBoyWorker;
 
 /// Top-level Game Boy emulator coordinator.

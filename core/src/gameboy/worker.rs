@@ -10,12 +10,16 @@ use crate::cpu::peripheral::ppu::{
 };
 use crate::cpu::save_state::PpuState;
 
-use super::protocol::{WorkerCommand, WorkerFrontendState};
+use super::protocol::WorkerCommand;
 
 pub struct GameBoyWorker {
     apu: ApuPeripheral,
     ppu: PpuWorkerState,
-    frontend_state: WorkerFrontendState,
+    apu_nr52: u8,
+    ppu_ly: u8,
+    ppu_stat: u8,
+    pending_if_bits: u8,
+    frame_ready: bool,
 }
 
 impl GameBoyWorker {
@@ -23,15 +27,18 @@ impl GameBoyWorker {
     pub fn new() -> Self {
         let apu = ApuPeripheral::new();
         let mut ppu = PpuWorkerState::new();
-        let mut frontend_state = WorkerFrontendState::default();
-        frontend_state.apu_nr52 = apu.read_register(NR52_ADDR);
-        frontend_state.ppu_ly = ppu.ly();
-        frontend_state.ppu_stat = ppu.stat();
+        let apu_nr52 = apu.read_register(NR52_ADDR);
+        let ppu_ly = ppu.ly();
+        let ppu_stat = ppu.stat();
         ppu.sync_prev_stat_line();
         Self {
             apu,
             ppu,
-            frontend_state,
+            apu_nr52,
+            ppu_ly,
+            ppu_stat,
+            pending_if_bits: 0,
+            frame_ready: false,
         }
     }
 
@@ -44,18 +51,18 @@ impl GameBoyWorker {
                 div_counter,
             } => {
                 let output = self.apu.tick(cycles, div_counter);
-                self.frontend_state.apu_nr52 = output.nr52;
+                self.apu_nr52 = output.nr52;
             }
             WorkerCommand::AdvancePpu { cycles } => {
                 let output = self.ppu.advance(cycles);
-                self.frontend_state.ppu_ly = output.ly;
-                self.frontend_state.ppu_stat = output.stat;
-                self.frontend_state.if_bits |= output.if_bits;
-                self.frontend_state.frame_ready |= output.frame_ready;
+                self.ppu_ly = output.ly;
+                self.ppu_stat = output.stat;
+                self.pending_if_bits |= output.if_bits;
+                self.frame_ready |= output.frame_ready;
             }
             WorkerCommand::WriteApuRegister { addr, value } => {
                 self.apu.write_register(addr, value);
-                self.frontend_state.apu_nr52 = self.apu.read_register(NR52_ADDR);
+                self.apu_nr52 = self.apu.read_register(NR52_ADDR);
             }
             WorkerCommand::WriteWaveRam { offset, value } => {
                 self.apu.write_wave_ram(offset, value);
@@ -68,8 +75,8 @@ impl GameBoyWorker {
             }
             WorkerCommand::WritePpuRegister { addr, value } => {
                 self.ppu.write_register(addr, value);
-                self.frontend_state.ppu_ly = self.ppu.ly();
-                self.frontend_state.ppu_stat = self.ppu.stat();
+                self.ppu_ly = self.ppu.ly();
+                self.ppu_stat = self.ppu.stat();
             }
         }
     }
@@ -84,23 +91,23 @@ impl GameBoyWorker {
 
     pub fn sync_apu_state(&mut self, io: &[u8]) {
         self.apu.sync_from_io_snapshot(io);
-        self.frontend_state.apu_nr52 = self.apu.read_register(NR52_ADDR);
+        self.apu_nr52 = self.apu.read_register(NR52_ADDR);
     }
 
     pub fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.ppu.sync_state(io, vram, oam);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
+        self.ppu_ly = self.ppu.ly();
+        self.ppu_stat = self.ppu.stat();
+        self.pending_if_bits = 0;
+        self.frame_ready = false;
     }
 
     pub fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.ppu.load_state(state, io, vram, oam);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
+        self.ppu_ly = self.ppu.ly();
+        self.ppu_stat = self.ppu.stat();
+        self.pending_if_bits = 0;
+        self.frame_ready = false;
     }
 
     pub fn snapshot_ppu_state(&self) -> PpuState {
@@ -129,19 +136,39 @@ impl GameBoyWorker {
     #[inline(always)]
     pub fn write_ppu_register(&mut self, addr: u16, value: u8) {
         self.ppu.write_register(addr, value);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
+        self.ppu_ly = self.ppu.ly();
+        self.ppu_stat = self.ppu.stat();
     }
 
     pub fn copy_framebuffer(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) {
         out.copy_from_slice(self.ppu.framebuffer());
     }
 
-    pub fn poll_frontend_state(&mut self) -> WorkerFrontendState {
-        let state = self.frontend_state;
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
-        state
+    pub fn read_apu_nr52(&self) -> u8 {
+        self.apu_nr52
+    }
+
+    pub fn read_ppu_ly(&self) -> u8 {
+        self.ppu_ly
+    }
+
+    pub fn read_ppu_stat(&self) -> u8 {
+        self.ppu_stat
+    }
+
+    pub fn take_pending_if_bits(&mut self) -> u8 {
+        let if_bits = self.pending_if_bits;
+        self.pending_if_bits = 0;
+        if_bits
+    }
+
+    pub fn copy_framebuffer_if_ready(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> bool {
+        if !self.frame_ready {
+            return false;
+        }
+        self.frame_ready = false;
+        self.copy_framebuffer(out);
+        true
     }
 
     #[cfg(feature = "perf")]
