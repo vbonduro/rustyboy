@@ -26,7 +26,12 @@ mod imp {
 
     #[inline]
     fn bounds() -> (usize, usize) {
-        unsafe { (&__sheap as *const u8 as usize, &_stack_start as *const u8 as usize) }
+        unsafe {
+            (
+                &__sheap as *const u8 as usize,
+                &_stack_start as *const u8 as usize,
+            )
+        }
     }
 
     fn active_thread_sp() -> usize {
@@ -70,10 +75,7 @@ mod imp {
         if current_margin <= COLLISION_GUARD_BYTES {
             panic!(
                 "stack collision risk {}: sp=0x{:08x} bottom=0x{:08x} margin={}B",
-                label,
-                state.current_sp,
-                state.bottom,
-                current_margin,
+                label, state.current_sp, state.bottom, current_margin,
             );
         }
 
@@ -82,10 +84,7 @@ mod imp {
         {
             warn!(
                 "stack low headroom {}: sp=0x{:08x} bottom=0x{:08x} margin={}B",
-                label,
-                state.current_sp,
-                state.bottom,
-                current_margin,
+                label, state.current_sp, state.bottom, current_margin,
             );
         }
     }

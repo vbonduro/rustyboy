@@ -1,4 +1,4 @@
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::fmt;
 
 pub enum Error {
@@ -49,6 +49,7 @@ impl ROMVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[test]
     fn test_read_romvec() {

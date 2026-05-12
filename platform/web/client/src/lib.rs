@@ -35,10 +35,14 @@ impl EmulatorHandle {
         // Start at 0x100 with DMG post-boot-ROM state (skips boot ROM).
         let cpu = GameBoy::new(rom)
             .with_registers(Registers {
-                a: 0x01, f: Flags::from_bits_truncate(0xB0),
-                b: 0x00, c: 0x13,
-                d: 0x00, e: 0xD8,
-                h: 0x01, l: 0x4D,
+                a: 0x01,
+                f: Flags::from_bits_truncate(0xB0),
+                b: 0x00,
+                c: 0x13,
+                d: 0x00,
+                e: 0xD8,
+                h: 0x01,
+                l: 0x4D,
                 pc: 0x0100,
                 sp: 0xFFFE,
             })
@@ -80,17 +84,17 @@ impl EmulatorHandle {
         let read = |a: u16| self.cpu.read_memory(a).unwrap_or(0);
         let lcdc = read(0xFF40);
         let stat = read(0xFF41);
-        let ly   = read(0xFF44);
-        let lyc  = read(0xFF45);
-        let scx  = read(0xFF43);
-        let scy  = read(0xFF42);
-        let if_  = read(0xFF0F);
-        let ie   = read(0xFFFF);
-        let bgp  = read(0xFF47);
+        let ly = read(0xFF44);
+        let lyc = read(0xFF45);
+        let scx = read(0xFF43);
+        let scy = read(0xFF42);
+        let if_ = read(0xFF0F);
+        let ie = read(0xFFFF);
+        let bgp = read(0xFF47);
         let obp0 = read(0xFF48);
         let ffeb = read(0xFFEB);
         let ffe6 = read(0xFFE6);
-        let ime  = if self.cpu.ime() { "1" } else { "0" };
+        let ime = if self.cpu.ime() { "1" } else { "0" };
         let bank = self.cpu.current_rom_bank();
         let pc = self.cpu.registers().pc;
         format!(
@@ -118,7 +122,10 @@ impl EmulatorHandle {
     /// Returns the cartridge external RAM (battery save) as bytes, or an empty Vec
     /// if this cartridge has no external RAM.
     pub fn get_battery_save(&self) -> Vec<u8> {
-        self.cpu.external_ram().map(|s| s.to_vec()).unwrap_or_default()
+        self.cpu
+            .external_ram()
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
     }
 
     /// Writes battery save data into the cartridge external RAM.

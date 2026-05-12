@@ -6,7 +6,7 @@ use core::fmt;
 use super::cartridge::{self, Cartridge, CartridgeRomWindows, NoMbc};
 use crate::cpu::save_state::SaveState;
 
-/// An event produced when a write occurs to an I/O or IE register address.
+/// An event produced when a write occurs to a worker-mirrored address.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct BusEvent {
     pub address: u16,
@@ -410,7 +410,12 @@ impl GameBoyMemory {
         if let Some(mbc) = state.mbc() {
             // Reconstruct MBC register state via the existing load path.
             // We build a minimal 4-byte buffer and reuse load_mbc_state.
-            let buf = [mbc.rom_bank_lo, mbc.upper_bits, mbc.ram_mode as u8, mbc.ram_enabled as u8];
+            let buf = [
+                mbc.rom_bank_lo,
+                mbc.upper_bits,
+                mbc.ram_mode as u8,
+                mbc.ram_enabled as u8,
+            ];
             self.cartridge.load_mbc_state(&buf, 0);
             self.refresh_rom_windows();
         }
@@ -506,6 +511,7 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::Vram(offset) => {
                 self.vram[offset as usize] = value;
+                self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
             RegionMapping::Wram(offset) => {
@@ -515,6 +521,7 @@ impl Memory for GameBoyMemory {
             RegionMapping::EchoRam(_) => Err(Error::ReadOnly(address)),
             RegionMapping::Oam(offset) => {
                 self.oam[offset as usize] = value;
+                self.events.push_back(BusEvent { address, value });
                 Ok(())
             }
             RegionMapping::Io(offset) => {

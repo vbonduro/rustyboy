@@ -34,13 +34,25 @@ impl TimerPeripheral {
         (self.internal_counter >> 8) as u8
     }
 
-    pub fn tima(&self) -> u8 { self.tima }
-    pub fn tma(&self)  -> u8 { self.tma  }
-    pub fn tac(&self)  -> u8 { self.tac  }
+    pub fn tima(&self) -> u8 {
+        self.tima
+    }
+    pub fn tma(&self) -> u8 {
+        self.tma
+    }
+    pub fn tac(&self) -> u8 {
+        self.tac
+    }
 
-    pub fn set_tima(&mut self, v: u8) { self.tima = v; }
-    pub fn set_tma(&mut self, v: u8)  { self.tma  = v; }
-    pub fn set_tac(&mut self, v: u8)  { self.tac  = v; }
+    pub fn set_tima(&mut self, v: u8) {
+        self.tima = v;
+    }
+    pub fn set_tma(&mut self, v: u8) {
+        self.tma = v;
+    }
+    pub fn set_tac(&mut self, v: u8) {
+        self.tac = v;
+    }
 
     /// The full 16-bit internal counter. Used by the APU to synchronize
     /// its frame sequencer with bit 12 (DIV bit 4) falling edge.
@@ -67,8 +79,8 @@ impl TimerPeripheral {
     pub fn load_state(&mut self, state: crate::cpu::save_state::TimerState) {
         self.internal_counter = state.internal_counter;
         self.tima = state.tima;
-        self.tma  = state.tma;
-        self.tac  = state.tac;
+        self.tma = state.tma;
+        self.tac = state.tac;
     }
 
     /// Advance the timer by `cycles` T-cycles.
@@ -87,8 +99,7 @@ impl TimerPeripheral {
                 (65536u32 / divisor as u32 - prev as u32 / divisor as u32)
                     + self.internal_counter as u32 / divisor as u32
             } else {
-                self.internal_counter as u32 / divisor as u32
-                    - prev as u32 / divisor as u32
+                self.internal_counter as u32 / divisor as u32 - prev as u32 / divisor as u32
             };
 
             for _ in 0..n_edges {
