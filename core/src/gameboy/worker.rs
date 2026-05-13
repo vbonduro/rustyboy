@@ -137,6 +137,10 @@ impl GameBoyWorker {
         out.copy_from_slice(self.ppu.framebuffer());
     }
 
+    pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
+        self.ppu.framebuffer()
+    }
+
     pub fn poll_frontend_state(&mut self) -> WorkerFrontendState {
         let state = self.frontend_state;
         self.frontend_state.if_bits = 0;
