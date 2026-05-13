@@ -53,12 +53,35 @@ use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 use rustyboy_pico2w::stack_probe;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
-#[cfg(feature = "oc-266")]
-const TARGET_SYS_HZ: u32 = 266_000_000;
-#[cfg(not(feature = "oc-266"))]
-const TARGET_SYS_HZ: u32 = 250_000_000;
+#[cfg(any(
+    all(feature = "oc-266", feature = "oc-280"),
+    all(feature = "oc-266", feature = "oc-300"),
+    all(feature = "oc-280", feature = "oc-300"),
+))]
+compile_error!("Enable at most one overclock feature at a time");
 
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_20;
+#[cfg(feature = "oc-300")]
+const TARGET_SYS_HZ: u32 = 300_000_000;
+#[cfg(all(not(feature = "oc-300"), feature = "oc-280"))]
+const TARGET_SYS_HZ: u32 = 280_000_000;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), feature = "oc-266"))]
+const TARGET_SYS_HZ: u32 = 266_000_000;
+#[cfg(all(
+    not(feature = "oc-300"),
+    not(feature = "oc-280"),
+    not(feature = "oc-266")
+))]
+const TARGET_SYS_HZ: u32 = 300_000_000;
+
+#[cfg(feature = "oc-300")]
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_30;
+#[cfg(feature = "oc-280")]
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_25;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280")))]
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_30;
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CYCLES_PER_FRAME: u64 = 70_224;

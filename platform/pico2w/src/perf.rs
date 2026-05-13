@@ -2,10 +2,91 @@ use defmt::info;
 use embassy_time::Instant;
 use rustyboy_pico2w::multicore::PicoGameBoy;
 
-#[cfg(all(feature = "perf", feature = "oc-266"))]
+#[cfg(any(
+    all(feature = "oc-266", feature = "oc-280"),
+    all(feature = "oc-266", feature = "oc-300"),
+    all(feature = "oc-280", feature = "oc-300"),
+))]
+compile_error!("Enable at most one overclock feature at a time");
+
+#[cfg(all(feature = "perf", feature = "oc-300"))]
+const CYCLES_PER_MS: u64 = 300_000;
+#[cfg(all(feature = "perf", not(feature = "oc-300"), feature = "oc-280"))]
+const CYCLES_PER_MS: u64 = 280_000;
+#[cfg(all(
+    feature = "perf",
+    not(feature = "oc-300"),
+    not(feature = "oc-280"),
+    feature = "oc-266"
+))]
 const CYCLES_PER_MS: u64 = 266_000;
-#[cfg(all(feature = "perf", not(feature = "oc-266")))]
-const CYCLES_PER_MS: u64 = 250_000;
+#[cfg(all(
+    feature = "perf",
+    not(feature = "oc-300"),
+    not(feature = "oc-280"),
+    not(feature = "oc-266")
+))]
+const CYCLES_PER_MS: u64 = 300_000;
+#[cfg(feature = "perf")]
+const TOP_OPCODE_COUNT: usize = 3;
+
+#[cfg(feature = "perf")]
+#[derive(Clone, Copy, Default)]
+struct OpcodeHotspot {
+    opcode: u8,
+    cycles: u32,
+    calls: u32,
+}
+
+#[cfg(feature = "perf")]
+fn top_opcode_hotspots(
+    cycles: &[u32; 256],
+    calls: &[u32; 256],
+) -> [OpcodeHotspot; TOP_OPCODE_COUNT] {
+    let mut top = [OpcodeHotspot::default(); TOP_OPCODE_COUNT];
+
+    for opcode in 0..256 {
+        let cycles = cycles[opcode];
+        let calls = calls[opcode];
+        if cycles == 0 || calls == 0 {
+            continue;
+        }
+
+        let candidate = OpcodeHotspot {
+            opcode: opcode as u8,
+            cycles,
+            calls,
+        };
+
+        let mut insert_at = TOP_OPCODE_COUNT;
+        for idx in 0..TOP_OPCODE_COUNT {
+            if candidate.cycles > top[idx].cycles {
+                insert_at = idx;
+                break;
+            }
+        }
+
+        if insert_at == TOP_OPCODE_COUNT {
+            continue;
+        }
+
+        for idx in (insert_at + 1..TOP_OPCODE_COUNT).rev() {
+            top[idx] = top[idx - 1];
+        }
+        top[insert_at] = candidate;
+    }
+
+    top
+}
+
+#[cfg(feature = "perf")]
+fn avg_cycles_per_call(entry: OpcodeHotspot) -> u32 {
+    if entry.calls == 0 {
+        0
+    } else {
+        entry.cycles / entry.calls
+    }
+}
 
 /// Tracks FPS and (when `perf` is enabled) per-component cycle counts.
 /// Call `tick` once per game loop iteration.
@@ -38,7 +119,11 @@ impl PerfTracker {
         }
     }
 
-    /// Accumulate DWT cycles spent in `scale_to_rgb565` for one frame.
+    /// Accumulate DWT cycles spent staging the next display frame on core 0.
+    ///
+    /// This used to cover `scale_to_rgb565`; after the core 1 publish hook it
+    /// now mostly measures copying the latest pre-scaled frame into the local
+    /// DMA buffer.
     #[cfg(feature = "perf")]
     pub fn record_scale(&mut self, cycles: u32) {
         self.scale_cycles += cycles as u64;
@@ -112,9 +197,11 @@ impl PerfTracker {
                 .wrapping_sub(p.mem_write_fast)
                 .wrapping_sub(p.mem_write_io)
                 .wrapping_sub(p.mem_write_enqueue);
+            let decode_other = p.total.wrapping_sub(p.mem_read).wrapping_sub(p.mem_write);
             info!(
-                "legacy sm83/60f — total={} mem_r={} mem_w={} route={} fast={} io={} enqueue={} other={}",
+                "sm83/60f — total={} decode={} mem_r={} mem_w={} route={} fast={} io={} enqueue={} other={}",
                 p.total,
+                decode_other,
                 p.mem_read,
                 p.mem_write,
                 p.mem_write_route,
@@ -122,6 +209,72 @@ impl PerfTracker {
                 p.mem_write_io,
                 p.mem_write_enqueue,
                 mem_write_other,
+            );
+            info!(
+                "decode breakdown — pc={} rom={} idle={} raw_rom={} wrap={} bus={} opcode={} cb={} operand={} pc_calls={} bus_calls={} opcode_calls={} cb_calls={} operand_calls={}",
+                p.pc_fetch,
+                p.pc_fetch_rom,
+                p.pc_fetch_rom_idle,
+                p.pc_fetch_rom_read,
+                p.pc_fetch_wrapper,
+                p.bus_read,
+                p.opcode_dispatch,
+                p.cb_prefix,
+                p.operand8,
+                p.pc_fetch_calls,
+                p.bus_read_calls,
+                p.opcode_dispatch_calls,
+                p.cb_prefix_calls,
+                p.operand8_calls,
+            );
+            info!(
+                "decode split — cb_exec={} cb_reg={} cb_hl={} op_reg={} op_imm={} op_mem={} cb_exec_calls={} cb_reg_calls={} cb_hl_calls={} op_reg_calls={} op_imm_calls={} op_mem_calls={}",
+                p.cb_exec,
+                p.cb_exec_reg,
+                p.cb_exec_hlmem,
+                p.operand8_reg,
+                p.operand8_imm,
+                p.operand8_mem,
+                p.cb_exec_calls,
+                p.cb_exec_reg_calls,
+                p.cb_exec_hlmem_calls,
+                p.operand8_reg_calls,
+                p.operand8_imm_calls,
+                p.operand8_mem_calls,
+            );
+
+            let opcode_top = top_opcode_hotspots(&p.opcode_exec_cycles, &p.opcode_exec_calls);
+            info!(
+                "opcode hot — 0x{:02X} cyc={} calls={} avg={} | 0x{:02X} cyc={} calls={} avg={} | 0x{:02X} cyc={} calls={} avg={}",
+                opcode_top[0].opcode,
+                opcode_top[0].cycles,
+                opcode_top[0].calls,
+                avg_cycles_per_call(opcode_top[0]),
+                opcode_top[1].opcode,
+                opcode_top[1].cycles,
+                opcode_top[1].calls,
+                avg_cycles_per_call(opcode_top[1]),
+                opcode_top[2].opcode,
+                opcode_top[2].cycles,
+                opcode_top[2].calls,
+                avg_cycles_per_call(opcode_top[2]),
+            );
+
+            let cb_top = top_opcode_hotspots(&p.cb_opcode_exec_cycles, &p.cb_opcode_exec_calls);
+            info!(
+                "cb hot — 0x{:02X} cyc={} calls={} avg={} | 0x{:02X} cyc={} calls={} avg={} | 0x{:02X} cyc={} calls={} avg={}",
+                cb_top[0].opcode,
+                cb_top[0].cycles,
+                cb_top[0].calls,
+                avg_cycles_per_call(cb_top[0]),
+                cb_top[1].opcode,
+                cb_top[1].cycles,
+                cb_top[1].calls,
+                avg_cycles_per_call(cb_top[1]),
+                cb_top[2].opcode,
+                cb_top[2].cycles,
+                cb_top[2].calls,
+                avg_cycles_per_call(cb_top[2]),
             );
 
             let pp = cpu.take_ppu_perf_profile();
