@@ -1,8 +1,8 @@
 #![cfg(target_arch = "arm")]
 
 use alloc::{boxed::Box, vec::Vec};
-use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::cell::{RefCell, UnsafeCell};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use cortex_m::asm;
 use critical_section::Mutex;
@@ -21,6 +21,8 @@ use rustyboy_core::gameboy::{
 };
 use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
+
+use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
 
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::peripheral::apu::ApuPerfProfile;
@@ -41,6 +43,18 @@ const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
 static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
 static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
 static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
+
+#[cfg(feature = "perf")]
+fn init_dwt_cycle_counter() {
+    // DWT CYCCNT is per-core, so core1 must enable it independently.
+    unsafe {
+        let demcr = 0xE000_EDFCu32 as *mut u32;
+        demcr.write_volatile(demcr.read_volatile() | (1 << 24));
+        (0xE000_1004u32 as *mut u32).write_volatile(0);
+        let ctrl = 0xE000_1000u32 as *mut u32;
+        ctrl.write_volatile(ctrl.read_volatile() | 1);
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Core1Command {
@@ -94,11 +108,33 @@ impl PpuSnapshot {
     }
 }
 
+struct SharedScaledFrameSlot(UnsafeCell<ScaledFrame>);
+
+impl SharedScaledFrameSlot {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; SCALED_FRAME_PIXELS]))
+    }
+
+    fn as_ptr(&self) -> *const ScaledFrame {
+        self.0.get() as *const ScaledFrame
+    }
+
+    fn as_mut_ptr(&self) -> *mut ScaledFrame {
+        self.0.get()
+    }
+}
+
+// Safety: access is synchronized by the published-frame atomics; core 1 only
+// writes the next unpublished slot and only flips the published slot after the
+// writes complete.
+unsafe impl Sync for SharedScaledFrameSlot {}
+
 struct SharedWorkerState {
     sync_snapshot: Mutex<RefCell<PpuSnapshot>>,
     live_ppu_snapshot: Mutex<RefCell<PpuSnapshot>>,
-    frame_slots: [Mutex<RefCell<[u8; FRAMEBUFFER_SIZE]>>; 2],
-    published_frame: AtomicUsize,
+    scaled_frame_slots: [SharedScaledFrameSlot; 2],
+    scaled_frame_busy: [AtomicBool; 2],
+    published_frame: AtomicU8,
     published_frame_seq: AtomicU32,
     sync_complete: AtomicU32,
     audio_queue_drops: AtomicU32,
@@ -119,11 +155,9 @@ impl SharedWorkerState {
         Self {
             sync_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
             live_ppu_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
-            frame_slots: [
-                Mutex::new(RefCell::new([0; FRAMEBUFFER_SIZE])),
-                Mutex::new(RefCell::new([0; FRAMEBUFFER_SIZE])),
-            ],
-            published_frame: AtomicUsize::new(0),
+            scaled_frame_slots: [SharedScaledFrameSlot::new(), SharedScaledFrameSlot::new()],
+            scaled_frame_busy: [AtomicBool::new(false), AtomicBool::new(false)],
+            published_frame: AtomicU8::new(0),
             published_frame_seq: AtomicU32::new(0),
             sync_complete: AtomicU32::new(0),
             audio_queue_drops: AtomicU32::new(0),
@@ -166,28 +200,28 @@ impl SharedWorkerState {
         }
     }
 
-    fn copy_published_frame(&self, out: &mut [u8; FRAMEBUFFER_SIZE]) {
-        let slot = self.published_frame.load(Ordering::Acquire) & 1;
-        critical_section::with(|cs| {
-            let frame = self.frame_slots[slot].borrow(cs).borrow();
-            out.copy_from_slice(&*frame);
-        });
-    }
-
-    fn publish_frame(&self, worker: &mut GameBoyWorker, slot: usize) {
-        critical_section::with(|cs| {
-            let mut frame = self.frame_slots[slot].borrow(cs).borrow_mut();
-            worker.copy_framebuffer(&mut *frame);
-        });
-        self.published_frame.store(slot, Ordering::Release);
+    fn publish_frame(&self, worker: &GameBoyWorker) {
+        let target_slot = (self.published_frame.load(Ordering::Acquire) as usize) ^ 1;
+        if self.scaled_frame_busy[target_slot].load(Ordering::Acquire) {
+            return;
+        }
+        let framebuffer = worker.framebuffer();
+        unsafe {
+            scale_to_rgb565(framebuffer, &mut *self.scaled_frame_slots[target_slot].as_mut_ptr());
+        }
+        self.published_frame.store(target_slot as u8, Ordering::Release);
         self.published_frame_seq.fetch_add(1, Ordering::AcqRel);
     }
 
     fn clear_published_frames(&self) {
-        critical_section::with(|cs| {
-            self.frame_slots[0].borrow(cs).borrow_mut().fill(0);
-            self.frame_slots[1].borrow(cs).borrow_mut().fill(0);
-        });
+        for slot in &self.scaled_frame_slots {
+            unsafe {
+                (*slot.as_mut_ptr()).fill(0);
+            }
+        }
+        for busy in &self.scaled_frame_busy {
+            busy.store(false, Ordering::Release);
+        }
         self.published_frame.store(0, Ordering::Release);
         self.published_frame_seq.store(0, Ordering::Release);
     }
@@ -266,6 +300,7 @@ struct Core1WorkerLink {
     next_ticket: u32,
     last_frame_seq: u32,
     last_profile_frame_seq: u32,
+    held_frame_slot: u8,
     transport_profile: TransportProfile,
 }
 
@@ -300,6 +335,7 @@ impl Core1WorkerLink {
             next_ticket: 1,
             last_frame_seq: 0,
             last_profile_frame_seq: 0,
+            held_frame_slot: u8::MAX,
             transport_profile: TransportProfile::default(),
         }
     }
@@ -425,6 +461,24 @@ impl Core1WorkerLink {
         self.last_profile_frame_seq = frame_seq;
         profile.audio_queue_drops = self.shared.audio_queue_drops.swap(0, Ordering::AcqRel);
         profile
+    }
+
+    fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
+        if self.held_frame_slot != u8::MAX {
+            self.release_scaled_frame();
+        }
+        let slot = self.shared.published_frame.load(Ordering::Acquire) as usize;
+        self.shared.scaled_frame_busy[slot].store(true, Ordering::Release);
+        self.held_frame_slot = slot as u8;
+        unsafe { &*self.shared.scaled_frame_slots[slot].as_ptr() }
+    }
+
+    fn release_scaled_frame(&mut self) {
+        if self.held_frame_slot == u8::MAX {
+            return;
+        }
+        self.shared.scaled_frame_busy[self.held_frame_slot as usize].store(false, Ordering::Release);
+        self.held_frame_slot = u8::MAX;
     }
 }
 
@@ -571,10 +625,10 @@ impl WorkerLink for Core1WorkerLink {
     }
 
     fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
+        let _ = out;
         let frame_seq = self.shared.published_frame_seq.load(Ordering::Acquire);
         let frame_ready = frame_seq != self.last_frame_seq;
         if frame_ready {
-            self.shared.copy_published_frame(out);
             self.last_frame_seq = frame_seq;
         }
         WorkerFrontendState {
@@ -656,6 +710,16 @@ impl PicoGameBoy {
     }
 
     #[inline(always)]
+    pub fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
+        self.link.published_scaled_frame()
+    }
+
+    #[inline(always)]
+    pub fn release_scaled_frame(&mut self) {
+        self.link.release_scaled_frame();
+    }
+
+    #[inline(always)]
     pub fn cycle_counter(&self) -> u64 {
         self.frontend.cycle_counter()
     }
@@ -715,12 +779,10 @@ impl PicoGameBoy {
 fn publish_worker_state(
     shared: &'static SharedWorkerState,
     worker: &mut GameBoyWorker,
-    publish_slot: &mut usize,
 ) {
     let state = worker.poll_frontend_state();
     if state.frame_ready {
-        shared.publish_frame(worker, *publish_slot);
-        *publish_slot ^= 1;
+        shared.publish_frame(worker);
     }
     shared.publish_frontend_state(state);
     critical_section::with(|cs| {
@@ -736,8 +798,10 @@ fn run_core1_worker(
     mut worker: &'static mut GameBoyWorker,
     mut audio_scratch: &'static mut Vec<i16>,
 ) -> ! {
+    #[cfg(feature = "perf")]
+    init_dwt_cycle_counter();
+
     info!("core1 worker loop start");
-    let mut publish_slot = 1usize;
     let mut last_ppu_render_version = 0u32;
 
     loop {
@@ -759,14 +823,14 @@ fn run_core1_worker(
                     }
                 }
                 worker.send(worker_command);
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
+                publish_worker_state(shared, &mut worker);
             }
             Core1Command::SyncApu { ticket } => {
                 critical_section::with(|cs| {
                     let snapshots = shared.sync_snapshot.borrow(cs).borrow();
                     worker.sync_apu_state(&snapshots.io);
                 });
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
+                publish_worker_state(shared, &mut worker);
                 info!("core1 sync apu {}", ticket);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
@@ -776,7 +840,7 @@ fn run_core1_worker(
                     worker.sync_ppu_state(&snapshots.io, &snapshots.vram, &snapshots.oam);
                 });
                 last_ppu_render_version = 0;
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
+                publish_worker_state(shared, &mut worker);
                 info!("core1 sync ppu {}", ticket);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
@@ -786,7 +850,7 @@ fn run_core1_worker(
                     worker.load_ppu_state(state, &snapshots.io, &snapshots.vram, &snapshots.oam);
                 });
                 last_ppu_render_version = 0;
-                publish_worker_state(shared, &mut worker, &mut publish_slot);
+                publish_worker_state(shared, &mut worker);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
             #[cfg(feature = "perf")]

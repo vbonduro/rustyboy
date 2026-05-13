@@ -44,6 +44,8 @@ const SCALED_H: i32 = 216; // 144 × 1.5
 pub const SCREEN_W: i32 = 240;
 pub const SCREEN_H: i32 = 320;
 const Y_OFFSET: i32 = (SCREEN_H - SCALED_H) / 2; // 52
+pub const SCALED_FRAME_PIXELS: usize = (SCALED_W as usize) * (SCALED_H as usize);
+pub type ScaledFrame = [u16; SCALED_FRAME_PIXELS];
 
 // Splash animation geometry
 pub const GLYPH_W: i32 = 16; // 8px × 2 scale
@@ -67,7 +69,7 @@ pub struct Display<D> {
 ///
 /// Stores raw `u16` Rgb565 storage values. Pass the result to
 /// [`Display::render_game_only_scaled`] or, in Phase C, directly to DMA.
-pub fn scale_to_rgb565(src: &[u8; 23040], dst: &mut [u16; 51840]) {
+pub fn scale_to_rgb565(src: &[u8; 23040], dst: &mut ScaledFrame) {
     for sy in 0..216usize {
         let gy = sy * 2 / 3;
         let src_row = &src[gy * 160..(gy + 1) * 160];
@@ -119,7 +121,7 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
     ///
     /// Eliminates per-pixel scaling work during the SPI transfer. The buffer
     /// holds raw `Rgb565` storage values produced by [`scale_to_rgb565`].
-    pub fn render_game_only_scaled(&mut self, buf: &[u16; 51840]) {
+    pub fn render_game_only_scaled(&mut self, buf: &ScaledFrame) {
         use embedded_graphics::pixelcolor::raw::RawU16;
         let rect = Rectangle::new(
             Point::new(0, Y_OFFSET),

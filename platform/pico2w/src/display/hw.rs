@@ -17,7 +17,7 @@ use mipidsi::models::ILI9341Rgb565;
 use mipidsi::options::{ColorOrder, Orientation};
 use mipidsi::Builder;
 
-use super::Display;
+use super::{Display, ScaledFrame};
 
 // GP10=SPI1_CLK, GP11=SPI1_MOSI.  SD card uses SPI0 on GP18/GP19.
 type MySpi<'d> = Spi<'d, SPI1, Blocking>;
@@ -197,7 +197,7 @@ impl<'d> GameDisplay<'d> {
     /// `buf` must contain big-endian RGB565 values as produced by
     /// [`super::scale_to_rgb565`]. Returns a future; `.await` it after doing
     /// other work to overlap the ~13 ms transfer with emulation.
-    pub async fn send_frame_raw(&mut self, buf: &[u16; 51840]) {
+    pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
         self.set_window(0, GAME_Y_START, DISPLAY_X_END, GAME_Y_END)
             .await;
         self.write_command(0x2C, &[]).await;

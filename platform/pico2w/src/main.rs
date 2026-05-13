@@ -46,7 +46,6 @@ use {defmt_rtt as _, panic_probe as _};
 use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
-use rustyboy_pico2w::display::scale_to_rgb565;
 use rustyboy_pico2w::flash_rom::{new_onboard_flash, probe_staged_rom, stage_rom_from_reader};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::multicore::PicoGameBoy;
@@ -96,20 +95,12 @@ fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 async fn main(_spawner: Spawner) {
     {
         use core::mem::MaybeUninit;
-        // Reserve less heap so the main task and splash path have real stack
-        // headroom instead of growing down into HEAP_MEM.
-        const HEAP_SIZE: usize = 192 * 1024;
+        // Leave breathing room for the main task stack during splash/startup;
+        // the display path no longer needs a heap-backed DMA frame buffer.
+        const HEAP_SIZE: usize = 96 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
-
-    // Allocate the pre-scaled display frame buffer from the heap so it does not
-    // live in .bss and eat into the stack guard region.
-    let frame_buf: &'static mut [u16; 51840] = {
-        let layout = core::alloc::Layout::new::<[u16; 51840]>();
-        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut [u16; 51840];
-        unsafe { alloc::boxed::Box::leak(alloc::boxed::Box::from_raw(ptr)) }
-    };
 
     let p = {
         use embassy_rp::clocks::ClockConfig;
@@ -263,10 +254,10 @@ async fn main(_spawner: Spawner) {
     loop {
         stack_probe::check_current_sp("game loop");
 
-        // Pre-scale current frame into the buffer (~0.5 ms).
+        // Grab the latest published RGB565 frame from the core 1 publish seam.
         #[cfg(feature = "perf")]
         let scale_start = perf::perf_cycle_read();
-        scale_to_rgb565(cpu.front_buffer(), frame_buf);
+        let frame_buf = cpu.published_scaled_frame();
         #[cfg(feature = "perf")]
         tracker.record_scale(perf::perf_cycle_read().wrapping_sub(scale_start));
 
@@ -315,6 +306,7 @@ async fn main(_spawner: Spawner) {
         #[cfg(feature = "perf")]
         let render_start = perf::perf_cycle_read();
         disp_future.as_mut().await;
+        cpu.release_scaled_frame();
         #[cfg(feature = "perf")]
         tracker.record_render(perf::perf_cycle_read().wrapping_sub(render_start));
 
