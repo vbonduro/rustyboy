@@ -19,6 +19,18 @@ use mipidsi::Builder;
 
 use super::{Display, ScaledFrame};
 
+// Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
+// the requested frequency. 62.5 MHz is exact at 250 MHz sysclk, but at 280 MHz
+// it rounds down to 46.7 MHz (280 / 2 / 3), which is slow enough to expose
+// display DMA wait time in release builds. Overclock profiles therefore choose
+// exact divider-friendly requests that preserve the intended overlap.
+#[cfg(feature = "oc-300")]
+const DISPLAY_SPI_HZ: u32 = 75_000_000;
+#[cfg(feature = "oc-280")]
+const DISPLAY_SPI_HZ: u32 = 70_000_000;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280")))]
+const DISPLAY_SPI_HZ: u32 = 75_000_000;
+
 // GP10=SPI1_CLK, GP11=SPI1_MOSI.  SD card uses SPI0 on GP18/GP19.
 type MySpi<'d> = Spi<'d, SPI1, Blocking>;
 type MySpiDev<'d> = ExclusiveDevice<MySpi<'d>, Output<'d>, embassy_time::Delay>;
@@ -46,7 +58,7 @@ impl<'d> HwDisplay<'d> {
         bl_pin: Peri<'d, PIN_13>,
     ) -> Self {
         let mut cfg = SpiConfig::default();
-        cfg.frequency = 62_500_000; // ILI9341 supports up to 66 MHz write
+        cfg.frequency = DISPLAY_SPI_HZ;
 
         let spi = Spi::new_blocking_txonly(spi1, clk, mosi, cfg);
         let cs = Output::new(cs_pin, Level::High);
@@ -152,7 +164,7 @@ impl<'d> GameDisplay<'d> {
         rp_pac::DMA.ints(0).write_value(1u32 << 1);
 
         let mut cfg = SpiConfig::default();
-        cfg.frequency = 62_500_000;
+        cfg.frequency = DISPLAY_SPI_HZ;
 
         let spi = Spi::new_txonly(spi1, clk, mosi, dma, irqs, cfg);
         let cs = Output::new(cs_pin, Level::High);
