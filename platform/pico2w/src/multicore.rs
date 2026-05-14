@@ -2,6 +2,8 @@
 
 use alloc::{boxed::Box, vec::Vec};
 use core::cell::{RefCell, UnsafeCell};
+use core::mem::MaybeUninit;
+use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use cortex_m::asm;
@@ -23,6 +25,7 @@ use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
 use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
+use crate::stack_probe;
 
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::peripheral::apu::ApuPerfProfile;
@@ -36,13 +39,21 @@ use rustyboy_core::gameboy::FrontendPerfProfile;
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
 
 const CORE1_STACK_SIZE: usize = 8192;
-const COMMAND_QUEUE_CAPACITY: usize = 1024;
-const AUDIO_QUEUE_CAPACITY: usize = 4096;
+const COMMAND_QUEUE_CAPACITY: usize = 512;
+const AUDIO_QUEUE_CAPACITY: usize = 2048;
+const AUDIO_SCRATCH_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
+const SCALED_FRAME_SLOT_COUNT: usize = 3;
 
 static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
 static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
 static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
+#[unsafe(link_section = ".core1_stack")]
+static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
+static CORE1_WORKER: StaticStorage<GameBoyWorker> = StaticStorage::new();
+static CORE1_AUDIO_SCRATCH: StaticStorage<Vec<i16>> = StaticStorage::new();
+static mut CORE1_AUDIO_SCRATCH_BUF: [MaybeUninit<i16>; AUDIO_SCRATCH_CAPACITY] =
+    [MaybeUninit::uninit(); AUDIO_SCRATCH_CAPACITY];
 
 #[cfg(feature = "perf")]
 fn init_dwt_cycle_counter() {
@@ -129,11 +140,29 @@ impl SharedScaledFrameSlot {
 // writes complete.
 unsafe impl Sync for SharedScaledFrameSlot {}
 
+struct StaticStorage<T>(UnsafeCell<MaybeUninit<T>>);
+
+impl<T> StaticStorage<T> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    unsafe fn init(&self, value: T) -> &'static mut T {
+        (*self.0.get()).write(value)
+    }
+
+    unsafe fn as_mut_ptr(&self) -> *mut T {
+        (*self.0.get()).as_mut_ptr()
+    }
+}
+
+unsafe impl<T> Sync for StaticStorage<T> {}
+
 struct SharedWorkerState {
     sync_snapshot: Mutex<RefCell<PpuSnapshot>>,
     live_ppu_snapshot: Mutex<RefCell<PpuSnapshot>>,
-    scaled_frame_slots: [SharedScaledFrameSlot; 2],
-    scaled_frame_busy: [AtomicBool; 2],
+    scaled_frame_slots: [SharedScaledFrameSlot; SCALED_FRAME_SLOT_COUNT],
+    scaled_frame_busy: [AtomicBool; SCALED_FRAME_SLOT_COUNT],
     published_frame: AtomicU8,
     published_frame_seq: AtomicU32,
     sync_complete: AtomicU32,
@@ -155,8 +184,16 @@ impl SharedWorkerState {
         Self {
             sync_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
             live_ppu_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
-            scaled_frame_slots: [SharedScaledFrameSlot::new(), SharedScaledFrameSlot::new()],
-            scaled_frame_busy: [AtomicBool::new(false), AtomicBool::new(false)],
+            scaled_frame_slots: [
+                SharedScaledFrameSlot::new(),
+                SharedScaledFrameSlot::new(),
+                SharedScaledFrameSlot::new(),
+            ],
+            scaled_frame_busy: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ],
             published_frame: AtomicU8::new(0),
             published_frame_seq: AtomicU32::new(0),
             sync_complete: AtomicU32::new(0),
@@ -201,10 +238,14 @@ impl SharedWorkerState {
     }
 
     fn publish_frame(&self, worker: &GameBoyWorker) {
-        let target_slot = (self.published_frame.load(Ordering::Acquire) as usize) ^ 1;
-        if self.scaled_frame_busy[target_slot].load(Ordering::Acquire) {
+        let current_slot = self.published_frame.load(Ordering::Acquire) as usize;
+        // Scan all slots for a free one that isn't currently being consumed.
+        // All initial values are zero so SharedWorkerState stays in .bss.
+        let Some(target_slot) = (0..SCALED_FRAME_SLOT_COUNT).find(|&slot| {
+            slot != current_slot && !self.scaled_frame_busy[slot].load(Ordering::Acquire)
+        }) else {
             return;
-        }
+        };
         let framebuffer = worker.framebuffer();
         unsafe {
             scale_to_rgb565(framebuffer, &mut *self.scaled_frame_slots[target_slot].as_mut_ptr());
@@ -309,9 +350,23 @@ impl Core1WorkerLink {
         let shared = &SHARED_WORKER_STATE;
         let command_tx = &COMMAND_QUEUE;
         let audio_rx = &AUDIO_QUEUE;
-        let core1_stack = Box::leak(Box::new(Stack::<CORE1_STACK_SIZE>::new()));
-        let worker = Box::leak(Box::new(GameBoyWorker::new()));
-        let audio_scratch = Box::leak(Box::new(Vec::with_capacity(2048)));
+        let core1_stack = unsafe { &mut *addr_of_mut!(CORE1_STACK) };
+        let worker = unsafe { GameBoyWorker::init_in_place(CORE1_WORKER.as_mut_ptr()) };
+        let audio_scratch = unsafe {
+            CORE1_AUDIO_SCRATCH.init(Vec::from_raw_parts(
+                addr_of_mut!(CORE1_AUDIO_SCRATCH_BUF) as *mut i16,
+                0,
+                AUDIO_SCRATCH_CAPACITY,
+            ))
+        };
+
+        // Paint the bottom guard zone of core1's stack before the thread starts.
+        unsafe {
+            stack_probe::paint_region(
+                core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8,
+                256,
+            );
+        }
 
         info!("spawning core1 worker");
         let shared_for_core1 = shared;
@@ -674,9 +729,12 @@ impl PicoGameBoy {
         let frontend = GameBoyFrontend::from_memory(memory);
         let link = Core1WorkerLink::new(core1);
         let mut gb = Self { frontend, link };
-        info!("syncing worker state");
-        gb.frontend.sync_worker_state(&mut gb.link);
-        info!("worker state synced");
+        info!("syncing worker apu");
+        gb.frontend.sync_apu_worker(&mut gb.link);
+        info!("worker apu synced");
+        info!("syncing worker ppu");
+        gb.frontend.sync_ppu_worker(&mut gb.link);
+        info!("worker ppu synced");
         gb.frontend = gb.frontend.with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),
@@ -803,8 +861,11 @@ fn run_core1_worker(
 
     info!("core1 worker loop start");
     let mut last_ppu_render_version = 0u32;
+    let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
 
     loop {
+        unsafe { stack_probe::check_region(core1_stack_bottom, 256, "core1") };
+
         let Some(command) = command_rx.dequeue() else {
             asm::wfe();
             continue;

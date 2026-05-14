@@ -93,6 +93,9 @@ fn avg_cycles_per_call(entry: OpcodeHotspot) -> u32 {
 pub struct PerfTracker {
     frame_count: u32,
     window_start: Instant,
+    emulate_wall_us: u64,
+    render_wait_wall_us: u64,
+    audio_wait_wall_us: u64,
     #[cfg(feature = "perf")]
     scale_cycles: u64,
     #[cfg(feature = "perf")]
@@ -108,6 +111,9 @@ impl PerfTracker {
         Self {
             frame_count: 0,
             window_start: Instant::now(),
+            emulate_wall_us: 0,
+            render_wait_wall_us: 0,
+            audio_wait_wall_us: 0,
             #[cfg(feature = "perf")]
             scale_cycles: 0,
             #[cfg(feature = "perf")]
@@ -134,15 +140,30 @@ impl PerfTracker {
         self.emulate_cycles += cycles as u64;
     }
 
+    #[allow(dead_code)]
+    pub fn record_emulate_wall_us(&mut self, micros: u64) {
+        self.emulate_wall_us += micros;
+    }
+
     /// Accumulate DWT cycles spent in `render_game_only_scaled` for one frame.
     #[cfg(feature = "perf")]
     pub fn record_render(&mut self, cycles: u32) {
         self.render_cycles += cycles as u64;
     }
 
+    #[allow(dead_code)]
+    pub fn record_render_wait_wall_us(&mut self, micros: u64) {
+        self.render_wait_wall_us += micros;
+    }
+
     #[cfg(feature = "perf")]
     pub fn record_audio_wait(&mut self, cycles: u32) {
         self.audio_wait_cycles += cycles as u64;
+    }
+
+    #[allow(dead_code)]
+    pub fn record_audio_wait_wall_us(&mut self, micros: u64) {
+        self.audio_wait_wall_us += micros;
     }
 
     pub fn tick(&mut self, cpu: &mut PicoGameBoy) {
@@ -153,18 +174,45 @@ impl PerfTracker {
 
         let elapsed_us = self.window_start.elapsed().as_micros();
         let fps = (self.frame_count as u64 * 1_000_000) / elapsed_us.max(1);
+        let transport = cpu.take_transport_profile();
+        let pub_fps = (transport.frame_publishes as u64 * 1_000_000) / elapsed_us.max(1);
         info!("fps: {}", fps);
+        info!("pub_fps: {}", pub_fps);
+
+        #[cfg(not(feature = "perf"))]
+        info!(
+            "transport/60f — enq={} spins={} apu_cmds={} ppu_adv={} frame_pub={} vram_bytes={} oam_bytes={} regs={} audio_drops={}",
+            transport.command_enqueues,
+            transport.command_queue_spins,
+            transport.apu_commands,
+            transport.ppu_advance_commands,
+            transport.frame_publishes,
+            transport.ppu_vram_bytes,
+            transport.ppu_oam_bytes,
+            transport.ppu_register_writes,
+            transport.audio_queue_drops,
+        );
+        info!(
+            "loop wall/60f — emulate={}ms render_wait={}ms audio_wait={}ms avg emulate={}us/frame",
+            self.emulate_wall_us / 1_000,
+            self.render_wait_wall_us / 1_000,
+            self.audio_wait_wall_us / 1_000,
+            self.emulate_wall_us / 60,
+        );
 
         #[cfg(feature = "perf")]
         {
-            let transport = cpu.take_transport_profile();
             info!(
-                "core1 transport/60f — enq={} spins={} apu_cmds={} ppu_adv={} frame_pub={} vram_bytes={} oam_bytes={} regs={} audio_drops={}",
+                "core1 transport/60f — enq={} spins={} apu_cmds={} ppu_adv={} ready={} pub_try={} frame_pub={} pub_ok={} pub_skip={} vram_bytes={} oam_bytes={} regs={} audio_drops={}",
                 transport.command_enqueues,
                 transport.command_queue_spins,
                 transport.apu_commands,
                 transport.ppu_advance_commands,
+                transport.frame_ready_seen,
+                transport.frame_publish_attempts,
                 transport.frame_publishes,
+                transport.frame_publish_successes,
+                transport.frame_publish_skips,
                 transport.ppu_vram_bytes,
                 transport.ppu_oam_bytes,
                 transport.ppu_register_writes,
@@ -323,6 +371,10 @@ impl PerfTracker {
             self.render_cycles = 0;
             self.audio_wait_cycles = 0;
         }
+
+        self.emulate_wall_us = 0;
+        self.render_wait_wall_us = 0;
+        self.audio_wait_wall_us = 0;
 
         // Suppress unused-variable warning when only `fps` (not `perf`) is enabled.
         let _ = cpu;

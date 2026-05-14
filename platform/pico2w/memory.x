@@ -17,10 +17,9 @@
  *   APP_B      : ORIGIN = 0x10200000, LENGTH = ~2M   <- OTA staging slot
  */
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 512K
-    RAM   : ORIGIN = 0x20000000, LENGTH = 512K
-    SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
-    SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K
+    FLASH       : ORIGIN = 0x10000000, LENGTH = 512K
+    RAM         : ORIGIN = 0x20000000, LENGTH = 512K
+    CORE1_STACK : ORIGIN = 0x20080000, LENGTH = 8K
 }
 
 SECTIONS {
@@ -55,6 +54,18 @@ SECTIONS {
     } > FLASH
 
 } INSERT AFTER .text;
+
+SECTIONS {
+    /*
+     * Dedicated core 1 stack storage in SRAM8/SRAM9 so the publish seam can
+     * use main striped RAM without also paying this 8 KiB out of the heap.
+     */
+    .core1_stack (NOLOAD) : ALIGN(32)
+    {
+        KEEP(*(.core1_stack));
+    } > CORE1_STACK
+
+} INSERT AFTER .uninit;
 
 SECTIONS {
     /*
