@@ -88,6 +88,35 @@ mod imp {
             );
         }
     }
+
+    /// Paint the bottom `guard_bytes` of an arbitrary stack region with the
+    /// sentinel pattern.  Call this before the stack's owning thread starts.
+    ///
+    /// # Safety
+    /// `bottom` must be a valid, writable pointer to at least `guard_bytes`
+    /// bytes that are not concurrently accessed by any other thread.
+    pub unsafe fn paint_region(bottom: *mut u8, guard_bytes: usize) {
+        unsafe { ptr::write_bytes(bottom, STACK_SENTINEL, guard_bytes) };
+    }
+
+    /// Verify that the bottom `guard_bytes` of a stack region still contain
+    /// the sentinel pattern.  Panics (via defmt) on the first corrupted byte.
+    ///
+    /// # Safety
+    /// `bottom` must be a valid pointer to at least `guard_bytes` bytes.
+    pub unsafe fn check_region(bottom: *const u8, guard_bytes: usize, label: &'static str) {
+        for i in 0..guard_bytes {
+            let byte = unsafe { bottom.add(i).read_volatile() };
+            if byte != STACK_SENTINEL {
+                panic!(
+                    "stack overflow {}: sentinel corrupted at +{}B (addr=0x{:08x})",
+                    label,
+                    i,
+                    bottom as usize + i,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "stack-probe"))]
@@ -95,6 +124,10 @@ mod imp {
     pub fn paint() {}
 
     pub fn check_current_sp(_label: &'static str) {}
+
+    pub unsafe fn paint_region(_bottom: *mut u8, _guard_bytes: usize) {}
+
+    pub unsafe fn check_region(_bottom: *const u8, _guard_bytes: usize, _label: &'static str) {}
 }
 
-pub use imp::{check_current_sp, paint};
+pub use imp::{check_current_sp, check_region, paint, paint_region};
