@@ -773,17 +773,21 @@ impl ApuPeripheral {
     /// falling edge of bit 12 (DIV bit 4).
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn tick(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
-        self.tick_internal(cycles, div_counter, true)
+        let out = self.tick_internal(cycles, div_counter);
+        if self.powered {
+            self.produce_samples(cycles);
+        }
+        out
     }
 
     /// Advance channel/frame-sequencer state without producing PCM output.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn tick_state_only(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
-        self.tick_internal(cycles, div_counter, false)
+        self.tick_internal(cycles, div_counter)
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_internal(&mut self, cycles: u16, div_counter: u16, emit_samples: bool) -> ApuOutput {
+    fn tick_internal(&mut self, cycles: u16, div_counter: u16) -> ApuOutput {
         if !self.powered {
             self.prev_div_bit = div_counter & FRAME_SEQ_BIT != 0;
             return ApuOutput {
@@ -793,10 +797,6 @@ impl ApuPeripheral {
 
         self.tick_frame_sequencer(cycles, div_counter);
         self.tick_channels(cycles);
-
-        if emit_samples {
-            self.produce_samples(cycles);
-        }
 
         ApuOutput {
             nr52: self.build_nr52(),

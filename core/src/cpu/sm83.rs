@@ -106,11 +106,6 @@ impl Sm83 {
         self.trace_hook = Some(Box::new(hook));
     }
 
-    #[inline(always)]
-    fn finish_step(&mut self, _total_start: (), cycles: u32) -> u32 {
-        cycles
-    }
-
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_ime(&mut self) {
         if self.ime == ImeState::Pending {
@@ -168,14 +163,6 @@ impl Sm83 {
     // ── Bus access helpers ────────────────────────────────────────────────────
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn bus_read(&mut self, memory: &GameBoyMemory, addr: u16) -> u8 {
-
-        let value = memory.read_fast(addr);
-
-        value
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_write(&mut self, memory: &mut GameBoyMemory, addr: u16, val: u8) {
 
         match addr {
@@ -216,13 +203,6 @@ impl Sm83 {
     /// Execute one complete instruction. Returns T-cycles elapsed.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn step(&mut self, memory: &mut GameBoyMemory) -> u32 {
-        self.step_inner(memory)
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn step_inner(&mut self, memory: &mut GameBoyMemory) -> u32 {
-        let total_start = ();
-
         self.advance_ime();
 
         if self.halted {
@@ -230,13 +210,12 @@ impl Sm83 {
                 self.halted = false;
                 if self.ime == ImeState::Enabled {
                     if let Some(bit) = self.take_pending_interrupt(memory) {
-                        let isr_cycles = self.dispatch_isr(memory, bit);
-                        return self.finish_step(total_start, isr_cycles);
+                        return self.dispatch_isr(memory, bit);
                     }
                 }
                 // IME=false: unhalt, fall through to execute next instruction
             } else {
-                return self.finish_step(total_start, 4); // one NOP-equivalent cycle while halted
+                return 4; // one NOP-equivalent cycle while halted
             }
         }
 
@@ -245,31 +224,31 @@ impl Sm83 {
             let cb_opcode = self.fetch_byte(memory);
             let handler = match self.opcodes.get_cb(cb_opcode) {
                 Ok(h) => h,
-                Err(_) => return self.finish_step(total_start, 8),
+                Err(_) => return 8,
             };
             let cycles = handler.execute(self, memory).unwrap_or(8) as u32;
             if self.ime == ImeState::Enabled {
                 if let Some(bit) = self.take_pending_interrupt(memory) {
                     let isr_cycles = self.dispatch_isr(memory, bit);
-                    return self.finish_step(total_start, cycles + isr_cycles);
+                    return cycles + isr_cycles;
                 }
             }
-            return self.finish_step(total_start, cycles);
+            return cycles;
         }
 
         let handler = match self.opcodes.get(opcode) {
             Ok(h) => h,
-            Err(_) => return self.finish_step(total_start, 4),
+            Err(_) => return 4,
         };
         let cycles = handler.execute(self, memory).unwrap_or(4) as u32;
         // Post-instruction: check for interrupt dispatch
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt(memory) {
                 let isr_cycles = self.dispatch_isr(memory, bit);
-                return self.finish_step(total_start, cycles + isr_cycles);
+                return cycles + isr_cycles;
             }
         }
-        self.finish_step(total_start, cycles)
+        cycles
     }
 
     /// Dispatch an interrupt service routine. Returns T-cycles for the ISR dispatch (20).
@@ -339,46 +318,26 @@ impl Sm83 {
     }
 
     fn get_operand8(&mut self, op: &Operand, memory: &mut GameBoyMemory) -> u8 {
-
-        let value = match op {
+        match op {
             Operand::Register8(r) => self.get_r8_enum(*r),
-            Operand::Memory(Memory::HL) => {
-                let a = self.registers.hl();
-                self.bus_read(memory, a)
-            }
-            Operand::Memory(Memory::BC) => {
-                let a = self.registers.bc();
-                self.bus_read(memory, a)
-            }
-            Operand::Memory(Memory::DE) => {
-                let a = self.registers.de();
-                self.bus_read(memory, a)
-            }
+            Operand::Memory(Memory::HL) => memory.read_fast(self.registers.hl()),
+            Operand::Memory(Memory::BC) => memory.read_fast(self.registers.bc()),
+            Operand::Memory(Memory::DE) => memory.read_fast(self.registers.de()),
             Operand::Memory(Memory::HLI) => {
                 let a = self.registers.hl();
-                let v = self.bus_read(memory, a);
+                let v = memory.read_fast(a);
                 self.registers.set_hl(a.wrapping_add(1));
                 v
             }
             Operand::Memory(Memory::HLD) => {
                 let a = self.registers.hl();
-                let v = self.bus_read(memory, a);
+                let v = memory.read_fast(a);
                 self.registers.set_hl(a.wrapping_sub(1));
                 v
             }
             Operand::Imm8 | Operand::ImmSigned8 => self.fetch_byte(memory),
             _ => panic!("get_operand8: unsupported {:?}", op),
-        };
-
-        value
-    }
-
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn fetch_operand8_immediate(&mut self, memory: &mut GameBoyMemory) -> u8 {
-
-        let value = self.fetch_byte(memory);
-
-        value
+        }
     }
 
     fn set_operand8(&mut self, op: &Operand, val: u8, memory: &mut GameBoyMemory) {
@@ -420,8 +379,8 @@ impl Sm83 {
     }
 
     fn pop16_inner(&mut self, memory: &mut GameBoyMemory) -> u16 {
-        let lo = self.bus_read(memory, self.registers.sp);
-        let hi = self.bus_read(memory, self.registers.sp.wrapping_add(1));
+        let lo = memory.read_fast(self.registers.sp);
+        let hi = memory.read_fast(self.registers.sp.wrapping_add(1));
         self.registers.sp = self.registers.sp.wrapping_add(2);
         u16::from_le_bytes([lo, hi])
     }
@@ -494,7 +453,7 @@ impl Sm83 {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn cb_hlmem(&mut self, op: CbOp, memory: &mut GameBoyMemory) {
         let addr = self.registers.hl();
-        let val = self.bus_read(memory, addr);
+        let val = memory.read_fast(addr);
         let carry = self.registers.f.contains(Flags::C);
         match op {
             CbOp::Rlc => {
@@ -554,10 +513,7 @@ impl Sm83 {
 
 impl Instructions for Sm83 {
     fn add8(&mut self, op: &Add8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = add_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
@@ -598,10 +554,7 @@ impl Instructions for Sm83 {
     }
 
     fn adc(&mut self, op: &Adc, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
         let (r, f) = adc_u8(self.registers.a, val, cy);
         self.registers.a = r;
@@ -610,10 +563,7 @@ impl Instructions for Sm83 {
     }
 
     fn sub8(&mut self, op: &Sub8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = sub_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
@@ -621,10 +571,7 @@ impl Instructions for Sm83 {
     }
 
     fn sbc8(&mut self, op: &Sbc8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
         let (r, f) = sbc_u8(self.registers.a, val, cy);
         self.registers.a = r;
@@ -633,17 +580,14 @@ impl Instructions for Sm83 {
     }
 
     fn cp8(&mut self, op: &Cp8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         self.registers.f = cp_u8(self.registers.a, val);
         Ok(op.cycles)
     }
 
     fn ld8(&mut self, op: &Ld8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         if op.src == Operand::Imm8 {
-            let val = self.fetch_operand8_immediate(memory);
+            let val = self.fetch_byte(memory);
             match op.dest {
                 Operand::Register8(r) => self.set_r8_enum(r, val),
                 Operand::Memory(Memory::HL) => {
@@ -698,11 +642,11 @@ impl Instructions for Sm83 {
             }
             Ld16Op::ABc => {
                 let a = self.registers.bc();
-                self.registers.a = self.bus_read(memory, a);
+                self.registers.a = memory.read_fast(a);
             }
             Ld16Op::ADe => {
                 let a = self.registers.de();
-                self.registers.a = self.bus_read(memory, a);
+                self.registers.a = memory.read_fast(a);
             }
             Ld16Op::HliA => {
                 let a = self.registers.hl();
@@ -716,12 +660,12 @@ impl Instructions for Sm83 {
             }
             Ld16Op::AHli => {
                 let a = self.registers.hl();
-                self.registers.a = self.bus_read(memory, a);
+                self.registers.a = memory.read_fast(a);
                 self.registers.set_hl(a.wrapping_add(1));
             }
             Ld16Op::AHld => {
                 let a = self.registers.hl();
-                self.registers.a = self.bus_read(memory, a);
+                self.registers.a = memory.read_fast(a);
                 self.registers.set_hl(a.wrapping_sub(1));
             }
             Ld16Op::NnA => {
@@ -734,7 +678,7 @@ impl Instructions for Sm83 {
                 let lo = self.fetch_byte(memory);
                 let hi = self.fetch_byte(memory);
                 let addr = u16::from_le_bytes([lo, hi]);
-                self.registers.a = self.bus_read(memory, addr);
+                self.registers.a = memory.read_fast(addr);
             }
             Ld16Op::LdhNA => {
                 let n = self.fetch_byte(memory);
@@ -742,7 +686,7 @@ impl Instructions for Sm83 {
             }
             Ld16Op::LdhAN => {
                 let n = self.fetch_byte(memory);
-                self.registers.a = self.bus_read(memory, IO_REG_BASE | (n as u16));
+                self.registers.a = memory.read_fast(IO_REG_BASE | (n as u16));
             }
             Ld16Op::LdCA => {
                 let c = self.registers.c;
@@ -750,7 +694,7 @@ impl Instructions for Sm83 {
             }
             Ld16Op::LdAC => {
                 let c = self.registers.c;
-                self.registers.a = self.bus_read(memory, IO_REG_BASE | (c as u16));
+                self.registers.a = memory.read_fast(IO_REG_BASE | (c as u16));
             }
         }
         Ok(op.cycles)
@@ -765,7 +709,7 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
-                let old = self.bus_read(memory, addr);
+                let old = memory.read_fast(addr);
                 let (v, f) = inc_u8(old, self.registers.f);
                 self.bus_write(memory, addr, v);
                 self.registers.f = f;
@@ -788,7 +732,7 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
-                let old = self.bus_read(memory, addr);
+                let old = memory.read_fast(addr);
                 let (v, f) = dec_u8(old, self.registers.f);
                 self.bus_write(memory, addr, v);
                 self.registers.f = f;
@@ -843,10 +787,7 @@ impl Instructions for Sm83 {
     }
 
     fn and8(&mut self, op: &And8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = and_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
@@ -854,10 +795,7 @@ impl Instructions for Sm83 {
     }
 
     fn or8(&mut self, op: &Or8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = or_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
@@ -865,10 +803,7 @@ impl Instructions for Sm83 {
     }
 
     fn xor8(&mut self, op: &Xor8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
-        let val = match op.operand {
-            Operand::Imm8 => self.fetch_operand8_immediate(memory),
-            _ => self.get_operand8(&op.operand, memory),
-        };
+        let val = self.get_operand8(&op.operand, memory);
         let (r, f) = xor_u8(self.registers.a, val);
         self.registers.a = r;
         self.registers.f = f;
