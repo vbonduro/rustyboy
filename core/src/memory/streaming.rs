@@ -2,37 +2,34 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::cartridge::Cartridge;
-use super::map::{EXT_RAM_BASE, EXT_RAM_END, ROM_BANK_SIZE, ROM_BANKED_BASE, ROM_BANKED_END, ROM_FIXED_END};
-#[cfg(feature = "perf")]
-use super::cartridge::CartridgePerfProfile;
 
 // ── RomReader trait ──────────────────────────────────────────────────────────
 
 pub trait RomReader {
     type Error;
-    fn read_bank(&mut self, bank: usize, buf: &mut [u8; ROM_BANK_SIZE]) -> Result<(), Self::Error>;
+    fn read_bank(&mut self, bank: usize, buf: &mut [u8; 0x4000]) -> Result<(), Self::Error>;
 }
 
 // ── Header offsets ───────────────────────────────────────────────────────────
 
 const CART_TYPE: usize = 0x0147;
-const ROM_SIZE: usize = 0x0148;
-const RAM_SIZE: usize = 0x0149;
+const ROM_SIZE:  usize = 0x0148;
+const RAM_SIZE:  usize = 0x0149;
 
 // ── MBC state ────────────────────────────────────────────────────────────────
 
 enum MbcState {
     NoMbc,
     Mbc1 {
-        rom_bank_lo: u8,
-        upper_bits: u8,
-        ram_mode: bool,
-        ram_enabled: bool,
+        rom_bank_lo:    u8,
+        upper_bits:     u8,
+        ram_mode:       bool,
+        ram_enabled:    bool,
         ram_bank_count: usize,
     },
     Mbc3 {
-        rom_bank: u8,
-        bank_or_rtc: u8,
+        rom_bank:        u8,
+        bank_or_rtc:     u8,
         ram_rtc_enabled: bool,
     },
 }
@@ -46,58 +43,46 @@ pub enum StreamingError<E> {
 }
 
 pub struct StreamingCartridge<R: RomReader> {
-    reader: R,
-    bank0_cache: [u8; ROM_BANK_SIZE],
-    banked_cache: [u8; ROM_BANK_SIZE],
-    fixed_bank_num: usize,
+    reader:           R,
+    bank0_cache:      [u8; 0x4000],
+    banked_cache:     [u8; 0x4000],
+    fixed_bank_num:   usize,
     current_bank_num: usize,
-    rom_bank_count: usize,
-    mbc: MbcState,
-    ram: Vec<u8>,
-    #[cfg(feature = "perf")]
-    perf_profile: CartridgePerfProfile,
+    rom_bank_count:   usize,
+    mbc:              MbcState,
+    ram:              Vec<u8>,
 }
 
 impl<R: RomReader> StreamingCartridge<R> {
     pub fn new(mut reader: R) -> Result<Self, StreamingError<R::Error>> {
-        let mut bank0_cache = [0u8; ROM_BANK_SIZE];
-        reader
-            .read_bank(0, &mut bank0_cache)
-            .map_err(StreamingError::Reader)?;
+        let mut bank0_cache = [0u8; 0x4000];
+        reader.read_bank(0, &mut bank0_cache).map_err(StreamingError::Reader)?;
 
-        let cart_type = bank0_cache[CART_TYPE];
+        let cart_type      = bank0_cache[CART_TYPE];
         let rom_bank_count = rom_bank_count_from_code(bank0_cache[ROM_SIZE]);
-        let ram_bytes = ram_bytes_from_code(bank0_cache[RAM_SIZE]);
+        let ram_bytes      = ram_bytes_from_code(bank0_cache[RAM_SIZE]);
         let mbc = mbc_state_from_header(cart_type, ram_bytes)
             .ok_or(StreamingError::UnsupportedCartType(cart_type))?;
 
-        let mut banked_cache = [0u8; ROM_BANK_SIZE];
-        reader
-            .read_bank(1, &mut banked_cache)
-            .map_err(StreamingError::Reader)?;
+        let mut banked_cache = [0u8; 0x4000];
+        reader.read_bank(1, &mut banked_cache).map_err(StreamingError::Reader)?;
 
         Ok(Self {
             reader,
             bank0_cache,
             banked_cache,
-            fixed_bank_num: 0,
+            fixed_bank_num:   0,
             current_bank_num: 1,
             rom_bank_count,
             mbc,
             ram: vec![0u8; ram_bytes],
-            #[cfg(feature = "perf")]
-            perf_profile: CartridgePerfProfile::default(),
         })
     }
 
     fn effective_fixed_bank(&self) -> usize {
         match &self.mbc {
             MbcState::NoMbc => 0,
-            MbcState::Mbc1 {
-                upper_bits,
-                ram_mode,
-                ..
-            } => {
+            MbcState::Mbc1 { upper_bits, ram_mode, .. } => {
                 if *ram_mode {
                     ((*upper_bits as usize) << 5) % self.rom_bank_count
                 } else {
@@ -111,11 +96,7 @@ impl<R: RomReader> StreamingCartridge<R> {
     fn effective_switchable_bank(&self) -> usize {
         match &self.mbc {
             MbcState::NoMbc => 1,
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ..
-            } => {
+            MbcState::Mbc1 { rom_bank_lo, upper_bits, .. } => {
                 let bank = ((*upper_bits as usize) << 5) | (*rom_bank_lo as usize);
                 let bank = if bank == 0 { 1 } else { bank };
                 bank % self.rom_bank_count
@@ -125,61 +106,20 @@ impl<R: RomReader> StreamingCartridge<R> {
     }
 
     fn sync_caches(&mut self) {
-        #[cfg(feature = "perf")]
-        let t_sync = crate::cpu::perf::cyccnt();
-        let new_fixed = self.effective_fixed_bank();
+        let new_fixed      = self.effective_fixed_bank();
         let new_switchable = self.effective_switchable_bank();
 
         if new_fixed != self.fixed_bank_num {
-            #[cfg(feature = "perf")]
-            let t_read = crate::cpu::perf::cyccnt();
-            if self
-                .reader
-                .read_bank(new_fixed, &mut self.bank0_cache)
-                .is_err()
-            {
+            if self.reader.read_bank(new_fixed, &mut self.bank0_cache).is_err() {
                 self.bank0_cache.fill(0xFF);
-            }
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.read_bank_fixed = self
-                    .perf_profile
-                    .read_bank_fixed
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_read));
-                self.perf_profile.read_bank_fixed_calls =
-                    self.perf_profile.read_bank_fixed_calls.wrapping_add(1);
             }
             self.fixed_bank_num = new_fixed;
         }
         if new_switchable != self.current_bank_num {
-            #[cfg(feature = "perf")]
-            let t_read = crate::cpu::perf::cyccnt();
-            if self
-                .reader
-                .read_bank(new_switchable, &mut self.banked_cache)
-                .is_err()
-            {
+            if self.reader.read_bank(new_switchable, &mut self.banked_cache).is_err() {
                 self.banked_cache.fill(0xFF);
             }
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.read_bank_switchable = self
-                    .perf_profile
-                    .read_bank_switchable
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_read));
-                self.perf_profile.read_bank_switchable_calls =
-                    self.perf_profile.read_bank_switchable_calls.wrapping_add(1);
-            }
             self.current_bank_num = new_switchable;
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.sync_caches = self
-                .perf_profile
-                .sync_caches
-                .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_sync));
-            self.perf_profile.sync_caches_calls =
-                self.perf_profile.sync_caches_calls.wrapping_add(1);
         }
     }
 
@@ -190,84 +130,75 @@ impl<R: RomReader> StreamingCartridge<R> {
     fn handle_mbc_write(&mut self, addr: u16, value: u8) -> bool {
         match &mut self.mbc {
             MbcState::NoMbc => false,
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => match addr {
-                0x0000..=0x1FFF => {
-                    *ram_enabled = value & 0x0F == 0x0A;
-                    false
-                }
-                0x2000..=0x3FFF => {
-                    let mut bank = value & 0x1F;
-                    if bank == 0 {
-                        bank = 1;
-                    }
-                    if *rom_bank_lo == bank {
+            MbcState::Mbc1 { rom_bank_lo, upper_bits, ram_mode, ram_enabled, .. } => {
+                match addr {
+                    0x0000..=0x1FFF => {
+                        *ram_enabled = value & 0x0F == 0x0A;
                         false
-                    } else {
-                        *rom_bank_lo = bank;
-                        true
                     }
+                    0x2000..=0x3FFF => {
+                        let mut bank = value & 0x1F;
+                        if bank == 0 {
+                            bank = 1;
+                        }
+                        if *rom_bank_lo == bank {
+                            false
+                        } else {
+                            *rom_bank_lo = bank;
+                            true
+                        }
+                    }
+                    0x4000..=0x5FFF => {
+                        let bits = value & 0x03;
+                        if *upper_bits == bits {
+                            false
+                        } else {
+                            *upper_bits = bits;
+                            true
+                        }
+                    }
+                    0x6000..=0x7FFF => {
+                        let new_ram_mode = value & 0x01 != 0;
+                        if *ram_mode == new_ram_mode {
+                            false
+                        } else {
+                            *ram_mode = new_ram_mode;
+                            true
+                        }
+                    }
+                    _ => false,
                 }
-                0x4000..=0x5FFF => {
-                    let bits = value & 0x03;
-                    if *upper_bits == bits {
+            }
+            MbcState::Mbc3 { rom_bank, bank_or_rtc, ram_rtc_enabled } => {
+                match addr {
+                    0x0000..=0x1FFF => {
+                        *ram_rtc_enabled = value & 0x0F == 0x0A;
                         false
-                    } else {
-                        *upper_bits = bits;
-                        true
                     }
-                }
-                0x6000..=0x7FFF => {
-                    let new_ram_mode = value & 0x01 != 0;
-                    if *ram_mode == new_ram_mode {
+                    0x2000..=0x3FFF => {
+                        let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
+                        if *rom_bank == bank {
+                            false
+                        } else {
+                            *rom_bank = bank;
+                            true
+                        }
+                    }
+                    0x4000..=0x5FFF => {
+                        *bank_or_rtc = value;
                         false
-                    } else {
-                        *ram_mode = new_ram_mode;
-                        true
                     }
+                    _ => false,
                 }
-                _ => false,
-            },
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => match addr {
-                0x0000..=0x1FFF => {
-                    *ram_rtc_enabled = value & 0x0F == 0x0A;
-                    false
-                }
-                0x2000..=0x3FFF => {
-                    let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
-                    if *rom_bank == bank {
-                        false
-                    } else {
-                        *rom_bank = bank;
-                        true
-                    }
-                }
-                0x4000..=0x5FFF => {
-                    *bank_or_rtc = value;
-                    false
-                }
-                _ => false,
-            },
+            }
         }
     }
 
     fn mbc1_ram_bank(&self) -> usize {
         match &self.mbc {
-            MbcState::Mbc1 {
-                upper_bits,
-                ram_mode: true,
-                ram_bank_count,
-                ..
-            } => (*upper_bits as usize) % (*ram_bank_count).max(1),
+            MbcState::Mbc1 { upper_bits, ram_mode: true, ram_bank_count, .. } => {
+                (*upper_bits as usize) % (*ram_bank_count).max(1)
+            }
             _ => 0,
         }
     }
@@ -276,11 +207,9 @@ impl<R: RomReader> StreamingCartridge<R> {
         match &self.mbc {
             MbcState::NoMbc => false,
             MbcState::Mbc1 { ram_enabled, .. } => *ram_enabled,
-            MbcState::Mbc3 {
-                ram_rtc_enabled,
-                bank_or_rtc,
-                ..
-            } => *ram_rtc_enabled && !matches!(bank_or_rtc, 0x08..=0x0C),
+            MbcState::Mbc3 { ram_rtc_enabled, bank_or_rtc, .. } => {
+                *ram_rtc_enabled && !matches!(bank_or_rtc, 0x08..=0x0C)
+            }
         }
     }
 }
@@ -288,80 +217,35 @@ impl<R: RomReader> StreamingCartridge<R> {
 impl<R: RomReader> Cartridge for StreamingCartridge<R> {
     fn read_rom(&self, addr: u16) -> u8 {
         match addr {
-            0x0000..=ROM_FIXED_END => self.bank0_cache[addr as usize],
-            ROM_BANKED_BASE..=ROM_BANKED_END => self.banked_cache[(addr - ROM_BANKED_BASE) as usize],
+            0x0000..=0x3FFF => self.bank0_cache[addr as usize],
+            0x4000..=0x7FFF => self.banked_cache[(addr - 0x4000) as usize],
             _ => 0xFF,
         }
     }
 
     fn read_ram(&self, addr: u16) -> u8 {
-        if !self.is_ram_enabled() || self.ram.is_empty() {
-            return 0xFF;
-        }
+        if !self.is_ram_enabled() || self.ram.is_empty() { return 0xFF; }
         let offset = self.mbc1_ram_bank() * 0x2000 + addr as usize;
         self.ram.get(offset).copied().unwrap_or(0xFF)
     }
 
     fn write(&mut self, addr: u16, value: u8) {
-        if (EXT_RAM_BASE..=EXT_RAM_END).contains(&addr) {
-            #[cfg(feature = "perf")]
-            let t_ram = crate::cpu::perf::cyccnt();
+        if (0xA000..=0xBFFF).contains(&addr) {
             if self.is_ram_enabled() && !self.ram.is_empty() {
-                let offset = self.mbc1_ram_bank() * 0x2000 + (addr - EXT_RAM_BASE) as usize;
-                if let Some(b) = self.ram.get_mut(offset) {
-                    *b = value;
-                }
-            }
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.write_ram = self
-                    .perf_profile
-                    .write_ram
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_ram));
+                let offset = self.mbc1_ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+                if let Some(b) = self.ram.get_mut(offset) { *b = value; }
             }
         } else {
-            #[cfg(feature = "perf")]
-            let t_rom = crate::cpu::perf::cyccnt();
-            #[cfg(feature = "perf")]
-            let t_control = crate::cpu::perf::cyccnt();
             if self.handle_mbc_write(addr, value) {
-                #[cfg(feature = "perf")]
-                {
-                    self.perf_profile.control_write = self
-                        .perf_profile
-                        .control_write
-                        .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_control));
-                }
                 self.sync_caches();
-            } else {
-                #[cfg(feature = "perf")]
-                {
-                    self.perf_profile.control_write = self
-                        .perf_profile
-                        .control_write
-                        .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_control));
-                }
-            }
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.write_rom = self
-                    .perf_profile
-                    .write_rom
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t_rom));
             }
         }
     }
 
-    fn current_rom_bank(&self) -> usize {
-        self.current_bank_num
-    }
+    fn current_rom_bank(&self) -> usize { self.current_bank_num }
 
     fn external_ram(&self) -> Option<&[u8]> {
-        if self.ram.is_empty() {
-            None
-        } else {
-            Some(&self.ram)
-        }
+        if self.ram.is_empty() { None } else { Some(&self.ram) }
     }
 
     fn set_external_ram(&mut self, data: &[u8]) {
@@ -372,25 +256,10 @@ impl<R: RomReader> Cartridge for StreamingCartridge<R> {
     fn save_mbc_state(&self, out: &mut Vec<u8>) {
         match &self.mbc {
             MbcState::NoMbc => {}
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => {
-                out.extend_from_slice(&[
-                    *rom_bank_lo,
-                    *upper_bits,
-                    *ram_mode as u8,
-                    *ram_enabled as u8,
-                ]);
+            MbcState::Mbc1 { rom_bank_lo, upper_bits, ram_mode, ram_enabled, .. } => {
+                out.extend_from_slice(&[*rom_bank_lo, *upper_bits, *ram_mode as u8, *ram_enabled as u8]);
             }
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => {
+            MbcState::Mbc3 { rom_bank, bank_or_rtc, ram_rtc_enabled } => {
                 out.extend_from_slice(&[*rom_bank, *bank_or_rtc, *ram_rtc_enabled as u8]);
             }
         }
@@ -399,48 +268,30 @@ impl<R: RomReader> Cartridge for StreamingCartridge<R> {
     fn load_mbc_state(&mut self, data: &[u8], offset: usize) -> usize {
         let consumed = match &mut self.mbc {
             MbcState::NoMbc => 0,
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => {
-                if data.len() < offset + 4 {
-                    return 0;
-                }
+            MbcState::Mbc1 { rom_bank_lo, upper_bits, ram_mode, ram_enabled, .. } => {
+                if data.len() < offset + 4 { return 0; }
                 *rom_bank_lo = data[offset].max(1);
-                *upper_bits = data[offset + 1] & 0x03;
-                *ram_mode = data[offset + 2] != 0;
+                *upper_bits  = data[offset + 1] & 0x03;
+                *ram_mode    = data[offset + 2] != 0;
                 *ram_enabled = data[offset + 3] != 0;
                 4
             }
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => {
-                if data.len() < offset + 3 {
-                    return 0;
-                }
-                *rom_bank = data[offset].max(1);
-                *bank_or_rtc = data[offset + 1];
+            MbcState::Mbc3 { rom_bank, bank_or_rtc, ram_rtc_enabled } => {
+                if data.len() < offset + 3 { return 0; }
+                *rom_bank        = data[offset].max(1);
+                *bank_or_rtc     = data[offset + 1];
                 *ram_rtc_enabled = data[offset + 2] != 0;
                 3
             }
         };
         if consumed > 0 {
-            self.fixed_bank_num = usize::MAX;
+            self.fixed_bank_num   = usize::MAX;
             self.current_bank_num = usize::MAX;
             self.sync_caches();
         }
         consumed
     }
 
-    #[cfg(feature = "perf")]
-    fn take_perf_profile(&mut self) -> CartridgePerfProfile {
-        core::mem::take(&mut self.perf_profile)
-    }
 }
 
 // ── Header decoders ──────────────────────────────────────────────────────────
@@ -461,11 +312,7 @@ fn ram_bytes_from_code(code: u8) -> usize {
 }
 
 fn mbc_state_from_header(cart_type: u8, ram_bytes: usize) -> Option<MbcState> {
-    let ram_bank_count = if ram_bytes == 0 {
-        0
-    } else {
-        (ram_bytes / 0x2000).max(1)
-    };
+    let ram_bank_count = if ram_bytes == 0 { 0 } else { (ram_bytes / 0x2000).max(1) };
     match cart_type {
         0x00 => Some(MbcState::NoMbc),
         0x01 | 0x02 | 0x03 => Some(MbcState::Mbc1 {
@@ -491,7 +338,7 @@ mod tests {
     use super::*;
 
     struct MockRomReader {
-        banks: Vec<[u8; 0x4000]>,
+        banks:    Vec<[u8; 0x4000]>,
         read_log: Vec<usize>,
     }
 
@@ -502,24 +349,21 @@ mod tests {
                 bank.fill(i as u8);
             }
             banks[0][CART_TYPE] = cart_type;
-            banks[0][ROM_SIZE] = rom_size_code_for(num_banks);
-            banks[0][RAM_SIZE] = ram_size_code;
-            Self {
-                banks,
-                read_log: Vec::new(),
-            }
+            banks[0][ROM_SIZE]  = rom_size_code_for(num_banks);
+            banks[0][RAM_SIZE]  = ram_size_code;
+            Self { banks, read_log: Vec::new() }
         }
     }
 
     fn rom_size_code_for(num_banks: usize) -> u8 {
         match num_banks {
-            2 => 0,
-            4 => 1,
-            8 => 2,
+            2  => 0,
+            4  => 1,
+            8  => 2,
             16 => 3,
             32 => 4,
             64 => 5,
-            _ => 0,
+            _  => 0,
         }
     }
 

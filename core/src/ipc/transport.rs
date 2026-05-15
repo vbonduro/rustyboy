@@ -1,9 +1,5 @@
 use alloc::vec::Vec;
 
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::apu::ApuPerfProfile;
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::ppu::PpuPerfProfile;
 use crate::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 use crate::cpu::save_state::PpuState;
 
@@ -26,8 +22,4 @@ pub trait WorkerTransport {
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]);
     fn snapshot_ppu_state(&self, io: &[u8]) -> PpuState;
     fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput;
-    #[cfg(feature = "perf")]
-    fn take_apu_perf_profile(&mut self) -> ApuPerfProfile;
-    #[cfg(feature = "perf")]
-    fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile;
 }

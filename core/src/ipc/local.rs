@@ -1,9 +1,5 @@
 use alloc::vec::Vec;
 
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::apu::ApuPerfProfile;
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::ppu::PpuPerfProfile;
 use crate::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 use crate::cpu::save_state::PpuState;
 
@@ -73,13 +69,4 @@ impl WorkerTransport for LocalTransport {
         output
     }
 
-    #[cfg(feature = "perf")]
-    fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.worker.take_apu_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.worker.take_ppu_perf_profile()
-    }
 }

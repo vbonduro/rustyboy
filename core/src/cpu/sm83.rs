@@ -29,12 +29,8 @@ use super::operations::inc_dec::{dec_u8, inc_u8};
 use super::operations::logic::{and_u8, or_u8, xor_u8};
 use super::operations::misc::daa_u8;
 use super::operations::sub::*;
-#[cfg(feature = "perf")]
-use super::perf::{cyccnt, Sm83PerfRecorder};
 use super::registers::{Flags, Registers};
 
-#[cfg(feature = "perf")]
-pub use super::perf::Sm83PerfProfile;
 use crate::memory::map::{IO_REG_BASE, IO_REG_END, OAM_BASE, OAM_END, VRAM_BASE, VRAM_END};
 use crate::memory::memory::GameBoyMemory;
 
@@ -69,8 +65,6 @@ pub struct Sm83 {
     /// Per-instruction trace hook, enabled by the `trace` feature.
     #[cfg(feature = "trace")]
     trace_hook: Option<Box<dyn FnMut(TraceEvent<'_>)>>,
-    #[cfg(feature = "perf")]
-    pub(crate) perf: Sm83PerfRecorder,
 }
 
 impl Sm83 {
@@ -84,8 +78,6 @@ impl Sm83 {
             opcodes: OpCodeTable::from_decoder(&OpCodeDecoder::new()),
             #[cfg(feature = "trace")]
             trace_hook: None,
-            #[cfg(feature = "perf")]
-            perf: Sm83PerfRecorder::default(),
         }
     }
 
@@ -114,19 +106,6 @@ impl Sm83 {
         self.trace_hook = Some(Box::new(hook));
     }
 
-    #[cfg(feature = "perf")]
-    pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
-        self.perf.take_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    #[inline(always)]
-    fn finish_step(&mut self, total_start: u32, cycles: u32) -> u32 {
-        self.perf.record_total(cyccnt().wrapping_sub(total_start));
-        cycles
-    }
-
-    #[cfg(not(feature = "perf"))]
     #[inline(always)]
     fn finish_step(&mut self, _total_start: (), cycles: u32) -> u32 {
         cycles
@@ -190,126 +169,44 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_read(&mut self, memory: &GameBoyMemory, addr: u16) -> u8 {
-        #[cfg(feature = "perf")]
-        let read_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
 
         let value = memory.read_fast(addr);
-
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(read_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            self.perf.record_mem_read(dt);
-            self.perf.record_bus_read(dt);
-        }
 
         value
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_write(&mut self, memory: &mut GameBoyMemory, addr: u16, val: u8) {
-        #[cfg(feature = "perf")]
-        let write_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
 
         match addr {
             IO_REG_BASE..=IO_REG_END | 0xFFFF => {
-                #[cfg(feature = "perf")]
-                let io_start = cyccnt();
                 memory.write_io(addr, val);
-                #[cfg(feature = "perf")]
-                self.perf
-                    .record_mem_write_io(cyccnt().wrapping_sub(io_start));
-
-                if matches!(addr, IO_REG_BASE..=IO_REG_END | 0xFFFF) {
-                    #[cfg(feature = "perf")]
-                    let enqueue_start = cyccnt();
-                    memory.enqueue_bus_event(addr, val);
-                    #[cfg(feature = "perf")]
-                    self.perf
-                        .record_mem_write_enqueue(cyccnt().wrapping_sub(enqueue_start));
-                }
+                memory.enqueue_bus_event(addr, val);
             }
             VRAM_BASE..=VRAM_END | OAM_BASE..=OAM_END => {
-                #[cfg(feature = "perf")]
-                let fast_start = cyccnt();
                 memory.write_fast(addr, val);
-                #[cfg(feature = "perf")]
-                self.perf
-                    .record_mem_write_fast(addr, cyccnt().wrapping_sub(fast_start));
-
-                #[cfg(feature = "perf")]
-                let enqueue_start = cyccnt();
                 memory.enqueue_bus_event(addr, val);
-                #[cfg(feature = "perf")]
-                self.perf
-                    .record_mem_write_enqueue(cyccnt().wrapping_sub(enqueue_start));
             }
             _ => {
-                #[cfg(feature = "perf")]
-                let fast_start = cyccnt();
                 memory.write_fast(addr, val);
-                #[cfg(feature = "perf")]
-                self.perf
-                    .record_mem_write_fast(addr, cyccnt().wrapping_sub(fast_start));
             }
-        }
-
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(write_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            self.perf.record_mem_write(dt);
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn fetch_byte(&mut self, memory: &mut GameBoyMemory) -> u8 {
         let addr = self.registers.pc;
-        #[cfg(feature = "perf")]
-        let fetch_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
 
         let value = if addr <= 0x7FFF {
-            #[cfg(feature = "perf")]
-            let idle_start = cyccnt();
-            #[cfg(feature = "perf")]
-            let read_start = cyccnt();
 
             let value = memory.read_rom_fast(addr);
-
-            #[cfg(feature = "perf")]
-            {
-                self.perf
-                    .record_pc_fetch_rom_read(cyccnt().wrapping_sub(read_start));
-                self.perf
-                    .record_pc_fetch_rom_idle(cyccnt().wrapping_sub(idle_start));
-            }
 
             value
         } else {
             memory.read_fast(addr)
         };
 
-        #[cfg(feature = "perf")]
-        let wrap_start = cyccnt();
         self.registers.pc = self.registers.pc.wrapping_add(1);
-
-        #[cfg(feature = "perf")]
-        {
-            self.perf
-                .record_pc_fetch_wrapper(cyccnt().wrapping_sub(wrap_start));
-            let dt = cyccnt()
-                .wrapping_sub(fetch_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            self.perf.record_pc_fetch(addr, dt);
-        }
 
         value
     }
@@ -324,9 +221,6 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn step_inner(&mut self, memory: &mut GameBoyMemory) -> u32 {
-        #[cfg(feature = "perf")]
-        let total_start = cyccnt();
-        #[cfg(not(feature = "perf"))]
         let total_start = ();
 
         self.advance_ime();
@@ -348,33 +242,12 @@ impl Sm83 {
 
         let opcode = self.fetch_byte(memory);
         if opcode == 0xCB {
-            #[cfg(feature = "perf")]
-            let cb_start = cyccnt();
             let cb_opcode = self.fetch_byte(memory);
-            #[cfg(feature = "perf")]
-            let dispatch_start = cyccnt();
             let handler = match self.opcodes.get_cb(cb_opcode) {
                 Ok(h) => h,
                 Err(_) => return self.finish_step(total_start, 8),
             };
-            #[cfg(feature = "perf")]
-            {
-                self.perf
-                    .record_opcode_dispatch(cyccnt().wrapping_sub(dispatch_start));
-                self.perf.record_cb_prefix(cyccnt().wrapping_sub(cb_start));
-            }
-            #[cfg(feature = "perf")]
-            let cb_exec_start = cyccnt();
-            #[cfg(feature = "perf")]
-            let cb_exec_nested = self.perf.nested_snapshot();
             let cycles = handler.execute(self, memory).unwrap_or(8) as u32;
-            #[cfg(feature = "perf")]
-            {
-                let dt = cyccnt()
-                    .wrapping_sub(cb_exec_start)
-                    .wrapping_sub(self.perf.nested_cycles_since(cb_exec_nested));
-                self.perf.record_cb_opcode_exec(cb_opcode, dt);
-            }
             if self.ime == ImeState::Enabled {
                 if let Some(bit) = self.take_pending_interrupt(memory) {
                     let isr_cycles = self.dispatch_isr(memory, bit);
@@ -384,27 +257,11 @@ impl Sm83 {
             return self.finish_step(total_start, cycles);
         }
 
-        #[cfg(feature = "perf")]
-        let dispatch_start = cyccnt();
         let handler = match self.opcodes.get(opcode) {
             Ok(h) => h,
             Err(_) => return self.finish_step(total_start, 4),
         };
-        #[cfg(feature = "perf")]
-        self.perf
-            .record_opcode_dispatch(cyccnt().wrapping_sub(dispatch_start));
-        #[cfg(feature = "perf")]
-        let exec_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let exec_nested = self.perf.nested_snapshot();
         let cycles = handler.execute(self, memory).unwrap_or(4) as u32;
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(exec_start)
-                .wrapping_sub(self.perf.nested_cycles_since(exec_nested));
-            self.perf.record_opcode_exec(opcode, dt);
-        }
         // Post-instruction: check for interrupt dispatch
         if self.ime == ImeState::Enabled {
             if let Some(bit) = self.take_pending_interrupt(memory) {
@@ -482,10 +339,6 @@ impl Sm83 {
     }
 
     fn get_operand8(&mut self, op: &Operand, memory: &mut GameBoyMemory) -> u8 {
-        #[cfg(feature = "perf")]
-        let operand_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
 
         let value = match op {
             Operand::Register8(r) => self.get_r8_enum(*r),
@@ -517,38 +370,13 @@ impl Sm83 {
             _ => panic!("get_operand8: unsupported {:?}", op),
         };
 
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(operand_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            match op {
-                Operand::Register8(_) => self.perf.record_operand8_reg(dt),
-                Operand::Imm8 | Operand::ImmSigned8 => self.perf.record_operand8_imm(dt),
-                Operand::Memory(_) => self.perf.record_operand8_mem(dt),
-                _ => unreachable!("get_operand8 perf classification drifted from operand match"),
-            }
-        }
-
         value
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn fetch_operand8_immediate(&mut self, memory: &mut GameBoyMemory) -> u8 {
-        #[cfg(feature = "perf")]
-        let operand_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
 
         let value = self.fetch_byte(memory);
-
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(operand_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            self.perf.record_operand8_imm(dt);
-        }
 
         value
     }
@@ -1199,38 +1027,9 @@ impl Instructions for Sm83 {
         op: &CbInstruction,
         memory: &mut GameBoyMemory,
     ) -> Result<u8, InstructionError> {
-        #[cfg(feature = "perf")]
-        let cb_exec_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let nested = self.perf.nested_snapshot();
-        #[cfg(feature = "perf")]
-        let is_reg_target = match op.target {
-            CbTarget::Reg(r) => {
-                self.cb_reg(op.op, r);
-                true
-            }
-            CbTarget::HLMem => {
-                self.cb_hlmem(op.op, memory);
-                false
-            }
-        };
-
-        #[cfg(not(feature = "perf"))]
         match op.target {
             CbTarget::Reg(r) => self.cb_reg(op.op, r),
             CbTarget::HLMem => self.cb_hlmem(op.op, memory),
-        }
-
-        #[cfg(feature = "perf")]
-        {
-            let dt = cyccnt()
-                .wrapping_sub(cb_exec_start)
-                .wrapping_sub(self.perf.nested_cycles_since(nested));
-            if is_reg_target {
-                self.perf.record_cb_exec_reg(dt);
-            } else {
-                self.perf.record_cb_exec_hlmem(dt);
-            }
         }
 
         Ok(op.cycles)
@@ -1418,50 +1217,4 @@ mod tests {
         assert_eq!(cpu.registers().f, Flags::Z | Flags::H | Flags::C);
     }
 
-    #[cfg(feature = "perf")]
-    #[test]
-    fn perf_counters_cover_fetch_decode_and_memory_paths() {
-        let mut rom = vec![0u8; 0x8000];
-        rom[0x0147] = 0x00;
-        rom[0x0148] = 0x00;
-        rom[0x0149] = 0x00;
-        rom[0x0100] = 0x3E; // LD A, d8
-        rom[0x0101] = 0x12;
-        rom[0x0102] = 0xEA; // LD (a16), A
-        rom[0x0103] = 0x00;
-        rom[0x0104] = 0x80;
-        rom[0x0105] = 0xFA; // LD A, (a16)
-        rom[0x0106] = 0x00;
-        rom[0x0107] = 0x80;
-        rom[0x0108] = 0x26; // LD H, d8
-        rom[0x0109] = 0x80;
-        rom[0x010A] = 0x2E; // LD L, d8
-        rom[0x010B] = 0x00;
-        rom[0x010C] = 0x86; // ADD A, (HL)
-
-        let mut gb = GameBoy::new(rom);
-        gb.tick();
-        gb.tick();
-        gb.tick();
-        gb.tick();
-        gb.tick();
-        gb.tick();
-
-        let profile = gb.take_perf_profile();
-        assert!(profile.total > 0);
-        assert!(profile.pc_fetch_calls >= 8);
-        assert!(profile.pc_fetch_rom_calls >= 8);
-        assert!(profile.pc_fetch_rom_idle > 0);
-        assert!(profile.pc_fetch_rom_read > 0);
-        assert!(profile.pc_fetch_wrapper > 0);
-        assert!(profile.opcode_dispatch_calls >= 3);
-        assert!(profile.operand8_calls >= 1);
-        assert!(profile.operand8_imm_calls >= 1);
-        assert!(profile.operand8_mem_calls >= 1);
-        assert!(profile.mem_write > 0);
-        assert!(profile.mem_write_fast_vram > 0);
-        assert!(profile.mem_read > 0);
-        assert!(profile.bus_read_calls >= 1);
-        assert!(profile.mem_write_route > 0);
-    }
 }
