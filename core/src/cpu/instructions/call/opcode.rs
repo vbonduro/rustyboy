@@ -34,7 +34,12 @@ mod tests {
             op: CallOp::Call,
             cycles: 24,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 24);
+        assert_eq!(
+            opcode
+                .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+                .unwrap(),
+            24
+        );
     }
 
     #[test]
@@ -43,6 +48,11 @@ mod tests {
             op: CallOp::CallCc(Condition::Z),
             cycles: 24,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 24);
+        assert_eq!(
+            opcode
+                .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+                .unwrap(),
+            24
+        );
     }
 }

@@ -7,6 +7,8 @@
 /// Writes to 0x0000–0x7FFF are intercepted by the MBC (not stored in ROM).
 use alloc::{boxed::Box, vec, vec::Vec};
 
+use super::map::{EXT_RAM_BASE, EXT_RAM_END, ROM_BANK_SIZE, ROM_BANKED_BASE, ROM_BANKED_END, ROM_FIXED_END};
+
 // ── Cartridge trait ──────────────────────────────────────────────────────────
 
 #[cfg(feature = "perf")]
@@ -98,7 +100,7 @@ const NINTENDO_LOGO: [u8; 48] = [
 
 /// Returns true if the Nintendo logo appears at offset `base + 0x0104` in `data`.
 fn has_logo_at_bank(data: &[u8], bank: usize) -> bool {
-    let base = bank * 0x4000;
+    let base = bank * ROM_BANK_SIZE;
     let logo_start = base + 0x0104;
     let logo_end = logo_start + NINTENDO_LOGO.len();
     data.get(logo_start..logo_end)
@@ -165,7 +167,7 @@ fn decode_ram_size(code: u8) -> usize {
 
 fn rom_window(rom: &[u8], base: usize) -> (*const u8, usize) {
     match rom.get(base..) {
-        Some(slice) => (slice.as_ptr(), slice.len().min(0x4000)),
+        Some(slice) => (slice.as_ptr(), slice.len().min(ROM_BANK_SIZE)),
         None => (core::ptr::null(), 0),
     }
 }
@@ -192,8 +194,8 @@ impl Cartridge for NoMbc {
         Some(CartridgeRomWindows {
             fixed_ptr: rom_window(&self.rom, 0).0,
             fixed_len: rom_window(&self.rom, 0).1,
-            banked_ptr: rom_window(&self.rom, 0x4000).0,
-            banked_len: rom_window(&self.rom, 0x4000).1,
+            banked_ptr: rom_window(&self.rom, ROM_BANK_SIZE).0,
+            banked_len: rom_window(&self.rom, ROM_BANK_SIZE).1,
         })
     }
 
@@ -206,8 +208,8 @@ impl Cartridge for NoMbc {
     }
 
     fn write(&mut self, addr: u16, value: u8) {
-        if (0xA000..=0xBFFF).contains(&addr) {
-            let offset = (addr - 0xA000) as usize;
+        if (EXT_RAM_BASE..=EXT_RAM_END).contains(&addr) {
+            let offset = (addr - EXT_RAM_BASE) as usize;
             if let Some(b) = self.ram.get_mut(offset) {
                 *b = value;
             }
@@ -307,8 +309,8 @@ impl Mbc1 {
 
 impl Cartridge for Mbc1 {
     fn rom_windows(&self) -> Option<CartridgeRomWindows> {
-        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * 0x4000);
-        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * 0x4000);
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * ROM_BANK_SIZE);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * ROM_BANK_SIZE);
         Some(CartridgeRomWindows {
             fixed_ptr,
             fixed_len,
@@ -334,8 +336,8 @@ impl Cartridge for Mbc1 {
 
     fn read_rom(&self, addr: u16) -> u8 {
         let physical = match addr {
-            0x0000..=0x3FFF => self.rom_bank0() * 0x4000 + addr as usize,
-            0x4000..=0x7FFF => self.rom_bank() * 0x4000 + (addr as usize - 0x4000),
+            0x0000..=ROM_FIXED_END => self.rom_bank0() * ROM_BANK_SIZE + addr as usize,
+            ROM_BANKED_BASE..=ROM_BANKED_END => self.rom_bank() * ROM_BANK_SIZE + (addr as usize - ROM_BANKED_BASE as usize),
             _ => return 0xFF,
         };
         self.rom.get(physical).copied().unwrap_or(0xFF)
@@ -384,9 +386,9 @@ impl Cartridge for Mbc1 {
                 }
             }
             // External RAM write
-            0xA000..=0xBFFF => {
+            EXT_RAM_BASE..=EXT_RAM_END => {
                 if self.ram_enabled && !self.ram.is_empty() {
-                    let offset = self.ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+                    let offset = self.ram_bank() * 0x2000 + (addr - EXT_RAM_BASE) as usize;
                     if let Some(b) = self.ram.get_mut(offset) {
                         *b = value;
                     }
@@ -490,8 +492,8 @@ impl Mbc1Multicart {
 
 impl Cartridge for Mbc1Multicart {
     fn rom_windows(&self) -> Option<CartridgeRomWindows> {
-        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * 0x4000);
-        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * 0x4000);
+        let (fixed_ptr, fixed_len) = rom_window(&self.rom, self.rom_bank0() * ROM_BANK_SIZE);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank() * ROM_BANK_SIZE);
         Some(CartridgeRomWindows {
             fixed_ptr,
             fixed_len,
@@ -513,8 +515,8 @@ impl Cartridge for Mbc1Multicart {
     }
     fn read_rom(&self, addr: u16) -> u8 {
         let physical = match addr {
-            0x0000..=0x3FFF => self.rom_bank0() * 0x4000 + addr as usize,
-            0x4000..=0x7FFF => self.rom_bank() * 0x4000 + (addr as usize - 0x4000),
+            0x0000..=ROM_FIXED_END => self.rom_bank0() * ROM_BANK_SIZE + addr as usize,
+            ROM_BANKED_BASE..=ROM_BANKED_END => self.rom_bank() * ROM_BANK_SIZE + (addr as usize - ROM_BANKED_BASE as usize),
             _ => return 0xFF,
         };
         self.rom.get(physical).copied().unwrap_or(0xFF)
@@ -558,9 +560,9 @@ impl Cartridge for Mbc1Multicart {
                     self.ram_mode = ram_mode;
                 }
             }
-            0xA000..=0xBFFF => {
+            EXT_RAM_BASE..=EXT_RAM_END => {
                 if self.ram_enabled && !self.ram.is_empty() {
-                    let offset = self.ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+                    let offset = self.ram_bank() * 0x2000 + (addr - EXT_RAM_BASE) as usize;
                     if let Some(b) = self.ram.get_mut(offset) {
                         *b = value;
                     }
@@ -737,7 +739,7 @@ impl Mbc3 {
 impl Cartridge for Mbc3 {
     fn rom_windows(&self) -> Option<CartridgeRomWindows> {
         let (fixed_ptr, fixed_len) = rom_window(&self.rom, 0);
-        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank as usize * 0x4000);
+        let (banked_ptr, banked_len) = rom_window(&self.rom, self.rom_bank as usize * ROM_BANK_SIZE);
         Some(CartridgeRomWindows {
             fixed_ptr,
             fixed_len,
@@ -771,8 +773,8 @@ impl Cartridge for Mbc3 {
 
     fn read_rom(&self, addr: u16) -> u8 {
         let physical = match addr {
-            0x0000..=0x3FFF => addr as usize,
-            0x4000..=0x7FFF => self.rom_bank as usize * 0x4000 + (addr as usize - 0x4000),
+            0x0000..=ROM_FIXED_END => addr as usize,
+            ROM_BANKED_BASE..=ROM_BANKED_END => self.rom_bank as usize * ROM_BANK_SIZE + (addr as usize - ROM_BANKED_BASE as usize),
             _ => return 0xFF,
         };
         self.rom.get(physical).copied().unwrap_or(0xFF)
@@ -830,7 +832,7 @@ impl Cartridge for Mbc3 {
                 }
             }
             // External RAM write
-            0xA000..=0xBFFF => {
+            EXT_RAM_BASE..=EXT_RAM_END => {
                 if !self.ram_rtc_enabled {
                     return;
                 }
@@ -843,7 +845,7 @@ impl Cartridge for Mbc3 {
                 if self.ram.is_empty() {
                     return;
                 }
-                let offset = self.bank_or_rtc as usize * 0x2000 + (addr - 0xA000) as usize;
+                let offset = self.bank_or_rtc as usize * 0x2000 + (addr - EXT_RAM_BASE) as usize;
                 if let Some(b) = self.ram.get_mut(offset) {
                     *b = value;
                 }

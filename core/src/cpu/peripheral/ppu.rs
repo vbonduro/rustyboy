@@ -721,6 +721,9 @@ fn apply_palette(palette: u8, color_index: u8) -> u8 {
 mod tests {
     use super::*;
 
+    /// Last scanline index that is drawn to the screen (LY 0–143 are visible).
+    const LAST_VISIBLE_LINE: u8 = VISIBLE_SCANLINES - 1;
+
     fn default_ppu() -> PpuPeripheral {
         PpuPeripheral::new()
     }
@@ -831,7 +834,7 @@ mod tests {
         let output = tick_dots(
             &mut ppu,
             &mut io,
-            143 * DOTS_PER_SCANLINE as u32,
+            LAST_VISIBLE_LINE as u32 * DOTS_PER_SCANLINE as u32,
             &vram,
             &oam,
         );
@@ -851,6 +854,7 @@ mod tests {
         io[LYC_IO] = 5;
         io[STAT_IO] = 0x40; // LYC=LY interrupt enable
 
+        // Advance exactly 5 full scanlines so LY reaches 5, matching LYC.
         let output = tick_dots(&mut ppu, &mut io, 5 * DOTS_PER_SCANLINE as u32, &vram, &oam);
         assert!(output.stat_interrupt);
         assert_eq!(io[STAT_IO] & 0x04, 0x04); // LYC=LY flag set

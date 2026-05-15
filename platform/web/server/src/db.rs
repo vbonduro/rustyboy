@@ -1,5 +1,8 @@
-use sqlx::{SqlitePool, sqlite::SqliteConnectOptions, Row};
-use std::{str::FromStr, time::{SystemTime, UNIX_EPOCH}};
+use sqlx::{sqlite::SqliteConnectOptions, Row, SqlitePool};
+use std::{
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -49,8 +52,8 @@ pub struct Database {
 
 impl Database {
     pub async fn connect(path: &str) -> Result<Self, sqlx::Error> {
-        let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}"))?
-            .create_if_missing(true);
+        let opts =
+            SqliteConnectOptions::from_str(&format!("sqlite:{path}"))?.create_if_missing(true);
         let pool = SqlitePool::connect_with(opts).await?;
 
         // Run embedded migrations
@@ -116,7 +119,10 @@ impl Database {
         })
     }
 
-    pub async fn get_user_by_google_sub(&self, google_sub: &str) -> Result<Option<User>, sqlx::Error> {
+    pub async fn get_user_by_google_sub(
+        &self,
+        google_sub: &str,
+    ) -> Result<Option<User>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, google_sub, email, display_name, avatar_url, created_at
              FROM users WHERE google_sub = ?",
@@ -198,14 +204,12 @@ impl Database {
         if let Some(row) = existing {
             let id: String = row.get("id");
             let created_at: i64 = row.get("created_at");
-            sqlx::query(
-                "UPDATE save_states SET data = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(&data)
-            .bind(now)
-            .bind(&id)
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("UPDATE save_states SET data = ?, updated_at = ? WHERE id = ?")
+                .bind(&data)
+                .bind(now)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
             return Ok(SaveState {
                 id,
                 user_id: user_id.to_string(),
@@ -293,7 +297,11 @@ impl Database {
     }
 
     /// Returns the most recent save state for a given user+rom, without the blob data.
-    pub async fn get_latest_save_state(&self, user_id: &str, rom_name: &str) -> Result<Option<SaveState>, sqlx::Error> {
+    pub async fn get_latest_save_state(
+        &self,
+        user_id: &str,
+        rom_name: &str,
+    ) -> Result<Option<SaveState>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, user_id, rom_name, slot_name, created_at, updated_at, data
              FROM save_states WHERE user_id = ? AND rom_name = ?
@@ -324,7 +332,12 @@ impl Database {
     }
 
     /// Delete the oldest save states for a user+rom beyond `keep` most recent.
-    pub async fn prune_save_states(&self, user_id: &str, rom_name: &str, keep: usize) -> Result<(), sqlx::Error> {
+    pub async fn prune_save_states(
+        &self,
+        user_id: &str,
+        rom_name: &str,
+        keep: usize,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "DELETE FROM save_states
              WHERE user_id = ? AND rom_name = ?
@@ -346,7 +359,10 @@ impl Database {
     }
 
     /// Returns one row per rom_name the user has saves for, with the most recent updated_at.
-    pub async fn list_roms_with_saves(&self, user_id: &str) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    pub async fn list_roms_with_saves(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<(String, i64)>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT rom_name, MAX(updated_at) as last_saved
              FROM save_states WHERE user_id = ?
@@ -357,7 +373,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| (r.get("rom_name"), r.get("last_saved"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get("rom_name"), r.get("last_saved")))
+            .collect())
     }
 
     // --- Battery Saves ---
@@ -370,24 +389,21 @@ impl Database {
     ) -> Result<BatterySave, sqlx::Error> {
         let now = now_secs();
 
-        let existing = sqlx::query(
-            "SELECT id FROM battery_saves WHERE user_id = ? AND rom_name = ?",
-        )
-        .bind(user_id)
-        .bind(rom_name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing =
+            sqlx::query("SELECT id FROM battery_saves WHERE user_id = ? AND rom_name = ?")
+                .bind(user_id)
+                .bind(rom_name)
+                .fetch_optional(&self.pool)
+                .await?;
 
         if let Some(row) = existing {
             let id: String = row.get("id");
-            sqlx::query(
-                "UPDATE battery_saves SET data = ?, updated_at = ? WHERE id = ?",
-            )
-            .bind(&data)
-            .bind(now)
-            .bind(&id)
-            .execute(&self.pool)
-            .await?;
+            sqlx::query("UPDATE battery_saves SET data = ?, updated_at = ? WHERE id = ?")
+                .bind(&data)
+                .bind(now)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
             return Ok(BatterySave {
                 id,
                 user_id: user_id.to_string(),
@@ -472,20 +488,30 @@ mod tests {
     use super::*;
 
     async fn new_db() -> Database {
-        Database::connect(":memory:").await.expect("in-memory db failed")
+        Database::connect(":memory:")
+            .await
+            .expect("in-memory db failed")
     }
 
     #[tokio::test]
     async fn test_upsert_and_get_user_by_google_sub() {
         let db = new_db().await;
         let user = db
-            .upsert_user("sub123", "alice@example.com", "Alice", Some("https://avatar.example.com/alice"))
+            .upsert_user(
+                "sub123",
+                "alice@example.com",
+                "Alice",
+                Some("https://avatar.example.com/alice"),
+            )
             .await
             .unwrap();
         assert_eq!(user.google_sub, "sub123");
         assert_eq!(user.email, "alice@example.com");
         assert_eq!(user.display_name, "Alice");
-        assert_eq!(user.avatar_url.as_deref(), Some("https://avatar.example.com/alice"));
+        assert_eq!(
+            user.avatar_url.as_deref(),
+            Some("https://avatar.example.com/alice")
+        );
 
         let fetched = db.get_user_by_google_sub("sub123").await.unwrap().unwrap();
         assert_eq!(fetched.id, user.id);
@@ -503,18 +529,27 @@ mod tests {
             .await
             .unwrap();
         let updated = db
-            .upsert_user("sub_update", "new@example.com", "NewName", Some("https://avatar.example.com/new"))
+            .upsert_user(
+                "sub_update",
+                "new@example.com",
+                "NewName",
+                Some("https://avatar.example.com/new"),
+            )
             .await
             .unwrap();
         assert_eq!(updated.email, "new@example.com");
         assert_eq!(updated.display_name, "NewName");
-        assert_eq!(updated.avatar_url.as_deref(), Some("https://avatar.example.com/new"));
+        assert_eq!(
+            updated.avatar_url.as_deref(),
+            Some("https://avatar.example.com/new")
+        );
 
         // Only one row should exist
-        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE google_sub = 'sub_update'")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        let row_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE google_sub = 'sub_update'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(row_count, 1);
     }
 
@@ -595,9 +630,15 @@ mod tests {
             .upsert_user("sub_ss_list", "sslist@example.com", "SSList", None)
             .await
             .unwrap();
-        db.upsert_save_state(&user.id, "zelda.gb", "slot1", vec![1]).await.unwrap();
-        db.upsert_save_state(&user.id, "zelda.gb", "slot2", vec![2]).await.unwrap();
-        db.upsert_save_state(&user.id, "zelda.gb", "slot3", vec![3]).await.unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot1", vec![1])
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot2", vec![2])
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "zelda.gb", "slot3", vec![3])
+            .await
+            .unwrap();
         let states = db.list_save_states(&user.id, "zelda.gb").await.unwrap();
         assert_eq!(states.len(), 3);
     }
@@ -680,7 +721,11 @@ mod tests {
             .upsert_user("sub_email", "vincent@example.com", "Vincent", None)
             .await
             .unwrap();
-        let fetched = db.get_user_by_email("vincent@example.com").await.unwrap().unwrap();
+        let fetched = db
+            .get_user_by_email("vincent@example.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.id, user.id);
         assert_eq!(fetched.email, "vincent@example.com");
         assert_eq!(fetched.display_name, "Vincent");
@@ -736,7 +781,10 @@ mod tests {
         // When no existing user exists, CF login creates one using the email local-part.
         let db = new_db().await;
 
-        let display_name = "vbonduro@example.com".split('@').next().unwrap_or("vbonduro@example.com");
+        let display_name = "vbonduro@example.com"
+            .split('@')
+            .next()
+            .unwrap_or("vbonduro@example.com");
         let user = db
             .upsert_user("cf-sub-new", "vbonduro@example.com", display_name, None)
             .await
@@ -753,15 +801,25 @@ mod tests {
             .upsert_user("sub_latest", "latest@example.com", "Latest", None)
             .await
             .unwrap();
-        db.upsert_save_state(&user.id, "link.gb", "slot1", vec![1]).await.unwrap();
-        db.upsert_save_state(&user.id, "link.gb", "slot2", vec![2]).await.unwrap();
-        // Force slot2 to have a clearly later updated_at so ORDER BY is deterministic
-        sqlx::query("UPDATE save_states SET updated_at = updated_at + 10 WHERE slot_name = 'slot2'")
-            .execute(&db.pool)
+        db.upsert_save_state(&user.id, "link.gb", "slot1", vec![1])
             .await
             .unwrap();
+        db.upsert_save_state(&user.id, "link.gb", "slot2", vec![2])
+            .await
+            .unwrap();
+        // Force slot2 to have a clearly later updated_at so ORDER BY is deterministic
+        sqlx::query(
+            "UPDATE save_states SET updated_at = updated_at + 10 WHERE slot_name = 'slot2'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-        let latest = db.get_latest_save_state(&user.id, "link.gb").await.unwrap().unwrap();
+        let latest = db
+            .get_latest_save_state(&user.id, "link.gb")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(latest.slot_name, "slot2");
         assert_eq!(latest.data, vec![2]);
     }
@@ -783,9 +841,15 @@ mod tests {
             .upsert_user("sub_roms", "roms@example.com", "Roms", None)
             .await
             .unwrap();
-        db.upsert_save_state(&user.id, "tetris.gb", "slot1", vec![1]).await.unwrap();
-        db.upsert_save_state(&user.id, "tetris.gb", "slot2", vec![2]).await.unwrap();
-        db.upsert_save_state(&user.id, "mario.gb",  "slot1", vec![3]).await.unwrap();
+        db.upsert_save_state(&user.id, "tetris.gb", "slot1", vec![1])
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "tetris.gb", "slot2", vec![2])
+            .await
+            .unwrap();
+        db.upsert_save_state(&user.id, "mario.gb", "slot1", vec![3])
+            .await
+            .unwrap();
 
         let roms = db.list_roms_with_saves(&user.id).await.unwrap();
         assert_eq!(roms.len(), 2);

@@ -1,9 +1,9 @@
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 
-use super::cb::decoder::CbDecoder;
 use super::adc::decoder::AdcDecoder;
 use super::add::decoder::{Add16Decoder, Add8Decoder, AddSP16Decoder};
 use super::call::decoder::CallDecoder;
+use super::cb::decoder::CbDecoder;
 use super::cp::decoder::Cp8Decoder;
 use super::decoder::{Decoder, Error};
 use super::inc_dec::decoder::{Dec16Decoder, Dec8Decoder, Inc16Decoder, Inc8Decoder};
@@ -73,7 +73,7 @@ impl Decoder for OpCodeDecoder {
 /// — no heap allocation per call.
 pub struct OpCodeTable {
     main: Vec<Option<Arc<dyn OpCode>>>,
-    cb:   Vec<Option<Arc<dyn OpCode>>>,
+    cb: Vec<Option<Arc<dyn OpCode>>>,
 }
 
 impl OpCodeTable {

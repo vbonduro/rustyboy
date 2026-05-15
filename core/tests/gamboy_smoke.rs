@@ -42,13 +42,12 @@ fn gamboy_ei_interrupt_dispatch() {
     rom[0x0101] = 0x00; // NOP
     rom[0x0102] = 0x00; // padding
 
-    let mut gb = GameBoy::new(rom)
-        .with_registers(Registers {
-            a: 0x01,
-            sp: 0xDFFE,
-            pc: 0x0100,
-            ..Default::default()
-        });
+    let mut gb = GameBoy::new(rom).with_registers(Registers {
+        a: 0x01,
+        sp: 0xDFFE,
+        pc: 0x0100,
+        ..Default::default()
+    });
 
     // IE: VBlank enabled (bit 0), IF: VBlank pending (bit 0)
     gb.write_io(0xFFFF, 0x01); // IE
@@ -59,7 +58,11 @@ fn gamboy_ei_interrupt_dispatch() {
 
     gb.step().unwrap(); // NOP — IME activates, interrupt dispatched after
 
-    assert_eq!(gb.registers().pc, 0x0040, "PC should be at VBlank vector 0x0040");
+    assert_eq!(
+        gb.registers().pc,
+        0x0040,
+        "PC should be at VBlank vector 0x0040"
+    );
     assert_eq!(gb.registers().sp, 0xDFFC, "SP should be decremented by 2");
     assert_eq!(gb.read_io(0xFF0F) & 0x01, 0, "IF bit 0 should be cleared");
     assert!(!gb.ime(), "IME should be cleared during dispatch");
@@ -75,26 +78,29 @@ fn gamboy_ei_halt_with_pending_interrupt() {
     rom[0x0101] = 0x76; // HALT
     rom[0x0102] = 0x00; // padding
 
-    let mut gb = GameBoy::new(rom)
-        .with_registers(Registers {
-            a: 0x01,
-            sp: 0xDFFE,
-            pc: 0x0100,
-            ..Default::default()
-        });
+    let mut gb = GameBoy::new(rom).with_registers(Registers {
+        a: 0x01,
+        sp: 0xDFFE,
+        pc: 0x0100,
+        ..Default::default()
+    });
 
     // IE: VBlank enabled (bit 0), IF: VBlank pending (bit 0)
     gb.write_io(0xFFFF, 0x01); // IE
     gb.write_io(0xFF0F, 0x01); // IF
 
     gb.step().unwrap(); // EI — IME=Pending
-    // After EI: IME is Pending (not yet Enabled)
+                        // After EI: IME is Pending (not yet Enabled)
     assert!(!gb.ime(), "IME should NOT be enabled immediately after EI");
 
     gb.step().unwrap(); // HALT: advance_ime makes IME=Enabled, post_instr dispatches interrupt
 
     // After HALT+interrupt dispatch: PC should be at VBlank vector
-    assert_eq!(gb.registers().pc, 0x0040, "PC should be at VBlank vector 0x0040 after EI+HALT dispatch");
+    assert_eq!(
+        gb.registers().pc,
+        0x0040,
+        "PC should be at VBlank vector 0x0040 after EI+HALT dispatch"
+    );
     assert_eq!(gb.registers().sp, 0xDFFC, "SP should be decremented by 2");
     assert_eq!(gb.read_io(0xFF0F) & 0x01, 0, "IF bit 0 should be cleared");
     assert!(!gb.ime(), "IME should be cleared during dispatch");
@@ -113,13 +119,12 @@ fn gamboy_reti_restores_ime_immediately() {
     rom[0x0101] = 0x00; // NOP (allows interrupt after EI)
     rom[0x0040] = 0xD9; // RETI at VBlank vector
 
-    let mut gb = GameBoy::new(rom)
-        .with_registers(Registers {
-            a: 0x01,
-            sp: 0xDFFE,
-            pc: 0x0100,
-            ..Default::default()
-        });
+    let mut gb = GameBoy::new(rom).with_registers(Registers {
+        a: 0x01,
+        sp: 0xDFFE,
+        pc: 0x0100,
+        ..Default::default()
+    });
 
     // IE: VBlank enabled, IF: VBlank pending
     gb.write_io(0xFFFF, 0x01);

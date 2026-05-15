@@ -65,34 +65,22 @@ fn test_mooneye_mbc1_rom_512kb() {
 
 #[test]
 fn test_mooneye_mbc1_rom_1mb() {
-    assert_mooneye_passed(
-        "roms/mooneye/emulator-only/mbc1/rom_1Mb.gb",
-        "mbc1/rom_1Mb",
-    );
+    assert_mooneye_passed("roms/mooneye/emulator-only/mbc1/rom_1Mb.gb", "mbc1/rom_1Mb");
 }
 
 #[test]
 fn test_mooneye_mbc1_rom_2mb() {
-    assert_mooneye_passed(
-        "roms/mooneye/emulator-only/mbc1/rom_2Mb.gb",
-        "mbc1/rom_2Mb",
-    );
+    assert_mooneye_passed("roms/mooneye/emulator-only/mbc1/rom_2Mb.gb", "mbc1/rom_2Mb");
 }
 
 #[test]
 fn test_mooneye_mbc1_rom_4mb() {
-    assert_mooneye_passed(
-        "roms/mooneye/emulator-only/mbc1/rom_4Mb.gb",
-        "mbc1/rom_4Mb",
-    );
+    assert_mooneye_passed("roms/mooneye/emulator-only/mbc1/rom_4Mb.gb", "mbc1/rom_4Mb");
 }
 
 #[test]
 fn test_mooneye_mbc1_rom_8mb() {
-    assert_mooneye_passed(
-        "roms/mooneye/emulator-only/mbc1/rom_8Mb.gb",
-        "mbc1/rom_8Mb",
-    );
+    assert_mooneye_passed("roms/mooneye/emulator-only/mbc1/rom_8Mb.gb", "mbc1/rom_8Mb");
 }
 
 #[test]

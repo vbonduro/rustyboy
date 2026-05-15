@@ -9,8 +9,5 @@ use common::assert_blargg_passed;
 #[test]
 #[ignore] // Requires cycle-accurate instruction timing
 fn test_blargg_instr_timing() {
-    assert_blargg_passed(
-        "roms/blargg/instr_timing/instr_timing.gb",
-        "instr_timing",
-    );
+    assert_blargg_passed("roms/blargg/instr_timing/instr_timing.gb", "instr_timing");
 }

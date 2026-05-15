@@ -36,7 +36,11 @@ pub struct Inc16 {
 }
 
 impl OpCode for Inc16 {
-    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        cpu: &mut dyn Instructions,
+        _memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         cpu.inc16(self)
     }
 }
@@ -48,7 +52,11 @@ pub struct Dec16 {
 }
 
 impl OpCode for Dec16 {
-    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        cpu: &mut dyn Instructions,
+        _memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         cpu.dec16(self)
     }
 }

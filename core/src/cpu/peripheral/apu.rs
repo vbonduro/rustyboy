@@ -1,5 +1,11 @@
+use crate::memory::map::IO_REG_BASE;
+
 /// APU register addresses.
 pub(crate) const NR10_ADDR: u16 = 0xFF10;
+pub(crate) const NR11_ADDR: u16 = 0xFF11;
+pub(crate) const NR21_ADDR: u16 = 0xFF16;
+pub(crate) const NR31_ADDR: u16 = 0xFF1B;
+pub(crate) const NR41_ADDR: u16 = 0xFF20;
 pub(crate) const NR52_ADDR: u16 = 0xFF26;
 pub(crate) const WAVE_RAM_START: u16 = 0xFF30;
 pub(crate) const WAVE_RAM_END: u16 = 0xFF3F;
@@ -174,31 +180,10 @@ impl SquareChannel {
         let period = self.frequency_period;
         let (fires, final_timer) = if self.frequency_timer == 0 {
             // timer=0: fires immediately without decrement, then `cycles` normal steps follow
-            let n = cycles as u32;
-            let p = period as u32;
-            let fires = 1 + (n - 1) / p;
-            let rem = (n - 1) % p;
-            (
-                fires,
-                if rem == 0 {
-                    period
-                } else {
-                    period - rem as u16
-                },
-            )
+            next_timer(cycles as u32, period as u32)
         } else {
             let remaining = (cycles - self.frequency_timer) as u32;
-            let p = period as u32;
-            let fires = 1 + remaining / p;
-            let rem = remaining % p;
-            (
-                fires,
-                if rem == 0 {
-                    period
-                } else {
-                    period - rem as u16
-                },
-            )
+            next_timer(remaining + 1, period as u32)
         };
         self.frequency_timer = final_timer;
         if fires > 0 {
@@ -390,31 +375,10 @@ impl WaveChannel {
         }
         let period = self.frequency_period;
         let (fires, final_timer) = if self.frequency_timer == 0 {
-            let n = n_ticks as u32;
-            let p = period as u32;
-            let fires = 1 + (n - 1) / p;
-            let rem = (n - 1) % p;
-            (
-                fires,
-                if rem == 0 {
-                    period
-                } else {
-                    period - rem as u16
-                },
-            )
+            next_timer(n_ticks as u32, period as u32)
         } else {
             let remaining = (n_ticks - self.frequency_timer) as u32;
-            let p = period as u32;
-            let fires = 1 + remaining / p;
-            let rem = remaining % p;
-            (
-                fires,
-                if rem == 0 {
-                    period
-                } else {
-                    period - rem as u16
-                },
-            )
+            next_timer(remaining + 1, period as u32)
         };
         self.frequency_timer = final_timer;
         if fires > 0 {
@@ -544,29 +508,13 @@ impl NoiseChannel {
             self.frequency_timer = self.frequency_timer.saturating_sub(cycles);
             return;
         }
-        let fires = if self.frequency_timer == 0 {
-            let n = cycles as u32;
-            let p = period as u32;
-            let fires = 1 + (n - 1) / p;
-            let rem = (n - 1) % p;
-            self.frequency_timer = if rem == 0 {
-                period
-            } else {
-                period - rem as u16
-            };
-            fires
+        let (fires, final_timer) = if self.frequency_timer == 0 {
+            next_timer(cycles as u32, period as u32)
         } else {
             let remaining = (cycles - self.frequency_timer) as u32;
-            let p = period as u32;
-            let fires = 1 + remaining / p;
-            let rem = remaining % p;
-            self.frequency_timer = if rem == 0 {
-                period
-            } else {
-                period - rem as u16
-            };
-            fires
+            next_timer(remaining + 1, period as u32)
         };
+        self.frequency_timer = final_timer;
         for _ in 0..fires {
             self.clock_lfsr();
         }
@@ -588,6 +536,28 @@ impl NoiseChannel {
 /// Bit 12 of the timer's internal counter (= bit 4 of DIV).
 /// The frame sequencer clocks on the falling edge of this bit.
 const FRAME_SEQ_BIT: u16 = 1 << 12;
+
+/// Compute the reloaded timer and fire count for a batch of channel ticks.
+///
+/// `elapsed` is the number of ticks that have passed since (and including) the
+/// last timer expiry, and `period` is the channel's reload period.  Returns
+/// `(fires, reloaded_timer)` where `fires` is the number of channel-clock
+/// firings in the batch and `reloaded_timer` is the timer value to carry
+/// forward.
+///
+/// This factors out the identical skip-ahead arithmetic used by all three
+/// channel frequency-advance paths.
+#[inline(always)]
+fn next_timer(elapsed: u32, period: u32) -> (u32, u16) {
+    let fires = 1 + (elapsed - 1) / period;
+    let rem = (elapsed - 1) % period;
+    let reloaded = if rem == 0 {
+        period as u16
+    } else {
+        period as u16 - rem as u16
+    };
+    (fires, reloaded)
+}
 
 /// Game Boy APU (Audio Processing Unit) peripheral.
 ///
@@ -640,6 +610,12 @@ pub struct ApuPeripheral {
 
 impl ApuPeripheral {
     pub fn new() -> Self {
+        Self::new_with_sample_buffer(alloc::vec::Vec::with_capacity(
+            SAMPLE_BUFFER_CAPACITY_HINT,
+        ))
+    }
+
+    fn new_with_sample_buffer(sample_buffer: alloc::vec::Vec<i16>) -> Self {
         Self {
             powered: true,
             prev_div_bit: false,
@@ -652,7 +628,7 @@ impl ApuPeripheral {
             channel4: NoiseChannel::default(),
             regs: [0u8; 23],
             sample_acc: 0,
-            sample_buffer: alloc::vec::Vec::with_capacity(SAMPLE_BUFFER_CAPACITY_HINT),
+            sample_buffer,
             left_scale: 0,
             right_scale: 0,
             left_routes: 0,
@@ -719,7 +695,7 @@ impl ApuPeripheral {
         // When powered off, only length counter writes (NRx1) are allowed on DMG
         if !self.powered {
             match address {
-                0xFF11 | 0xFF16 | 0xFF1B | 0xFF20 => {
+                NR11_ADDR | NR21_ADDR | NR31_ADDR | NR41_ADDR => {
                     // Update length counter state but don't store in regs[]
                     self.apply_register_write(address, value);
                 }
@@ -775,20 +751,22 @@ impl ApuPeripheral {
     /// save-state restoration. Internal channel phase and timers are
     /// approximated from the register image plus NR52 status bits.
     pub fn sync_from_io_snapshot(&mut self, io: &[u8]) {
-        *self = Self::new();
+        let mut sample_buffer = core::mem::take(&mut self.sample_buffer);
+        sample_buffer.clear();
+        *self = Self::new_with_sample_buffer(sample_buffer);
 
-        let nr52 = io[(NR52_ADDR - 0xFF00) as usize];
+        let nr52 = io[(NR52_ADDR - IO_REG_BASE) as usize];
         let powered = nr52 & 0x80 != 0;
 
         if !powered {
             self.write_nr52(0x00);
-            for &address in &[0xFF11, 0xFF16, 0xFF1B, 0xFF20] {
-                let value = io[(address - 0xFF00) as usize];
+            for &address in &[NR11_ADDR, NR21_ADDR, NR31_ADDR, NR41_ADDR] {
+                let value = io[(address - IO_REG_BASE) as usize];
                 self.apply_register_write(address, value);
             }
         } else {
             for address in NR10_ADDR..NR52_ADDR {
-                let value = io[(address - 0xFF00) as usize];
+                let value = io[(address - IO_REG_BASE) as usize];
                 self.write_register(address, value);
             }
             self.channel1.enabled = nr52 & 0x01 != 0 && self.channel1.dac_enabled;
@@ -799,7 +777,7 @@ impl ApuPeripheral {
 
         for address in WAVE_RAM_START..=WAVE_RAM_END {
             let offset = (address - WAVE_RAM_START) as usize;
-            self.channel3.wave_ram[offset] = io[(address - 0xFF00) as usize];
+            self.channel3.wave_ram[offset] = io[(address - IO_REG_BASE) as usize];
         }
 
         self.prev_div_bit = false;
@@ -824,7 +802,7 @@ impl ApuPeripheral {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick_internal(&mut self, cycles: u16, div_counter: u16, produce_samples: bool) -> ApuOutput {
+    fn tick_internal(&mut self, cycles: u16, div_counter: u16, emit_samples: bool) -> ApuOutput {
         if !self.powered {
             self.prev_div_bit = div_counter & FRAME_SEQ_BIT != 0;
             return ApuOutput {
@@ -832,6 +810,22 @@ impl ApuPeripheral {
             };
         }
 
+        self.tick_frame_sequencer(cycles, div_counter);
+        self.tick_channels(cycles);
+
+        if emit_samples {
+            self.produce_samples(cycles);
+        }
+
+        ApuOutput {
+            nr52: self.build_nr52(),
+        }
+    }
+
+    /// Check for a frame-sequencer falling edge in this batch and clock it if
+    /// one occurred.  Updates `prev_div_bit` for the next call.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn tick_frame_sequencer(&mut self, cycles: u16, div_counter: u16) {
         // Frame sequencer: check O(1) if bit 12 fell anywhere in (div_start, div_counter].
         // A falling edge of bit 12 occurs at every counter value that is a multiple of 8192.
         // Distance from div_start+1 to the next multiple of 8192:
@@ -856,7 +850,11 @@ impl ApuPeripheral {
             }
         }
         self.prev_div_bit = cur_div_bit;
+    }
 
+    /// Advance all channel frequency timers by `cycles` T-cycles.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn tick_channels(&mut self, cycles: u16) {
         // Square channel frequency timers: skip-ahead arithmetic.
         #[cfg(feature = "perf")]
         let t0 = crate::cpu::perf::cyccnt();
@@ -897,51 +895,49 @@ impl ApuPeripheral {
             let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
             self.perf_profile.noise = self.perf_profile.noise.wrapping_add(dt);
         }
+    }
 
-        if produce_samples {
-            // Downsample to 48 kHz. The Pico runtime almost always calls this
-            // with cycles=1/3/4, so a single-sample fast path avoids a 64-bit
-            // divide/mod in the common case while keeping the generic batch
-            // path for tests and any larger callers.
-            let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
-            if cycles <= 4 {
-                self.sample_acc += sample_inc;
-                if self.sample_acc >= SAMPLE_PERIOD_NUM {
-                    self.sample_acc -= SAMPLE_PERIOD_NUM;
-                    #[cfg(feature = "perf")]
-                    let t0 = crate::cpu::perf::cyccnt();
+    /// Downsample to 48 kHz and push stereo PCM pairs into `sample_buffer`.
+    ///
+    /// The Pico runtime almost always calls this with `cycles` <= 4, so a
+    /// single-sample fast path avoids a 64-bit divide/mod in the common case
+    /// while the generic batch path handles tests and any larger callers.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn produce_samples(&mut self, cycles: u16) {
+        let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
+        if cycles <= 4 {
+            self.sample_acc += sample_inc;
+            if self.sample_acc >= SAMPLE_PERIOD_NUM {
+                self.sample_acc -= SAMPLE_PERIOD_NUM;
+                #[cfg(feature = "perf")]
+                let t0 = crate::cpu::perf::cyccnt();
+                let (left, right) = self.mix_sample();
+                self.sample_buffer.push(left);
+                self.sample_buffer.push(right);
+                #[cfg(feature = "perf")]
+                {
+                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
+                }
+            }
+        } else {
+            let acc = self.sample_acc as u64 + sample_inc as u64;
+            let n_samples = acc / SAMPLE_PERIOD_NUM as u64;
+            self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
+            if n_samples != 0 {
+                #[cfg(feature = "perf")]
+                let t0 = crate::cpu::perf::cyccnt();
+                for _ in 0..n_samples {
                     let (left, right) = self.mix_sample();
                     self.sample_buffer.push(left);
                     self.sample_buffer.push(right);
-                    #[cfg(feature = "perf")]
-                    {
-                        let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-                        self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
-                    }
                 }
-            } else {
-                let acc = self.sample_acc as u64 + sample_inc as u64;
-                let n_samples = acc / SAMPLE_PERIOD_NUM as u64;
-                self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
-                if n_samples != 0 {
-                    #[cfg(feature = "perf")]
-                    let t0 = crate::cpu::perf::cyccnt();
-                    for _ in 0..n_samples {
-                        let (left, right) = self.mix_sample();
-                        self.sample_buffer.push(left);
-                        self.sample_buffer.push(right);
-                    }
-                    #[cfg(feature = "perf")]
-                    {
-                        let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-                        self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
-                    }
+                #[cfg(feature = "perf")]
+                {
+                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
+                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
                 }
             }
-        }
-
-        ApuOutput {
-            nr52: self.build_nr52(),
         }
     }
 
@@ -1085,8 +1081,8 @@ impl ApuPeripheral {
     fn apply_register_write(&mut self, address: u16, value: u8) {
         match address {
             // ── Channel 1 (pulse + sweep) ─────────────────────────────────
-            0xFF10 => self.write_nr10_sweep(value),
-            0xFF11 => {
+            NR10_ADDR => self.write_nr10_sweep(value),
+            NR11_ADDR => {
                 // NR11: duty pattern (bits 7–6) and length counter (bits 5–0)
                 self.channel1.duty = (value >> 6) & 0x03;
                 self.channel1.length_counter = 64 - (value & 0x3F) as u16;
@@ -1100,7 +1096,7 @@ impl ApuPeripheral {
             0xFF14 => self.write_ch1_trigger(value),
 
             // ── Channel 2 (pulse) ─────────────────────────────────────────
-            0xFF16 => {
+            NR21_ADDR => {
                 // NR21: duty pattern (bits 7–6) and length counter (bits 5–0)
                 self.channel2.duty = (value >> 6) & 0x03;
                 self.channel2.length_counter = 64 - (value & 0x3F) as u16;
@@ -1121,7 +1117,7 @@ impl ApuPeripheral {
                     self.channel3.enabled = false;
                 }
             }
-            0xFF1B => {
+            NR31_ADDR => {
                 // NR31: length counter (full byte, max 256)
                 self.channel3.length_counter = 256 - value as u16;
             }
@@ -1137,7 +1133,7 @@ impl ApuPeripheral {
             0xFF1E => self.write_ch3_trigger(value),
 
             // ── Channel 4 (noise) ─────────────────────────────────────────
-            0xFF20 => {
+            NR41_ADDR => {
                 // NR41: length counter (bits 5–0, max 64)
                 self.channel4.length_counter = 64 - (value & 0x3F) as u16;
             }

@@ -22,7 +22,11 @@ pub struct Add16 {
 }
 
 impl OpCode for Add16 {
-    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        cpu: &mut dyn Instructions,
+        _memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         cpu.add16(&self)
     }
 }

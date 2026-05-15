@@ -48,7 +48,9 @@ mod tests {
             op: JumpOp::Jp,
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -58,7 +60,9 @@ mod tests {
             op: JumpOp::JpHl,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -68,7 +72,9 @@ mod tests {
             op: JumpOp::JpCc(Condition::NZ),
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -78,7 +84,9 @@ mod tests {
             op: JumpOp::Jr,
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -88,7 +96,9 @@ mod tests {
             op: JumpOp::JrCc(Condition::Z),
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 }

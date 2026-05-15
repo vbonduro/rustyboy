@@ -98,8 +98,6 @@ impl Registers {
         self.a = (af >> 8) as u8;
         self.f = Flags::from_bits_truncate((af & 0xF0) as u8);
     }
-
-
 }
 
 #[cfg(test)]

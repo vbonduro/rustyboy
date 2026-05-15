@@ -18,9 +18,8 @@ use rustyboy_core::cpu::peripheral::joypad::Button;
 use rustyboy_core::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::save_state::{PpuState, SaveState};
-use rustyboy_core::gameboy::{
-    GameBoyFrontend, GameBoyWorker, WorkerCommand, WorkerFrontendState, WorkerLink,
-};
+use rustyboy_core::gameboy::GameBoy;
+use rustyboy_core::ipc::{GameBoyWorker, WorkerCommand, WorkerOutput, WorkerTransport};
 use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
@@ -34,7 +33,7 @@ use rustyboy_core::cpu::peripheral::ppu::PpuPerfProfile;
 #[cfg(feature = "perf")]
 use rustyboy_core::cpu::sm83::Sm83PerfProfile;
 #[cfg(feature = "perf")]
-use rustyboy_core::gameboy::FrontendPerfProfile;
+use rustyboy_core::gameboy::GameBoyPerfProfile;
 #[cfg(feature = "perf")]
 use rustyboy_core::memory::cartridge::CartridgePerfProfile;
 
@@ -44,6 +43,8 @@ const AUDIO_QUEUE_CAPACITY: usize = 2048;
 const AUDIO_SCRATCH_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
 const SCALED_FRAME_SLOT_COUNT: usize = 3;
+const IO_REG_BASE: u16 = 0xFF00;
+const IO_REG_END: u16 = 0xFF7F;
 
 static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
 static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
@@ -267,7 +268,7 @@ impl SharedWorkerState {
         self.published_frame_seq.store(0, Ordering::Release);
     }
 
-    fn publish_frontend_state(&self, state: WorkerFrontendState) {
+    fn publish_worker_output(&self, state: WorkerOutput) {
         self.apu_nr52.store(state.apu_nr52, Ordering::Release);
         self.ppu_ly.store(state.ppu_ly, Ordering::Release);
         self.ppu_stat.store(state.ppu_stat, Ordering::Release);
@@ -308,11 +309,12 @@ impl SharedWorkerState {
     }
 
     fn write_live_ppu_register(&self, addr: u16, value: u8) {
-        if !(0xFF00..=0xFF7F).contains(&addr) {
+        if !(IO_REG_BASE..=IO_REG_END).contains(&addr) {
             return;
         }
         critical_section::with(|cs| {
-            self.live_ppu_snapshot.borrow(cs).borrow_mut().io[(addr - 0xFF00) as usize] = value;
+            self.live_ppu_snapshot.borrow(cs).borrow_mut().io[(addr - IO_REG_BASE) as usize] =
+                value;
         });
     }
 
@@ -332,7 +334,7 @@ struct PendingPpuAdvance {
     cycles: u16,
 }
 
-struct Core1WorkerLink {
+struct Core1Transport {
     command_tx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
     audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
     shared: &'static SharedWorkerState,
@@ -345,7 +347,7 @@ struct Core1WorkerLink {
     transport_profile: TransportProfile,
 }
 
-impl Core1WorkerLink {
+impl Core1Transport {
     fn new(core1: Peri<'static, CORE1>) -> Self {
         let shared = &SHARED_WORKER_STATE;
         let command_tx = &COMMAND_QUEUE;
@@ -537,7 +539,7 @@ impl Core1WorkerLink {
     }
 }
 
-impl WorkerLink for Core1WorkerLink {
+impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn send(&mut self, command: WorkerCommand) {
@@ -604,6 +606,33 @@ impl WorkerLink for Core1WorkerLink {
             addr,
             value,
         }));
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn write_ppu_registers(&mut self, regs: &[(u16, u8)]) {
+        if regs.is_empty() {
+            return;
+        }
+        self.flush_pending_ppu();
+        critical_section::with(|cs| {
+            let mut snapshot = self.shared.live_ppu_snapshot.borrow(cs).borrow_mut();
+            for &(addr, value) in regs {
+                if (IO_REG_BASE..=IO_REG_END).contains(&addr) {
+                    snapshot.io[(addr - IO_REG_BASE) as usize] = value;
+                }
+            }
+        });
+        self.transport_profile.ppu_register_writes = self
+            .transport_profile
+            .ppu_register_writes
+            .wrapping_add(regs.len() as u32);
+        for &(addr, value) in regs {
+            self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
+                addr,
+                value,
+            }));
+        }
     }
 
     fn drain_audio_samples(&mut self) -> Vec<f32> {
@@ -679,14 +708,14 @@ impl WorkerLink for Core1WorkerLink {
         self.shared.snapshot_ppu_state()
     }
 
-    fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
+    fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
         let _ = out;
         let frame_seq = self.shared.published_frame_seq.load(Ordering::Acquire);
         let frame_ready = frame_seq != self.last_frame_seq;
         if frame_ready {
             self.last_frame_seq = frame_seq;
         }
-        WorkerFrontendState {
+        WorkerOutput {
             apu_nr52: self.shared.apu_nr52.load(Ordering::Acquire),
             ppu_ly: self.shared.ppu_ly.load(Ordering::Acquire),
             ppu_stat: self.shared.ppu_stat.load(Ordering::Acquire),
@@ -719,23 +748,18 @@ impl WorkerLink for Core1WorkerLink {
 }
 
 pub struct PicoGameBoy {
-    frontend: GameBoyFrontend,
-    link: Core1WorkerLink,
+    gb: GameBoy<Core1Transport>,
 }
 
 impl PicoGameBoy {
     pub fn with_cartridge(core1: Peri<'static, CORE1>, cart: Box<dyn Cartridge>) -> Self {
         let memory = Box::new(GameBoyMemory::with_cartridge(cart));
-        let frontend = GameBoyFrontend::from_memory(memory);
-        let link = Core1WorkerLink::new(core1);
-        let mut gb = Self { frontend, link };
-        info!("syncing worker apu");
-        gb.frontend.sync_apu_worker(&mut gb.link);
-        info!("worker apu synced");
-        info!("syncing worker ppu");
-        gb.frontend.sync_ppu_worker(&mut gb.link);
-        info!("worker ppu synced");
-        gb.frontend = gb.frontend.with_registers(Registers {
+        let transport = Core1Transport::new(core1);
+        let mut gb = GameBoy::with_transport(memory, transport);
+        info!("syncing worker state");
+        gb.push_worker_state();
+        info!("worker state synced");
+        gb = gb.with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),
             b: 0x00,
@@ -748,88 +772,87 @@ impl PicoGameBoy {
             sp: 0xFFFE,
         });
         info!("applying dmg state");
-        gb.frontend.apply_dmg_state(&mut gb.link);
+        gb.apply_dmg_state();
         info!("dmg state applied");
-        gb
+        Self { gb }
     }
 
     #[inline(always)]
     pub fn tick(&mut self) {
-        self.frontend.tick(&mut self.link);
+        self.gb.tick();
     }
 
     pub fn step(&mut self) -> Result<u8, CpuError> {
-        self.frontend.step(&mut self.link)
+        self.gb.step()
     }
 
     #[inline(always)]
     pub fn front_buffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
-        self.frontend.front_buffer()
+        self.gb.front_buffer()
     }
 
     #[inline(always)]
     pub fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
-        self.link.published_scaled_frame()
+        self.gb.transport_mut().published_scaled_frame()
     }
 
     #[inline(always)]
     pub fn release_scaled_frame(&mut self) {
-        self.link.release_scaled_frame();
+        self.gb.transport_mut().release_scaled_frame();
     }
 
     #[inline(always)]
     pub fn cycle_counter(&self) -> u64 {
-        self.frontend.cycle_counter()
+        self.gb.cycle_counter()
     }
 
     pub fn set_button(&mut self, btn: Button, pressed: bool) {
-        self.frontend.set_button(btn, pressed);
+        self.gb.set_button(btn, pressed);
     }
 
     pub fn drain_audio_samples_into_i16(&mut self, out: &mut Vec<i16>) {
-        self.link.drain_audio_samples_into_i16(out);
+        self.gb.drain_audio_samples_into_i16(out);
     }
 
     pub fn read_memory(&self, address: u16) -> Result<u8, MemoryError> {
-        self.frontend.read_memory(address)
+        self.gb.read_memory(address)
     }
 
     pub fn save_state(&self) -> Vec<u8> {
-        self.frontend.save_state(&self.link)
+        self.gb.save_state()
     }
 
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
-        self.frontend.load_state(state, &mut self.link)?;
-        Ok(())
+        self.gb.load_state(state)
     }
 
     pub fn take_transport_profile(&mut self) -> TransportProfile {
-        self.link.take_transport_profile()
+        self.gb.transport_mut().take_transport_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
-        self.frontend.take_perf_profile()
+        self.gb.take_perf_profile()
     }
 
     #[cfg(feature = "perf")]
-    pub fn take_frontend_perf_profile(&mut self) -> FrontendPerfProfile {
-        self.frontend.take_frontend_perf_profile()
+    pub fn take_game_boy_perf_profile(&mut self) -> GameBoyPerfProfile {
+        self.gb.take_game_boy_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.link.take_ppu_perf_profile()
+        self.gb.take_ppu_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.link.take_apu_perf_profile()
+        self.gb.take_apu_perf_profile()
     }
 
     #[cfg(feature = "perf")]
     pub fn take_cartridge_perf_profile(&mut self) -> CartridgePerfProfile {
-        self.frontend.take_cartridge_perf_profile()
+        self.gb.take_cartridge_perf_profile()
     }
 }
 
@@ -838,11 +861,11 @@ fn publish_worker_state(
     shared: &'static SharedWorkerState,
     worker: &mut GameBoyWorker,
 ) {
-    let state = worker.poll_frontend_state();
+    let state = worker.poll_output();
     if state.frame_ready {
         shared.publish_frame(worker);
     }
-    shared.publish_frontend_state(state);
+    shared.publish_worker_output(state);
     critical_section::with(|cs| {
         *shared.ppu_state.borrow(cs).borrow_mut() = worker.snapshot_ppu_state();
     });

@@ -1,6 +1,6 @@
-use alloc::boxed::Box;
 use crate::cpu::instructions::decoder::{Decoder, Error};
 use crate::cpu::instructions::opcode::OpCode;
+use alloc::boxed::Box;
 
 use super::opcode::{Condition, Jump, JumpOp};
 
