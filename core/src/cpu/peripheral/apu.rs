@@ -72,16 +72,6 @@ pub struct ApuOutput {
     pub nr52: u8,
 }
 
-#[cfg(feature = "perf")]
-#[derive(Default)]
-pub struct ApuPerfProfile {
-    pub frame_seq: u32,
-    pub pulse: u32,
-    pub wave: u32,
-    pub noise: u32,
-    pub mix: u32,
-}
-
 /// Pulse (square wave) channel — used by ch1 (with sweep) and ch2.
 #[derive(Default)]
 struct SquareChannel {
@@ -604,8 +594,6 @@ pub struct ApuPeripheral {
     /// Cached NR51 routing bits normalized to channel bits 0..3.
     left_routes: u8,
     right_routes: u8,
-    #[cfg(feature = "perf")]
-    perf_profile: ApuPerfProfile,
 }
 
 impl ApuPeripheral {
@@ -633,8 +621,6 @@ impl ApuPeripheral {
             right_scale: 0,
             left_routes: 0,
             right_routes: 0,
-            #[cfg(feature = "perf")]
-            perf_profile: ApuPerfProfile::default(),
         }
     }
 
@@ -664,11 +650,6 @@ impl ApuPeripheral {
     pub fn clear_samples(&mut self) {
         self.sample_buffer.clear();
         self.sample_acc = 0;
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_perf_profile(&mut self) -> ApuPerfProfile {
-        core::mem::take(&mut self.perf_profile)
     }
 
     /// Read a register with OR masks applied.
@@ -840,14 +821,7 @@ impl ApuPeripheral {
             (k as u32) < (cycles as u32)
         };
         if frame_seq_fell {
-            #[cfg(feature = "perf")]
-            let t0 = crate::cpu::perf::cyccnt();
             self.clock_frame_sequencer();
-            #[cfg(feature = "perf")]
-            {
-                let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-                self.perf_profile.frame_seq = self.perf_profile.frame_seq.wrapping_add(dt);
-            }
         }
         self.prev_div_bit = cur_div_bit;
     }
@@ -856,15 +830,8 @@ impl ApuPeripheral {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn tick_channels(&mut self, cycles: u16) {
         // Square channel frequency timers: skip-ahead arithmetic.
-        #[cfg(feature = "perf")]
-        let t0 = crate::cpu::perf::cyccnt();
         self.channel1.advance_frequency(cycles);
         self.channel2.advance_frequency(cycles);
-        #[cfg(feature = "perf")]
-        {
-            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-            self.perf_profile.pulse = self.perf_profile.pulse.wrapping_add(dt);
-        }
 
         // Wave channel clocks at 2 MHz (once per 2 T-cycles).
         // Number of 2MHz ticks depends on current phase:
@@ -875,26 +842,12 @@ impl ApuPeripheral {
         } else {
             (cycles + 1) / 2
         };
-        #[cfg(feature = "perf")]
-        let t0 = crate::cpu::perf::cyccnt();
         self.channel3.advance_frequency_wave(n_wave_ticks);
         if cycles % 2 != 0 {
             self.wave_2mhz_phase = !self.wave_2mhz_phase;
         }
-        #[cfg(feature = "perf")]
-        {
-            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-            self.perf_profile.wave = self.perf_profile.wave.wrapping_add(dt);
-        }
 
-        #[cfg(feature = "perf")]
-        let t0 = crate::cpu::perf::cyccnt();
         self.channel4.advance_frequency_noise(cycles);
-        #[cfg(feature = "perf")]
-        {
-            let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-            self.perf_profile.noise = self.perf_profile.noise.wrapping_add(dt);
-        }
     }
 
     /// Downsample to 48 kHz and push stereo PCM pairs into `sample_buffer`.
@@ -909,33 +862,19 @@ impl ApuPeripheral {
             self.sample_acc += sample_inc;
             if self.sample_acc >= SAMPLE_PERIOD_NUM {
                 self.sample_acc -= SAMPLE_PERIOD_NUM;
-                #[cfg(feature = "perf")]
-                let t0 = crate::cpu::perf::cyccnt();
                 let (left, right) = self.mix_sample();
                 self.sample_buffer.push(left);
                 self.sample_buffer.push(right);
-                #[cfg(feature = "perf")]
-                {
-                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
-                }
             }
         } else {
             let acc = self.sample_acc as u64 + sample_inc as u64;
             let n_samples = acc / SAMPLE_PERIOD_NUM as u64;
             self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
             if n_samples != 0 {
-                #[cfg(feature = "perf")]
-                let t0 = crate::cpu::perf::cyccnt();
                 for _ in 0..n_samples {
                     let (left, right) = self.mix_sample();
                     self.sample_buffer.push(left);
                     self.sample_buffer.push(right);
-                }
-                #[cfg(feature = "perf")]
-                {
-                    let dt = crate::cpu::perf::cyccnt().wrapping_sub(t0);
-                    self.perf_profile.mix = self.perf_profile.mix.wrapping_add(dt);
                 }
             }
         }

@@ -238,11 +238,6 @@ impl GameBoyMemory {
         self.cartridge_has_rtc
     }
 
-    #[cfg(feature = "perf")]
-    pub fn take_cartridge_perf_profile(&mut self) -> super::cartridge::CartridgePerfProfile {
-        self.cartridge.take_perf_profile()
-    }
-
     /// Advance the cartridge RTC by `cycles` T-cycles. No-op for non-RTC carts.
     #[inline(always)]
     pub fn tick_rtc(&mut self, cycles: u32) {

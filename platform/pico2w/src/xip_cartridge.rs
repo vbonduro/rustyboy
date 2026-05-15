@@ -1,11 +1,6 @@
 use alloc::vec::Vec;
 
-#[cfg(feature = "perf")]
-use rustyboy_core::memory::cartridge::CartridgePerfProfile;
 use rustyboy_core::memory::cartridge::{Cartridge, CartridgeRomWindows};
-
-#[cfg(feature = "perf")]
-use rustyboy_core::cpu::perf::cyccnt;
 
 #[cfg(target_arch = "arm")]
 use crate::flash_rom::{FlashRomInfo, ROM_DATA_OFFSET};
@@ -53,8 +48,6 @@ pub struct XipCartridge {
     rom_bank_count: usize,
     mbc: MbcState,
     ram: Vec<u8>,
-    #[cfg(feature = "perf")]
-    perf_profile: CartridgePerfProfile,
 }
 
 impl XipCartridge {
@@ -84,8 +77,6 @@ impl XipCartridge {
             rom_bank_count,
             mbc,
             ram: alloc::vec![0u8; ram_bytes],
-            #[cfg(feature = "perf")]
-            perf_profile: CartridgePerfProfile::default(),
         };
         cart.refresh_mappings();
         Ok(cart)
@@ -297,45 +288,18 @@ impl Cartridge for XipCartridge {
 
     fn write(&mut self, addr: u16, value: u8) {
         if (0xA000..=0xBFFF).contains(&addr) {
-            #[cfg(feature = "perf")]
-            let t_ram = cyccnt();
             if self.is_ram_enabled() && !self.ram.is_empty() {
                 let offset = self.mbc1_ram_bank() * 0x2000 + (addr - 0xA000) as usize;
                 if let Some(b) = self.ram.get_mut(offset) {
                     *b = value;
                 }
             }
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.write_ram = self
-                    .perf_profile
-                    .write_ram
-                    .wrapping_add(cyccnt().wrapping_sub(t_ram));
-            }
             return;
         }
 
-        #[cfg(feature = "perf")]
-        let t_rom = cyccnt();
-        #[cfg(feature = "perf")]
-        let t_control = cyccnt();
         let changed = self.handle_mbc_write(addr, value);
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.control_write = self
-                .perf_profile
-                .control_write
-                .wrapping_add(cyccnt().wrapping_sub(t_control));
-        }
         if changed {
             self.refresh_mappings();
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.write_rom = self
-                .perf_profile
-                .write_rom
-                .wrapping_add(cyccnt().wrapping_sub(t_rom));
         }
     }
 
@@ -422,10 +386,6 @@ impl Cartridge for XipCartridge {
         consumed
     }
 
-    #[cfg(feature = "perf")]
-    fn take_perf_profile(&mut self) -> CartridgePerfProfile {
-        core::mem::take(&mut self.perf_profile)
-    }
 }
 
 fn rom_bank_count_from_code(code: u8) -> Option<usize> {

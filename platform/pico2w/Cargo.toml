@@ -19,8 +19,6 @@ oc-280 = []
 oc-300 = []
 # Log FPS to RTT every 60 frames.
 fps = []
-# Enable all profiling: implies fps and enables core APU cycle counters.
-perf = ["fps", "rustyboy-core/perf"]
 # Enable stack sentinel / collision detection instrumentation.
 stack-probe = []
 

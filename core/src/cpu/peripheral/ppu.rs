@@ -92,15 +92,6 @@ pub struct PpuTimingOutput {
     pub lcd_reset: bool,
 }
 
-#[cfg(feature = "perf")]
-#[derive(Default)]
-pub struct PpuPerfProfile {
-    pub render_bg: u32,
-    pub render_window: u32,
-    pub render_sprites: u32,
-    pub build_stat: u32,
-}
-
 /// Scanline-based PPU peripheral.
 ///
 /// Config registers (LCDC, STAT, SCY, SCX, LYC, BGP, OBP0, OBP1, WY, WX) live
@@ -116,8 +107,6 @@ pub struct PpuPeripheral {
     framebuffer: [u8; FRAMEBUFFER_SIZE],
     /// Raw BG/window color indices (0–3) for the current scanline, used for sprite priority.
     bg_color_indices: [u8; SCREEN_WIDTH],
-    #[cfg(feature = "perf")]
-    perf_profile: PpuPerfProfile,
 }
 
 impl PpuPeripheral {
@@ -130,8 +119,6 @@ impl PpuPeripheral {
             prev_stat_line: false,
             framebuffer: [0u8; FRAMEBUFFER_SIZE],
             bg_color_indices: [0u8; SCREEN_WIDTH],
-            #[cfg(feature = "perf")]
-            perf_profile: PpuPerfProfile::default(),
         }
     }
 
@@ -151,11 +138,6 @@ impl PpuPeripheral {
             || (self.mode == PpuMode::VBlank && (stat & 0x10 != 0))
             || (self.mode == PpuMode::OamScan && (stat & 0x20 != 0));
         self.prev_stat_line = stat_line;
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_perf_profile(&mut self) -> PpuPerfProfile {
-        core::mem::take(&mut self.perf_profile)
     }
 
     pub fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
@@ -279,16 +261,7 @@ impl PpuPeripheral {
             }
         }
 
-        #[cfg(feature = "perf")]
-        let t0 = crate::cpu::perf::cyccnt();
         let stat_interrupt = self.build_stat(io);
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.build_stat = self
-                .perf_profile
-                .build_stat
-                .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
-        }
 
         io[LY_IO] = self.ly;
 
@@ -427,16 +400,7 @@ impl PpuPeripheral {
         let wx = io[WX_IO];
 
         if lcdc.bg_enabled() {
-            #[cfg(feature = "perf")]
-            let t0 = crate::cpu::perf::cyccnt();
             self.render_bg_scanline(vram, lcdc, row_start, scy, scx, bgp);
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.render_bg = self
-                    .perf_profile
-                    .render_bg
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
-            }
         } else {
             for x in 0..SCREEN_WIDTH {
                 self.framebuffer[row_start + x] = 0;
@@ -445,29 +409,11 @@ impl PpuPeripheral {
         }
 
         if lcdc.window_enabled() && lcdc.bg_enabled() {
-            #[cfg(feature = "perf")]
-            let t0 = crate::cpu::perf::cyccnt();
             self.render_window_scanline(vram, lcdc, row_start, wy, wx, bgp);
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.render_window = self
-                    .perf_profile
-                    .render_window
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
-            }
         }
 
         if lcdc.obj_enabled() {
-            #[cfg(feature = "perf")]
-            let t0 = crate::cpu::perf::cyccnt();
             self.render_sprite_scanline(vram, oam, lcdc, row_start, obp0, obp1);
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.render_sprites = self
-                    .perf_profile
-                    .render_sprites
-                    .wrapping_add(crate::cpu::perf::cyccnt().wrapping_sub(t0));
-            }
         }
     }
 

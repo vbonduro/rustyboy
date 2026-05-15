@@ -26,17 +26,6 @@ use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
 use crate::stack_probe;
 
-#[cfg(feature = "perf")]
-use rustyboy_core::cpu::peripheral::apu::ApuPerfProfile;
-#[cfg(feature = "perf")]
-use rustyboy_core::cpu::peripheral::ppu::PpuPerfProfile;
-#[cfg(feature = "perf")]
-use rustyboy_core::cpu::sm83::Sm83PerfProfile;
-#[cfg(feature = "perf")]
-use rustyboy_core::gameboy::GameBoyPerfProfile;
-#[cfg(feature = "perf")]
-use rustyboy_core::memory::cartridge::CartridgePerfProfile;
-
 const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
@@ -56,18 +45,6 @@ static CORE1_AUDIO_SCRATCH: StaticStorage<Vec<i16>> = StaticStorage::new();
 static mut CORE1_AUDIO_SCRATCH_BUF: [MaybeUninit<i16>; AUDIO_SCRATCH_CAPACITY] =
     [MaybeUninit::uninit(); AUDIO_SCRATCH_CAPACITY];
 
-#[cfg(feature = "perf")]
-fn init_dwt_cycle_counter() {
-    // DWT CYCCNT is per-core, so core1 must enable it independently.
-    unsafe {
-        let demcr = 0xE000_EDFCu32 as *mut u32;
-        demcr.write_volatile(demcr.read_volatile() | (1 << 24));
-        (0xE000_1004u32 as *mut u32).write_volatile(0);
-        let ctrl = 0xE000_1000u32 as *mut u32;
-        ctrl.write_volatile(ctrl.read_volatile() | 1);
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Core1Command {
     Worker(WorkerCommand),
@@ -80,14 +57,6 @@ enum Core1Command {
     LoadPpuState {
         ticket: u32,
         state: PpuState,
-    },
-    #[cfg(feature = "perf")]
-    TakeApuPerfProfile {
-        ticket: u32,
-    },
-    #[cfg(feature = "perf")]
-    TakePpuPerfProfile {
-        ticket: u32,
     },
 }
 
@@ -174,10 +143,6 @@ struct SharedWorkerState {
     pending_if_bits: AtomicU8,
     ppu_render_version: AtomicU32,
     ppu_state: Mutex<RefCell<PpuState>>,
-    #[cfg(feature = "perf")]
-    apu_perf: Mutex<RefCell<ApuPerfProfile>>,
-    #[cfg(feature = "perf")]
-    ppu_perf: Mutex<RefCell<PpuPerfProfile>>,
 }
 
 impl SharedWorkerState {
@@ -219,21 +184,6 @@ impl SharedWorkerState {
                 obp1: 0,
                 wy: 0,
                 wx: 0,
-            })),
-            #[cfg(feature = "perf")]
-            apu_perf: Mutex::new(RefCell::new(ApuPerfProfile {
-                frame_seq: 0,
-                pulse: 0,
-                wave: 0,
-                noise: 0,
-                mix: 0,
-            })),
-            #[cfg(feature = "perf")]
-            ppu_perf: Mutex::new(RefCell::new(PpuPerfProfile {
-                render_bg: 0,
-                render_window: 0,
-                render_sprites: 0,
-                build_stat: 0,
             })),
         }
     }
@@ -724,27 +674,6 @@ impl WorkerTransport for Core1Transport {
         }
     }
 
-    #[cfg(feature = "perf")]
-    fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.flush_pending_apu();
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::TakeApuPerfProfile { ticket });
-        self.wait_for_ticket(ticket);
-        critical_section::with(|cs| {
-            core::mem::take(&mut *self.shared.apu_perf.borrow(cs).borrow_mut())
-        })
-    }
-
-    #[cfg(feature = "perf")]
-    fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.flush_pending_ppu();
-        let ticket = self.issue_ticket();
-        self.enqueue_blocking(Core1Command::TakePpuPerfProfile { ticket });
-        self.wait_for_ticket(ticket);
-        critical_section::with(|cs| {
-            core::mem::take(&mut *self.shared.ppu_perf.borrow(cs).borrow_mut())
-        })
-    }
 }
 
 pub struct PicoGameBoy {
@@ -830,30 +759,6 @@ impl PicoGameBoy {
         self.gb.transport_mut().take_transport_profile()
     }
 
-    #[cfg(feature = "perf")]
-    pub fn take_perf_profile(&mut self) -> Sm83PerfProfile {
-        self.gb.take_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_game_boy_perf_profile(&mut self) -> GameBoyPerfProfile {
-        self.gb.take_game_boy_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.gb.take_ppu_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.gb.take_apu_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_cartridge_perf_profile(&mut self) -> CartridgePerfProfile {
-        self.gb.take_cartridge_perf_profile()
-    }
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -879,9 +784,6 @@ fn run_core1_worker(
     mut worker: &'static mut GameBoyWorker,
     mut audio_scratch: &'static mut Vec<i16>,
 ) -> ! {
-    #[cfg(feature = "perf")]
-    init_dwt_cycle_counter();
-
     info!("core1 worker loop start");
     let mut last_ppu_render_version = 0u32;
     let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
@@ -935,20 +837,6 @@ fn run_core1_worker(
                 });
                 last_ppu_render_version = 0;
                 publish_worker_state(shared, &mut worker);
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
-            #[cfg(feature = "perf")]
-            Core1Command::TakeApuPerfProfile { ticket } => {
-                critical_section::with(|cs| {
-                    *shared.apu_perf.borrow(cs).borrow_mut() = worker.take_apu_perf_profile();
-                });
-                shared.sync_complete.store(ticket, Ordering::Release);
-            }
-            #[cfg(feature = "perf")]
-            Core1Command::TakePpuPerfProfile { ticket } => {
-                critical_section::with(|cs| {
-                    *shared.ppu_perf.borrow(cs).borrow_mut() = worker.take_ppu_perf_profile();
-                });
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
         }

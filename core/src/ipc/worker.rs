@@ -1,11 +1,7 @@
 use alloc::vec::Vec;
 use core::ptr;
 
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::apu::ApuPerfProfile;
 use crate::cpu::peripheral::apu::{ApuPeripheral, NR52_ADDR};
-#[cfg(feature = "perf")]
-use crate::cpu::peripheral::ppu::PpuPerfProfile;
 use crate::cpu::peripheral::ppu::{
     PpuPeripheral, FRAMEBUFFER_SIZE, LY_ADDR, STAT_ADDR, STAT_INTERRUPT_BIT, VBLANK_INTERRUPT_BIT,
 };
@@ -162,15 +158,6 @@ impl GameBoyWorker {
         output
     }
 
-    #[cfg(feature = "perf")]
-    pub fn take_apu_perf_profile(&mut self) -> ApuPerfProfile {
-        self.apu.take_perf_profile()
-    }
-
-    #[cfg(feature = "perf")]
-    pub fn take_ppu_perf_profile(&mut self) -> PpuPerfProfile {
-        self.ppu.take_perf_profile()
-    }
 }
 
 struct PpuWorkerOutput {
@@ -293,8 +280,4 @@ impl PpuWorkerState {
         self.ppu.framebuffer()
     }
 
-    #[cfg(feature = "perf")]
-    fn take_perf_profile(&mut self) -> PpuPerfProfile {
-        self.ppu.take_perf_profile()
-    }
 }

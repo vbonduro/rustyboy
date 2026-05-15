@@ -20,8 +20,6 @@ use crate::memory::cartridge::Cartridge;
 use crate::memory::map::{OAM_BASE, OAM_END, VRAM_BASE, VRAM_END};
 use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
 
-#[cfg(feature = "perf")]
-use crate::cpu::perf::cyccnt;
 
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
@@ -36,25 +34,6 @@ pub(crate) struct DmaState {
     pub progress: u8,
 }
 
-#[cfg(feature = "perf")]
-#[derive(Default)]
-pub struct GameBoyPerfProfile {
-    pub step_total: u32,
-    pub cpu_step: u32,
-    pub route_bus_events: u32,
-    pub ppu_timing: u32,
-    pub ppu_sync: u32,
-    pub timer: u32,
-    pub apu_state: u32,
-    pub apu_send: u32,
-    pub rtc: u32,
-    pub serial: u32,
-    pub dma: u32,
-    pub steps: u32,
-    pub bus_events: u32,
-    pub dma_bytes: u32,
-    pub render_scanlines: u32,
-}
 
 /// Game Boy emulator. `W` is the worker transport — `LocalTransport` runs PPU/APU
 /// on the calling thread; platform-specific transports can offload to another core.
@@ -70,8 +49,6 @@ pub struct GameBoy<W: WorkerTransport = LocalTransport> {
     bus_event_buf: Vec<BusEvent>,
     cycle_counter: u64,
     transport: W,
-    #[cfg(feature = "perf")]
-    perf_profile: GameBoyPerfProfile,
 }
 
 // --- constructors for the default LocalTransport ---
@@ -148,8 +125,6 @@ impl<W: WorkerTransport> GameBoy<W> {
             bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             transport,
-            #[cfg(feature = "perf")]
-            perf_profile: GameBoyPerfProfile::default(),
         }
     }
 
@@ -192,48 +167,15 @@ impl<W: WorkerTransport> GameBoy<W> {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     pub fn tick(&mut self) {
-        #[cfg(feature = "perf")]
-        let step_start = cyccnt();
 
-        #[cfg(feature = "perf")]
-        let cpu_start = cyccnt();
         let t_cycles = self.cpu.step(&mut self.memory) as u16;
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.cpu_step = self
-                .perf_profile
-                .cpu_step
-                .wrapping_add(cyccnt().wrapping_sub(cpu_start));
-        }
 
-        #[cfg(feature = "perf")]
-        let route_start = cyccnt();
-        #[cfg(feature = "perf")]
-        let bus_events = self.route_bus_events();
-        #[cfg(not(feature = "perf"))]
         self.route_bus_events();
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.route_bus_events = self
-                .perf_profile
-                .route_bus_events
-                .wrapping_add(cyccnt().wrapping_sub(route_start));
-            self.perf_profile.bus_events =
-                self.perf_profile.bus_events.wrapping_add(bus_events as u32);
-        }
 
         self.advance_peripherals(t_cycles);
         self.read_worker_output();
         self.cycle_counter = self.cycle_counter.wrapping_add(t_cycles as u64);
 
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.steps = self.perf_profile.steps.wrapping_add(1);
-            self.perf_profile.step_total = self
-                .perf_profile
-                .step_total
-                .wrapping_add(cyccnt().wrapping_sub(step_start));
-        }
     }
 
     /// Execute one complete SM83 instruction, returning the T-cycles elapsed.
@@ -365,97 +307,30 @@ impl<W: WorkerTransport> GameBoy<W> {
         &mut self.transport
     }
 
-    #[cfg(feature = "perf")]
-    pub fn take_perf_profile(&mut self) -> crate::cpu::sm83::Sm83PerfProfile {
-        self.cpu.perf.take_profile()
-    }
 
-    #[cfg(feature = "perf")]
-    pub fn take_game_boy_perf_profile(&mut self) -> GameBoyPerfProfile {
-        core::mem::take(&mut self.perf_profile)
-    }
 
-    #[cfg(feature = "perf")]
-    pub fn take_cartridge_perf_profile(
-        &mut self,
-    ) -> crate::memory::cartridge::CartridgePerfProfile {
-        self.memory.take_cartridge_perf_profile()
-    }
 
-    #[cfg(feature = "perf")]
-    pub fn take_apu_perf_profile(&mut self) -> crate::cpu::peripheral::apu::ApuPerfProfile {
-        self.transport.take_apu_perf_profile()
-    }
 
-    #[cfg(feature = "perf")]
-    pub fn take_ppu_perf_profile(&mut self) -> crate::cpu::peripheral::ppu::PpuPerfProfile {
-        self.transport.take_ppu_perf_profile()
-    }
 
     // --- hot path internals ---
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn advance_peripherals(&mut self, cycles: u16) {
-        #[cfg(feature = "perf")]
-        let ppu_start = cyccnt();
         self.transport.send(WorkerCommand::AdvancePpu { cycles });
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.ppu_timing = self
-                .perf_profile
-                .ppu_timing
-                .wrapping_add(cyccnt().wrapping_sub(ppu_start));
-        }
 
-        #[cfg(feature = "perf")]
-        let timer_start = cyccnt();
         self.advance_timer(cycles);
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.timer = self
-                .perf_profile
-                .timer
-                .wrapping_add(cyccnt().wrapping_sub(timer_start));
-        }
 
-        #[cfg(feature = "perf")]
-        let apu_start = cyccnt();
         self.transport.send(WorkerCommand::AdvanceApu {
             cycles,
             div_counter: self.timer.internal_counter(),
         });
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.apu_send = self
-                .perf_profile
-                .apu_send
-                .wrapping_add(cyccnt().wrapping_sub(apu_start));
-        }
 
         if self.memory.has_rtc() {
-            #[cfg(feature = "perf")]
-            let rtc_start = cyccnt();
             self.memory.tick_rtc(cycles as u32);
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.rtc = self
-                    .perf_profile
-                    .rtc
-                    .wrapping_add(cyccnt().wrapping_sub(rtc_start));
-            }
         }
 
         if !self.serial.is_idle() {
-            #[cfg(feature = "perf")]
-            let serial_start = cyccnt();
             self.advance_serial(cycles);
-            #[cfg(feature = "perf")]
-            {
-                self.perf_profile.serial = self
-                    .perf_profile
-                    .serial
-                    .wrapping_add(cyccnt().wrapping_sub(serial_start));
-            }
         }
 
         self.advance_dma_bulk(cycles);
@@ -486,8 +361,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         let Some(DmaState { source, progress }) = self.dma else {
             return;
         };
-        #[cfg(feature = "perf")]
-        let dma_start = cyccnt();
         let steps = (cycles / 4) as u8;
         let to_copy = steps.min(OAM_DMA_BYTES - progress);
         self.memory.copy_dma_step(source, progress, to_copy);
@@ -498,15 +371,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         } else {
             self.dma = Some(DmaState { source, progress: next });
         }
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.dma = self
-                .perf_profile
-                .dma
-                .wrapping_add(cyccnt().wrapping_sub(dma_start));
-            self.perf_profile.dma_bytes =
-                self.perf_profile.dma_bytes.wrapping_add(to_copy as u32);
-        }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -514,8 +378,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         if !self.memory.has_events() {
             return 0;
         }
-        #[cfg(feature = "perf")]
-        let route_start = cyccnt();
         let mut buf = core::mem::take(&mut self.bus_event_buf);
         self.memory.drain_into(&mut buf);
         let event_count = buf.len();
@@ -552,10 +414,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         }
         buf.clear();
         self.bus_event_buf = buf;
-        #[cfg(feature = "perf")]
-        self.cpu
-            .perf
-            .record_mem_write_route(cyccnt().wrapping_sub(route_start));
         event_count
     }
 
@@ -634,8 +492,6 @@ impl<W: WorkerTransport> GameBoy<W> {
     /// Poll the worker for its output and write it back into CPU-visible memory.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn read_worker_output(&mut self) {
-        #[cfg(feature = "perf")]
-        let sync_start = cyccnt();
         let output = self.transport.poll_output(&mut self.front_buffer);
         self.memory.write_io(NR52_ADDR, output.apu_nr52);
         self.memory.write_io(LY_ADDR, output.ppu_ly);
@@ -643,17 +499,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         if output.if_bits != 0 {
             let if_ = self.memory.read_io(IF_ADDR);
             self.memory.write_io(IF_ADDR, if_ | output.if_bits);
-        }
-        #[cfg(feature = "perf")]
-        {
-            self.perf_profile.ppu_sync = self
-                .perf_profile
-                .ppu_sync
-                .wrapping_add(cyccnt().wrapping_sub(sync_start));
-            if output.frame_ready {
-                self.perf_profile.render_scanlines =
-                    self.perf_profile.render_scanlines.wrapping_add(144);
-            }
         }
     }
 }
