@@ -16,6 +16,16 @@ const CART_TYPE: usize = 0x0147;
 const ROM_SIZE:  usize = 0x0148;
 const RAM_SIZE:  usize = 0x0149;
 
+// ── MBC register write address ranges ────────────────────────────────────────
+
+const MBC_RAM_ENABLE_END: u16 = 0x1FFF;
+const MBC_ROM_BANK_BASE: u16 = 0x2000;
+const MBC_ROM_BANK_END: u16 = 0x3FFF;
+const MBC_BANK_HIGH_BASE: u16 = 0x4000;
+const MBC_BANK_HIGH_END: u16 = 0x5FFF;
+const MBC1_MODE_BASE: u16 = 0x6000;
+const MBC1_MODE_END: u16 = 0x7FFF;
+
 // ── MBC state ────────────────────────────────────────────────────────────────
 
 enum MbcState {
@@ -132,11 +142,11 @@ impl<R: RomReader> StreamingCartridge<R> {
             MbcState::NoMbc => false,
             MbcState::Mbc1 { rom_bank_lo, upper_bits, ram_mode, ram_enabled, .. } => {
                 match addr {
-                    0x0000..=0x1FFF => {
+                    0x0000..=MBC_RAM_ENABLE_END => {
                         *ram_enabled = value & 0x0F == 0x0A;
                         false
                     }
-                    0x2000..=0x3FFF => {
+                    MBC_ROM_BANK_BASE..=MBC_ROM_BANK_END => {
                         let mut bank = value & 0x1F;
                         if bank == 0 {
                             bank = 1;
@@ -148,7 +158,7 @@ impl<R: RomReader> StreamingCartridge<R> {
                             true
                         }
                     }
-                    0x4000..=0x5FFF => {
+                    MBC_BANK_HIGH_BASE..=MBC_BANK_HIGH_END => {
                         let bits = value & 0x03;
                         if *upper_bits == bits {
                             false
@@ -157,7 +167,7 @@ impl<R: RomReader> StreamingCartridge<R> {
                             true
                         }
                     }
-                    0x6000..=0x7FFF => {
+                    MBC1_MODE_BASE..=MBC1_MODE_END => {
                         let new_ram_mode = value & 0x01 != 0;
                         if *ram_mode == new_ram_mode {
                             false
@@ -171,11 +181,11 @@ impl<R: RomReader> StreamingCartridge<R> {
             }
             MbcState::Mbc3 { rom_bank, bank_or_rtc, ram_rtc_enabled } => {
                 match addr {
-                    0x0000..=0x1FFF => {
+                    0x0000..=MBC_RAM_ENABLE_END => {
                         *ram_rtc_enabled = value & 0x0F == 0x0A;
                         false
                     }
-                    0x2000..=0x3FFF => {
+                    MBC_ROM_BANK_BASE..=MBC_ROM_BANK_END => {
                         let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
                         if *rom_bank == bank {
                             false
@@ -184,7 +194,7 @@ impl<R: RomReader> StreamingCartridge<R> {
                             true
                         }
                     }
-                    0x4000..=0x5FFF => {
+                    MBC_BANK_HIGH_BASE..=MBC_BANK_HIGH_END => {
                         *bank_or_rtc = value;
                         false
                     }
