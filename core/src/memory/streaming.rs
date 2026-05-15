@@ -2,6 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::cartridge::Cartridge;
+use super::map::{EXT_RAM_BASE, EXT_RAM_END, ROM_BANK_SIZE, ROM_BANKED_BASE, ROM_BANKED_END, ROM_FIXED_END};
 #[cfg(feature = "perf")]
 use super::cartridge::CartridgePerfProfile;
 
@@ -9,7 +10,7 @@ use super::cartridge::CartridgePerfProfile;
 
 pub trait RomReader {
     type Error;
-    fn read_bank(&mut self, bank: usize, buf: &mut [u8; 0x4000]) -> Result<(), Self::Error>;
+    fn read_bank(&mut self, bank: usize, buf: &mut [u8; ROM_BANK_SIZE]) -> Result<(), Self::Error>;
 }
 
 // ── Header offsets ───────────────────────────────────────────────────────────
@@ -46,8 +47,8 @@ pub enum StreamingError<E> {
 
 pub struct StreamingCartridge<R: RomReader> {
     reader: R,
-    bank0_cache: [u8; 0x4000],
-    banked_cache: [u8; 0x4000],
+    bank0_cache: [u8; ROM_BANK_SIZE],
+    banked_cache: [u8; ROM_BANK_SIZE],
     fixed_bank_num: usize,
     current_bank_num: usize,
     rom_bank_count: usize,
@@ -59,7 +60,7 @@ pub struct StreamingCartridge<R: RomReader> {
 
 impl<R: RomReader> StreamingCartridge<R> {
     pub fn new(mut reader: R) -> Result<Self, StreamingError<R::Error>> {
-        let mut bank0_cache = [0u8; 0x4000];
+        let mut bank0_cache = [0u8; ROM_BANK_SIZE];
         reader
             .read_bank(0, &mut bank0_cache)
             .map_err(StreamingError::Reader)?;
@@ -70,7 +71,7 @@ impl<R: RomReader> StreamingCartridge<R> {
         let mbc = mbc_state_from_header(cart_type, ram_bytes)
             .ok_or(StreamingError::UnsupportedCartType(cart_type))?;
 
-        let mut banked_cache = [0u8; 0x4000];
+        let mut banked_cache = [0u8; ROM_BANK_SIZE];
         reader
             .read_bank(1, &mut banked_cache)
             .map_err(StreamingError::Reader)?;
@@ -287,8 +288,8 @@ impl<R: RomReader> StreamingCartridge<R> {
 impl<R: RomReader> Cartridge for StreamingCartridge<R> {
     fn read_rom(&self, addr: u16) -> u8 {
         match addr {
-            0x0000..=0x3FFF => self.bank0_cache[addr as usize],
-            0x4000..=0x7FFF => self.banked_cache[(addr - 0x4000) as usize],
+            0x0000..=ROM_FIXED_END => self.bank0_cache[addr as usize],
+            ROM_BANKED_BASE..=ROM_BANKED_END => self.banked_cache[(addr - ROM_BANKED_BASE) as usize],
             _ => 0xFF,
         }
     }
@@ -302,11 +303,11 @@ impl<R: RomReader> Cartridge for StreamingCartridge<R> {
     }
 
     fn write(&mut self, addr: u16, value: u8) {
-        if (0xA000..=0xBFFF).contains(&addr) {
+        if (EXT_RAM_BASE..=EXT_RAM_END).contains(&addr) {
             #[cfg(feature = "perf")]
             let t_ram = crate::cpu::perf::cyccnt();
             if self.is_ram_enabled() && !self.ram.is_empty() {
-                let offset = self.mbc1_ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+                let offset = self.mbc1_ram_bank() * 0x2000 + (addr - EXT_RAM_BASE) as usize;
                 if let Some(b) = self.ram.get_mut(offset) {
                     *b = value;
                 }

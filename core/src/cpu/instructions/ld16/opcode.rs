@@ -50,7 +50,9 @@ mod tests {
             },
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -60,7 +62,9 @@ mod tests {
             op: Ld16Op::NnSp,
             cycles: 20,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 20);
     }
 
@@ -70,7 +74,9 @@ mod tests {
             op: Ld16Op::SpHl,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -80,7 +86,9 @@ mod tests {
             op: Ld16Op::HlSpE,
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -90,7 +98,9 @@ mod tests {
             op: Ld16Op::BcA,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -100,7 +110,9 @@ mod tests {
             op: Ld16Op::DeA,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -110,7 +122,9 @@ mod tests {
             op: Ld16Op::ABc,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -120,7 +134,9 @@ mod tests {
             op: Ld16Op::ADe,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -130,7 +146,9 @@ mod tests {
             op: Ld16Op::HliA,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -140,7 +158,9 @@ mod tests {
             op: Ld16Op::HldA,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -150,7 +170,9 @@ mod tests {
             op: Ld16Op::AHli,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -160,7 +182,9 @@ mod tests {
             op: Ld16Op::AHld,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -170,7 +194,9 @@ mod tests {
             op: Ld16Op::NnA,
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -180,7 +206,9 @@ mod tests {
             op: Ld16Op::ANn,
             cycles: 16,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 16);
     }
 
@@ -190,7 +218,9 @@ mod tests {
             op: Ld16Op::LdhNA,
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -200,7 +230,9 @@ mod tests {
             op: Ld16Op::LdhAN,
             cycles: 12,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 12);
     }
 
@@ -210,7 +242,9 @@ mod tests {
             op: Ld16Op::LdCA,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 
@@ -220,7 +254,9 @@ mod tests {
             op: Ld16Op::LdAC,
             cycles: 8,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 8);
     }
 }

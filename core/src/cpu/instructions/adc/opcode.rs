@@ -10,7 +10,11 @@ pub struct Adc {
 }
 
 impl OpCode for Adc {
-    fn execute(&self, instruction: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        instruction: &mut dyn Instructions,
+        memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         instruction.adc(&self, memory)
     }
 }

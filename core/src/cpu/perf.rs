@@ -1,10 +1,13 @@
 // Read the cycle counter. Bare-metal platforms provide the implementation,
 // while host builds use a cheap monotonic fallback so tests and coverage can
 // link with `perf` enabled.
+use crate::memory::map::{
+    EXT_RAM_BASE, EXT_RAM_END, OAM_BASE, OAM_END, ROM_BANKED_END, VRAM_BASE, VRAM_END, WRAM_BASE,
+    WRAM_END,
+};
 #[cfg(feature = "perf")]
 /// Per-component DWT cycle accumulator. Drained each time `Sm83::take_perf_profile` is called.
 /// `cpu` = `total` − `ppu` − `timer` − `apu` (instruction fetch/decode/execute overhead).
-#[derive(Default)]
 pub struct Sm83PerfProfile {
     pub ppu: u32,
     pub timer: u32,
@@ -75,14 +78,110 @@ pub struct Sm83PerfProfile {
     pub opcode_dispatch: u32,
     /// Number of opcode-table lookups.
     pub opcode_dispatch_calls: u32,
+    /// Per-opcode execution-body cycles for non-`0xCB` instructions.
+    pub opcode_exec_cycles: [u32; 256],
+    /// Per-opcode execution-body call counts for non-`0xCB` instructions.
+    pub opcode_exec_calls: [u32; 256],
     /// Nested decode hotspot: time spent in the `0xCB` prefix path, including second-byte fetch.
     pub cb_prefix: u32,
     /// Number of `0xCB` prefix dispatches.
     pub cb_prefix_calls: u32,
+    /// Per-opcode execution-body cycles for decoded `0xCB` instructions.
+    pub cb_opcode_exec_cycles: [u32; 256],
+    /// Per-opcode execution-body call counts for decoded `0xCB` instructions.
+    pub cb_opcode_exec_calls: [u32; 256],
+    /// Nested decode hotspot: time spent executing decoded `0xCB` operations,
+    /// excluding the second-byte fetch/dispatch work recorded in `cb_prefix`.
+    pub cb_exec: u32,
+    /// Number of decoded `0xCB` executions.
+    pub cb_exec_calls: u32,
+    /// `0xCB` execution time for register targets.
+    pub cb_exec_reg: u32,
+    /// Number of register-target `0xCB` executions.
+    pub cb_exec_reg_calls: u32,
+    /// `0xCB` execution time for `(HL)` memory targets.
+    pub cb_exec_hlmem: u32,
+    /// Number of `(HL)`-target `0xCB` executions.
+    pub cb_exec_hlmem_calls: u32,
     /// Nested decode hotspot: time spent in `get_8bit_operand`, excluding nested PPU/timer/APU work.
     pub operand8: u32,
     /// Number of `get_8bit_operand` calls.
     pub operand8_calls: u32,
+    /// `get_8bit_operand` time for register operands.
+    pub operand8_reg: u32,
+    /// Number of register `get_8bit_operand` calls.
+    pub operand8_reg_calls: u32,
+    /// `get_8bit_operand` time for immediate operands (`d8`, signed `r8`).
+    pub operand8_imm: u32,
+    /// Number of immediate `get_8bit_operand` calls.
+    pub operand8_imm_calls: u32,
+    /// `get_8bit_operand` time for memory-backed operands.
+    pub operand8_mem: u32,
+    /// Number of memory-backed `get_8bit_operand` calls.
+    pub operand8_mem_calls: u32,
+}
+
+#[cfg(feature = "perf")]
+impl Default for Sm83PerfProfile {
+    fn default() -> Self {
+        Self {
+            ppu: 0,
+            timer: 0,
+            apu: 0,
+            total: 0,
+            mem_read: 0,
+            mem_write: 0,
+            mem_write_fast: 0,
+            mem_write_fast_rom: 0,
+            mem_write_fast_rom_0000_1fff: 0,
+            mem_write_fast_rom_2000_3fff: 0,
+            mem_write_fast_rom_4000_5fff: 0,
+            mem_write_fast_rom_6000_7fff: 0,
+            mem_write_fast_eram: 0,
+            mem_write_fast_vram: 0,
+            mem_write_fast_wram: 0,
+            mem_write_fast_oam: 0,
+            mem_write_fast_hram: 0,
+            mem_write_fast_unmapped: 0,
+            mem_write_io: 0,
+            mem_write_enqueue: 0,
+            mem_write_route: 0,
+            pc_fetch: 0,
+            pc_fetch_calls: 0,
+            pc_fetch_rom: 0,
+            pc_fetch_rom_calls: 0,
+            pc_fetch_wrapper: 0,
+            pc_fetch_wrapper_calls: 0,
+            pc_fetch_rom_idle: 0,
+            pc_fetch_rom_idle_calls: 0,
+            pc_fetch_rom_read: 0,
+            pc_fetch_rom_read_calls: 0,
+            bus_read: 0,
+            bus_read_calls: 0,
+            opcode_dispatch: 0,
+            opcode_dispatch_calls: 0,
+            opcode_exec_cycles: [0; 256],
+            opcode_exec_calls: [0; 256],
+            cb_prefix: 0,
+            cb_prefix_calls: 0,
+            cb_opcode_exec_cycles: [0; 256],
+            cb_opcode_exec_calls: [0; 256],
+            cb_exec: 0,
+            cb_exec_calls: 0,
+            cb_exec_reg: 0,
+            cb_exec_reg_calls: 0,
+            cb_exec_hlmem: 0,
+            cb_exec_hlmem_calls: 0,
+            operand8: 0,
+            operand8_calls: 0,
+            operand8_reg: 0,
+            operand8_reg_calls: 0,
+            operand8_imm: 0,
+            operand8_imm_calls: 0,
+            operand8_mem: 0,
+            operand8_mem_calls: 0,
+        }
+    }
 }
 
 #[cfg(feature = "perf")]
@@ -138,7 +237,7 @@ impl Sm83PerfRecorder {
     pub(crate) fn record_mem_write_fast(&mut self, addr: u16, dt: u32) {
         self.profile.mem_write_fast = self.profile.mem_write_fast.wrapping_add(dt);
         match addr {
-            0x0000..=0x7FFF => {
+            0x0000..=ROM_BANKED_END => {
                 self.profile.mem_write_fast_rom = self.profile.mem_write_fast_rom.wrapping_add(dt);
                 match addr {
                     0x0000..=0x1FFF => {
@@ -153,26 +252,26 @@ impl Sm83PerfRecorder {
                         self.profile.mem_write_fast_rom_4000_5fff =
                             self.profile.mem_write_fast_rom_4000_5fff.wrapping_add(dt);
                     }
-                    0x6000..=0x7FFF => {
+                    0x6000..=ROM_BANKED_END => {
                         self.profile.mem_write_fast_rom_6000_7fff =
                             self.profile.mem_write_fast_rom_6000_7fff.wrapping_add(dt);
                     }
                     _ => {}
                 }
             }
-            0x8000..=0x9FFF => {
+            VRAM_BASE..=VRAM_END => {
                 self.profile.mem_write_fast_vram =
                     self.profile.mem_write_fast_vram.wrapping_add(dt);
             }
-            0xA000..=0xBFFF => {
+            EXT_RAM_BASE..=EXT_RAM_END => {
                 self.profile.mem_write_fast_eram =
                     self.profile.mem_write_fast_eram.wrapping_add(dt);
             }
-            0xC000..=0xDFFF => {
+            WRAM_BASE..=WRAM_END => {
                 self.profile.mem_write_fast_wram =
                     self.profile.mem_write_fast_wram.wrapping_add(dt);
             }
-            0xFE00..=0xFE9F => {
+            OAM_BASE..=OAM_END => {
                 self.profile.mem_write_fast_oam = self.profile.mem_write_fast_oam.wrapping_add(dt);
             }
             0xFF80..=0xFFFE => {
@@ -205,7 +304,7 @@ impl Sm83PerfRecorder {
     pub(crate) fn record_pc_fetch(&mut self, addr: u16, dt: u32) {
         self.profile.pc_fetch = self.profile.pc_fetch.wrapping_add(dt);
         self.profile.pc_fetch_calls = self.profile.pc_fetch_calls.wrapping_add(1);
-        if addr <= 0x7FFF {
+        if addr <= ROM_BANKED_END {
             self.profile.pc_fetch_rom = self.profile.pc_fetch_rom.wrapping_add(dt);
             self.profile.pc_fetch_rom_calls = self.profile.pc_fetch_rom_calls.wrapping_add(1);
         }
@@ -242,27 +341,81 @@ impl Sm83PerfRecorder {
     }
 
     #[inline]
+    pub(crate) fn record_opcode_exec(&mut self, opcode: u8, dt: u32) {
+        let slot = opcode as usize;
+        self.profile.opcode_exec_cycles[slot] =
+            self.profile.opcode_exec_cycles[slot].wrapping_add(dt);
+        self.profile.opcode_exec_calls[slot] = self.profile.opcode_exec_calls[slot].wrapping_add(1);
+    }
+
+    #[inline]
     pub(crate) fn record_cb_prefix(&mut self, dt: u32) {
         self.profile.cb_prefix = self.profile.cb_prefix.wrapping_add(dt);
         self.profile.cb_prefix_calls = self.profile.cb_prefix_calls.wrapping_add(1);
     }
 
     #[inline]
-    pub(crate) fn record_operand8(&mut self, dt: u32) {
-        self.profile.operand8 = self.profile.operand8.wrapping_add(dt);
-        self.profile.operand8_calls = self.profile.operand8_calls.wrapping_add(1);
+    pub(crate) fn record_cb_opcode_exec(&mut self, opcode: u8, dt: u32) {
+        let slot = opcode as usize;
+        self.profile.cb_opcode_exec_cycles[slot] =
+            self.profile.cb_opcode_exec_cycles[slot].wrapping_add(dt);
+        self.profile.cb_opcode_exec_calls[slot] =
+            self.profile.cb_opcode_exec_calls[slot].wrapping_add(1);
     }
 
+    #[inline]
+    pub(crate) fn record_cb_exec_reg(&mut self, dt: u32) {
+        self.profile.cb_exec = self.profile.cb_exec.wrapping_add(dt);
+        self.profile.cb_exec_calls = self.profile.cb_exec_calls.wrapping_add(1);
+        self.profile.cb_exec_reg = self.profile.cb_exec_reg.wrapping_add(dt);
+        self.profile.cb_exec_reg_calls = self.profile.cb_exec_reg_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_cb_exec_hlmem(&mut self, dt: u32) {
+        self.profile.cb_exec = self.profile.cb_exec.wrapping_add(dt);
+        self.profile.cb_exec_calls = self.profile.cb_exec_calls.wrapping_add(1);
+        self.profile.cb_exec_hlmem = self.profile.cb_exec_hlmem.wrapping_add(dt);
+        self.profile.cb_exec_hlmem_calls = self.profile.cb_exec_hlmem_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_operand8_reg(&mut self, dt: u32) {
+        self.profile.operand8 = self.profile.operand8.wrapping_add(dt);
+        self.profile.operand8_calls = self.profile.operand8_calls.wrapping_add(1);
+        self.profile.operand8_reg = self.profile.operand8_reg.wrapping_add(dt);
+        self.profile.operand8_reg_calls = self.profile.operand8_reg_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_operand8_imm(&mut self, dt: u32) {
+        self.profile.operand8 = self.profile.operand8.wrapping_add(dt);
+        self.profile.operand8_calls = self.profile.operand8_calls.wrapping_add(1);
+        self.profile.operand8_imm = self.profile.operand8_imm.wrapping_add(dt);
+        self.profile.operand8_imm_calls = self.profile.operand8_imm_calls.wrapping_add(1);
+    }
+
+    #[inline]
+    pub(crate) fn record_operand8_mem(&mut self, dt: u32) {
+        self.profile.operand8 = self.profile.operand8.wrapping_add(dt);
+        self.profile.operand8_calls = self.profile.operand8_calls.wrapping_add(1);
+        self.profile.operand8_mem = self.profile.operand8_mem.wrapping_add(dt);
+        self.profile.operand8_mem_calls = self.profile.operand8_mem_calls.wrapping_add(1);
+    }
+
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn record_ppu(&mut self, dt: u32) {
         self.profile.ppu = self.profile.ppu.wrapping_add(dt);
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn record_timer(&mut self, dt: u32) {
         self.profile.timer = self.profile.timer.wrapping_add(dt);
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn record_apu(&mut self, dt: u32) {
         self.profile.apu = self.profile.apu.wrapping_add(dt);
@@ -321,8 +474,15 @@ mod tests {
         perf.record_pc_fetch_rom_read(11);
         perf.record_bus_read(7);
         perf.record_opcode_dispatch(11);
+        perf.record_opcode_exec(0x12, 17);
+        perf.record_opcode_exec(0x12, 19);
         perf.record_cb_prefix(13);
-        perf.record_operand8(17);
+        perf.record_cb_opcode_exec(0x86, 23);
+        perf.record_cb_exec_reg(19);
+        perf.record_cb_exec_hlmem(23);
+        perf.record_operand8_reg(17);
+        perf.record_operand8_imm(29);
+        perf.record_operand8_mem(31);
 
         let profile = perf.take_profile();
         assert_eq!(profile.pc_fetch, 8);
@@ -339,10 +499,26 @@ mod tests {
         assert_eq!(profile.bus_read_calls, 1);
         assert_eq!(profile.opcode_dispatch, 11);
         assert_eq!(profile.opcode_dispatch_calls, 1);
+        assert_eq!(profile.opcode_exec_cycles[0x12], 36);
+        assert_eq!(profile.opcode_exec_calls[0x12], 2);
         assert_eq!(profile.cb_prefix, 13);
         assert_eq!(profile.cb_prefix_calls, 1);
-        assert_eq!(profile.operand8, 17);
-        assert_eq!(profile.operand8_calls, 1);
+        assert_eq!(profile.cb_opcode_exec_cycles[0x86], 23);
+        assert_eq!(profile.cb_opcode_exec_calls[0x86], 1);
+        assert_eq!(profile.cb_exec, 42);
+        assert_eq!(profile.cb_exec_calls, 2);
+        assert_eq!(profile.cb_exec_reg, 19);
+        assert_eq!(profile.cb_exec_reg_calls, 1);
+        assert_eq!(profile.cb_exec_hlmem, 23);
+        assert_eq!(profile.cb_exec_hlmem_calls, 1);
+        assert_eq!(profile.operand8, 77);
+        assert_eq!(profile.operand8_calls, 3);
+        assert_eq!(profile.operand8_reg, 17);
+        assert_eq!(profile.operand8_reg_calls, 1);
+        assert_eq!(profile.operand8_imm, 29);
+        assert_eq!(profile.operand8_imm_calls, 1);
+        assert_eq!(profile.operand8_mem, 31);
+        assert_eq!(profile.operand8_mem_calls, 1);
     }
 
     #[test]

@@ -11,7 +11,7 @@ fn make_rom(cart_type: u8, rom_size_code: u8, ram_size_code: u8) -> Vec<u8> {
     rom[0x0147] = cart_type;
     rom[0x0148] = rom_size_code; // 0 = 32 KB (2 banks)
     rom[0x0149] = ram_size_code; // 2 = 8 KB
-    // NOP + JR -2 infinite loop at 0x0100
+                                 // NOP + JR -2 infinite loop at 0x0100
     rom[0x0100] = 0x00; // NOP
     rom[0x0101] = 0x18; // JR
     rom[0x0102] = 0xFE; // -2
@@ -78,8 +78,14 @@ fn test_mbc1_external_ram_roundtrip() {
     gb.set_external_ram(&data);
 
     // Read back and verify
-    let readback = gb.external_ram().expect("external_ram should still be Some");
-    assert_eq!(readback.len(), ram_len, "RAM length changed after set_external_ram");
+    let readback = gb
+        .external_ram()
+        .expect("external_ram should still be Some");
+    assert_eq!(
+        readback.len(),
+        ram_len,
+        "RAM length changed after set_external_ram"
+    );
     for (i, (&expected, &actual)) in data.iter().zip(readback.iter()).enumerate() {
         assert_eq!(
             actual, expected,
@@ -111,7 +117,9 @@ fn test_mbc3_external_ram_roundtrip() {
     }
     gb.set_external_ram(&data);
 
-    let readback = gb.external_ram().expect("external_ram should still be Some after write");
+    let readback = gb
+        .external_ram()
+        .expect("external_ram should still be Some after write");
     assert_eq!(readback.len(), ram_len);
     for (i, (&expected, &actual)) in data.iter().zip(readback.iter()).enumerate() {
         assert_eq!(
@@ -136,7 +144,9 @@ fn test_external_ram_partial_write() {
     let partial: Vec<u8> = (0u8..64u8).collect();
     gb.set_external_ram(&partial);
 
-    let readback = gb.external_ram().expect("external_ram should be Some after partial write");
+    let readback = gb
+        .external_ram()
+        .expect("external_ram should be Some after partial write");
 
     // The written bytes should match
     for (i, (&expected, &actual)) in partial.iter().zip(readback.iter()).enumerate() {
@@ -148,5 +158,9 @@ fn test_external_ram_partial_write() {
     }
 
     // The rest of the RAM should still be accessible (no panic, no out-of-bounds)
-    assert_eq!(readback.len(), ram_len, "RAM length should be unchanged after partial write");
+    assert_eq!(
+        readback.len(),
+        ram_len,
+        "RAM length should be unchanged after partial write"
+    );
 }

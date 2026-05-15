@@ -7,14 +7,16 @@ use crate::cpu::peripheral::ppu::PpuPerfProfile;
 use crate::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 use crate::cpu::save_state::PpuState;
 
-use super::protocol::{WorkerCommand, WorkerFrontendState, WorkerLink};
+use super::protocol::{WorkerCommand, WorkerOutput};
+use super::transport::WorkerTransport;
 use super::worker::GameBoyWorker;
 
-pub struct InlineWorkerLink {
+/// Single-threaded transport: runs the worker directly on the calling thread.
+pub struct LocalTransport {
     worker: GameBoyWorker,
 }
 
-impl InlineWorkerLink {
+impl LocalTransport {
     pub fn new() -> Self {
         Self {
             worker: GameBoyWorker::new(),
@@ -22,7 +24,7 @@ impl InlineWorkerLink {
     }
 }
 
-impl WorkerLink for InlineWorkerLink {
+impl WorkerTransport for LocalTransport {
     fn send(&mut self, command: WorkerCommand) {
         self.worker.send(command)
     }
@@ -63,12 +65,12 @@ impl WorkerLink for InlineWorkerLink {
         self.worker.snapshot_ppu_state()
     }
 
-    fn poll_frontend_state(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerFrontendState {
-        let state = self.worker.poll_frontend_state();
-        if state.frame_ready {
+    fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
+        let output = self.worker.poll_output();
+        if output.frame_ready {
             self.worker.copy_framebuffer(out);
         }
-        state
+        output
     }
 
     #[cfg(feature = "perf")]

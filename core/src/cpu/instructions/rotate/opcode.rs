@@ -16,7 +16,11 @@ pub struct Rotate {
 }
 
 impl OpCode for Rotate {
-    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        cpu: &mut dyn Instructions,
+        _memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         cpu.rotate_accumulator(self)
     }
 }
@@ -33,7 +37,9 @@ mod tests {
             op: RotateOp::Rlca,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let actual_cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -43,7 +49,9 @@ mod tests {
             op: RotateOp::Rla,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let actual_cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -53,7 +61,9 @@ mod tests {
             op: RotateOp::Rrca,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let actual_cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(actual_cycles, 4);
     }
 
@@ -63,7 +73,9 @@ mod tests {
             op: RotateOp::Rra,
             cycles: 4,
         };
-        let actual_cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let actual_cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(actual_cycles, 4);
     }
 }

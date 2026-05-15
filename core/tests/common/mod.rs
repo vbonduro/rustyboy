@@ -15,8 +15,7 @@ pub fn rom_path(relative: &str) -> std::path::PathBuf {
 /// Load a ROM file and return its bytes.
 pub fn load_rom(path: &str) -> Vec<u8> {
     let full_path = rom_path(path);
-    std::fs::read(&full_path)
-        .unwrap_or_else(|_| panic!("ROM not found: {}", full_path.display()))
+    std::fs::read(&full_path).unwrap_or_else(|_| panic!("ROM not found: {}", full_path.display()))
 }
 
 /// Run a Blargg-style ROM that outputs results via serial port.
@@ -146,8 +145,7 @@ pub fn run_mooneye_rom(path: &str) -> MooneyeResult {
     }
 
     let regs = gb.registers();
-    if regs.b == 3 && regs.c == 5 && regs.d == 8 && regs.e == 13 && regs.h == 21 && regs.l == 34
-    {
+    if regs.b == 3 && regs.c == 5 && regs.d == 8 && regs.e == 13 && regs.h == 21 && regs.l == 34 {
         MooneyeResult::Pass
     } else if regs.b == 0x42
         && regs.c == 0x42
@@ -180,7 +178,10 @@ pub fn assert_mooneye_passed(path: &str, name: &str) {
         MooneyeResult::Fail => panic!("{}: Mooneye test reported FAIL", name),
         MooneyeResult::Timeout => panic!("{}: Mooneye test timed out", name),
         MooneyeResult::Unknown(regs) => {
-            panic!("{}: Mooneye test ended with unexpected registers: {:?}", name, regs)
+            panic!(
+                "{}: Mooneye test ended with unexpected registers: {:?}",
+                name, regs
+            )
         }
     }
 }

@@ -93,8 +93,5 @@ fn test_blargg_03_op_sp_hl() {
 
 #[test]
 fn test_blargg_05_op_rp() {
-    assert_blargg_passed(
-        "roms/blargg/cpu_instrs/individual/05-op rp.gb",
-        "05-op rp",
-    );
+    assert_blargg_passed("roms/blargg/cpu_instrs/individual/05-op rp.gb", "05-op rp");
 }

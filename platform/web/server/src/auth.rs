@@ -1,11 +1,13 @@
 use axum::{
     async_trait,
     extract::{FromRequestParts, Query, State},
-    http::{StatusCode, header, request::Parts},
+    http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,16 +40,19 @@ impl OAuthConfig {
         let cf_certs_url = if team_domain.is_empty() {
             String::new()
         } else {
-            format!("https://{}.cloudflareaccess.com/cdn-cgi/access/certs", team_domain)
+            format!(
+                "https://{}.cloudflareaccess.com/cdn-cgi/access/certs",
+                team_domain
+            )
         };
         Self {
-            client_id:     std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
+            client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),
             client_secret: std::env::var("GOOGLE_CLIENT_SECRET").unwrap_or_default(),
-            redirect_uri:  std::env::var("OAUTH_REDIRECT_URI").unwrap_or_default(),
-            jwt_secret:    std::env::var("JWT_SECRET").unwrap_or_default(),
+            redirect_uri: std::env::var("OAUTH_REDIRECT_URI").unwrap_or_default(),
+            jwt_secret: std::env::var("JWT_SECRET").unwrap_or_default(),
             cf_access_aud: std::env::var("CF_ACCESS_AUD").unwrap_or_default(),
             cf_certs_url,
-            dev_mode:      false,
+            dev_mode: false,
         }
     }
 }
@@ -236,8 +241,9 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -278,7 +284,11 @@ fn redirect_uri_from_request(headers: &axum::http::HeaderMap, configured: &str) 
         // and the configured OAUTH_REDIRECT_URI is the correct value to use.
         let is_ip = hostname.parse::<std::net::IpAddr>().is_ok();
         if !is_ip {
-            let scheme = if hostname == "localhost" { "http" } else { "https" };
+            let scheme = if hostname == "localhost" {
+                "http"
+            } else {
+                "https"
+            };
             return format!("{}://{}/auth/google/callback", scheme, host);
         }
     }
@@ -311,7 +321,11 @@ pub async fn google_login(
     tracing::debug!(
         "google_login: host={:?} configured_redirect_uri={:?} resolved_redirect_uri={:?}",
         headers.get("host").and_then(|v| v.to_str().ok()),
-        if cfg.redirect_uri.is_empty() { "(not set)" } else { &cfg.redirect_uri },
+        if cfg.redirect_uri.is_empty() {
+            "(not set)"
+        } else {
+            &cfg.redirect_uri
+        },
         redirect_uri,
     );
     let url = format!(
@@ -503,7 +517,10 @@ pub async fn cf_access_login(
         return redirect_response("/?auth_error=1", None);
     }
 
-    let jwt = match headers.get("Cf-Access-Jwt-Assertion").and_then(|v| v.to_str().ok()) {
+    let jwt = match headers
+        .get("Cf-Access-Jwt-Assertion")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(j) => j.to_string(),
         None => return redirect_response("/?auth_error=1", None),
     };
@@ -527,9 +544,14 @@ pub async fn cf_access_login(
     };
 
     // Find the matching key (by kid if present, else try all)
-    let matching_keys: Vec<&JwkKey> = jwks.keys.iter().filter(|k| {
-        kid.as_deref().map_or(true, |kid| k.kid.as_deref() == Some(kid))
-    }).collect();
+    let matching_keys: Vec<&JwkKey> = jwks
+        .keys
+        .iter()
+        .filter(|k| {
+            kid.as_deref()
+                .map_or(true, |kid| k.kid.as_deref() == Some(kid))
+        })
+        .collect();
 
     let claims = matching_keys.iter().find_map(|key| {
         let n_bytes = URL_SAFE_NO_PAD.decode(&key.n).ok()?;
@@ -538,7 +560,9 @@ pub async fn cf_access_login(
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[&cfg.cf_access_aud]);
         validation.leeway = 0;
-        decode::<CfClaims>(&jwt, &decoding_key, &validation).ok().map(|t| t.claims)
+        decode::<CfClaims>(&jwt, &decoding_key, &validation)
+            .ok()
+            .map(|t| t.claims)
     });
 
     let claims = match claims {
@@ -552,7 +576,11 @@ pub async fn cf_access_login(
     // Use the email local-part as display name when creating a new CF user.
     // upsert_user will merge with an existing email-matched record (e.g. from Google OAuth).
     let display_name = claims.email.split('@').next().unwrap_or(&claims.email);
-    let user = match state.db.upsert_user(&claims.sub, &claims.email, display_name, None).await {
+    let user = match state
+        .db
+        .upsert_user(&claims.sub, &claims.email, display_name, None)
+        .await
+    {
         Ok(u) => u,
         Err(e) => {
             tracing::error!("CF Access: upsert_user failed: {e}");
@@ -585,14 +613,16 @@ mod tests {
     #[test]
     fn redirect_uri_uses_host_for_named_domain() {
         let h = headers_with_host("rustyboy.example.com");
-        let uri = redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
+        let uri =
+            redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
         assert_eq!(uri, "https://rustyboy.example.com/auth/google/callback");
     }
 
     #[test]
     fn redirect_uri_uses_http_for_localhost() {
         let h = headers_with_host("localhost:8080");
-        let uri = redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
+        let uri =
+            redirect_uri_from_request(&h, "https://fallback.example.com/auth/google/callback");
         assert_eq!(uri, "http://localhost:8080/auth/google/callback");
     }
 
@@ -657,9 +687,15 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
-        let claims = Claims { sub, email, aud, exp };
-        let pem = rsa::pkcs1::EncodeRsaPrivateKey::to_pkcs1_pem(private_key, rsa::pkcs1::LineEnding::LF)
-            .unwrap();
+        let claims = Claims {
+            sub,
+            email,
+            aud,
+            exp,
+        };
+        let pem =
+            rsa::pkcs1::EncodeRsaPrivateKey::to_pkcs1_pem(private_key, rsa::pkcs1::LineEnding::LF)
+                .unwrap();
         let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("test-key-1".to_string());
@@ -675,8 +711,8 @@ mod tests {
 
     /// Spawn a tiny HTTP server that returns `body` for every GET, return its base URL.
     async fn mock_jwks_server(body: serde_json::Value) -> String {
-        use std::convert::Infallible;
         use axum::response::Json as AxumJson;
+        use std::convert::Infallible;
 
         let app = axum::Router::new().route(
             "/certs",
@@ -713,7 +749,10 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::FOUND);
         let location = res.headers().get("location").unwrap().to_str().unwrap();
-        assert!(location.contains("auth_error"), "expected auth_error redirect, got: {location}");
+        assert!(
+            location.contains("auth_error"),
+            "expected auth_error redirect, got: {location}"
+        );
     }
 
     #[tokio::test]

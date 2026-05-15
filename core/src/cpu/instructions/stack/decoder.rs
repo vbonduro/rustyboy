@@ -1,8 +1,8 @@
-use alloc::boxed::Box;
 use super::opcode::{Pop16, Push16};
 use crate::cpu::instructions::decoder::{Decoder, Error};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::Register16;
+use alloc::boxed::Box;
 
 pub struct Push16Decoder {}
 

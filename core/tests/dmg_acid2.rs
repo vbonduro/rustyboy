@@ -38,7 +38,8 @@ fn test_dmg_acid2() {
     }
 
     assert_eq!(
-        mismatches, 0,
+        mismatches,
+        0,
         "dmg-acid2: {} pixel mismatches out of {} total",
         mismatches,
         framebuffer.len()

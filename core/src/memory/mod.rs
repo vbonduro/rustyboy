@@ -1,4 +1,5 @@
 pub mod cartridge;
+pub(crate) mod map;
 #[cfg(test)]
 pub mod fake;
 pub mod memory;

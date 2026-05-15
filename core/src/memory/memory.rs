@@ -4,6 +4,10 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 
 use super::cartridge::{self, Cartridge, CartridgeRomWindows, NoMbc};
+use super::map::{
+    ECHO_BASE, ECHO_END, EXT_RAM_BASE, EXT_RAM_END, IO_REG_BASE, IO_REG_END, OAM_BASE, OAM_END,
+    ROM_BANKED_BASE, ROM_BANKED_END, ROM_FIXED_END, VRAM_BASE, VRAM_END, WRAM_BASE, WRAM_END,
+};
 use crate::cpu::save_state::SaveState;
 
 /// An event produced when a write occurs to a worker-mirrored address.
@@ -58,13 +62,13 @@ enum RegionMapping {
 impl RegionMapping {
     fn for_address(address: u16) -> Self {
         match address {
-            0x0000..=0x7FFF => RegionMapping::Rom,
-            0x8000..=0x9FFF => RegionMapping::Vram(address - 0x8000),
-            0xA000..=0xBFFF => RegionMapping::ExternalRam(address - 0xA000),
-            0xC000..=0xDFFF => RegionMapping::Wram(address - 0xC000),
-            0xE000..=0xFDFF => RegionMapping::EchoRam(address - 0xE000),
-            0xFE00..=0xFE9F => RegionMapping::Oam(address - 0xFE00),
-            0xFF00..=0xFF7F => RegionMapping::Io(address - 0xFF00),
+            0x0000..=ROM_BANKED_END => RegionMapping::Rom,
+            VRAM_BASE..=VRAM_END => RegionMapping::Vram(address - VRAM_BASE),
+            EXT_RAM_BASE..=EXT_RAM_END => RegionMapping::ExternalRam(address - EXT_RAM_BASE),
+            WRAM_BASE..=WRAM_END => RegionMapping::Wram(address - WRAM_BASE),
+            ECHO_BASE..=ECHO_END => RegionMapping::EchoRam(address - ECHO_BASE),
+            OAM_BASE..=OAM_END => RegionMapping::Oam(address - OAM_BASE),
+            IO_REG_BASE..=IO_REG_END => RegionMapping::Io(address - IO_REG_BASE),
             0xFF80..=0xFFFE => RegionMapping::Hram(address - 0xFF80),
             0xFFFF => RegionMapping::InterruptEnable,
             _ => RegionMapping::Unmapped,
@@ -249,13 +253,13 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn read_fast(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x7FFF => self.read_rom_fast(address),
-            0x8000..=0x9FFF => Self::read_region_fast(&self.vram, address - 0x8000),
-            0xA000..=0xBFFF => self.cartridge.read_ram(address - 0xA000),
-            0xC000..=0xDFFF => Self::read_region_fast(&self.wram, address - 0xC000),
-            0xE000..=0xFDFF => Self::read_region_fast(&self.wram, address - 0xE000),
-            0xFE00..=0xFE9F => Self::read_region_fast(&self.oam, address - 0xFE00),
-            0xFF00..=0xFF7F => Self::read_region_fast(&self.io, address - 0xFF00),
+            0x0000..=ROM_BANKED_END => self.read_rom_fast(address),
+            VRAM_BASE..=VRAM_END => Self::read_region_fast(&self.vram, address - VRAM_BASE),
+            EXT_RAM_BASE..=EXT_RAM_END => self.cartridge.read_ram(address - EXT_RAM_BASE),
+            WRAM_BASE..=WRAM_END => Self::read_region_fast(&self.wram, address - WRAM_BASE),
+            ECHO_BASE..=ECHO_END => Self::read_region_fast(&self.wram, address - ECHO_BASE),
+            OAM_BASE..=OAM_END => Self::read_region_fast(&self.oam, address - OAM_BASE),
+            IO_REG_BASE..=IO_REG_END => Self::read_region_fast(&self.io, address - IO_REG_BASE),
             0xFF80..=0xFFFE => Self::read_region_fast(&self.hram, address - 0xFF80),
             0xFFFF => self.ie,
             _ => 0xFF,
@@ -267,15 +271,15 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn read_rom_fast(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x3FFF => self.read_rom_fixed_fast(address),
-            0x4000..=0x7FFF => self.read_rom_banked_fast(address),
+            0x0000..=ROM_FIXED_END => self.read_rom_fixed_fast(address),
+            ROM_BANKED_BASE..=ROM_BANKED_END => self.read_rom_banked_fast(address),
             _ => 0xFF,
         }
     }
 
     #[inline(always)]
     pub fn read_rom_fixed_fast(&self, address: u16) -> u8 {
-        debug_assert!(address <= 0x3FFF);
+        debug_assert!(address <= ROM_FIXED_END);
         if self.cartridge_has_rom_windows {
             Self::read_cached_rom_window(self.rom_fixed_ptr, self.rom_fixed_len, address as usize)
         } else {
@@ -285,12 +289,12 @@ impl GameBoyMemory {
 
     #[inline(always)]
     pub fn read_rom_banked_fast(&self, address: u16) -> u8 {
-        debug_assert!((0x4000..=0x7FFF).contains(&address));
+        debug_assert!((ROM_BANKED_BASE..=ROM_BANKED_END).contains(&address));
         if self.cartridge_has_rom_windows {
             Self::read_cached_rom_window(
                 self.rom_banked_ptr,
                 self.rom_banked_len,
-                (address - 0x4000) as usize,
+                (address - ROM_BANKED_BASE) as usize,
             )
         } else {
             self.cartridge.read_rom(address)
@@ -301,16 +305,16 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn write_fast(&mut self, address: u16, value: u8) {
         match address {
-            0x0000..=0x7FFF => {
+            0x0000..=ROM_BANKED_END => {
                 self.cartridge.write(address, value);
                 self.refresh_rom_windows();
             }
-            0xA000..=0xBFFF => self.cartridge.write(address, value),
-            0x8000..=0x9FFF => Self::write_region_fast(&mut self.vram, address - 0x8000, value),
-            0xC000..=0xDFFF => Self::write_region_fast(&mut self.wram, address - 0xC000, value),
-            0xE000..=0xFDFF => {}
-            0xFE00..=0xFE9F => Self::write_region_fast(&mut self.oam, address - 0xFE00, value),
-            0xFF00..=0xFF7F => Self::write_region_fast(&mut self.io, address - 0xFF00, value),
+            EXT_RAM_BASE..=EXT_RAM_END => self.cartridge.write(address, value),
+            VRAM_BASE..=VRAM_END => Self::write_region_fast(&mut self.vram, address - VRAM_BASE, value),
+            WRAM_BASE..=WRAM_END => Self::write_region_fast(&mut self.wram, address - WRAM_BASE, value),
+            ECHO_BASE..=ECHO_END => {}
+            OAM_BASE..=OAM_END => Self::write_region_fast(&mut self.oam, address - OAM_BASE, value),
+            IO_REG_BASE..=IO_REG_END => Self::write_region_fast(&mut self.io, address - IO_REG_BASE, value),
             0xFF80..=0xFFFE => Self::write_region_fast(&mut self.hram, address - 0xFF80, value),
             0xFFFF => self.ie = value,
             _ => {}
@@ -324,6 +328,66 @@ impl GameBoyMemory {
         for i in 0..0xA0u16 {
             let byte = self.read(base + i).unwrap_or(0xFF);
             Self::write_region_fast(&mut self.oam, i, byte);
+        }
+    }
+
+    /// Copy `count` bytes from `source + progress` into OAM at `progress`.
+    /// Uses a zero-copy slice path for regions with direct backing storage
+    /// (VRAM, WRAM, cached ROM); falls back to byte-by-byte for cart RAM.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn copy_dma_step(&mut self, source: u16, progress: u8, count: u8) {
+        // actual_src is the real memory address to read from: base + bytes already transferred.
+        let actual_src = source as usize + progress as usize;
+        let n = count as usize;
+        let dst = progress as usize;
+
+        let copied = if (VRAM_BASE as usize..=VRAM_END as usize).contains(&actual_src) {
+            let off = actual_src - VRAM_BASE as usize;
+            off + n <= self.vram.len() && {
+                self.oam[dst..dst + n].copy_from_slice(&self.vram[off..off + n]);
+                true
+            }
+        } else if (WRAM_BASE as usize..=WRAM_END as usize).contains(&actual_src) {
+            let off = actual_src - WRAM_BASE as usize;
+            off + n <= self.wram.len() && {
+                self.oam[dst..dst + n].copy_from_slice(&self.wram[off..off + n]);
+                true
+            }
+        } else if (ECHO_BASE as usize..=ECHO_END as usize).contains(&actual_src) {
+            let off = actual_src - ECHO_BASE as usize;
+            off + n <= self.wram.len() && {
+                self.oam[dst..dst + n].copy_from_slice(&self.wram[off..off + n]);
+                true
+            }
+        } else if self.cartridge_has_rom_windows
+            && actual_src <= ROM_FIXED_END as usize
+            && actual_src + n <= self.rom_fixed_len
+        {
+            // Safety: rom_fixed_ptr is valid for rom_fixed_len bytes and does not alias oam.
+            unsafe {
+                let sl = core::slice::from_raw_parts(self.rom_fixed_ptr.add(actual_src), n);
+                self.oam[dst..dst + n].copy_from_slice(sl);
+            }
+            true
+        } else if self.cartridge_has_rom_windows
+            && (ROM_BANKED_BASE as usize..=ROM_BANKED_END as usize).contains(&actual_src)
+            && (actual_src - ROM_BANKED_BASE as usize) + n <= self.rom_banked_len
+        {
+            let off = actual_src - ROM_BANKED_BASE as usize;
+            // Safety: rom_banked_ptr is valid for rom_banked_len bytes and does not alias oam.
+            unsafe {
+                let sl = core::slice::from_raw_parts(self.rom_banked_ptr.add(off), n);
+                self.oam[dst..dst + n].copy_from_slice(sl);
+            }
+            true
+        } else {
+            false
+        };
+
+        if !copied {
+            for i in 0..n {
+                self.oam[dst + i] = self.read_fast((actual_src + i) as u16);
+            }
         }
     }
 
@@ -456,6 +520,13 @@ impl GameBoyMemory {
             }
             _ => {}
         }
+    }
+
+    /// Queue a worker-mirrored bus event after the caller has already updated
+    /// memory through a direct fast path.
+    #[inline(always)]
+    pub fn enqueue_bus_event(&mut self, address: u16, value: u8) {
+        self.events.push_back(BusEvent { address, value });
     }
 
     /// Returns a read-only view of the IO register array (0xFF00–0xFF7F).

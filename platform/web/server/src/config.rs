@@ -33,7 +33,9 @@ pub fn load_secrets_file() {
             // Only set if not already present — explicit env vars take precedence
             if std::env::var(key).is_err() {
                 // Safety: single-threaded startup, no other threads reading env yet
-                unsafe { std::env::set_var(key, value); }
+                unsafe {
+                    std::env::set_var(key, value);
+                }
             }
         }
     }

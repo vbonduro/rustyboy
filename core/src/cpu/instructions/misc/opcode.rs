@@ -21,7 +21,11 @@ pub struct Misc {
 }
 
 impl OpCode for Misc {
-    fn execute(&self, cpu: &mut dyn Instructions, _memory: &mut GameBoyMemory) -> Result<u8, Error> {
+    fn execute(
+        &self,
+        cpu: &mut dyn Instructions,
+        _memory: &mut GameBoyMemory,
+    ) -> Result<u8, Error> {
         cpu.misc(self)
     }
 }
@@ -38,7 +42,9 @@ mod tests {
             op: MiscOp::Nop,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -48,7 +54,9 @@ mod tests {
             op: MiscOp::Halt,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -58,7 +66,9 @@ mod tests {
             op: MiscOp::Stop,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -68,7 +78,9 @@ mod tests {
             op: MiscOp::Daa,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -78,7 +90,9 @@ mod tests {
             op: MiscOp::Cpl,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -88,7 +102,9 @@ mod tests {
             op: MiscOp::Scf,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -98,7 +114,9 @@ mod tests {
             op: MiscOp::Ccf,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -108,7 +126,9 @@ mod tests {
             op: MiscOp::Di,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 
@@ -118,7 +138,9 @@ mod tests {
             op: MiscOp::Ei,
             cycles: 4,
         };
-        let cycles = opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap();
+        let cycles = opcode
+            .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+            .unwrap();
         assert_eq!(cycles, 4);
     }
 }

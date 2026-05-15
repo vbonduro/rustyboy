@@ -25,6 +25,11 @@ mod tests {
             vector: 0x08,
             cycles: 16,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 16);
+        assert_eq!(
+            opcode
+                .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+                .unwrap(),
+            16
+        );
     }
 }

@@ -1,5 +1,10 @@
 # Performance Roadmap
 
+> Note (2026-05-12): the latest live Pico `perf` output, the restored SM83
+> instrumentation details, and the current core 1 offload guidance now live in
+> `docs/perf-profiling.md`. The numbers below are historical snapshots from an
+> earlier instrumentation pass and are still useful mainly for trend context.
+
 ## Current state — post decode/fetch follow-up
 
 ROM: Tetris, Pico2W @ 250 MHz.

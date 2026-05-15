@@ -79,7 +79,7 @@ impl JoypadPeripheral {
         // Select lines are active-low: bit = 0 means that group is selected.
         match group {
             Group::Directions => self.select & 0x10 == 0,
-            Group::Actions    => self.select & 0x20 == 0,
+            Group::Actions => self.select & 0x20 == 0,
         }
     }
 
@@ -117,14 +117,14 @@ enum Group {
 
 fn button_to_group_bit(button: Button) -> (Group, u8) {
     match button {
-        Button::Right  => (Group::Directions, 0),
-        Button::Left   => (Group::Directions, 1),
-        Button::Up     => (Group::Directions, 2),
-        Button::Down   => (Group::Directions, 3),
-        Button::A      => (Group::Actions, 0),
-        Button::B      => (Group::Actions, 1),
+        Button::Right => (Group::Directions, 0),
+        Button::Left => (Group::Directions, 1),
+        Button::Up => (Group::Directions, 2),
+        Button::Down => (Group::Directions, 3),
+        Button::A => (Group::Actions, 0),
+        Button::B => (Group::Actions, 1),
         Button::Select => (Group::Actions, 2),
-        Button::Start  => (Group::Actions, 3),
+        Button::Start => (Group::Actions, 3),
     }
 }
 
@@ -183,7 +183,7 @@ mod tests {
         let mut joy = JoypadPeripheral::new();
         joy.write(0x00); // both selected (bits 4 and 5 = 0)
         joy.set_button(Button::Right, true); // directions bit 0
-        joy.set_button(Button::A, true);     // actions bit 0 — same physical bit
+        joy.set_button(Button::A, true); // actions bit 0 — same physical bit
         assert_eq!(joy.read() & 0x01, 0); // bit 0 low (either group pressed)
     }
 

@@ -51,7 +51,12 @@ mod tests {
             target: CbTarget::Reg(Register8::B),
             cycles: 8,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 8);
+        assert_eq!(
+            opcode
+                .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+                .unwrap(),
+            8
+        );
     }
 
     #[test]
@@ -61,6 +66,11 @@ mod tests {
             target: CbTarget::HLMem,
             cycles: 12,
         };
-        assert_eq!(opcode.execute(&mut FakeCpu::new(), &mut GameBoyMemory::new()).unwrap(), 12);
+        assert_eq!(
+            opcode
+                .execute(&mut FakeCpu::new(), &mut GameBoyMemory::new())
+                .unwrap(),
+            12
+        );
     }
 }

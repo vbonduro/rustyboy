@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::ptr;
 
 #[cfg(feature = "perf")]
 use crate::cpu::peripheral::apu::ApuPerfProfile;
@@ -10,12 +11,13 @@ use crate::cpu::peripheral::ppu::{
 };
 use crate::cpu::save_state::PpuState;
 
-use super::protocol::{WorkerCommand, WorkerFrontendState};
+use crate::memory::map::{IO_REG_BASE, IO_REG_END};
+use super::protocol::{WorkerCommand, WorkerOutput};
 
 pub struct GameBoyWorker {
     apu: ApuPeripheral,
     ppu: PpuWorkerState,
-    frontend_state: WorkerFrontendState,
+    output: WorkerOutput,
 }
 
 impl GameBoyWorker {
@@ -23,15 +25,26 @@ impl GameBoyWorker {
     pub fn new() -> Self {
         let apu = ApuPeripheral::new();
         let mut ppu = PpuWorkerState::new();
-        let mut frontend_state = WorkerFrontendState::default();
-        frontend_state.apu_nr52 = apu.read_register(NR52_ADDR);
-        frontend_state.ppu_ly = ppu.ly();
-        frontend_state.ppu_stat = ppu.stat();
+        let mut output = WorkerOutput::default();
+        output.apu_nr52 = apu.read_register(NR52_ADDR);
+        output.ppu_ly = ppu.ly();
+        output.ppu_stat = ppu.stat();
         ppu.sync_prev_stat_line();
-        Self {
-            apu,
-            ppu,
-            frontend_state,
+        Self { apu, ppu, output }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub unsafe fn init_in_place(dst: *mut Self) -> &'static mut Self {
+        unsafe {
+            ptr::addr_of_mut!((*dst).apu).write(ApuPeripheral::new());
+            ptr::addr_of_mut!((*dst).ppu).write(PpuWorkerState::new());
+            ptr::addr_of_mut!((*dst).output).write(WorkerOutput::default());
+            let result = &mut *dst;
+            result.output.apu_nr52 = result.apu.read_register(NR52_ADDR);
+            result.output.ppu_ly = result.ppu.ly();
+            result.output.ppu_stat = result.ppu.stat();
+            result.ppu.sync_prev_stat_line();
+            result
         }
     }
 
@@ -43,19 +56,19 @@ impl GameBoyWorker {
                 cycles,
                 div_counter,
             } => {
-                let output = self.apu.tick(cycles, div_counter);
-                self.frontend_state.apu_nr52 = output.nr52;
+                let apu_output = self.apu.tick(cycles, div_counter);
+                self.output.apu_nr52 = apu_output.nr52;
             }
             WorkerCommand::AdvancePpu { cycles } => {
-                let output = self.ppu.advance(cycles);
-                self.frontend_state.ppu_ly = output.ly;
-                self.frontend_state.ppu_stat = output.stat;
-                self.frontend_state.if_bits |= output.if_bits;
-                self.frontend_state.frame_ready |= output.frame_ready;
+                let ppu_output = self.ppu.advance(cycles);
+                self.output.ppu_ly = ppu_output.ly;
+                self.output.ppu_stat = ppu_output.stat;
+                self.output.if_bits |= ppu_output.if_bits;
+                self.output.frame_ready |= ppu_output.frame_ready;
             }
             WorkerCommand::WriteApuRegister { addr, value } => {
                 self.apu.write_register(addr, value);
-                self.frontend_state.apu_nr52 = self.apu.read_register(NR52_ADDR);
+                self.output.apu_nr52 = self.apu.read_register(NR52_ADDR);
             }
             WorkerCommand::WriteWaveRam { offset, value } => {
                 self.apu.write_wave_ram(offset, value);
@@ -68,8 +81,8 @@ impl GameBoyWorker {
             }
             WorkerCommand::WritePpuRegister { addr, value } => {
                 self.ppu.write_register(addr, value);
-                self.frontend_state.ppu_ly = self.ppu.ly();
-                self.frontend_state.ppu_stat = self.ppu.stat();
+                self.output.ppu_ly = self.ppu.ly();
+                self.output.ppu_stat = self.ppu.stat();
             }
         }
     }
@@ -84,23 +97,23 @@ impl GameBoyWorker {
 
     pub fn sync_apu_state(&mut self, io: &[u8]) {
         self.apu.sync_from_io_snapshot(io);
-        self.frontend_state.apu_nr52 = self.apu.read_register(NR52_ADDR);
+        self.output.apu_nr52 = self.apu.read_register(NR52_ADDR);
     }
 
     pub fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.ppu.sync_state(io, vram, oam);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
+        self.output.ppu_ly = self.ppu.ly();
+        self.output.ppu_stat = self.ppu.stat();
+        self.output.if_bits = 0;
+        self.output.frame_ready = false;
     }
 
     pub fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.ppu.load_state(state, io, vram, oam);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
+        self.output.ppu_ly = self.ppu.ly();
+        self.output.ppu_stat = self.ppu.stat();
+        self.output.if_bits = 0;
+        self.output.frame_ready = false;
     }
 
     pub fn snapshot_ppu_state(&self) -> PpuState {
@@ -129,8 +142,8 @@ impl GameBoyWorker {
     #[inline(always)]
     pub fn write_ppu_register(&mut self, addr: u16, value: u8) {
         self.ppu.write_register(addr, value);
-        self.frontend_state.ppu_ly = self.ppu.ly();
-        self.frontend_state.ppu_stat = self.ppu.stat();
+        self.output.ppu_ly = self.ppu.ly();
+        self.output.ppu_stat = self.ppu.stat();
     }
 
     pub fn copy_framebuffer(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) {
@@ -141,11 +154,12 @@ impl GameBoyWorker {
         self.ppu.framebuffer()
     }
 
-    pub fn poll_frontend_state(&mut self) -> WorkerFrontendState {
-        let state = self.frontend_state;
-        self.frontend_state.if_bits = 0;
-        self.frontend_state.frame_ready = false;
-        state
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    pub fn poll_output(&mut self) -> WorkerOutput {
+        let output = self.output;
+        self.output.if_bits = 0;
+        self.output.frame_ready = false;
+        output
     }
 
     #[cfg(feature = "perf")]
@@ -190,7 +204,7 @@ impl PpuWorkerState {
         self.oam.copy_from_slice(&oam[..0xA0]);
         self.ppu.clear_framebuffer();
         self.sync_prev_stat_line();
-        self.io[(LY_ADDR - 0xFF00) as usize] = self.ppu.ly();
+        self.io[(LY_ADDR - IO_REG_BASE) as usize] = self.ppu.ly();
     }
 
     fn load_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
@@ -199,8 +213,8 @@ impl PpuWorkerState {
         self.oam.copy_from_slice(&oam[..0xA0]);
         self.ppu.load_state(state);
         self.sync_prev_stat_line();
-        self.io[(LY_ADDR - 0xFF00) as usize] = self.ppu.ly();
-        self.io[(STAT_ADDR - 0xFF00) as usize] = state.stat;
+        self.io[(LY_ADDR - IO_REG_BASE) as usize] = self.ppu.ly();
+        self.io[(STAT_ADDR - IO_REG_BASE) as usize] = state.stat;
     }
 
     fn to_save_state(&self) -> PpuState {
@@ -208,11 +222,11 @@ impl PpuWorkerState {
     }
 
     fn ly(&self) -> u8 {
-        self.io[(LY_ADDR - 0xFF00) as usize]
+        self.io[(LY_ADDR - IO_REG_BASE) as usize]
     }
 
     fn stat(&self) -> u8 {
-        self.io[(STAT_ADDR - 0xFF00) as usize]
+        self.io[(STAT_ADDR - IO_REG_BASE) as usize]
     }
 
     fn sync_prev_stat_line(&mut self) {
@@ -245,15 +259,15 @@ impl PpuWorkerState {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_register(&mut self, addr: u16, value: u8) {
-        if !(0xFF00..=0xFF7F).contains(&addr) {
+        if !(IO_REG_BASE..=IO_REG_END).contains(&addr) {
             return;
         }
         if addr == LY_ADDR {
             self.ppu.reset_ly();
-            self.io[(LY_ADDR - 0xFF00) as usize] = 0;
+            self.io[(LY_ADDR - IO_REG_BASE) as usize] = 0;
             return;
         }
-        self.io[(addr - 0xFF00) as usize] = value;
+        self.io[(addr - IO_REG_BASE) as usize] = value;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -268,8 +282,8 @@ impl PpuWorkerState {
             if_bits |= 1 << STAT_INTERRUPT_BIT;
         }
         PpuWorkerOutput {
-            ly: self.io[(LY_ADDR - 0xFF00) as usize],
-            stat: self.io[(STAT_ADDR - 0xFF00) as usize],
+            ly: self.io[(LY_ADDR - IO_REG_BASE) as usize],
+            stat: self.io[(STAT_ADDR - IO_REG_BASE) as usize],
             if_bits,
             frame_ready: output.vblank_interrupt,
         }

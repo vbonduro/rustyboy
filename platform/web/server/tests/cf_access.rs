@@ -16,15 +16,15 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::rngs::OsRng;
+use rsa::sha2::Sha256;
 use rsa::{
     pkcs1v15::SigningKey,
     signature::{RandomizedSigner, SignatureEncoding},
     traits::PublicKeyParts,
     RsaPrivateKey,
 };
-use rustyboy_web_server::{AppState, auth::OAuthConfig, build_router};
+use rustyboy_web_server::{auth::OAuthConfig, build_router, AppState};
 use serde_json::json;
-use rsa::sha2::Sha256;
 use std::{net::SocketAddr, sync::Arc};
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -39,7 +39,10 @@ struct TestKeys {
 impl TestKeys {
     fn generate() -> Self {
         let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
-        Self { private_key, kid: "test-key-1".to_string() }
+        Self {
+            private_key,
+            kid: "test-key-1".to_string(),
+        }
     }
 
     /// Build a minimal JWKS JSON document with the public key.
@@ -78,13 +81,12 @@ impl TestKeys {
             "exp": exp,
         });
 
-        let header_b64  = URL_SAFE_NO_PAD.encode(header.to_string());
-        let claims_b64  = URL_SAFE_NO_PAD.encode(claims.to_string());
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
+        let claims_b64 = URL_SAFE_NO_PAD.encode(claims.to_string());
         let signing_input = format!("{}.{}", header_b64, claims_b64);
 
         let signing_key: SigningKey<Sha256> = SigningKey::new(self.private_key.clone());
-        let sig = signing_key
-            .sign_with_rng(&mut OsRng, signing_input.as_bytes());
+        let sig = signing_key.sign_with_rng(&mut OsRng, signing_input.as_bytes());
         let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -109,26 +111,28 @@ async fn spawn_jwks_server(jwks: serde_json::Value) -> String {
     format!("http://127.0.0.1:{}", addr.port())
 }
 
-async fn make_app(cf_aud: Option<&str>, certs_base_url: Option<&str>) -> (axum::Router, TempDir, TempDir) {
-    let roms_dir   = TempDir::new().unwrap();
+async fn make_app(
+    cf_aud: Option<&str>,
+    certs_base_url: Option<&str>,
+) -> (axum::Router, TempDir, TempDir) {
+    let roms_dir = TempDir::new().unwrap();
     let static_dir = TempDir::new().unwrap();
     let db = rustyboy_web_server::db_connect(":memory:").await.unwrap();
 
-    let certs_url = certs_base_url
-        .map(|base| format!("{}/cdn-cgi/access/certs", base));
+    let certs_url = certs_base_url.map(|base| format!("{}/cdn-cgi/access/certs", base));
 
     let state = Arc::new(AppState {
-        roms_dir:   roms_dir.path().to_path_buf(),
+        roms_dir: roms_dir.path().to_path_buf(),
         static_dir: static_dir.path().to_path_buf(),
         db,
         oauth: OAuthConfig {
-            client_id:     String::new(),
+            client_id: String::new(),
             client_secret: String::new(),
-            redirect_uri:  String::new(),
-            jwt_secret:    "test-secret".to_string(),
+            redirect_uri: String::new(),
+            jwt_secret: "test-secret".to_string(),
             cf_access_aud: cf_aud.unwrap_or("").to_string(),
-            cf_certs_url:  certs_url.unwrap_or_default(),
-            dev_mode:      false,
+            cf_certs_url: certs_url.unwrap_or_default(),
+            dev_mode: false,
         },
         http_client: reqwest::Client::new(),
     });
@@ -157,10 +161,10 @@ fn redirect_location(response: &axum::http::Response<Body>) -> Option<String> {
 /// A valid CF JWT → server sets a session cookie and redirects to `/`.
 #[tokio::test]
 async fn cf_valid_jwt_sets_session_cookie() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "test-audience-tag";
-    let jwt      = keys.sign_jwt("alice@example.com", aud, 3600);
+    let aud = "test-audience-tag";
+    let jwt = keys.sign_jwt("alice@example.com", aud, 3600);
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -180,9 +184,9 @@ async fn cf_valid_jwt_sets_session_cookie() {
 /// request continues to normal (unauthenticated) flow.
 #[tokio::test]
 async fn cf_missing_header_no_cookie() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "test-audience-tag";
+    let aud = "test-audience-tag";
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -193,19 +197,22 @@ async fn cf_missing_header_no_cookie() {
 
     let res = app.oneshot(req).await.unwrap();
     // No CF header → redirect to error (not authed)
-    assert!(!has_session_cookie(&res), "must not set session cookie without CF header");
+    assert!(
+        !has_session_cookie(&res),
+        "must not set session cookie without CF header"
+    );
 }
 
 /// A CF JWT with a bad signature → rejected, redirected to auth error.
 #[tokio::test]
 async fn cf_tampered_jwt_rejected() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "test-audience-tag";
+    let aud = "test-audience-tag";
 
     // Sign with a *different* key so the signature won't verify
     let other_keys = TestKeys::generate();
-    let bad_jwt    = other_keys.sign_jwt("evil@example.com", aud, 3600);
+    let bad_jwt = other_keys.sign_jwt("evil@example.com", aud, 3600);
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -216,10 +223,16 @@ async fn cf_tampered_jwt_rejected() {
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
-    assert!(!has_session_cookie(&res), "tampered JWT must not set session cookie");
+    assert!(
+        !has_session_cookie(&res),
+        "tampered JWT must not set session cookie"
+    );
     assert_eq!(res.status(), StatusCode::FOUND);
     assert!(
-        redirect_location(&res).as_deref().unwrap_or("").contains("auth_error"),
+        redirect_location(&res)
+            .as_deref()
+            .unwrap_or("")
+            .contains("auth_error"),
         "expected auth_error redirect"
     );
 }
@@ -227,10 +240,10 @@ async fn cf_tampered_jwt_rejected() {
 /// An expired CF JWT → rejected.
 #[tokio::test]
 async fn cf_expired_jwt_rejected() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "test-audience-tag";
-    let jwt      = keys.sign_jwt("alice@example.com", aud, -3600); // expired an hour ago
+    let aud = "test-audience-tag";
+    let jwt = keys.sign_jwt("alice@example.com", aud, -3600); // expired an hour ago
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -241,9 +254,15 @@ async fn cf_expired_jwt_rejected() {
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
-    assert!(!has_session_cookie(&res), "expired JWT must not set session cookie");
     assert!(
-        redirect_location(&res).as_deref().unwrap_or("").contains("auth_error"),
+        !has_session_cookie(&res),
+        "expired JWT must not set session cookie"
+    );
+    assert!(
+        redirect_location(&res)
+            .as_deref()
+            .unwrap_or("")
+            .contains("auth_error"),
         "expected auth_error redirect"
     );
 }
@@ -251,10 +270,10 @@ async fn cf_expired_jwt_rejected() {
 /// Wrong audience in JWT → rejected.
 #[tokio::test]
 async fn cf_wrong_audience_rejected() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "correct-audience";
-    let jwt      = keys.sign_jwt("alice@example.com", "wrong-audience", 3600);
+    let aud = "correct-audience";
+    let jwt = keys.sign_jwt("alice@example.com", "wrong-audience", 3600);
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -265,9 +284,15 @@ async fn cf_wrong_audience_rejected() {
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
-    assert!(!has_session_cookie(&res), "wrong audience must not set session cookie");
     assert!(
-        redirect_location(&res).as_deref().unwrap_or("").contains("auth_error"),
+        !has_session_cookie(&res),
+        "wrong audience must not set session cookie"
+    );
+    assert!(
+        redirect_location(&res)
+            .as_deref()
+            .unwrap_or("")
+            .contains("auth_error"),
         "expected auth_error redirect"
     );
 }
@@ -280,7 +305,7 @@ async fn cf_disabled_when_no_aud_configured() {
     let keys = TestKeys::generate();
     // Point at a real certs URL but aud is empty → CF path should not activate
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let jwt      = keys.sign_jwt("alice@example.com", "any-aud", 3600);
+    let jwt = keys.sign_jwt("alice@example.com", "any-aud", 3600);
 
     let (app, _r, _s) = make_app(None, Some(&base_url)).await;
 
@@ -291,16 +316,19 @@ async fn cf_disabled_when_no_aud_configured() {
         .unwrap();
 
     let res = app.oneshot(req).await.unwrap();
-    assert!(!has_session_cookie(&res), "CF path must not activate when aud is not configured");
+    assert!(
+        !has_session_cookie(&res),
+        "CF path must not activate when aud is not configured"
+    );
 }
 
 /// After CF auth succeeds, /api/me returns the user's data.
 #[tokio::test]
 async fn cf_valid_jwt_user_visible_in_api_me() {
-    let keys     = TestKeys::generate();
+    let keys = TestKeys::generate();
     let base_url = spawn_jwks_server(keys.jwks()).await;
-    let aud      = "test-audience-tag";
-    let jwt      = keys.sign_jwt("alice@example.com", aud, 3600);
+    let aud = "test-audience-tag";
+    let jwt = keys.sign_jwt("alice@example.com", aud, 3600);
 
     let (app, _r, _s) = make_app(Some(aud), Some(&base_url)).await;
 
@@ -320,7 +348,11 @@ async fn cf_valid_jwt_user_visible_in_api_me() {
         .iter()
         .find_map(|v| {
             let s = v.to_str().ok()?;
-            if s.starts_with("rb_session=") { Some(s.split(';').next()?.to_string()) } else { None }
+            if s.starts_with("rb_session=") {
+                Some(s.split(';').next()?.to_string())
+            } else {
+                None
+            }
         })
         .expect("no session cookie");
 
@@ -332,7 +364,9 @@ async fn cf_valid_jwt_user_visible_in_api_me() {
         .unwrap();
     let me_res = app.oneshot(me_req).await.unwrap();
     assert_eq!(me_res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(me_res.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(me_res.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let user: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(user["email"], "alice@example.com");
 }

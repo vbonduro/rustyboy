@@ -10,10 +10,7 @@ use common::assert_mooneye_passed;
 
 #[test]
 fn test_mooneye_oam_dma_basic() {
-    assert_mooneye_passed(
-        "roms/mooneye/acceptance/oam_dma/basic.gb",
-        "oam_dma/basic",
-    );
+    assert_mooneye_passed("roms/mooneye/acceptance/oam_dma/basic.gb", "oam_dma/basic");
 }
 
 #[test]

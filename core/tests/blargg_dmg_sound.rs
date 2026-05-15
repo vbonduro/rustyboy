@@ -35,10 +35,7 @@ fn test_dmg_sound_03_trigger() {
 
 #[test]
 fn test_dmg_sound_04_sweep() {
-    assert_blargg_mem_passed(
-        "roms/blargg/dmg_sound/individual/04-sweep.gb",
-        "04-sweep",
-    );
+    assert_blargg_mem_passed("roms/blargg/dmg_sound/individual/04-sweep.gb", "04-sweep");
 }
 
 #[test]

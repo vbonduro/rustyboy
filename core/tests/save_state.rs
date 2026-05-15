@@ -54,7 +54,8 @@ fn test_save_state_roundtrip_basic() {
 
     // Restore into a fresh emulator from the same ROM
     let mut gb2 = make_emulator(rom);
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
     let regs_after = gb2.registers();
     assert_eq!(regs_before.a, regs_after.a, "register A mismatch");
@@ -85,9 +86,14 @@ fn test_save_state_pc_preserved() {
     let state = gb.save_state();
 
     let mut gb2 = make_emulator(rom);
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
-    assert_eq!(pc_before, gb2.registers().pc, "PC not preserved across save/load");
+    assert_eq!(
+        pc_before,
+        gb2.registers().pc,
+        "PC not preserved across save/load"
+    );
 }
 
 // ── WRAM preserved ───────────────────────────────────────────────────────────
@@ -101,19 +107,28 @@ fn test_save_state_wram_preserved() {
     // WRAM occupies bytes [164..164+0x2000] in the blob.
     let mut state = gb.save_state();
     let wram_offset: usize = 177;
-    let pattern: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67,
-                              0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x20, 0x30, 0x40];
+    let pattern: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x10, 0x20, 0x30,
+        0x40,
+    ];
     state[wram_offset..wram_offset + 16].copy_from_slice(&pattern);
 
     // Load the patched state into a fresh emulator
     let mut gb2 = make_emulator(rom);
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
     // Read back WRAM via the memory bus (0xC000 maps to WRAM base)
     for (i, &expected) in pattern.iter().enumerate() {
         let addr = 0xC000u16 + i as u16;
-        let actual = gb2.read_memory(addr).unwrap_or_else(|_| panic!("read_memory failed at {:#06x}", addr));
-        assert_eq!(actual, expected, "WRAM byte at {:#06x} mismatch: got {:#04x}, want {:#04x}", addr, actual, expected);
+        let actual = gb2
+            .read_memory(addr)
+            .unwrap_or_else(|_| panic!("read_memory failed at {:#06x}", addr));
+        assert_eq!(
+            actual, expected,
+            "WRAM byte at {:#06x} mismatch: got {:#04x}, want {:#04x}",
+            addr, actual, expected
+        );
     }
 }
 
@@ -127,7 +142,10 @@ fn test_save_state_invalid_magic() {
     garbage[2] = b'X';
     garbage[3] = b'X';
 
-    assert!(SaveState::from_blob(garbage).is_err(), "expected Err for invalid magic, got Ok");
+    assert!(
+        SaveState::from_blob(garbage).is_err(),
+        "expected Err for invalid magic, got Ok"
+    );
 }
 
 // ── Too short ─────────────────────────────────────────────────────────────────
@@ -135,7 +153,10 @@ fn test_save_state_invalid_magic() {
 #[test]
 fn test_save_state_too_short() {
     let short_blob = vec![0u8; 10];
-    assert!(SaveState::from_blob(short_blob).is_err(), "expected Err for too-short blob, got Ok");
+    assert!(
+        SaveState::from_blob(short_blob).is_err(),
+        "expected Err for too-short blob, got Ok"
+    );
 }
 
 // ── MBC bank state preserved ──────────────────────────────────────────────────
@@ -173,7 +194,11 @@ fn test_save_state_mbc1_bank_preserved() {
 
     // Bank 7 should now be mapped
     assert_eq!(gb.current_rom_bank(), 7, "bank 7 should be active");
-    assert_eq!(gb.read_memory(0x4000).unwrap(), 0xAB, "sentinel should be readable in bank 7");
+    assert_eq!(
+        gb.read_memory(0x4000).unwrap(),
+        0xAB,
+        "sentinel should be readable in bank 7"
+    );
 
     let state = gb.save_state();
 
@@ -181,11 +206,20 @@ fn test_save_state_mbc1_bank_preserved() {
     let mut gb2 = make_emulator(rom);
     assert_eq!(gb2.current_rom_bank(), 1, "fresh emulator starts at bank 1");
 
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
     // After restoring, bank 7 should be remapped
-    assert_eq!(gb2.current_rom_bank(), 7, "MBC bank not restored across save/load");
-    assert_eq!(gb2.read_memory(0x4000).unwrap(), 0xAB, "sentinel should be readable after load_state");
+    assert_eq!(
+        gb2.current_rom_bank(),
+        7,
+        "MBC bank not restored across save/load"
+    );
+    assert_eq!(
+        gb2.read_memory(0x4000).unwrap(),
+        0xAB,
+        "sentinel should be readable after load_state"
+    );
 }
 
 // ── MBC1 cart RAM preserved across save/load ─────────────────────────────────
@@ -219,8 +253,10 @@ fn test_save_state_mbc1_cart_ram_preserved() {
     }
 
     // Write a known pattern into cart RAM via set_external_ram
-    let pattern: [u8; 16] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-                              0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00];
+    let pattern: [u8; 16] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x00,
+    ];
     let mut ram = vec![0u8; 0x2000];
     ram[..16].copy_from_slice(&pattern);
     gb.set_external_ram(&ram);
@@ -235,13 +271,16 @@ fn test_save_state_mbc1_cart_ram_preserved() {
 
     // Fresh emulator — cart RAM is zeroed
     let mut gb2 = make_emulator(rom);
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
     // Cart RAM must survive the round-trip
     for (i, &expected) in pattern.iter().enumerate() {
         let actual = gb2.read_memory(0xA000 + i as u16).unwrap();
-        assert_eq!(actual, expected,
-            "cart RAM byte {i} lost across save/load: got {actual:#04x}, want {expected:#04x}");
+        assert_eq!(
+            actual, expected,
+            "cart RAM byte {i} lost across save/load: got {actual:#04x}, want {expected:#04x}"
+        );
     }
 }
 
@@ -265,14 +304,25 @@ fn test_save_state_struct_inspect_then_apply() {
 
     // Inspect fields before touching any emulator state
     assert_eq!(state.cpu.pc, pc_before, "SaveState pc field mismatch");
-    assert_eq!(state.cpu.cycle_counter, cycles_before, "SaveState cycle_counter field mismatch");
+    assert_eq!(
+        state.cpu.cycle_counter, cycles_before,
+        "SaveState cycle_counter field mismatch"
+    );
 
     // Apply into a fresh emulator and verify
     let mut gb2 = make_emulator(rom);
     gb2.load_state(state).expect("load_state failed");
 
-    assert_eq!(gb2.registers().pc, pc_before, "PC not preserved after apply");
-    assert_eq!(gb2.cycle_counter(), cycles_before, "cycle_counter not preserved after apply");
+    assert_eq!(
+        gb2.registers().pc,
+        pc_before,
+        "PC not preserved after apply"
+    );
+    assert_eq!(
+        gb2.cycle_counter(),
+        cycles_before,
+        "cycle_counter not preserved after apply"
+    );
 }
 
 // ── SaveState: from_blob rejects invalid input ────────────────────────────────
@@ -303,12 +353,20 @@ fn test_save_state_roundtrip_preserves_cycle_counter() {
     }
 
     let cycles_before = gb.cycle_counter();
-    assert!(cycles_before > 0, "cycle_counter should be non-zero after ticking");
+    assert!(
+        cycles_before > 0,
+        "cycle_counter should be non-zero after ticking"
+    );
 
     let state = gb.save_state();
 
     let mut gb2 = make_emulator(rom);
-    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed")).expect("load_state failed");
+    gb2.load_state(SaveState::from_blob(state).expect("from_blob failed"))
+        .expect("load_state failed");
 
-    assert_eq!(cycles_before, gb2.cycle_counter(), "cycle_counter not preserved across save/load");
+    assert_eq!(
+        cycles_before,
+        gb2.cycle_counter(),
+        "cycle_counter not preserved across save/load"
+    );
 }

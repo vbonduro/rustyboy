@@ -10,19 +10,13 @@ use common::assert_blargg_passed;
 #[test]
 #[ignore] // Requires PPU implementation
 fn test_oam_bug_01_lcd_sync() {
-    assert_blargg_passed(
-        "roms/blargg/oam_bug/individual/1-lcd_sync.gb",
-        "1-lcd_sync",
-    );
+    assert_blargg_passed("roms/blargg/oam_bug/individual/1-lcd_sync.gb", "1-lcd_sync");
 }
 
 #[test]
 #[ignore] // Requires PPU implementation
 fn test_oam_bug_02_causes() {
-    assert_blargg_passed(
-        "roms/blargg/oam_bug/individual/2-causes.gb",
-        "2-causes",
-    );
+    assert_blargg_passed("roms/blargg/oam_bug/individual/2-causes.gb", "2-causes");
 }
 
 #[test]

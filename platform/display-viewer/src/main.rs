@@ -5,10 +5,7 @@
 //!   cargo run -p display-viewer -- splash --last  # final splash frame only → /tmp/splash_final.png
 //!   cargo run -p display-viewer -- frame          # test GB framebuffer → /tmp/frame.png
 
-use rustyboy_pico2w::display::{
-    fb::FbDisplay,
-    Display, SCREEN_H, SCREEN_W,
-};
+use rustyboy_pico2w::display::{fb::FbDisplay, Display, SCREEN_H, SCREEN_W};
 
 fn make_display() -> Display<FbDisplay> {
     Display::from_draw_target(FbDisplay::new(SCREEN_W as u32, SCREEN_H as u32))
@@ -55,7 +52,8 @@ fn cmd_frame() {
     }
 
     disp.render_frame(&fb);
-    disp.save_png("/tmp/frame.png").expect("failed to write PNG");
+    disp.save_png("/tmp/frame.png")
+        .expect("failed to write PNG");
     println!("wrote /tmp/frame.png");
 }
 

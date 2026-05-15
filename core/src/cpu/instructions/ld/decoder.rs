@@ -1,7 +1,7 @@
-use alloc::boxed::Box;
 use crate::cpu::instructions::decoder::{Decoder, Error};
 use crate::cpu::instructions::opcode::OpCode;
 use crate::cpu::instructions::operand::*;
+use alloc::boxed::Box;
 
 use super::opcode::Ld8;
 
