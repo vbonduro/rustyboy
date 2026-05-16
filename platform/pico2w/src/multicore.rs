@@ -198,6 +198,8 @@ impl SharedWorkerState {
             return;
         };
         let framebuffer = worker.framebuffer();
+        // Safety: called only from core 1; target_slot is neither the currently
+        // published slot nor marked busy, so core 0 cannot be reading it.
         unsafe {
             scale_to_rgb565(framebuffer, &mut *self.scaled_frame_slots[target_slot].as_mut_ptr());
         }
@@ -207,6 +209,8 @@ impl SharedWorkerState {
 
     fn clear_published_frames(&self) {
         for slot in &self.scaled_frame_slots {
+            // Safety: called during reset before core 1 is re-spawned, so no
+            // concurrent access to any slot is possible.
             unsafe {
                 (*slot.as_mut_ptr()).fill(0);
             }
@@ -302,8 +306,15 @@ impl Core1Transport {
         let shared = &SHARED_WORKER_STATE;
         let command_tx = &COMMAND_QUEUE;
         let audio_rx = &AUDIO_QUEUE;
+        // Safety: CORE1_STACK is a static mut accessed exactly once here during
+        // init, before spawn_core1 transfers ownership to the core 1 thread.
         let core1_stack = unsafe { &mut *addr_of_mut!(CORE1_STACK) };
+        // Safety: CORE1_WORKER is MaybeUninit; init_in_place writes it exactly
+        // once here before core 1 starts, so there is no concurrent access.
         let worker = unsafe { GameBoyWorker::init_in_place(CORE1_WORKER.as_mut_ptr()) };
+        // Safety: CORE1_AUDIO_SCRATCH_BUF is a static MaybeUninit<i16> array;
+        // from_raw_parts takes ownership of it as a Vec backing buffer.
+        // Initialized once before core 1 starts, so no concurrent access.
         let audio_scratch = unsafe {
             CORE1_AUDIO_SCRATCH.init(Vec::from_raw_parts(
                 addr_of_mut!(CORE1_AUDIO_SCRATCH_BUF) as *mut i16,
@@ -312,7 +323,8 @@ impl Core1Transport {
             ))
         };
 
-        // Paint the bottom guard zone of core1's stack before the thread starts.
+        // Safety: writing to the bottom 256 bytes of core 1's stack before the
+        // thread starts; no concurrent access to this memory region yet.
         unsafe {
             stack_probe::paint_region(
                 core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8,
@@ -477,6 +489,10 @@ impl Core1Transport {
         let slot = self.shared.published_frame.load(Ordering::Acquire) as usize;
         self.shared.scaled_frame_busy[slot].store(true, Ordering::Release);
         self.held_frame_slot = slot as u8;
+        // Safety: slot was loaded with Acquire from published_frame and then
+        // marked busy with Release; core 1 only writes to slots that are
+        // neither published nor busy, so exclusive read access is guaranteed
+        // until release_scaled_frame clears the busy flag.
         unsafe { &*self.shared.scaled_frame_slots[slot].as_ptr() }
     }
 
@@ -789,6 +805,8 @@ fn run_core1_worker(
     let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
 
     loop {
+        // Safety: core1_stack_bottom points to the bottom of this thread's own
+        // stack; reading the guard region to detect overflow is safe from core 1.
         unsafe { stack_probe::check_region(core1_stack_bottom, 256, "core1") };
 
         let Some(command) = command_rx.dequeue() else {
