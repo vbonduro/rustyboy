@@ -3,6 +3,7 @@
 extern crate alloc;
 
 // Capture the stacked exception frame so we can log the exact faulting PC.
+use alloc::{boxed::Box, vec::Vec};
 use core::future::Future;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -37,25 +38,35 @@ use embedded_sdmmc::{SdCard, VolumeManager};
 use {defmt_rtt as _, panic_probe as _};
 
 use rustyboy_core::cpu::peripheral::joypad::Button;
-use rustyboy_core::GameBoy;
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
-use rustyboy_pico2w::display::scale_to_rgb565;
 use rustyboy_pico2w::flash_rom::{
     new_onboard_flash, probe_staged_rom, stage_rom_from_reader,
 };
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
+use rustyboy_pico2w::multicore::PicoGameBoy;
 use rustyboy_pico2w::sd::{DummyClock, SdRomReader};
 use rustyboy_pico2w::stack_probe;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
-#[cfg(feature = "oc-266")]
+#[cfg(feature = "oc-300")]
+const TARGET_SYS_HZ: u32 = 300_000_000;
+#[cfg(all(not(feature = "oc-300"), feature = "oc-280"))]
+const TARGET_SYS_HZ: u32 = 280_000_000;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), feature = "oc-266"))]
 const TARGET_SYS_HZ: u32 = 266_000_000;
-#[cfg(not(feature = "oc-266"))]
-const TARGET_SYS_HZ: u32 = 250_000_000;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), not(feature = "oc-266")))]
+const TARGET_SYS_HZ: u32 = 300_000_000;
 
+#[cfg(feature = "oc-300")]
 const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
-    embassy_rp::clocks::CoreVoltage::V1_20;
+    embassy_rp::clocks::CoreVoltage::V1_30;
+#[cfg(feature = "oc-280")]
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_25;
+#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280")))]
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
+    embassy_rp::clocks::CoreVoltage::V1_30;
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CYCLES_PER_FRAME: u64 = 70_224;
@@ -92,20 +103,10 @@ fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 async fn main(_spawner: Spawner) {
     {
         use core::mem::MaybeUninit;
-        // Reserve less heap so the main task and splash path have real stack
-        // headroom instead of growing down into HEAP_MEM.
-        const HEAP_SIZE: usize = 192 * 1024;
+        const HEAP_SIZE: usize = 96 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
-
-    // Allocate the pre-scaled display frame buffer from the heap so it does not
-    // live in .bss and eat into the stack guard region.
-    let frame_buf: &'static mut [u16; 51840] = {
-        let layout = core::alloc::Layout::new::<[u16; 51840]>();
-        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) } as *mut [u16; 51840];
-        unsafe { alloc::boxed::Box::leak(alloc::boxed::Box::from_raw(ptr)) }
-    };
 
     let p = {
         use embassy_rp::clocks::ClockConfig;
@@ -199,12 +200,10 @@ async fn main(_spawner: Spawner) {
         }
     };
 
-    info!("building GameBoy");
-    let mut cpu = GameBoy::with_cartridge(alloc::boxed::Box::new(cart));
-    info!("ROM loaded, starting peripheral init");
-
     // I2S audio: GP14=BCLK  GP15=LRCLK  GP16=DIN  GP17=SD_MODE (MAX98357A).
     // Drive SD_MODE high to enable the amplifier.
+    // Must initialise before with_cartridge; the PIO clock-divider computation
+    // reads clk_sys_freq(), which gets corrupted inside with_transport().
     let _sd_mode = Output::new(p.PIN_17, Level::High);
     let Pio {
         mut common, sm0, ..
@@ -224,9 +223,9 @@ async fn main(_spawner: Spawner) {
     );
     i2s.start();
 
-    stack_probe::paint();
-
     // Re-initialise SPI1 as async for DMA-driven display transfers.
+    // Must initialise before with_cartridge; SPI clock-divider computation
+    // reads clk_peri_freq(), which gets corrupted inside with_transport().
     // SAFETY: hw_disp was dropped above, SPI1 and all display pins are free.
     let mut game_disp = unsafe {
         GameDisplay::new_after_splash(
@@ -240,9 +239,19 @@ async fn main(_spawner: Spawner) {
     // Draw the static letterbox bars that the game loop never repaints.
     game_disp.draw_letterbox_bars().await;
 
+    info!("building GameBoy, clk={}", embassy_rp::clocks::clk_sys_freq());
+    let mut cpu = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
+    info!("ROM loaded, starting peripheral init");
+
+    stack_probe::paint();
+
     info!("entering game loop");
 
+    #[cfg(feature = "perf")]
+    perf::init_dwt();
+
     let mut audio_buffers = AudioBuffers::new();
+    let mut audio_samples = Vec::with_capacity(2048);
     let mut prev_state = ButtonState::default();
 
     #[cfg(feature = "fps")]
@@ -251,8 +260,12 @@ async fn main(_spawner: Spawner) {
     loop {
         stack_probe::check_current_sp("game loop");
 
-        // Pre-scale current frame into the buffer (~0.5 ms).
-        scale_to_rgb565(cpu.front_buffer(), frame_buf);
+        // Grab the latest published RGB565 frame from core 1.
+        #[cfg(feature = "perf")]
+        let scale_start = perf::perf_cycle_read();
+        let frame_buf = cpu.published_scaled_frame();
+        #[cfg(feature = "perf")]
+        tracker.record_scale(perf::perf_cycle_read().wrapping_sub(scale_start));
 
         // Poll once to arm the DMA in hardware before we start emulating.
         // The future remains pending while the transfer runs in the background.
@@ -266,10 +279,14 @@ async fn main(_spawner: Spawner) {
 
         // Run exactly one Game Boy frame (~16.74 ms).
         // Both DMAs run while the CPU emulates — display finishes at ~13 ms.
+        #[cfg(feature = "perf")]
+        let emulate_start = perf::perf_cycle_read();
         let frame_start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
             cpu.tick();
         }
+        #[cfg(feature = "perf")]
+        tracker.record_emulate(perf::perf_cycle_read().wrapping_sub(emulate_start));
 
         // Propagate button changes to the CPU.
         let (state, menu) = input.poll();
@@ -287,14 +304,23 @@ async fn main(_spawner: Spawner) {
         }
 
         // Fill audio back-buffer from APU output.
-        let samples = cpu.drain_audio_samples();
-        audio_buffers.queue_next_frame(&samples, back_buf);
+        cpu.drain_audio_samples_into_i16(&mut audio_samples);
+        audio_buffers.queue_next_frame_i16(&audio_samples, back_buf);
 
         // Await display DMA — should already be done (~13 ms < ~16.7 ms emulation).
+        #[cfg(feature = "perf")]
+        let render_start = perf::perf_cycle_read();
         disp_future.as_mut().await;
+        cpu.release_scaled_frame();
+        #[cfg(feature = "perf")]
+        tracker.record_render(perf::perf_cycle_read().wrapping_sub(render_start));
 
         // Await audio DMA — paces the loop to ~59.7 fps.
+        #[cfg(feature = "perf")]
+        let audio_wait_start = perf::perf_cycle_read();
         audio_future.as_mut().await;
+        #[cfg(feature = "perf")]
+        tracker.record_audio_wait(perf::perf_cycle_read().wrapping_sub(audio_wait_start));
 
         watchdog.feed(Duration::from_millis(5_000));
 
