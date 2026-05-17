@@ -1,6 +1,5 @@
 use defmt::info;
 use embassy_time::Instant;
-use rustyboy_core::GameBoy;
 
 pub struct PerfTracker {
     frame_count: u32,
@@ -15,7 +14,7 @@ impl PerfTracker {
         }
     }
 
-    pub fn tick(&mut self, _cpu: &mut GameBoy) {
+    pub fn tick(&mut self) {
         self.frame_count += 1;
         if self.frame_count < 60 {
             return;
