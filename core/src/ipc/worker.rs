@@ -33,7 +33,9 @@ impl GameBoyWorker {
     pub unsafe fn init_in_place(dst: *mut Self) -> &'static mut Self {
         unsafe {
             ptr::addr_of_mut!((*dst).apu).write(ApuPeripheral::new());
-            ptr::addr_of_mut!((*dst).ppu).write(PpuWorkerState::new());
+            // Use init_in_place to avoid a ~31 KiB PpuWorkerState stack temporary
+            // that would overflow the Core 0 stack (only ~15 KiB available).
+            PpuWorkerState::init_in_place(ptr::addr_of_mut!((*dst).ppu));
             ptr::addr_of_mut!((*dst).output).write(WorkerOutput::default());
             let result = &mut *dst;
             result.output.apu_nr52 = result.apu.read_register(NR52_ADDR);
@@ -182,6 +184,20 @@ impl PpuWorkerState {
             io: [0; 0x80],
             vram: [0; 0x2000],
             oam: [0; 0xA0],
+        }
+    }
+
+    /// Write a zero-initialized `PpuWorkerState` directly at `dst`, avoiding the
+    /// ~31 KiB stack temporary that `new()` would create.
+    /// SAFETY: `dst` must be valid for `size_of::<PpuWorkerState>()` bytes and
+    /// must not alias any live reference.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    unsafe fn init_in_place(dst: *mut Self) {
+        unsafe {
+            PpuPeripheral::init_in_place(core::ptr::addr_of_mut!((*dst).ppu));
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).io) as *mut u8, 0, 0x80);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).vram) as *mut u8, 0, 0x2000);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).oam) as *mut u8, 0, 0xA0);
         }
     }
 

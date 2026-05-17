@@ -156,6 +156,41 @@ impl GameBoyMemory {
         }
     }
 
+    /// Construct a boxed `GameBoyMemory` without creating a large stack temporary.
+    ///
+    /// `Box::new(GameBoyMemory::with_cartridge(cart))` materialises a ~17 KiB struct
+    /// on the call-stack before moving it to the heap; on embedded targets with small
+    /// stacks (e.g. Pico 2W Core 0 at ~15 KiB) that overflows.  This function
+    /// allocates the heap slot first and writes each field into it in-place.
+    ///
+    /// SAFETY: every field is written before `assume_init` is called.
+    pub fn with_cartridge_boxed(cart: Box<dyn Cartridge>) -> Box<Self> {
+        let cartridge_has_rtc = cart.has_rtc();
+        let (cartridge_has_rom_windows, rom_windows) = match cart.rom_windows() {
+            Some(w) => (true, w),
+            None => (false, CartridgeRomWindows::EMPTY),
+        };
+        let mut b = Box::<Self>::new_uninit();
+        let p = b.as_mut_ptr();
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge), cart);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge_has_rtc), cartridge_has_rtc);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge_has_rom_windows), cartridge_has_rom_windows);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_fixed_ptr), rom_windows.fixed_ptr);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_fixed_len), rom_windows.fixed_len);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_banked_ptr), rom_windows.banked_ptr);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_banked_len), rom_windows.banked_len);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).vram) as *mut u8, 0, 0x2000);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).wram) as *mut u8, 0, 0x2000);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).oam) as *mut u8, 0, 0xA0);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).io) as *mut u8, 0, 0x80);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).hram) as *mut u8, 0, 0x7F);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).ie), 0u8);
+            core::ptr::write(core::ptr::addr_of_mut!((*p).events), VecDeque::with_capacity(8));
+            b.assume_init()
+        }
+    }
+
     /// Construct memory with a cartridge ROM. The cartridge type is auto-detected
     /// from the ROM header (byte 0x0147) to select the correct MBC.
     pub fn with_rom(data: Vec<u8>) -> Self {
