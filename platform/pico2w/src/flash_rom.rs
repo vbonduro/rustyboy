@@ -88,12 +88,14 @@ pub fn stage_rom_from_reader<R: RomReader>(
 where
     R::Error: Debug,
 {
-    let mut bank0 = [0u8; ROM_BANK_BYTES];
+    // Heap-allocate the read buffer: two 16 KiB stack arrays would be inlined
+    // into main()'s async poll frame, overflowing Core 0's 15 KiB stack.
+    let mut buf = alloc::boxed::Box::new([0u8; ROM_BANK_BYTES]);
     reader
-        .read_bank(0, &mut bank0)
+        .read_bank(0, &mut *buf)
         .map_err(FlashRomStageError::Reader)?;
 
-    let rom_size_code = bank0[ROM_SIZE_CODE_OFFSET];
+    let rom_size_code = buf[ROM_SIZE_CODE_OFFSET];
     let bank_count = rom_bank_count_from_code(rom_size_code)
         .ok_or(FlashRomStageError::InvalidRomSizeCode(rom_size_code))?;
     let size_bytes = bank_count * ROM_BANK_BYTES;
@@ -111,16 +113,15 @@ where
         .map_err(FlashRomStageError::Flash)?;
 
     flash
-        .blocking_write(ROM_DATA_OFFSET as u32, &bank0)
+        .blocking_write(ROM_DATA_OFFSET as u32, &*buf)
         .map_err(FlashRomStageError::Flash)?;
 
-    let mut bank_buf = [0u8; ROM_BANK_BYTES];
     for bank in 1..bank_count {
         reader
-            .read_bank(bank, &mut bank_buf)
+            .read_bank(bank, &mut *buf)
             .map_err(FlashRomStageError::Reader)?;
         flash
-            .blocking_write((ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32, &bank_buf)
+            .blocking_write((ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32, &*buf)
             .map_err(FlashRomStageError::Flash)?;
     }
 

@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use cortex_m::asm;
 use critical_section::Mutex;
-use defmt::info;
+
 use embassy_rp::multicore::{self, Stack};
 use embassy_rp::peripherals::CORE1;
 use embassy_rp::Peri;
@@ -332,7 +332,6 @@ impl Core1Transport {
             );
         }
 
-        info!("spawning core1 worker");
         let shared_for_core1 = shared;
         multicore::spawn_core1(core1, core1_stack, move || {
             run_core1_worker(
@@ -343,8 +342,6 @@ impl Core1Transport {
                 audio_scratch,
             )
         });
-        info!("core1 worker spawned");
-
         Self {
             command_tx,
             audio_rx,
@@ -698,12 +695,10 @@ pub struct PicoGameBoy {
 
 impl PicoGameBoy {
     pub fn with_cartridge(core1: Peri<'static, CORE1>, cart: Box<dyn Cartridge>) -> Self {
-        let memory = Box::new(GameBoyMemory::with_cartridge(cart));
+        let memory = GameBoyMemory::with_cartridge_boxed(cart);
         let transport = Core1Transport::new(core1);
         let mut gb = GameBoy::with_transport(memory, transport);
-        info!("syncing worker state");
         gb.push_worker_state();
-        info!("worker state synced");
         gb = gb.with_registers(Registers {
             a: 0x01,
             f: Flags::from_bits_truncate(0xB0),
@@ -716,9 +711,7 @@ impl PicoGameBoy {
             pc: 0x0100,
             sp: 0xFFFE,
         });
-        info!("applying dmg state");
         gb.apply_dmg_state();
-        info!("dmg state applied");
         Self { gb }
     }
 
@@ -800,7 +793,6 @@ fn run_core1_worker(
     mut worker: &'static mut GameBoyWorker,
     mut audio_scratch: &'static mut Vec<i16>,
 ) -> ! {
-    info!("core1 worker loop start");
     let mut last_ppu_render_version = 0u32;
     let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
 
@@ -835,7 +827,6 @@ fn run_core1_worker(
                     worker.sync_apu_state(&snapshots.io);
                 });
                 publish_worker_state(shared, &mut worker);
-                info!("core1 sync apu {}", ticket);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
             Core1Command::SyncPpu { ticket } => {
@@ -845,7 +836,6 @@ fn run_core1_worker(
                 });
                 last_ppu_render_version = 0;
                 publish_worker_state(shared, &mut worker);
-                info!("core1 sync ppu {}", ticket);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
             Core1Command::LoadPpuState { ticket, state } => {
