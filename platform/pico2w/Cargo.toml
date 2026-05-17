@@ -21,6 +21,8 @@ oc-300 = []
 fps = []
 # Enable stack sentinel / collision detection instrumentation.
 stack-probe = []
+# Enable cycle-count performance instrumentation.
+perf = []
 
 # ---------------------------------------------------------------------------
 # Cross-platform dependencies (compile on any target, including host tests)

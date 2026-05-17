@@ -5,8 +5,6 @@
 ///
 /// ROM bank size is `usize` because it is used as an array size and multiplier,
 /// not as an address bound.
-pub(crate) const ROM_BANK_SIZE: usize = 0x4000;
-
 pub(crate) const ROM_FIXED_END: u16 = 0x3FFF;
 pub(crate) const ROM_BANKED_BASE: u16 = 0x4000;
 pub(crate) const ROM_BANKED_END: u16 = 0x7FFF;
