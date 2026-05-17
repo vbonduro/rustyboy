@@ -10,6 +10,7 @@ trace = []
 
 [dependencies]
 bitflags = "2.5.0"
+bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
 
 [dev-dependencies]
 png = "0.17"

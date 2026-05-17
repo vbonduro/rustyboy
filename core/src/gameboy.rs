@@ -120,14 +120,7 @@ impl<W: WorkerTransport> GameBoy<W> {
             joypad,
             serial: SerialPort::new(),
             dma: None,
-            front_buffer: {
-                // Box::new_zeroed() is unstable (new_zeroed_alloc); use new_uninit + write_bytes.
-                let mut b = Box::<[u8; FRAMEBUFFER_SIZE]>::new_uninit();
-                unsafe {
-                    core::ptr::write_bytes(b.as_mut_ptr() as *mut u8, 0, FRAMEBUFFER_SIZE);
-                    b.assume_init()
-                }
-            },
+            front_buffer: Box::new([0u8; FRAMEBUFFER_SIZE]),
             bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             transport,
