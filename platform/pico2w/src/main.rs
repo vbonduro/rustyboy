@@ -247,9 +247,6 @@ async fn main(_spawner: Spawner) {
 
     info!("entering game loop");
 
-    #[cfg(feature = "perf")]
-    perf::init_dwt();
-
     let mut audio_buffers = AudioBuffers::new();
     let mut audio_samples = Vec::with_capacity(2048);
     let mut prev_state = ButtonState::default();
@@ -261,11 +258,7 @@ async fn main(_spawner: Spawner) {
         stack_probe::check_current_sp("game loop");
 
         // Grab the latest published RGB565 frame from core 1.
-        #[cfg(feature = "perf")]
-        let scale_start = perf::perf_cycle_read();
         let frame_buf = cpu.published_scaled_frame();
-        #[cfg(feature = "perf")]
-        tracker.record_scale(perf::perf_cycle_read().wrapping_sub(scale_start));
 
         // Poll once to arm the DMA in hardware before we start emulating.
         // The future remains pending while the transfer runs in the background.
@@ -279,14 +272,10 @@ async fn main(_spawner: Spawner) {
 
         // Run exactly one Game Boy frame (~16.74 ms).
         // Both DMAs run while the CPU emulates — display finishes at ~13 ms.
-        #[cfg(feature = "perf")]
-        let emulate_start = perf::perf_cycle_read();
         let frame_start = cpu.cycle_counter();
         while cpu.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
             cpu.tick();
         }
-        #[cfg(feature = "perf")]
-        tracker.record_emulate(perf::perf_cycle_read().wrapping_sub(emulate_start));
 
         // Propagate button changes to the CPU.
         let (state, menu) = input.poll();
@@ -308,24 +297,16 @@ async fn main(_spawner: Spawner) {
         audio_buffers.queue_next_frame_i16(&audio_samples, back_buf);
 
         // Await display DMA — should already be done (~13 ms < ~16.7 ms emulation).
-        #[cfg(feature = "perf")]
-        let render_start = perf::perf_cycle_read();
         disp_future.as_mut().await;
         cpu.release_scaled_frame();
-        #[cfg(feature = "perf")]
-        tracker.record_render(perf::perf_cycle_read().wrapping_sub(render_start));
 
         // Await audio DMA — paces the loop to ~59.7 fps.
-        #[cfg(feature = "perf")]
-        let audio_wait_start = perf::perf_cycle_read();
         audio_future.as_mut().await;
-        #[cfg(feature = "perf")]
-        tracker.record_audio_wait(perf::perf_cycle_read().wrapping_sub(audio_wait_start));
 
         watchdog.feed(Duration::from_millis(5_000));
 
         #[cfg(feature = "fps")]
-        tracker.tick(&mut cpu);
+        tracker.tick();
     }
 }
 
