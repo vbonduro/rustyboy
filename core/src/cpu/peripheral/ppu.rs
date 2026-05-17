@@ -42,6 +42,9 @@ pub enum PpuMode {
     PixelTransfer = 3,
 }
 
+// SAFETY: HBlank = 0 is a valid discriminant; all-zero bytes produce a valid PpuMode.
+unsafe impl bytemuck::Zeroable for PpuMode {}
+
 /// Bitfield accessor for the LCDC register.
 #[derive(Clone, Copy)]
 struct Lcdc(u8);
@@ -101,13 +104,18 @@ pub struct PpuTimingOutput {
 pub struct PpuPeripheral {
     dot: u16,
     ly: u8,
-    mode: PpuMode,
+    pub(crate) mode: PpuMode,
     window_line_counter: u8,
     prev_stat_line: bool,
     framebuffer: [u8; FRAMEBUFFER_SIZE],
     /// Raw BG/window color indices (0–3) for the current scanline, used for sprite priority.
     bg_color_indices: [u8; SCREEN_WIDTH],
 }
+
+// SAFETY: Every field is a primitive, bool, or byte array — all valid when zeroed.
+// mode = 0 is HBlank, a valid PpuMode discriminant. Callers must set mode = OamScan
+// after construction if that is the intended initial state.
+unsafe impl bytemuck::Zeroable for PpuPeripheral {}
 
 impl PpuPeripheral {
     pub fn new() -> Self {
@@ -119,18 +127,6 @@ impl PpuPeripheral {
             prev_stat_line: false,
             framebuffer: [0u8; FRAMEBUFFER_SIZE],
             bg_color_indices: [0u8; SCREEN_WIDTH],
-        }
-    }
-
-    /// Write a zero-initialized `PpuPeripheral` directly at `dst`, avoiding
-    /// a ~23 KiB stack temporary that `new()` would create via the return slot.
-    /// SAFETY: `dst` must be valid for writes of `size_of::<PpuPeripheral>()` bytes
-    /// and must not alias any live reference.
-    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
-        unsafe {
-            core::ptr::write_bytes(dst as *mut u8, 0, core::mem::size_of::<Self>());
-            // OamScan = 2; the write_bytes above set mode = 0 (HBlank), fix it up.
-            core::ptr::addr_of_mut!((*dst).mode).write(PpuMode::OamScan);
         }
     }
 

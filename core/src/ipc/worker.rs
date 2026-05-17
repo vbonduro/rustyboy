@@ -3,7 +3,8 @@ use core::ptr;
 
 use crate::cpu::peripheral::apu::{ApuPeripheral, NR52_ADDR};
 use crate::cpu::peripheral::ppu::{
-    PpuPeripheral, FRAMEBUFFER_SIZE, LY_ADDR, STAT_ADDR, STAT_INTERRUPT_BIT, VBLANK_INTERRUPT_BIT,
+    PpuMode, PpuPeripheral, FRAMEBUFFER_SIZE, LY_ADDR, STAT_ADDR, STAT_INTERRUPT_BIT,
+    VBLANK_INTERRUPT_BIT,
 };
 use crate::cpu::save_state::PpuState;
 
@@ -12,7 +13,7 @@ use super::protocol::{WorkerCommand, WorkerOutput};
 
 pub struct GameBoyWorker {
     apu: ApuPeripheral,
-    ppu: PpuWorkerState,
+    ppu: alloc::boxed::Box<PpuWorkerState>,
     output: WorkerOutput,
 }
 
@@ -20,7 +21,7 @@ impl GameBoyWorker {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn new() -> Self {
         let apu = ApuPeripheral::new();
-        let mut ppu = PpuWorkerState::new();
+        let mut ppu = PpuWorkerState::new_boxed();
         let mut output = WorkerOutput::default();
         output.apu_nr52 = apu.read_register(NR52_ADDR);
         output.ppu_ly = ppu.ly();
@@ -29,20 +30,16 @@ impl GameBoyWorker {
         Self { apu, ppu, output }
     }
 
+    /// Write a `GameBoyWorker` into `dst` (a `MaybeUninit` static slot on Core 1).
+    /// `new()` is stack-safe after boxing `PpuWorkerState`; this wrapper exists only
+    /// to obtain the required `&'static mut` reference from the raw pointer.
+    /// SAFETY: `dst` must be valid for `size_of::<Self>()` bytes and must not alias
+    /// any live reference. Caller must ensure this is called exactly once.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub unsafe fn init_in_place(dst: *mut Self) -> &'static mut Self {
         unsafe {
-            ptr::addr_of_mut!((*dst).apu).write(ApuPeripheral::new());
-            // Use init_in_place to avoid a ~31 KiB PpuWorkerState stack temporary
-            // that would overflow the Core 0 stack (only ~15 KiB available).
-            PpuWorkerState::init_in_place(ptr::addr_of_mut!((*dst).ppu));
-            ptr::addr_of_mut!((*dst).output).write(WorkerOutput::default());
-            let result = &mut *dst;
-            result.output.apu_nr52 = result.apu.read_register(NR52_ADDR);
-            result.output.ppu_ly = result.ppu.ly();
-            result.output.ppu_stat = result.ppu.stat();
-            result.ppu.sync_prev_stat_line();
-            result
+            ptr::write(dst, Self::new());
+            &mut *dst
         }
     }
 
@@ -176,29 +173,18 @@ struct PpuWorkerState {
     oam: [u8; 0xA0],
 }
 
-impl PpuWorkerState {
-    #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn new() -> Self {
-        Self {
-            ppu: PpuPeripheral::new(),
-            io: [0; 0x80],
-            vram: [0; 0x2000],
-            oam: [0; 0xA0],
-        }
-    }
+// SAFETY: PpuPeripheral is Zeroable and all other fields are byte arrays.
+// The zeroed state has mode = HBlank; new_boxed() fixes it up to OamScan.
+unsafe impl bytemuck::Zeroable for PpuWorkerState {}
 
-    /// Write a zero-initialized `PpuWorkerState` directly at `dst`, avoiding the
-    /// ~31 KiB stack temporary that `new()` would create.
-    /// SAFETY: `dst` must be valid for `size_of::<PpuWorkerState>()` bytes and
-    /// must not alias any live reference.
+impl PpuWorkerState {
+    /// Heap-allocate a zero-initialized `PpuWorkerState` without a ~31 KiB stack
+    /// temporary, then fix up the PPU mode to the correct power-on state.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    unsafe fn init_in_place(dst: *mut Self) {
-        unsafe {
-            PpuPeripheral::init_in_place(core::ptr::addr_of_mut!((*dst).ppu));
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).io) as *mut u8, 0, 0x80);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).vram) as *mut u8, 0, 0x2000);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*dst).oam) as *mut u8, 0, 0xA0);
-        }
+    fn new_boxed() -> alloc::boxed::Box<Self> {
+        let mut s = bytemuck::zeroed_box::<Self>();
+        s.ppu.mode = PpuMode::OamScan;
+        s
     }
 
     fn sync_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
