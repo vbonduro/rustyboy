@@ -122,6 +122,18 @@ impl PpuPeripheral {
         }
     }
 
+    /// Write a zero-initialized `PpuPeripheral` directly at `dst`, avoiding
+    /// a ~23 KiB stack temporary that `new()` would create via the return slot.
+    /// SAFETY: `dst` must be valid for writes of `size_of::<PpuPeripheral>()` bytes
+    /// and must not alias any live reference.
+    pub(crate) unsafe fn init_in_place(dst: *mut Self) {
+        unsafe {
+            core::ptr::write_bytes(dst as *mut u8, 0, core::mem::size_of::<Self>());
+            // OamScan = 2; the write_bytes above set mode = 0 (HBlank), fix it up.
+            core::ptr::addr_of_mut!((*dst).mode).write(PpuMode::OamScan);
+        }
+    }
+
     pub fn ly(&self) -> u8 {
         self.ly
     }

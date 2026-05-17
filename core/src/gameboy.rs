@@ -120,7 +120,6 @@ impl<W: WorkerTransport> GameBoy<W> {
             joypad,
             serial: SerialPort::new(),
             dma: None,
-            // SAFETY: [u8; N] is valid for all-zero bytes.
             front_buffer: unsafe { Box::<[u8; FRAMEBUFFER_SIZE]>::new_zeroed().assume_init() },
             bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
