@@ -103,7 +103,7 @@ fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 async fn main(_spawner: Spawner) {
     {
         use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 96 * 1024;
+        const HEAP_SIZE: usize = 128 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
