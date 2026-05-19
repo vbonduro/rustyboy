@@ -410,7 +410,9 @@ mod tests {
     fn main_frame_disables_continue_without_game() {
         let menu = MainMenu::new();
         let frame = menu.frame(false);
-        assert!(!frame.enabled[0], "CONTINUE should be disabled with no ROM staged");
+        // When no game is available, CONTINUE is omitted entirely; only ROMS appears.
+        assert_eq!(frame.items, &["ROMS"]);
+        assert!(frame.enabled[0], "ROMS should be enabled with no game running");
     }
 
     #[test]
