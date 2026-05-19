@@ -29,7 +29,6 @@ use crate::stack_probe;
 const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
-const AUDIO_SCRATCH_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
 const SCALED_FRAME_SLOT_COUNT: usize = 3;
 const IO_REG_BASE: u16 = 0xFF00;
@@ -41,9 +40,6 @@ static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
 #[unsafe(link_section = ".core1_stack")]
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 static CORE1_WORKER: StaticStorage<GameBoyWorker> = StaticStorage::new();
-static CORE1_AUDIO_SCRATCH: StaticStorage<Vec<i16>> = StaticStorage::new();
-static mut CORE1_AUDIO_SCRATCH_BUF: [MaybeUninit<i16>; AUDIO_SCRATCH_CAPACITY] =
-    [MaybeUninit::uninit(); AUDIO_SCRATCH_CAPACITY];
 
 #[derive(Clone, Copy)]
 enum Core1Command {
@@ -57,6 +53,11 @@ enum Core1Command {
     LoadPpuState {
         ticket: u32,
         state: PpuState,
+    },
+    /// Drain the queue and halt core1 in a WFE loop. After the ticket is
+    /// acknowledged, core1 will never access flash again — safe to erase/write.
+    Halt {
+        ticket: u32,
     },
 }
 
@@ -312,16 +313,6 @@ impl Core1Transport {
         // Safety: CORE1_WORKER is MaybeUninit; init_in_place writes it exactly
         // once here before core 1 starts, so there is no concurrent access.
         let worker = unsafe { GameBoyWorker::init_in_place(CORE1_WORKER.as_mut_ptr()) };
-        // Safety: CORE1_AUDIO_SCRATCH_BUF is a static MaybeUninit<i16> array;
-        // from_raw_parts takes ownership of it as a Vec backing buffer.
-        // Initialized once before core 1 starts, so no concurrent access.
-        let audio_scratch = unsafe {
-            CORE1_AUDIO_SCRATCH.init(Vec::from_raw_parts(
-                addr_of_mut!(CORE1_AUDIO_SCRATCH_BUF) as *mut i16,
-                0,
-                AUDIO_SCRATCH_CAPACITY,
-            ))
-        };
 
         // Safety: writing to the bottom 256 bytes of core 1's stack before the
         // thread starts; no concurrent access to this memory region yet.
@@ -339,7 +330,6 @@ impl Core1Transport {
                 audio_rx,
                 shared_for_core1,
                 worker,
-                audio_scratch,
             )
         });
         Self {
@@ -613,8 +603,17 @@ impl WorkerTransport for Core1Transport {
     fn drain_audio_samples_into_i16(&mut self, out: &mut Vec<i16>) {
         self.flush_pending_apu();
         out.clear();
-        while let Some(sample) = self.audio_rx.dequeue() {
-            out.push(sample);
+        // Bound the drain to out.capacity() to prevent Vec growth: Core 1 may
+        // enqueue new samples concurrently, so an unbounded loop can exceed cap.
+        let cap = out.capacity();
+        let mut n = 0usize;
+        while n < cap {
+            if let Some(sample) = self.audio_rx.dequeue() {
+                out.push(sample);
+                n += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -768,6 +767,18 @@ impl PicoGameBoy {
         self.gb.transport_mut().take_transport_profile()
     }
 
+    /// Flush pending commands and halt core1 in a WFE loop.
+    ///
+    /// After this returns, core1 will never read from flash again, making it
+    /// safe to erase and reprogram the ROM staging area.
+    pub fn halt(&mut self) {
+        let transport = self.gb.transport_mut();
+        transport.flush_pending_apu();
+        transport.flush_pending_ppu();
+        let ticket = transport.issue_ticket();
+        transport.enqueue_blocking(Core1Command::Halt { ticket });
+        transport.wait_for_ticket(ticket);
+    }
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -791,7 +802,6 @@ fn run_core1_worker(
     audio_tx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
     shared: &'static SharedWorkerState,
     mut worker: &'static mut GameBoyWorker,
-    mut audio_scratch: &'static mut Vec<i16>,
 ) -> ! {
     let mut last_ppu_render_version = 0u32;
     let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
@@ -847,15 +857,20 @@ fn run_core1_worker(
                 publish_worker_state(shared, &mut worker);
                 shared.sync_complete.store(ticket, Ordering::Release);
             }
+            Core1Command::Halt { ticket } => {
+                shared.sync_complete.store(ticket, Ordering::Release);
+                loop {
+                    asm::wfe();
+                }
+            }
         }
 
-        worker.drain_audio_samples_into_i16(&mut audio_scratch);
         let mut dropped = 0u32;
-        for sample in audio_scratch.drain(..) {
+        worker.drain_audio_samples_to(|sample| {
             if audio_tx.enqueue(sample).is_err() {
                 dropped = dropped.wrapping_add(1);
             }
-        }
+        });
         if dropped != 0 {
             shared
                 .audio_queue_drops

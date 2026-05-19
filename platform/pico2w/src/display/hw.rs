@@ -17,7 +17,8 @@ use mipidsi::models::ILI9341Rgb565;
 use mipidsi::options::{ColorOrder, Orientation};
 use mipidsi::Builder;
 
-use super::{Display, ScaledFrame};
+use super::{render_loading_row, render_menu_row, Display, ScaledFrame};
+use crate::menu::MenuFrame;
 
 // Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
 // the requested frequency. 62.5 MHz is exact at 250 MHz sysclk, but at 280 MHz
@@ -218,6 +219,45 @@ impl<'d> GameDisplay<'d> {
         self.cs.set_low();
         // buf stores big-endian u16s; cast to bytes gives the correct SPI byte order.
         self.spi.write(bytemuck::cast_slice(buf)).await.ok();
+        self.cs.set_high();
+    }
+
+    /// Paint the full 240×320 screen with a ROM loading progress screen.
+    ///
+    /// Uses a 480-byte stack buffer; no heap allocation.
+    pub async fn draw_loading_progress(
+        &mut self,
+        filename: &str,
+        banks_done: u32,
+        total_banks: u32,
+    ) {
+        self.set_window(0, 0, DISPLAY_X_END, DISPLAY_Y_END).await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in 0u16..320 {
+            render_loading_row(filename, banks_done, total_banks, y, &mut row);
+            self.spi.write(&row).await.ok();
+        }
+        self.cs.set_high();
+    }
+
+    /// Paint the full 240×320 screen with a menu, row by row.
+    ///
+    /// Uses a 480-byte stack buffer; no heap allocation.
+    pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
+        self.set_window(0, 0, DISPLAY_X_END, DISPLAY_Y_END).await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in 0u16..320 {
+            render_menu_row(frame, y, &mut row);
+            self.spi.write(&row).await.ok();
+        }
         self.cs.set_high();
     }
 
