@@ -90,6 +90,12 @@ impl GameBoyWorker {
         self.apu.drain_samples_into(out);
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    pub fn drain_audio_samples_to<F: FnMut(i16)>(&mut self, f: F) {
+        self.apu.drain_samples_to(f);
+    }
+
     pub fn sync_apu_state(&mut self, io: &[u8]) {
         self.apu.sync_from_io_snapshot(io);
         self.output.apu_nr52 = self.apu.read_register(NR52_ADDR);

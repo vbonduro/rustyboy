@@ -640,11 +640,21 @@ impl ApuPeripheral {
         out
     }
 
-    /// Drain accumulated PCM samples into a caller-owned buffer so the hot
-    /// producer path can keep reusing the same allocation across frames.
+    /// Drain accumulated PCM samples into a caller-owned buffer.
     pub fn drain_samples_into(&mut self, out: &mut alloc::vec::Vec<i16>) {
         out.clear();
         core::mem::swap(out, &mut self.sample_buffer);
+    }
+
+    /// Drain accumulated PCM samples through a callback, bypassing any
+    /// intermediate buffer. Clears the internal buffer when done.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    pub fn drain_samples_to<F: FnMut(i16)>(&mut self, mut f: F) {
+        for &sample in &self.sample_buffer {
+            f(sample);
+        }
+        self.sample_buffer.clear();
     }
 
     pub fn clear_samples(&mut self) {
@@ -846,18 +856,24 @@ impl ApuPeripheral {
         let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
         if cycles <= 4 {
             self.sample_acc += sample_inc;
-            if self.sample_acc >= SAMPLE_PERIOD_NUM {
+            if self.sample_acc >= SAMPLE_PERIOD_NUM
+                && self.sample_buffer.len() + 2 <= self.sample_buffer.capacity()
+            {
                 self.sample_acc -= SAMPLE_PERIOD_NUM;
                 let (left, right) = self.mix_sample();
                 self.sample_buffer.push(left);
                 self.sample_buffer.push(right);
+            } else if self.sample_acc >= SAMPLE_PERIOD_NUM {
+                self.sample_acc -= SAMPLE_PERIOD_NUM;
             }
         } else {
             let acc = self.sample_acc as u64 + sample_inc as u64;
             let n_samples = acc / SAMPLE_PERIOD_NUM as u64;
             self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
             if n_samples != 0 {
-                for _ in 0..n_samples {
+                let cap = self.sample_buffer.capacity();
+                let pushable = ((cap - self.sample_buffer.len()) / 2).min(n_samples as usize);
+                for _ in 0..pushable {
                     let (left, right) = self.mix_sample();
                     self.sample_buffer.push(left);
                     self.sample_buffer.push(right);

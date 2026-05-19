@@ -16,7 +16,17 @@ pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSE
 const ROM_BANK_BYTES: usize = 0x4000;
 const HEADER_MAGIC: [u8; 8] = *b"RBROM1\0\0";
 const HEADER_VERSION: u32 = 1;
-const HEADER_LEN: usize = 32;
+// Layout:
+//   [0..8]   magic
+//   [8..12]  version
+//   [12..16] size_bytes
+//   [16..20] size_bytes_inv
+//   [20..24] bank_count
+//   [24..32] reserved (0xFF padding)
+//   [32..96] filename (null-terminated UTF-8, max 63 chars + null)
+const HEADER_LEN: usize = 96;
+const FILENAME_OFFSET: usize = 32;
+const FILENAME_MAX_BYTES: usize = 63; // + 1 null terminator
 const ROM_SIZE_CODE_OFFSET: usize = 0x0148;
 
 pub type OnboardFlash<'d> = Flash<'d, FLASH, Blocking, FLASH_CAPACITY_BYTES>;
@@ -76,66 +86,129 @@ pub fn new_onboard_flash<'d>(flash: Peri<'d, FLASH>) -> OnboardFlash<'d> {
     Flash::new_blocking(flash)
 }
 
-pub fn probe_staged_rom(flash: &mut OnboardFlash<'_>) -> Option<FlashRomInfo> {
+/// Check for a valid staged ROM header.
+///
+/// Returns `(FlashRomInfo, staged_filename)` if valid. The filename is `None`
+/// when the header was written by an older firmware version that did not
+/// include the filename field.
+pub fn probe_staged_rom(
+    flash: &mut OnboardFlash<'_>,
+) -> Option<(FlashRomInfo, Option<heapless::String<64>>)> {
     let header = read_header(flash).ok()?;
     parse_header(&header)
 }
 
-pub fn stage_rom_from_reader<R: RomReader>(
-    flash: &mut OnboardFlash<'_>,
-    reader: &mut R,
-) -> Result<FlashRomInfo, FlashRomStageError<R::Error>>
-where
-    R::Error: Debug,
-{
-    // Heap-allocate the read buffer: two 16 KiB stack arrays would be inlined
-    // into main()'s async poll frame, overflowing Core 0's 15 KiB stack.
-    let mut buf = alloc::boxed::Box::new([0u8; ROM_BANK_BYTES]);
-    reader
-        .read_bank(0, &mut *buf)
-        .map_err(FlashRomStageError::Reader)?;
+// ---------------------------------------------------------------------------
+// RomStager — step-by-step staging for async progress updates
+// ---------------------------------------------------------------------------
 
-    let rom_size_code = buf[ROM_SIZE_CODE_OFFSET];
-    let bank_count = rom_bank_count_from_code(rom_size_code)
-        .ok_or(FlashRomStageError::InvalidRomSizeCode(rom_size_code))?;
-    let size_bytes = bank_count * ROM_BANK_BYTES;
+/// Stateful ROM stager that allows the caller to interleave progress draws
+/// between bank writes.
+///
+/// Usage:
+/// 1. Call `begin` — reads bank 0, parses bank count, erases flash.
+/// 2. Loop: call `write_next_bank` until it returns `Ok(true)`.
+/// 3. Call `finish` to write the metadata header.
+pub struct RomStager {
+    bank_count: usize,
+    banks_written: usize,
+    buf: alloc::boxed::Box<[u8; ROM_BANK_BYTES]>,
+}
 
-    if size_bytes > ROM_DATA_CAPACITY_BYTES {
-        return Err(FlashRomStageError::TooLarge {
-            bytes: size_bytes,
-            capacity: ROM_DATA_CAPACITY_BYTES,
-        });
+impl RomStager {
+    /// Start staging: read bank 0, determine bank count, erase flash.
+    pub fn begin<R: RomReader>(
+        flash: &mut OnboardFlash<'_>,
+        reader: &mut R,
+    ) -> Result<Self, FlashRomStageError<R::Error>>
+    where
+        R::Error: Debug,
+    {
+        let mut buf = alloc::boxed::Box::new([0u8; ROM_BANK_BYTES]);
+        reader
+            .read_bank(0, &mut *buf)
+            .map_err(FlashRomStageError::Reader)?;
+
+        let rom_size_code = buf[ROM_SIZE_CODE_OFFSET];
+        let bank_count = rom_bank_count_from_code(rom_size_code)
+            .ok_or(FlashRomStageError::InvalidRomSizeCode(rom_size_code))?;
+        let size_bytes = bank_count * ROM_BANK_BYTES;
+
+        if size_bytes > ROM_DATA_CAPACITY_BYTES {
+            return Err(FlashRomStageError::TooLarge {
+                bytes: size_bytes,
+                capacity: ROM_DATA_CAPACITY_BYTES,
+            });
+        }
+
+        let erase_end = align_up(ROM_DATA_OFFSET + size_bytes, ERASE_SIZE);
+        flash
+            .blocking_erase(ROM_SLOT_OFFSET as u32, erase_end as u32)
+            .map_err(FlashRomStageError::Flash)?;
+
+        flash
+            .blocking_write(ROM_DATA_OFFSET as u32, &*buf)
+            .map_err(FlashRomStageError::Flash)?;
+
+        Ok(Self {
+            bank_count,
+            banks_written: 1,
+            buf,
+        })
     }
 
-    let erase_end = align_up(ROM_DATA_OFFSET + size_bytes, ERASE_SIZE);
-    flash
-        .blocking_erase(ROM_SLOT_OFFSET as u32, erase_end as u32)
-        .map_err(FlashRomStageError::Flash)?;
+    pub fn total_banks(&self) -> usize {
+        self.bank_count
+    }
 
-    flash
-        .blocking_write(ROM_DATA_OFFSET as u32, &*buf)
-        .map_err(FlashRomStageError::Flash)?;
+    pub fn banks_written(&self) -> usize {
+        self.banks_written
+    }
 
-    for bank in 1..bank_count {
+    /// Write the next bank. Returns `Ok(true)` when all banks have been written.
+    pub fn write_next_bank<R: RomReader>(
+        &mut self,
+        flash: &mut OnboardFlash<'_>,
+        reader: &mut R,
+    ) -> Result<bool, FlashRomStageError<R::Error>>
+    where
+        R::Error: Debug,
+    {
+        if self.banks_written >= self.bank_count {
+            return Ok(true);
+        }
         reader
-            .read_bank(bank, &mut *buf)
+            .read_bank(self.banks_written, &mut *self.buf)
             .map_err(FlashRomStageError::Reader)?;
         flash
-            .blocking_write((ROM_DATA_OFFSET + bank * ROM_BANK_BYTES) as u32, &*buf)
+            .blocking_write(
+                (ROM_DATA_OFFSET + self.banks_written * ROM_BANK_BYTES) as u32,
+                &*self.buf,
+            )
             .map_err(FlashRomStageError::Flash)?;
+        self.banks_written += 1;
+        Ok(self.banks_written >= self.bank_count)
     }
 
-    let info = FlashRomInfo {
-        size_bytes,
-        bank_count,
-    };
-    let header = build_header(info);
-    flash
-        .blocking_write(ROM_SLOT_OFFSET as u32, &header)
-        .map_err(FlashRomStageError::Flash)?;
-
-    Ok(info)
+    /// Write the metadata header. Call only after all banks are written.
+    pub fn finish(
+        self,
+        flash: &mut OnboardFlash<'_>,
+        filename: &str,
+    ) -> Result<FlashRomInfo, FlashError> {
+        let info = FlashRomInfo {
+            size_bytes: self.bank_count * ROM_BANK_BYTES,
+            bank_count: self.bank_count,
+        };
+        let header = build_header(info, filename);
+        flash.blocking_write(ROM_SLOT_OFFSET as u32, &header)?;
+        Ok(info)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
 
 fn read_header(flash: &mut OnboardFlash<'_>) -> Result<[u8; HEADER_LEN], FlashError> {
     let mut header = [0u8; HEADER_LEN];
@@ -143,7 +216,7 @@ fn read_header(flash: &mut OnboardFlash<'_>) -> Result<[u8; HEADER_LEN], FlashEr
     Ok(header)
 }
 
-fn parse_header(header: &[u8; HEADER_LEN]) -> Option<FlashRomInfo> {
+fn parse_header(header: &[u8; HEADER_LEN]) -> Option<(FlashRomInfo, Option<heapless::String<64>>)> {
     if header[..8] != HEADER_MAGIC {
         return None;
     }
@@ -170,19 +243,45 @@ fn parse_header(header: &[u8; HEADER_LEN]) -> Option<FlashRomInfo> {
         return None;
     }
 
-    Some(FlashRomInfo {
+    let info = FlashRomInfo {
         size_bytes,
         bank_count,
-    })
+    };
+
+    // Parse filename from bytes [FILENAME_OFFSET..FILENAME_OFFSET+64].
+    // Absent (all 0xFF) when written by old firmware — treat as None.
+    let name_region = &header[FILENAME_OFFSET..FILENAME_OFFSET + FILENAME_MAX_BYTES + 1];
+    let staged_name = parse_filename(name_region);
+
+    Some((info, staged_name))
 }
 
-fn build_header(info: FlashRomInfo) -> [u8; HEADER_LEN] {
+fn parse_filename(region: &[u8]) -> Option<heapless::String<64>> {
+    let null_pos = region.iter().position(|&b| b == 0)?;
+    if null_pos == 0 {
+        return None;
+    }
+    let bytes = &region[..null_pos];
+    // Old firmware leaves 0xFF; treat as absent.
+    if bytes.iter().all(|&b| b == 0xFF) {
+        return None;
+    }
+    core::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| heapless::String::try_from(s).ok())
+}
+
+fn build_header(info: FlashRomInfo, filename: &str) -> [u8; HEADER_LEN] {
     let mut header = [0xFFu8; HEADER_LEN];
     header[..8].copy_from_slice(&HEADER_MAGIC);
     header[8..12].copy_from_slice(&HEADER_VERSION.to_le_bytes());
     header[12..16].copy_from_slice(&(info.size_bytes as u32).to_le_bytes());
     header[16..20].copy_from_slice(&(!(info.size_bytes as u32)).to_le_bytes());
     header[20..24].copy_from_slice(&(info.bank_count as u32).to_le_bytes());
+    let name_bytes = filename.as_bytes();
+    let copy_len = name_bytes.len().min(FILENAME_MAX_BYTES);
+    header[FILENAME_OFFSET..FILENAME_OFFSET + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+    header[FILENAME_OFFSET + copy_len] = 0;
     header
 }
 

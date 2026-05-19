@@ -13,6 +13,7 @@
 pub mod fb;
 #[cfg(target_arch = "arm")]
 pub mod hw;
+pub mod font;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
@@ -237,7 +238,7 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
                 if slot < 8 && slot_x < GLYPH_W {
                     let gx = slot_x / 2;
                     let gy = ry / 2;
-                    let row = font::GLYPHS[SEQUENCE[slot]][gy as usize];
+                    let row = logo_font::GLYPHS[SEQUENCE[slot]][gy as usize];
                     if (row >> (7 - gx)) & 1 == 1 {
                         fg
                     } else {
@@ -267,7 +268,7 @@ impl<D: DrawTarget<Color = Rgb565> + Dimensions> Display<D> {
             Point::new(x0, y0),
             Size::new((x1 - x0) as u32, (y1 - y0) as u32),
         );
-        let bitmap = font::GLYPHS[idx];
+        let bitmap = logo_font::GLYPHS[idx];
         let colors = (y0..y1).flat_map(move |py2| {
             let row = bitmap[(py2 - py) as usize];
             (x0..x1).map(move |px2| {
@@ -313,7 +314,7 @@ pub fn dmg_color(idx: u8) -> Rgb565 {
 // Font bitmaps
 // ---------------------------------------------------------------------------
 
-mod font {
+mod logo_font {
     /// 8×8 bitmaps for: V I N T E D O ®
     /// Each `u8` is one row; bit 7 is the leftmost pixel.
     pub const GLYPHS: [[u8; 8]; 8] = [
@@ -334,6 +335,229 @@ mod font {
         // ®
         [0x3C, 0x42, 0xBD, 0xB1, 0xAD, 0x42, 0x3C, 0x00],
     ];
+}
+
+// ---------------------------------------------------------------------------
+// Menu rendering
+// ---------------------------------------------------------------------------
+
+use crate::menu::MenuFrame;
+
+// DMG palette in big-endian RGB565 — the byte order the ILI9341 SPI bus expects.
+const C0_BE: [u8; 2] = [0xE7, 0xDA]; // #E0F8D0
+const C1_BE: [u8; 2] = [0x8E, 0x0E]; // #88C070
+const C2_BE: [u8; 2] = [0x33, 0x4A]; // #346856
+const C3_BE: [u8; 2] = [0x08, 0xC4]; // #081820
+
+// Layout constants (pixels on the 240×320 display).
+const HEADER_H:        u16 = 40;
+const SEPARATOR_H:     u16 = 4;
+const ITEMS_START_Y:   u16 = HEADER_H + SEPARATOR_H;
+const ITEM_H:          u16 = 32;
+const ITEM_TEXT_PAD:   u16 = 8;  // top padding within each item slot
+const FOOTER_SEP_Y:    u16 = 280;
+const FOOTER_Y:        u16 = FOOTER_SEP_Y + SEPARATOR_H;
+const CURSOR_X:        usize = 10;
+const ITEM_TEXT_X:     usize = 28;
+const MARKER_X:        usize = 196; // right-side "loaded" indicator column
+const CHAR_W:          usize = 8;   // glyph width in pixels
+const SCALE:           usize = 2;   // render scale for items and title
+
+/// Render one horizontal scan-line of a menu into `row` (240 pixels × 2 bytes BE).
+///
+/// Call for every `y` in `0..320` to produce a complete menu frame.
+/// The buffer is entirely overwritten each call.
+pub fn render_menu_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
+    // ── Determine zone ───────────────────────────────────────────────────────
+    let in_top_sep    = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
+    let in_footer_sep = y >= FOOTER_SEP_Y && y < FOOTER_Y;
+    let in_items      = y >= ITEMS_START_Y && y < FOOTER_SEP_Y;
+
+    // ── Base fill ────────────────────────────────────────────────────────────
+    let base = if in_top_sep || in_footer_sep { C2_BE } else { C3_BE };
+    fill_row(row, base);
+
+    // ── Header: title text at 2× scale, vertically centred ──────────────────
+    if y < HEADER_H {
+        let title_screen_h = (8 * SCALE) as u16;
+        let title_top = (HEADER_H - title_screen_h) / 2;
+        if y >= title_top && y < title_top + title_screen_h {
+            let glyph_row = ((y - title_top) as usize) / SCALE;
+            let title_screen_w = (frame.title.len() * CHAR_W * SCALE) as usize;
+            let title_x = (SCREEN_W as usize).saturating_sub(title_screen_w) / 2;
+            write_text_row(row, frame.title.as_bytes(), title_x, glyph_row, SCALE, C0_BE, C3_BE);
+        }
+    }
+
+    // ── Items ────────────────────────────────────────────────────────────────
+    if in_items {
+        let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
+        if slot < frame.items.len() {
+            let slot_top  = ITEMS_START_Y + slot as u16 * ITEM_H;
+            let selected  = slot == frame.selected;
+            let enabled   = frame.enabled.get(slot).copied().unwrap_or(true);
+
+            // Override base fill with per-item background.
+            fill_row(row, if selected { C2_BE } else { C3_BE });
+
+            // Text rows within the slot.
+            let text_top    = slot_top + ITEM_TEXT_PAD;
+            let text_bottom = text_top + (8 * SCALE) as u16;
+            if y >= text_top && y < text_bottom {
+                let glyph_row = ((y - text_top) as usize) / SCALE;
+                let text_color = if !enabled {
+                    C2_BE
+                } else if selected {
+                    C0_BE
+                } else {
+                    C1_BE
+                };
+                let item_bg = if selected { C2_BE } else { C3_BE };
+
+                // Cursor (">" for selected, " " for others).
+                let cursor: &[u8] = if selected { b">" } else { b" " };
+                write_text_row(row, cursor, CURSOR_X, glyph_row, SCALE, text_color, item_bg);
+
+                write_text_row(
+                    row,
+                    frame.items[slot].as_bytes(),
+                    ITEM_TEXT_X,
+                    glyph_row,
+                    SCALE,
+                    text_color,
+                    item_bg,
+                );
+
+                // "Loaded" marker on the right side.
+                if frame.marked == Some(slot) {
+                    write_text_row(row, b"*", MARKER_X, glyph_row, SCALE, C0_BE, item_bg);
+                }
+            }
+        }
+    }
+
+    // ── Footer: "A:SELECT  B:BACK" at 1× scale ──────────────────────────────
+    if y >= FOOTER_Y {
+        const FOOTER: &[u8] = b"A:SELECT  B:BACK";
+        let footer_text_h = 8u16;
+        let footer_top = FOOTER_Y + (SCREEN_H as u16 - FOOTER_Y - footer_text_h) / 2;
+        if y >= footer_top && y < footer_top + footer_text_h {
+            let glyph_row = (y - footer_top) as usize;
+            let footer_w = FOOTER.len() * CHAR_W;
+            let footer_x = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
+            write_text_row(row, FOOTER, footer_x, glyph_row, 1, C1_BE, C3_BE);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loading screen rendering
+// ---------------------------------------------------------------------------
+
+const LOADING_FILENAME_Y:    u16 = 140;
+const LOADING_BAR_TOP:       u16 = 200;
+const LOADING_BAR_BOTTOM:    u16 = 220;
+const LOADING_BAR_X0:        usize = 20;
+const LOADING_BAR_X1:        usize = 220;
+
+/// Render one scan-line of the ROM loading screen.
+///
+/// `banks_done` / `total_banks` drives the progress bar fill (0–100%).
+/// Call for every `y` in `0..320` to produce a complete frame.
+pub fn render_loading_row(
+    filename: &str,
+    banks_done: u32,
+    total_banks: u32,
+    y: u16,
+    row: &mut [u8; 480],
+) {
+    let in_top_sep = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
+    let base = if in_top_sep { C2_BE } else { C3_BE };
+    fill_row(row, base);
+
+    // Header: "LOADING" title at 2× scale, centred.
+    if y < HEADER_H {
+        let title_screen_h = (8 * SCALE) as u16;
+        let title_top = (HEADER_H - title_screen_h) / 2;
+        if y >= title_top && y < title_top + title_screen_h {
+            let glyph_row = ((y - title_top) as usize) / SCALE;
+            let title = b"LOADING";
+            let title_w = title.len() * CHAR_W * SCALE;
+            let title_x = (SCREEN_W as usize).saturating_sub(title_w) / 2;
+            write_text_row(row, title, title_x, glyph_row, SCALE, C0_BE, C3_BE);
+        }
+    }
+
+    // Filename at 1× scale, centred.
+    if y >= LOADING_FILENAME_Y && y < LOADING_FILENAME_Y + 8 {
+        let glyph_row = (y - LOADING_FILENAME_Y) as usize;
+        let text = filename.as_bytes();
+        let text_w = text.len() * CHAR_W;
+        let text_x = (SCREEN_W as usize).saturating_sub(text_w) / 2;
+        write_text_row(row, text, text_x, glyph_row, 1, C1_BE, C3_BE);
+    }
+
+    // Progress bar.
+    if y >= LOADING_BAR_TOP && y < LOADING_BAR_BOTTOM {
+        let bar_w = LOADING_BAR_X1 - LOADING_BAR_X0;
+        let filled = if total_banks > 0 {
+            (bar_w as u64 * banks_done as u64 / total_banks as u64) as usize
+        } else {
+            0
+        };
+        // Background
+        for px in LOADING_BAR_X0..LOADING_BAR_X1 {
+            row[px * 2]     = C2_BE[0];
+            row[px * 2 + 1] = C2_BE[1];
+        }
+        // Filled portion
+        for px in LOADING_BAR_X0..LOADING_BAR_X0 + filled.min(bar_w) {
+            row[px * 2]     = C0_BE[0];
+            row[px * 2 + 1] = C0_BE[1];
+        }
+    }
+}
+
+/// Fill every pixel in `row` with `color` (big-endian RGB565).
+fn fill_row(row: &mut [u8; 480], color: [u8; 2]) {
+    let mut i = 0;
+    while i < 480 {
+        row[i]     = color[0];
+        row[i + 1] = color[1];
+        i += 2;
+    }
+}
+
+/// Write `text` into `row` at horizontal pixel offset `x_start`.
+///
+/// `glyph_row` selects which of the 8 bitmap rows to render.
+/// `scale` is 1 or 2 (each source pixel becomes `scale` screen pixels wide).
+fn write_text_row(
+    row:       &mut [u8; 480],
+    text:      &[u8],
+    x_start:   usize,
+    glyph_row: usize,
+    scale:     usize,
+    fg:        [u8; 2],
+    bg:        [u8; 2],
+) {
+    let char_screen_w = CHAR_W * scale;
+    for (char_idx, &ch) in text.iter().enumerate() {
+        let bitmap = font::glyph_row(ch, glyph_row);
+        let char_x = x_start + char_idx * char_screen_w;
+        for glyph_x in 0..CHAR_W {
+            // Font bitmaps use bit 0 = leftmost pixel (LSB-first convention).
+            let lit = (bitmap >> glyph_x) & 1 != 0;
+            let color = if lit { fg } else { bg };
+            for sx in 0..scale {
+                let px = char_x + glyph_x * scale + sx;
+                if px < SCREEN_W as usize {
+                    row[px * 2]     = color[0];
+                    row[px * 2 + 1] = color[1];
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
