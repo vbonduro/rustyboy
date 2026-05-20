@@ -118,10 +118,6 @@ impl<T> StaticStorage<T> {
         Self(UnsafeCell::new(MaybeUninit::uninit()))
     }
 
-    unsafe fn init(&self, value: T) -> &'static mut T {
-        (*self.0.get()).write(value)
-    }
-
     unsafe fn as_mut_ptr(&self) -> *mut T {
         (*self.0.get()).as_mut_ptr()
     }
