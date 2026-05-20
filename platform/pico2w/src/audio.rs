@@ -2,6 +2,14 @@
 
 const AUDIO_BUF_SIZE: usize = 1024;
 
+/// Hardware output volume scale: divide samples by this before packing into I2S.
+/// With the `audio` feature: 8 (~18 dB attenuation).
+/// Without the `audio` feature: i16::MAX (effective silence).
+#[cfg(feature = "audio")]
+const VOLUME_DIV: i16 = 8;
+#[cfg(not(feature = "audio"))]
+const VOLUME_DIV: i16 = i16::MAX;
+
 // Double-buffer for I2S DMA: two back-to-back static arrays in .bss.
 static mut AUDIO_BUF_A: [u32; AUDIO_BUF_SIZE] = [0u32; AUDIO_BUF_SIZE];
 static mut AUDIO_BUF_B: [u32; AUDIO_BUF_SIZE] = [0u32; AUDIO_BUF_SIZE];
@@ -71,8 +79,8 @@ impl AudioBuffers {
 fn samples_to_i2s(samples: &[f32], buf: &mut [u32]) -> usize {
     let pairs = (samples.len() / 2).min(buf.len());
     for i in 0..pairs {
-        let l = (samples[i * 2] * 32767.0) as i16;
-        let r = (samples[i * 2 + 1] * 32767.0) as i16;
+        let l = (samples[i * 2] * 32767.0) as i16 / VOLUME_DIV;
+        let r = (samples[i * 2 + 1] * 32767.0) as i16 / VOLUME_DIV;
         buf[i] = ((l as u16 as u32) << 16) | (r as u16 as u32);
     }
     pairs
@@ -81,8 +89,8 @@ fn samples_to_i2s(samples: &[f32], buf: &mut [u32]) -> usize {
 fn samples_i16_to_i2s(samples: &[i16], buf: &mut [u32]) -> usize {
     let pairs = (samples.len() / 2).min(buf.len());
     for i in 0..pairs {
-        let l = samples[i * 2];
-        let r = samples[i * 2 + 1];
+        let l = samples[i * 2] / VOLUME_DIV;
+        let r = samples[i * 2 + 1] / VOLUME_DIV;
         buf[i] = ((l as u16 as u32) << 16) | (r as u16 as u32);
     }
     pairs
