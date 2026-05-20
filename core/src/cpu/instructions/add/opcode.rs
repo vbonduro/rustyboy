@@ -10,6 +10,7 @@ pub struct Add8 {
 }
 
 impl OpCode for Add8 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.add8(&self, memory)
     }
@@ -22,6 +23,7 @@ pub struct Add16 {
 }
 
 impl OpCode for Add16 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         cpu: &mut dyn Instructions,
@@ -38,6 +40,7 @@ pub struct AddSP16 {
 }
 
 impl OpCode for AddSP16 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.add_sp16(&self, memory)
     }

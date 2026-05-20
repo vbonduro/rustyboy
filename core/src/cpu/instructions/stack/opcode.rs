@@ -9,6 +9,7 @@ pub struct Push16 {
 }
 
 impl OpCode for Push16 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.push16(self, memory)
     }
@@ -20,6 +21,7 @@ pub struct Pop16 {
 }
 
 impl OpCode for Pop16 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.pop16(self, memory)
     }

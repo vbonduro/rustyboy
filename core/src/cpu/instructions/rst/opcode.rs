@@ -8,6 +8,7 @@ pub struct Rst {
 }
 
 impl OpCode for Rst {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.rst(self, memory)
     }
