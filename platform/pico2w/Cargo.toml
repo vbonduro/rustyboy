@@ -21,6 +21,8 @@ oc-300 = []
 fps = []
 # Enable stack sentinel / collision detection instrumentation.
 stack-probe = []
+# Enable audio output. Off by default; pass --features audio to enable.
+audio = []
 
 # ---------------------------------------------------------------------------
 # Cross-platform dependencies (compile on any target, including host tests)

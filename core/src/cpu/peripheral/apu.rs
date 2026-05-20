@@ -61,6 +61,17 @@ const CPU_FREQ: u32 = 4_194_304;
 /// Using fixed-point: accumulator counts in units of SAMPLE_RATE.
 const SAMPLE_PERIOD_NUM: u32 = CPU_FREQ;
 const SAMPLE_PERIOD_DEN: u32 = SAMPLE_RATE;
+/// Maximum T-cycles per tick() sub-step. Must be ≤ the shortest duty-cycle
+/// step period of any audible frequency so that tick_channels() always runs at
+/// least once between consecutive sample emissions.
+///
+/// Step period for frequency f = CPU_FREQ / (f * 8).
+/// At 16 384 Hz: step = 4 194 304 / (16384 * 8) = 32 T-cycles — so 32 is the
+/// largest value that stays correct up to ~16 kHz, which covers all music
+/// notes and typical sound effects.  Smaller values improve accuracy further
+/// but increase Core 1 iteration count: 4 → ~16 400 iters/batch (~5.8 ms),
+/// 32 → ~2 050 iters/batch (~1.4 ms).
+const TICK_GRAN: u16 = 32;
 /// About 804 stereo pairs are produced per Game Boy frame at 48 kHz.
 /// Reserve some headroom so the hot audio path doesn't regrow this buffer.
 const SAMPLE_BUFFER_CAPACITY_HINT: usize = 2048;
@@ -782,9 +793,29 @@ impl ApuPeripheral {
             };
         }
 
-        self.tick_frame_sequencer(cycles, div_counter);
-        self.tick_channels(cycles);
-        self.produce_samples(cycles);
+        if cycles <= TICK_GRAN {
+            self.tick_frame_sequencer(cycles, div_counter);
+            self.tick_channels(cycles);
+            self.produce_samples(cycles);
+        } else {
+            // Subdivide into ≤TICK_GRAN chunks so tick_channels() runs at
+            // per-instruction granularity. Larger chunks let the channel advance
+            // multiple duty-cycle steps before the sample is read, which shifts
+            // high-frequency tones off pitch and causes the 60 Hz buzz fixed in
+            // the first pass.
+            let div_start = div_counter.wrapping_sub(cycles);
+            let mut remaining = cycles;
+            let mut elapsed = 0u16;
+            while remaining > 0 {
+                let chunk = remaining.min(TICK_GRAN);
+                elapsed = elapsed.wrapping_add(chunk);
+                let div = div_start.wrapping_add(elapsed);
+                self.tick_frame_sequencer(chunk, div);
+                self.tick_channels(chunk);
+                self.produce_samples(chunk);
+                remaining -= chunk;
+            }
+        }
 
         ApuOutput {
             nr52: self.build_nr52(),
