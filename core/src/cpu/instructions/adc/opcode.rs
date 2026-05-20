@@ -10,6 +10,7 @@ pub struct Adc {
 }
 
 impl OpCode for Adc {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         instruction: &mut dyn Instructions,

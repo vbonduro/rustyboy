@@ -21,6 +21,7 @@ pub struct Misc {
 }
 
 impl OpCode for Misc {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         cpu: &mut dyn Instructions,

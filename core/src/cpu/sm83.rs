@@ -135,6 +135,7 @@ impl Sm83 {
     // ── Register encoding helpers ─────────────────────────────────────────────
 
     /// r16 pairs for stack instructions: 0=BC 1=DE 2=HL 3=AF.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn r16stk_get(&self, r: u8) -> u16 {
         match r {
             0 => self.registers.bc(),
@@ -148,6 +149,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn r16stk_set(&mut self, r: u8, v: u16) {
         match r {
             0 => self.registers.set_bc(v),
@@ -264,6 +266,7 @@ impl Sm83 {
 
     // ── Register enum helpers ─────────────────────────────────────────────────
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_r8_enum(&self, r: Register8) -> u8 {
         match r {
             Register8::A => self.registers.a,
@@ -276,6 +279,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_r8_enum(&mut self, r: Register8, val: u8) {
         match r {
             Register8::A => self.registers.a = val,
@@ -288,6 +292,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_r16_enum(&self, r: Register16) -> u16 {
         match r {
             Register16::AF => {
@@ -302,6 +307,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_r16_enum(&mut self, r: Register16, val: u16) {
         match r {
             Register16::AF => {
@@ -315,6 +321,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn get_operand8(&mut self, op: &Operand, memory: &mut GameBoyMemory) -> u8 {
         match op {
             Operand::Register8(r) => self.get_r8_enum(*r),
@@ -338,6 +345,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn set_operand8(&mut self, op: &Operand, val: u8, memory: &mut GameBoyMemory) {
         match op {
             Operand::Register8(r) => self.set_r8_enum(*r, val),
@@ -367,6 +375,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn check_condition(&self, cond: &Condition) -> bool {
         match cond {
             Condition::NZ => !self.registers.f.contains(Flags::Z),
@@ -376,6 +385,7 @@ impl Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn pop16_inner(&mut self, memory: &mut GameBoyMemory) -> u16 {
         let lo = memory.read_fast(self.registers.sp);
         let hi = memory.read_fast(self.registers.sp.wrapping_add(1));
@@ -383,6 +393,7 @@ impl Sm83 {
         u16::from_le_bytes([lo, hi])
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn push16_inner(&mut self, val: u16, memory: &mut GameBoyMemory) {
         self.registers.sp = self.registers.sp.wrapping_sub(2);
         self.bus_write(memory, self.registers.sp.wrapping_add(1), (val >> 8) as u8);
@@ -510,6 +521,7 @@ impl Sm83 {
 // ── Instructions implementation ───────────────────────────────────────────────
 
 impl Instructions for Sm83 {
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add8(&mut self, op: &Add8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let (r, f) = add_u8(self.registers.a, val);
@@ -518,6 +530,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add16(&mut self, op: &Add16) -> Result<u8, InstructionError> {
         let rr = match op.operand {
             Operand::Register16(r) => self.get_r16_enum(r),
@@ -539,6 +552,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn add_sp16(
         &mut self,
         op: &AddSP16,
@@ -551,6 +565,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn adc(&mut self, op: &Adc, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
@@ -560,6 +575,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn sub8(&mut self, op: &Sub8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let (r, f) = sub_u8(self.registers.a, val);
@@ -568,6 +584,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn sbc8(&mut self, op: &Sbc8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let cy = self.registers.f.contains(Flags::C) as u8;
@@ -577,12 +594,14 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn cp8(&mut self, op: &Cp8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         self.registers.f = cp_u8(self.registers.a, val);
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ld8(&mut self, op: &Ld8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         if op.src == Operand::Imm8 {
             let val = self.fetch_byte(memory);
@@ -606,6 +625,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ld16(&mut self, op: &Ld16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             Ld16Op::RrImm16 { dest } => {
@@ -698,6 +718,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn inc8(&mut self, op: &Inc8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.operand {
             Operand::Register8(r) => {
@@ -721,6 +742,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn dec8(&mut self, op: &Dec8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.operand {
             Operand::Register8(r) => {
@@ -744,18 +766,21 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn inc16(&mut self, op: &Inc16) -> Result<u8, InstructionError> {
         let v = self.get_r16_enum(op.operand);
         self.set_r16_enum(op.operand, v.wrapping_add(1));
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn dec16(&mut self, op: &Dec16) -> Result<u8, InstructionError> {
         let v = self.get_r16_enum(op.operand);
         self.set_r16_enum(op.operand, v.wrapping_sub(1));
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn rotate_accumulator(&mut self, op: &Rotate) -> Result<u8, InstructionError> {
         let a = self.registers.a;
         let carry = self.registers.f.contains(Flags::C);
@@ -784,6 +809,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn and8(&mut self, op: &And8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let (r, f) = and_u8(self.registers.a, val);
@@ -792,6 +818,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn or8(&mut self, op: &Or8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let (r, f) = or_u8(self.registers.a, val);
@@ -800,6 +827,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn xor8(&mut self, op: &Xor8, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.get_operand8(&op.operand, memory);
         let (r, f) = xor_u8(self.registers.a, val);
@@ -808,6 +836,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn jump(&mut self, op: &Jump, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             JumpOp::Jp => {
@@ -843,6 +872,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn misc(&mut self, op: &Misc) -> Result<u8, InstructionError> {
         match op.op {
             MiscOp::Nop => {}
@@ -881,6 +911,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn push16(&mut self, op: &Push16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let idx = match op.operand {
             Register16::BC => 0,
@@ -894,6 +925,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn pop16(&mut self, op: &Pop16, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let val = self.pop16_inner(memory);
         let idx = match op.operand {
@@ -907,6 +939,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn call(&mut self, op: &Call, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let lo = self.fetch_byte(memory);
         let hi = self.fetch_byte(memory);
@@ -925,6 +958,7 @@ impl Instructions for Sm83 {
         }
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn ret(&mut self, op: &Ret, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         match &op.op {
             RetOp::Ret => {
@@ -948,6 +982,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn rst(&mut self, op: &Rst, memory: &mut GameBoyMemory) -> Result<u8, InstructionError> {
         let ret = self.registers.pc;
         self.push16_inner(ret, memory);
@@ -955,6 +990,7 @@ impl Instructions for Sm83 {
         Ok(op.cycles)
     }
 
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn cb(
         &mut self,
         op: &CbInstruction,

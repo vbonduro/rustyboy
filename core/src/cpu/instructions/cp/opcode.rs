@@ -11,6 +11,7 @@ pub struct Cp8 {
 }
 
 impl OpCode for Cp8 {
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.cp8(&self, memory)
     }

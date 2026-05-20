@@ -337,7 +337,13 @@ async fn main(_spawner: Spawner) {
                     .await;
 
                 #[cfg(feature = "fps")]
-                tracker.tick();
+                {
+                    let profile = gameboy
+                        .as_mut()
+                        .expect("Running without GameBoy")
+                        .take_transport_profile();
+                    tracker.tick(profile);
+                }
             }
 
             AppState::InGameMenu(menu_state) => {
