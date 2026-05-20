@@ -1,7 +1,7 @@
 pub mod cartridge;
-pub(crate) mod map;
 #[cfg(test)]
 pub mod fake;
+pub(crate) mod map;
 pub mod memory;
 pub mod rom;
 pub mod streaming;

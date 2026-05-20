@@ -68,5 +68,4 @@ impl WorkerTransport for LocalTransport {
         }
         output
     }
-
 }

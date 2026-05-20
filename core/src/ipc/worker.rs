@@ -8,8 +8,8 @@ use crate::cpu::peripheral::ppu::{
 };
 use crate::cpu::save_state::PpuState;
 
-use crate::memory::map::{IO_REG_BASE, IO_REG_END};
 use super::protocol::{WorkerCommand, WorkerOutput};
+use crate::memory::map::{IO_REG_BASE, IO_REG_END};
 
 pub struct GameBoyWorker {
     apu: ApuPeripheral,
@@ -163,7 +163,6 @@ impl GameBoyWorker {
         self.output.frame_ready = false;
         output
     }
-
 }
 
 struct PpuWorkerOutput {
@@ -288,5 +287,4 @@ impl PpuWorkerState {
     fn framebuffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
         self.ppu.framebuffer()
     }
-
 }

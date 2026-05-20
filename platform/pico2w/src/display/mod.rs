@@ -11,9 +11,9 @@
 
 #[cfg(any(not(target_arch = "arm"), feature = "std"))]
 pub mod fb;
+pub mod font;
 #[cfg(target_arch = "arm")]
 pub mod hw;
-pub mod font;
 
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
@@ -350,65 +350,106 @@ const C2_BE: [u8; 2] = [0x33, 0x4A]; // #346856
 const C3_BE: [u8; 2] = [0x08, 0xC4]; // #081820
 
 // Layout constants (pixels on the 240×320 display).
-const HEADER_H:        u16 = 40;
-const SEPARATOR_H:     u16 = 4;
-const ITEMS_START_Y:   u16 = HEADER_H + SEPARATOR_H;
-const ITEM_H:          u16 = 32;
-const ITEM_TEXT_PAD:   u16 = 8;  // top padding within each item slot
-const FOOTER_SEP_Y:    u16 = 280;
-const FOOTER_Y:        u16 = FOOTER_SEP_Y + SEPARATOR_H;
-const CURSOR_X:        usize = 10;
-const ITEM_TEXT_X:     usize = 28;
-const MARKER_X:        usize = 196; // right-side "loaded" indicator column
-const CHAR_W:          usize = 8;   // glyph width in pixels
-const SCALE:           usize = 2;   // render scale for items and title
+const HEADER_H: u16 = 40;
+const SEPARATOR_H: u16 = 4;
+const ITEMS_START_Y: u16 = HEADER_H + SEPARATOR_H;
+const ITEM_H: u16 = 32;
+const ITEM_TEXT_PAD: u16 = 8; // top padding within each item slot
+const FOOTER_SEP_Y: u16 = 280;
+const FOOTER_Y: u16 = FOOTER_SEP_Y + SEPARATOR_H;
+const CURSOR_X: usize = 10;
+const ITEM_TEXT_X: usize = 28;
+const MARKER_X: usize = 196; // right-side "loaded" indicator column
+const CHAR_W: usize = 8; // glyph width in pixels
+const SCALE: usize = 2; // render scale for items and title
 
 /// Render one horizontal scan-line of a menu into `row` (240 pixels × 2 bytes BE).
 ///
 /// Call for every `y` in `0..320` to produce a complete menu frame.
 /// The buffer is entirely overwritten each call.
 pub fn render_menu_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
-    let in_top_sep    = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
+    let in_top_sep = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
     let in_footer_sep = y >= FOOTER_SEP_Y && y < FOOTER_Y;
-    let in_items      = y >= ITEMS_START_Y && y < FOOTER_SEP_Y;
+    let in_items = y >= ITEMS_START_Y && y < FOOTER_SEP_Y;
 
-    fill_row(row, if in_top_sep || in_footer_sep { C2_BE } else { C3_BE });
+    fill_row(
+        row,
+        if in_top_sep || in_footer_sep {
+            C2_BE
+        } else {
+            C3_BE
+        },
+    );
 
-    if y < HEADER_H       { render_menu_header_row(frame.title, y, row); }
-    if in_items           { render_menu_items_row(frame, y, row); }
-    if y >= FOOTER_Y      { render_menu_footer_row(y, row); }
+    if y < HEADER_H {
+        render_menu_header_row(frame.title, y, row);
+    }
+    if in_items {
+        render_menu_items_row(frame, y, row);
+    }
+    if y >= FOOTER_Y {
+        render_menu_footer_row(y, row);
+    }
 }
 
 fn render_menu_header_row(title: &str, y: u16, row: &mut [u8; 480]) {
     let title_screen_h = (8 * SCALE) as u16;
     let title_top = (HEADER_H - title_screen_h) / 2;
-    if y < title_top || y >= title_top + title_screen_h { return; }
+    if y < title_top || y >= title_top + title_screen_h {
+        return;
+    }
     let glyph_row = ((y - title_top) as usize) / SCALE;
     let title_screen_w = (title.len() * CHAR_W * SCALE) as usize;
     let title_x = (SCREEN_W as usize).saturating_sub(title_screen_w) / 2;
-    write_text_row(row, title.as_bytes(), title_x, glyph_row, SCALE, C0_BE, C3_BE);
+    write_text_row(
+        row,
+        title.as_bytes(),
+        title_x,
+        glyph_row,
+        SCALE,
+        C0_BE,
+        C3_BE,
+    );
 }
 
 fn render_menu_items_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
     let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
-    if slot >= frame.items.len() { return; }
+    if slot >= frame.items.len() {
+        return;
+    }
     let slot_top = ITEMS_START_Y + slot as u16 * ITEM_H;
     let selected = slot == frame.selected;
-    let enabled  = frame.enabled.get(slot).copied().unwrap_or(true);
+    let enabled = frame.enabled.get(slot).copied().unwrap_or(true);
 
     fill_row(row, if selected { C2_BE } else { C3_BE });
 
-    let text_top    = slot_top + ITEM_TEXT_PAD;
+    let text_top = slot_top + ITEM_TEXT_PAD;
     let text_bottom = text_top + (8 * SCALE) as u16;
-    if y < text_top || y >= text_bottom { return; }
+    if y < text_top || y >= text_bottom {
+        return;
+    }
 
-    let glyph_row  = ((y - text_top) as usize) / SCALE;
-    let text_color = if !enabled { C2_BE } else if selected { C0_BE } else { C1_BE };
-    let item_bg    = if selected { C2_BE } else { C3_BE };
+    let glyph_row = ((y - text_top) as usize) / SCALE;
+    let text_color = if !enabled {
+        C2_BE
+    } else if selected {
+        C0_BE
+    } else {
+        C1_BE
+    };
+    let item_bg = if selected { C2_BE } else { C3_BE };
 
     let cursor: &[u8] = if selected { b">" } else { b" " };
     write_text_row(row, cursor, CURSOR_X, glyph_row, SCALE, text_color, item_bg);
-    write_text_row(row, frame.items[slot].as_bytes(), ITEM_TEXT_X, glyph_row, SCALE, text_color, item_bg);
+    write_text_row(
+        row,
+        frame.items[slot].as_bytes(),
+        ITEM_TEXT_X,
+        glyph_row,
+        SCALE,
+        text_color,
+        item_bg,
+    );
     if frame.marked == Some(slot) {
         write_text_row(row, b"*", MARKER_X, glyph_row, SCALE, C0_BE, item_bg);
     }
@@ -418,10 +459,12 @@ fn render_menu_footer_row(y: u16, row: &mut [u8; 480]) {
     const FOOTER: &[u8] = b"A:SELECT  B:BACK";
     let footer_text_h = 8u16;
     let footer_top = FOOTER_Y + (SCREEN_H as u16 - FOOTER_Y - footer_text_h) / 2;
-    if y < footer_top || y >= footer_top + footer_text_h { return; }
+    if y < footer_top || y >= footer_top + footer_text_h {
+        return;
+    }
     let glyph_row = (y - footer_top) as usize;
-    let footer_w  = FOOTER.len() * CHAR_W;
-    let footer_x  = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
+    let footer_w = FOOTER.len() * CHAR_W;
+    let footer_x = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
     write_text_row(row, FOOTER, footer_x, glyph_row, 1, C1_BE, C3_BE);
 }
 
@@ -429,11 +472,11 @@ fn render_menu_footer_row(y: u16, row: &mut [u8; 480]) {
 // Loading screen rendering
 // ---------------------------------------------------------------------------
 
-const LOADING_FILENAME_Y:    u16 = 140;
-const LOADING_BAR_TOP:       u16 = 200;
-const LOADING_BAR_BOTTOM:    u16 = 220;
-const LOADING_BAR_X0:        usize = 20;
-const LOADING_BAR_X1:        usize = 220;
+const LOADING_FILENAME_Y: u16 = 140;
+const LOADING_BAR_TOP: u16 = 200;
+const LOADING_BAR_BOTTOM: u16 = 220;
+const LOADING_BAR_X0: usize = 20;
+const LOADING_BAR_X1: usize = 220;
 
 /// Render one scan-line of the ROM loading screen.
 ///
@@ -449,15 +492,23 @@ pub fn render_loading_row(
     let in_top_sep = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
     fill_row(row, if in_top_sep { C2_BE } else { C3_BE });
 
-    if y < HEADER_H                                          { render_loading_header_row(y, row); }
-    if y >= LOADING_FILENAME_Y && y < LOADING_FILENAME_Y + 8 { render_loading_filename_row(filename, y, row); }
-    if y >= LOADING_BAR_TOP    && y < LOADING_BAR_BOTTOM    { render_loading_bar_row(banks_done, total_banks, row); }
+    if y < HEADER_H {
+        render_loading_header_row(y, row);
+    }
+    if y >= LOADING_FILENAME_Y && y < LOADING_FILENAME_Y + 8 {
+        render_loading_filename_row(filename, y, row);
+    }
+    if y >= LOADING_BAR_TOP && y < LOADING_BAR_BOTTOM {
+        render_loading_bar_row(banks_done, total_banks, row);
+    }
 }
 
 fn render_loading_header_row(y: u16, row: &mut [u8; 480]) {
     let title_screen_h = (8 * SCALE) as u16;
     let title_top = (HEADER_H - title_screen_h) / 2;
-    if y < title_top || y >= title_top + title_screen_h { return; }
+    if y < title_top || y >= title_top + title_screen_h {
+        return;
+    }
     let glyph_row = ((y - title_top) as usize) / SCALE;
     let title = b"LOADING";
     let title_w = title.len() * CHAR_W * SCALE;
@@ -481,11 +532,11 @@ fn render_loading_bar_row(banks_done: u32, total_banks: u32, row: &mut [u8; 480]
         0
     };
     for px in LOADING_BAR_X0..LOADING_BAR_X1 {
-        row[px * 2]     = C2_BE[0];
+        row[px * 2] = C2_BE[0];
         row[px * 2 + 1] = C2_BE[1];
     }
     for px in LOADING_BAR_X0..LOADING_BAR_X0 + filled.min(bar_w) {
-        row[px * 2]     = C0_BE[0];
+        row[px * 2] = C0_BE[0];
         row[px * 2 + 1] = C0_BE[1];
     }
 }
@@ -494,7 +545,7 @@ fn render_loading_bar_row(banks_done: u32, total_banks: u32, row: &mut [u8; 480]
 fn fill_row(row: &mut [u8; 480], color: [u8; 2]) {
     let mut i = 0;
     while i < 480 {
-        row[i]     = color[0];
+        row[i] = color[0];
         row[i + 1] = color[1];
         i += 2;
     }
@@ -505,13 +556,13 @@ fn fill_row(row: &mut [u8; 480], color: [u8; 2]) {
 /// `glyph_row` selects which of the 8 bitmap rows to render.
 /// `scale` is 1 or 2 (each source pixel becomes `scale` screen pixels wide).
 fn write_text_row(
-    row:       &mut [u8; 480],
-    text:      &[u8],
-    x_start:   usize,
+    row: &mut [u8; 480],
+    text: &[u8],
+    x_start: usize,
     glyph_row: usize,
-    scale:     usize,
-    fg:        [u8; 2],
-    bg:        [u8; 2],
+    scale: usize,
+    fg: [u8; 2],
+    bg: [u8; 2],
 ) {
     let char_screen_w = CHAR_W * scale;
     for (char_idx, &ch) in text.iter().enumerate() {
@@ -524,7 +575,7 @@ fn write_text_row(
             for sx in 0..scale {
                 let px = char_x + glyph_x * scale + sx;
                 if px < SCREEN_W as usize {
-                    row[px * 2]     = color[0];
+                    row[px * 2] = color[0];
                     row[px * 2 + 1] = color[1];
                 }
             }

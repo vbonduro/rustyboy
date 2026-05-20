@@ -20,7 +20,6 @@ use crate::memory::cartridge::Cartridge;
 use crate::memory::map::{OAM_BASE, OAM_END, VRAM_BASE, VRAM_END};
 use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
 
-
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
 const SB_ADDR: u16 = 0xFF01;
@@ -33,7 +32,6 @@ pub(crate) struct DmaState {
     pub source: u16,
     pub progress: u8,
 }
-
 
 /// Game Boy emulator. `W` is the worker transport — `LocalTransport` runs PPU/APU
 /// on the calling thread; platform-specific transports can offload to another core.
@@ -166,7 +164,6 @@ impl<W: WorkerTransport> GameBoy<W> {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     pub fn tick(&mut self) {
-
         let t_cycles = self.cpu.step(&mut self.memory) as u16;
 
         self.route_bus_events();
@@ -174,7 +171,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         self.advance_peripherals(t_cycles);
         self.read_worker_output();
         self.cycle_counter = self.cycle_counter.wrapping_add(t_cycles as u64);
-
     }
 
     /// Execute one complete SM83 instruction, returning the T-cycles elapsed.
@@ -306,11 +302,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         &mut self.transport
     }
 
-
-
-
-
-
     // --- hot path internals ---
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -366,9 +357,13 @@ impl<W: WorkerTransport> GameBoy<W> {
         let next = progress + to_copy;
         if next >= OAM_DMA_BYTES {
             self.dma = None;
-            self.transport.write_oam_range(0, &self.memory.oam()[..OAM_DMA_BYTES as usize]);
+            self.transport
+                .write_oam_range(0, &self.memory.oam()[..OAM_DMA_BYTES as usize]);
         } else {
-            self.dma = Some(DmaState { source, progress: next });
+            self.dma = Some(DmaState {
+                source,
+                progress: next,
+            });
         }
     }
 
@@ -409,7 +404,8 @@ impl<W: WorkerTransport> GameBoy<W> {
             i += 1;
         }
         if ppu_reg_count > 0 {
-            self.transport.write_ppu_registers(&ppu_reg_buf[..ppu_reg_count]);
+            self.transport
+                .write_ppu_registers(&ppu_reg_buf[..ppu_reg_count]);
         }
         buf.clear();
         self.bus_event_buf = buf;

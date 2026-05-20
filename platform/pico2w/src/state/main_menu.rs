@@ -3,8 +3,8 @@ use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{MainMenu, MenuEffect, MenuInput, MenuLogic};
 
-use crate::{App, AppState, PicoSdMgr};
 use super::{RomListState, RunningState};
+use crate::{App, AppState, PicoSdMgr};
 
 pub struct MainMenuState {
     menu: MainMenu,

@@ -7,19 +7,19 @@ use crate::input::ButtonState;
 /// Derived from two consecutive ButtonState snapshots — no hardware dependency.
 #[derive(Default, Clone, Copy)]
 pub struct MenuInput {
-    pub up:      bool,
-    pub down:    bool,
+    pub up: bool,
+    pub down: bool,
     pub confirm: bool,
-    pub back:    bool,
+    pub back: bool,
 }
 
 impl MenuInput {
     pub fn from_diff(previous: ButtonState, current: ButtonState) -> Self {
         Self {
-            up:      !previous.up     && current.up,
-            down:    !previous.down   && current.down,
-            confirm: !previous.a      && current.a,
-            back:    !previous.b      && current.b,
+            up: !previous.up && current.up,
+            down: !previous.down && current.down,
+            confirm: !previous.a && current.a,
+            back: !previous.b && current.b,
         }
     }
 
@@ -61,13 +61,13 @@ pub enum RomListEffect {
 // ---------------------------------------------------------------------------
 
 pub struct MenuFrame<'a> {
-    pub title:    &'a str,
-    pub items:    &'a [&'a str],
+    pub title: &'a str,
+    pub items: &'a [&'a str],
     pub selected: usize,
     /// Parallel to `items`; false = greyed out (e.g. Load with no save slot).
-    pub enabled:  &'a [bool],
+    pub enabled: &'a [bool],
     /// Index of the item that carries a "currently loaded" indicator, if any.
-    pub marked:   Option<usize>,
+    pub marked: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -98,14 +98,18 @@ impl InGameMenu {
 impl MenuLogic for InGameMenu {
     /// `context_flag` = save slot available (enables Load).
     fn frame(&self, save_available: bool) -> MenuFrame<'_> {
-        static ALL_ENABLED:    [bool; 4] = [true, true, true,  true];
-        static LOAD_DISABLED:  [bool; 4] = [true, true, false, true];
+        static ALL_ENABLED: [bool; 4] = [true, true, true, true];
+        static LOAD_DISABLED: [bool; 4] = [true, true, false, true];
         MenuFrame {
-            title:    "PAUSED",
-            items:    INGAME_ITEMS,
+            title: "PAUSED",
+            items: INGAME_ITEMS,
             selected: self.selected,
-            enabled:  if save_available { &ALL_ENABLED } else { &LOAD_DISABLED },
-            marked:   None,
+            enabled: if save_available {
+                &ALL_ENABLED
+            } else {
+                &LOAD_DISABLED
+            },
+            marked: None,
         }
     }
 
@@ -186,19 +190,19 @@ impl MenuLogic for MainMenu {
         static ROMS_ENABLED: [bool; 1] = [true];
         if game_available {
             MenuFrame {
-                title:    "MAIN MENU",
-                items:    MAIN_ITEMS_FULL,
+                title: "MAIN MENU",
+                items: MAIN_ITEMS_FULL,
                 selected: self.selected,
-                enabled:  &FULL_ENABLED,
-                marked:   None,
+                enabled: &FULL_ENABLED,
+                marked: None,
             }
         } else {
             MenuFrame {
-                title:    "MAIN MENU",
-                items:    MAIN_ITEMS_ROMS,
+                title: "MAIN MENU",
+                items: MAIN_ITEMS_ROMS,
                 selected: 0,
-                enabled:  &ROMS_ENABLED,
-                marked:   None,
+                enabled: &ROMS_ENABLED,
+                marked: None,
             }
         }
     }
@@ -219,7 +223,10 @@ pub struct RomListLogic {
 
 impl RomListLogic {
     pub fn new(page_len: usize) -> Self {
-        Self { selected: 0, page_len }
+        Self {
+            selected: 0,
+            page_len,
+        }
     }
 
     pub fn selected(&self) -> usize {
@@ -269,18 +276,43 @@ impl RomListLogic {
 mod tests {
     use super::*;
 
-    fn press_down() -> MenuInput { MenuInput { down: true, ..Default::default() } }
-    fn press_up()   -> MenuInput { MenuInput { up:   true, ..Default::default() } }
-    fn press_a()    -> MenuInput { MenuInput { confirm: true, ..Default::default() } }
-    fn press_b()    -> MenuInput { MenuInput { back: true, ..Default::default() } }
-    fn no_input()   -> MenuInput { MenuInput::default() }
+    fn press_down() -> MenuInput {
+        MenuInput {
+            down: true,
+            ..Default::default()
+        }
+    }
+    fn press_up() -> MenuInput {
+        MenuInput {
+            up: true,
+            ..Default::default()
+        }
+    }
+    fn press_a() -> MenuInput {
+        MenuInput {
+            confirm: true,
+            ..Default::default()
+        }
+    }
+    fn press_b() -> MenuInput {
+        MenuInput {
+            back: true,
+            ..Default::default()
+        }
+    }
+    fn no_input() -> MenuInput {
+        MenuInput::default()
+    }
 
     // --- MenuInput::from_diff ---
 
     #[test]
     fn from_diff_detects_press_edge() {
         let previous = ButtonState::default();
-        let current  = ButtonState { a: true, ..Default::default() };
+        let current = ButtonState {
+            a: true,
+            ..Default::default()
+        };
         let input = MenuInput::from_diff(previous, current);
         assert!(input.confirm);
         assert!(!input.up);
@@ -290,15 +322,21 @@ mod tests {
 
     #[test]
     fn from_diff_ignores_held_button() {
-        let held = ButtonState { a: true, ..Default::default() };
+        let held = ButtonState {
+            a: true,
+            ..Default::default()
+        };
         let input = MenuInput::from_diff(held, held);
         assert!(!input.confirm, "held button should not re-fire");
     }
 
     #[test]
     fn from_diff_detects_release_as_no_input() {
-        let previous = ButtonState { b: true, ..Default::default() };
-        let current  = ButtonState::default();
+        let previous = ButtonState {
+            b: true,
+            ..Default::default()
+        };
+        let current = ButtonState::default();
         let input = MenuInput::from_diff(previous, current);
         assert!(!input.back, "release should not count as a press");
     }
@@ -352,7 +390,9 @@ mod tests {
     #[test]
     fn ingame_confirm_on_quit_returns_quit() {
         let mut menu = InGameMenu::new();
-        for _ in 0..3 { menu.handle(press_down()); } // -> QUIT
+        for _ in 0..3 {
+            menu.handle(press_down());
+        } // -> QUIT
         assert_eq!(menu.handle(press_a()), MenuEffect::Quit);
     }
 
@@ -374,7 +414,10 @@ mod tests {
     fn ingame_frame_disables_load_without_save() {
         let menu = InGameMenu::new();
         let frame = menu.frame(false);
-        assert!(!frame.enabled[2], "LOAD should be disabled with no save slot");
+        assert!(
+            !frame.enabled[2],
+            "LOAD should be disabled with no save slot"
+        );
     }
 
     #[test]
@@ -402,7 +445,9 @@ mod tests {
     #[test]
     fn main_down_does_not_exceed_last_item() {
         let mut menu = MainMenu::new();
-        for _ in 0..10 { menu.handle(press_down()); }
+        for _ in 0..10 {
+            menu.handle(press_down());
+        }
         assert_eq!(menu.selected, MAIN_ITEMS_FULL.len() - 1);
     }
 
@@ -412,14 +457,20 @@ mod tests {
         let frame = menu.frame(false);
         // When no game is available, CONTINUE is omitted entirely; only ROMS appears.
         assert_eq!(frame.items, &["ROMS"]);
-        assert!(frame.enabled[0], "ROMS should be enabled with no game running");
+        assert!(
+            frame.enabled[0],
+            "ROMS should be enabled with no game running"
+        );
     }
 
     #[test]
     fn main_frame_enables_continue_with_game() {
         let menu = MainMenu::new();
         let frame = menu.frame(true);
-        assert!(frame.enabled[0], "CONTINUE should be enabled with a ROM staged");
+        assert!(
+            frame.enabled[0],
+            "CONTINUE should be enabled with a ROM staged"
+        );
     }
 
     // --- RomListLogic ---

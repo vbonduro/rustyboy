@@ -68,10 +68,7 @@ where
 
         let mut all: heapless::Vec<ShortFileName, 100> = heapless::Vec::new();
         let _ = self.mgr.iterate_dir(root, |entry| {
-            if !entry.attributes.is_directory()
-                && is_rom_file(&entry.name)
-                && all.len() < 100
-            {
+            if !entry.attributes.is_directory() && is_rom_file(&entry.name) && all.len() < 100 {
                 let _ = all.push(entry.name.clone());
             }
         });

@@ -9,8 +9,12 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use cortex_m_rt::ExceptionFrame;
 #[cortex_m_rt::exception]
 unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
-    defmt::error!("HardFault: PC=0x{:08x} LR=0x{:08x} PSR=0x{:08x}",
-        ef.pc(), ef.lr(), ef.xpsr());
+    defmt::error!(
+        "HardFault: PC=0x{:08x} LR=0x{:08x} PSR=0x{:08x}",
+        ef.pc(),
+        ef.lr(),
+        ef.xpsr()
+    );
     loop {}
 }
 
@@ -29,14 +33,13 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{
-    CORE1, DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13,
-    PIN_8, PIN_9, PIO0, SPI0, SPI1,
+    CORE1, DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0, SPI0, SPI1,
 };
-use embassy_rp::Peri;
 use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::spi::{self, Blocking, Spi};
 use embassy_rp::watchdog::Watchdog;
+use embassy_rp::Peri;
 use embassy_rp::{bind_interrupts, dma};
 use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
@@ -58,18 +61,19 @@ const TARGET_SYS_HZ: u32 = 300_000_000;
 const TARGET_SYS_HZ: u32 = 280_000_000;
 #[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), feature = "oc-266"))]
 const TARGET_SYS_HZ: u32 = 266_000_000;
-#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), not(feature = "oc-266")))]
+#[cfg(all(
+    not(feature = "oc-300"),
+    not(feature = "oc-280"),
+    not(feature = "oc-266")
+))]
 const TARGET_SYS_HZ: u32 = 300_000_000;
 
 #[cfg(feature = "oc-300")]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
-    embassy_rp::clocks::CoreVoltage::V1_30;
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_30;
 #[cfg(feature = "oc-280")]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
-    embassy_rp::clocks::CoreVoltage::V1_25;
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_25;
 #[cfg(all(not(feature = "oc-300"), not(feature = "oc-280")))]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage =
-    embassy_rp::clocks::CoreVoltage::V1_30;
+const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_30;
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const CYCLES_PER_FRAME: u64 = 70_224;
@@ -91,10 +95,8 @@ pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 3] = [
 // SD type aliases
 // ---------------------------------------------------------------------------
 
-type PicoSdCard = SdCard<
-    ExclusiveDevice<Spi<'static, SPI0, Blocking>, Output<'static>, Delay>,
-    Delay,
->;
+type PicoSdCard =
+    SdCard<ExclusiveDevice<Spi<'static, SPI0, Blocking>, Output<'static>, Delay>, Delay>;
 pub(crate) type PicoSdMgr = sd::SdManager<PicoSdCard, DummyClock>;
 
 // ---------------------------------------------------------------------------
@@ -119,12 +121,12 @@ pub(crate) fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct App {
-    pub(crate) state:             AppState,
-    pub(crate) next_state:        Option<AppState>,
-    pub(crate) save_slot:         Option<Vec<u8>>,
-    pub(crate) previous_buttons:  ButtonState,
-    pub(crate) staged_rom_name:   Option<heapless::String<64>>,
-    pub(crate) core1:             Option<Peri<'static, CORE1>>,
+    pub(crate) state: AppState,
+    pub(crate) next_state: Option<AppState>,
+    pub(crate) save_slot: Option<Vec<u8>>,
+    pub(crate) previous_buttons: ButtonState,
+    pub(crate) staged_rom_name: Option<heapless::String<64>>,
+    pub(crate) core1: Option<Peri<'static, CORE1>>,
 }
 
 impl App {
@@ -210,22 +212,35 @@ async fn main(_spawner: Spawner) {
     let staged = probe_staged_rom(&mut onboard_flash);
 
     let _sd_mode = Output::new(p.PIN_17, Level::High);
-    let Pio { mut common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(p.PIO0, Irqs);
     let i2s_prog = PioI2sOutProgram::new(&mut common);
     let mut i2s = PioI2sOut::new(
-        &mut common, sm0, p.DMA_CH0, Irqs,
-        p.PIN_16, p.PIN_14, p.PIN_15,
-        SAMPLE_RATE, 16, &i2s_prog,
+        &mut common,
+        sm0,
+        p.DMA_CH0,
+        Irqs,
+        p.PIN_16,
+        p.PIN_14,
+        p.PIN_15,
+        SAMPLE_RATE,
+        16,
+        &i2s_prog,
     );
     i2s.start();
 
     // SAFETY: hw_disp was dropped above; SPI1 and all display pins are free.
     let mut game_disp = unsafe {
         GameDisplay::new_after_splash(
-            PIN_10::steal(), PIN_11::steal(),
-            PIN_9::steal(),  PIN_8::steal(),
-            PIN_12::steal(), PIN_13::steal(),
-            SPI1::steal(),   p.DMA_CH1,
+            PIN_10::steal(),
+            PIN_11::steal(),
+            PIN_9::steal(),
+            PIN_8::steal(),
+            PIN_12::steal(),
+            PIN_13::steal(),
+            SPI1::steal(),
+            p.DMA_CH1,
             Irqs,
         )
     };
@@ -245,7 +260,10 @@ async fn main(_spawner: Spawner) {
             match XipCartridge::from_staged_flash(info) {
                 Ok(cart) => {
                     game_disp.draw_letterbox_bars().await;
-                    info!("building GameBoy, clk={}", embassy_rp::clocks::clk_sys_freq());
+                    info!(
+                        "building GameBoy, clk={}",
+                        embassy_rp::clocks::clk_sys_freq()
+                    );
                     let gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
                     info!("ROM loaded, entering main loop");
                     (AppState::Running(RunningState), Some(gb), name, None)
@@ -253,12 +271,12 @@ async fn main(_spawner: Spawner) {
                 Err(e) => {
                     defmt::error!("flash ROM mapping failed: {:?}", defmt::Debug2Format(&e));
                     let stub_app = App {
-                        state:            AppState::Running(RunningState),
-                        next_state:       None,
-                        save_slot:        None,
+                        state: AppState::Running(RunningState),
+                        next_state: None,
+                        save_slot: None,
                         previous_buttons: ButtonState::default(),
-                        staged_rom_name:  None,
-                        core1:            None,
+                        staged_rom_name: None,
+                        core1: None,
                     };
                     let next = MainMenuState::new(&mut game_disp, &stub_app).await;
                     (AppState::MainMenu(next), None, None, Some(p.CORE1))
@@ -268,12 +286,12 @@ async fn main(_spawner: Spawner) {
         None => {
             info!("no staged ROM in flash; showing main menu");
             let stub_app = App {
-                state:            AppState::Running(RunningState),
-                next_state:       None,
-                save_slot:        None,
+                state: AppState::Running(RunningState),
+                next_state: None,
+                save_slot: None,
                 previous_buttons: ButtonState::default(),
-                staged_rom_name:  None,
-                core1:            None,
+                staged_rom_name: None,
+                core1: None,
             };
             let menu_state = MainMenuState::new(&mut game_disp, &stub_app).await;
             (AppState::MainMenu(menu_state), None, None, Some(p.CORE1))
@@ -286,12 +304,12 @@ async fn main(_spawner: Spawner) {
     let mut gameboy: Option<PicoGameBoy> = gameboy_init;
 
     let mut app = App {
-        state:            initial_state,
-        next_state:       None,
-        save_slot:        None,
+        state: initial_state,
+        next_state: None,
+        save_slot: None,
         previous_buttons: ButtonState::default(),
         staged_rom_name,
-        core1:            core1_token,
+        core1: core1_token,
     };
 
     #[cfg(feature = "fps")]
@@ -306,46 +324,56 @@ async fn main(_spawner: Spawner) {
 
         match &mut state {
             AppState::Running(running) => {
-                running.tick(
-                    &mut app,
-                    gameboy.as_mut().expect("Running without GameBoy"),
-                    &mut game_disp,
-                    &mut i2s,
-                    &mut input,
-                    &mut audio_buffers,
-                    &mut audio_samples,
-                ).await;
+                running
+                    .tick(
+                        &mut app,
+                        gameboy.as_mut().expect("Running without GameBoy"),
+                        &mut game_disp,
+                        &mut i2s,
+                        &mut input,
+                        &mut audio_buffers,
+                        &mut audio_samples,
+                    )
+                    .await;
 
                 #[cfg(feature = "fps")]
                 tracker.tick();
             }
 
             AppState::InGameMenu(menu_state) => {
-                menu_state.tick(
-                    &mut app,
-                    gameboy.as_mut().expect("InGameMenu without GameBoy"),
-                    &mut game_disp,
-                    &mut input,
-                ).await;
+                menu_state
+                    .tick(
+                        &mut app,
+                        gameboy.as_mut().expect("InGameMenu without GameBoy"),
+                        &mut game_disp,
+                        &mut input,
+                    )
+                    .await;
             }
 
             AppState::MainMenu(menu_state) => {
-                menu_state.tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr).await;
+                menu_state
+                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr)
+                    .await;
             }
 
             AppState::RomList(rom_list_state) => {
-                rom_list_state.tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr).await;
+                rom_list_state
+                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr)
+                    .await;
             }
 
             AppState::Loading(loading_state) => {
-                loading_state.tick(
-                    &mut app,
-                    &mut gameboy,
-                    &mut onboard_flash,
-                    &mut sd_mgr,
-                    &mut game_disp,
-                    &mut watchdog,
-                ).await;
+                loading_state
+                    .tick(
+                        &mut app,
+                        &mut gameboy,
+                        &mut onboard_flash,
+                        &mut sd_mgr,
+                        &mut game_disp,
+                        &mut watchdog,
+                    )
+                    .await;
             }
         }
 

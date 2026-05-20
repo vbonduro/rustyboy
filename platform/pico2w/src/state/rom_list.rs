@@ -3,14 +3,14 @@ use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{MenuFrame, MenuInput, RomListEffect, RomListLogic};
 
-use crate::{App, AppState, PicoSdMgr};
 use super::{LoadingState, MainMenuState};
+use crate::{App, AppState, PicoSdMgr};
 
 pub struct RomListState {
-    page:        heapless::Vec<heapless::String<64>, 7>,
+    page: heapless::Vec<heapless::String<64>, 7>,
     page_offset: usize,
-    has_next:    bool,
-    logic:       RomListLogic,
+    has_next: bool,
+    logic: RomListLogic,
 }
 
 impl RomListState {
@@ -28,7 +28,12 @@ impl RomListState {
         };
         let page_len = page.len();
         let logic = RomListLogic::new(page_len);
-        let state = Self { page, page_offset: 0, has_next, logic };
+        let state = Self {
+            page,
+            page_offset: 0,
+            has_next,
+            logic,
+        };
         state.draw(app, game_disp).await;
         state
     }
@@ -42,14 +47,16 @@ impl RomListState {
         }
 
         let marked = app.staged_rom_name.as_ref().and_then(|staged| {
-            self.page.iter().position(|name| name.as_str().eq_ignore_ascii_case(staged.as_str()))
+            self.page
+                .iter()
+                .position(|name| name.as_str().eq_ignore_ascii_case(staged.as_str()))
         });
 
         let frame = MenuFrame {
-            title:    "ROMS",
-            items:    items_arr.as_slice(),
+            title: "ROMS",
+            items: items_arr.as_slice(),
             selected: self.logic.selected(),
-            enabled:  enabled_arr.as_slice(),
+            enabled: enabled_arr.as_slice(),
             marked,
         };
         game_disp.draw_menu(&frame).await;
@@ -93,7 +100,9 @@ impl RomListState {
             }
             RomListEffect::SelectItem => {
                 let filename = self.page[self.logic.selected()].clone();
-                app.transition_to(AppState::Loading(alloc::boxed::Box::new(LoadingState { filename })));
+                app.transition_to(AppState::Loading(alloc::boxed::Box::new(LoadingState {
+                    filename,
+                })));
             }
             RomListEffect::NextPage => {
                 if self.has_next {

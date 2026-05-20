@@ -174,19 +174,40 @@ impl GameBoyMemory {
         let p = b.as_mut_ptr();
         unsafe {
             core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge), cart);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge_has_rtc), cartridge_has_rtc);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).cartridge_has_rom_windows), cartridge_has_rom_windows);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_fixed_ptr), rom_windows.fixed_ptr);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_fixed_len), rom_windows.fixed_len);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_banked_ptr), rom_windows.banked_ptr);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).rom_banked_len), rom_windows.banked_len);
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).cartridge_has_rtc),
+                cartridge_has_rtc,
+            );
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).cartridge_has_rom_windows),
+                cartridge_has_rom_windows,
+            );
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).rom_fixed_ptr),
+                rom_windows.fixed_ptr,
+            );
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).rom_fixed_len),
+                rom_windows.fixed_len,
+            );
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).rom_banked_ptr),
+                rom_windows.banked_ptr,
+            );
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).rom_banked_len),
+                rom_windows.banked_len,
+            );
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).vram) as *mut u8, 0, 0x2000);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).wram) as *mut u8, 0, 0x2000);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).oam) as *mut u8, 0, 0xA0);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).io) as *mut u8, 0, 0x80);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).hram) as *mut u8, 0, 0x7F);
             core::ptr::write(core::ptr::addr_of_mut!((*p).ie), 0u8);
-            core::ptr::write(core::ptr::addr_of_mut!((*p).events), VecDeque::with_capacity(8));
+            core::ptr::write(
+                core::ptr::addr_of_mut!((*p).events),
+                VecDeque::with_capacity(8),
+            );
             b.assume_init()
         }
     }
@@ -340,11 +361,17 @@ impl GameBoyMemory {
                 self.refresh_rom_windows();
             }
             EXT_RAM_BASE..=EXT_RAM_END => self.cartridge.write(address, value),
-            VRAM_BASE..=VRAM_END => Self::write_region_fast(&mut self.vram, address - VRAM_BASE, value),
-            WRAM_BASE..=WRAM_END => Self::write_region_fast(&mut self.wram, address - WRAM_BASE, value),
+            VRAM_BASE..=VRAM_END => {
+                Self::write_region_fast(&mut self.vram, address - VRAM_BASE, value)
+            }
+            WRAM_BASE..=WRAM_END => {
+                Self::write_region_fast(&mut self.wram, address - WRAM_BASE, value)
+            }
             ECHO_BASE..=ECHO_END => {}
             OAM_BASE..=OAM_END => Self::write_region_fast(&mut self.oam, address - OAM_BASE, value),
-            IO_REG_BASE..=IO_REG_END => Self::write_region_fast(&mut self.io, address - IO_REG_BASE, value),
+            IO_REG_BASE..=IO_REG_END => {
+                Self::write_region_fast(&mut self.io, address - IO_REG_BASE, value)
+            }
             0xFF80..=0xFFFE => Self::write_region_fast(&mut self.hram, address - 0xFF80, value),
             0xFFFF => self.ie = value,
             _ => {}
