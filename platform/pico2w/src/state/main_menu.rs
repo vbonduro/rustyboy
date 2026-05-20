@@ -1,0 +1,55 @@
+use embassy_time::{Duration, Timer};
+use rustyboy_pico2w::display::hw::GameDisplay;
+use rustyboy_pico2w::input::InputHandler;
+use rustyboy_pico2w::menu::{MainMenu, MenuEffect, MenuInput, MenuLogic};
+
+use crate::{App, AppState, PicoSdMgr};
+use super::{RomListState, RunningState};
+
+pub struct MainMenuState {
+    menu: MainMenu,
+}
+
+impl MainMenuState {
+    pub async fn new(game_disp: &mut GameDisplay<'static>, app: &App) -> Self {
+        let menu = MainMenu::new();
+        let frame = menu.frame(app.staged_rom_name.is_some());
+        game_disp.draw_menu(&frame).await;
+        Self { menu }
+    }
+
+    pub async fn tick(
+        &mut self,
+        app: &mut App,
+        game_disp: &mut GameDisplay<'static>,
+        input: &mut InputHandler<'static>,
+        sd_mgr: &mut PicoSdMgr,
+    ) {
+        Timer::after(Duration::from_millis(33)).await;
+
+        let (current_buttons, _) = input.poll();
+        let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);
+        app.previous_buttons = current_buttons;
+
+        if !menu_input.any() {
+            return;
+        }
+
+        let game_available = app.staged_rom_name.is_some();
+        match self.menu.handle_main(menu_input, game_available) {
+            MenuEffect::None => {
+                let frame = self.menu.frame(game_available);
+                game_disp.draw_menu(&frame).await;
+            }
+            MenuEffect::Continue => {
+                game_disp.draw_letterbox_bars().await;
+                app.transition_to(AppState::Running(RunningState));
+            }
+            MenuEffect::ShowRoms => {
+                let next = RomListState::new(app, game_disp, sd_mgr).await;
+                app.transition_to(AppState::RomList(alloc::boxed::Box::new(next)));
+            }
+            _ => {}
+        }
+    }
+}

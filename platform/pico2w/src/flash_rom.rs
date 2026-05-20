@@ -102,17 +102,25 @@ pub fn probe_staged_rom(
 // RomStager — step-by-step staging for async progress updates
 // ---------------------------------------------------------------------------
 
+/// Returned by [`RomStager::write_next_bank`].
+pub enum WriteResult {
+    /// More banks remain; call `write_next_bank` again.
+    Continue,
+    /// All banks written and metadata header committed. Contains the ROM info.
+    Done(FlashRomInfo),
+}
+
 /// Stateful ROM stager that allows the caller to interleave progress draws
 /// between bank writes.
 ///
 /// Usage:
 /// 1. Call `begin` — reads bank 0, parses bank count, erases flash.
-/// 2. Loop: call `write_next_bank` until it returns `Ok(true)`.
-/// 3. Call `finish` to write the metadata header.
+/// 2. Loop: call `write_next_bank` until it returns `Ok(WriteResult::Done(_))`.
 pub struct RomStager {
     bank_count: usize,
     banks_written: usize,
     buf: alloc::boxed::Box<[u8; ROM_BANK_BYTES]>,
+    filename: alloc::string::String,
 }
 
 impl RomStager {
@@ -120,6 +128,7 @@ impl RomStager {
     pub fn begin<R: RomReader>(
         flash: &mut OnboardFlash<'_>,
         reader: &mut R,
+        filename: &str,
     ) -> Result<Self, FlashRomStageError<R::Error>>
     where
         R::Error: Debug,
@@ -154,6 +163,7 @@ impl RomStager {
             bank_count,
             banks_written: 1,
             buf,
+            filename: alloc::string::String::from(filename),
         })
     }
 
@@ -165,17 +175,19 @@ impl RomStager {
         self.banks_written
     }
 
-    /// Write the next bank. Returns `Ok(true)` when all banks have been written.
+    /// Write the next bank. Returns `Done(info)` on the final bank, which also
+    /// commits the metadata header — no separate call required.
     pub fn write_next_bank<R: RomReader>(
         &mut self,
         flash: &mut OnboardFlash<'_>,
         reader: &mut R,
-    ) -> Result<bool, FlashRomStageError<R::Error>>
+    ) -> Result<WriteResult, FlashRomStageError<R::Error>>
     where
         R::Error: Debug,
     {
         if self.banks_written >= self.bank_count {
-            return Ok(true);
+            let info = self.make_info();
+            return Ok(WriteResult::Done(info));
         }
         reader
             .read_bank(self.banks_written, &mut *self.buf)
@@ -187,22 +199,22 @@ impl RomStager {
             )
             .map_err(FlashRomStageError::Flash)?;
         self.banks_written += 1;
-        Ok(self.banks_written >= self.bank_count)
+        if self.banks_written >= self.bank_count {
+            let info = self.make_info();
+            let header = build_header(info, &self.filename);
+            flash.blocking_write(ROM_SLOT_OFFSET as u32, &header)
+                .map_err(FlashRomStageError::Flash)?;
+            Ok(WriteResult::Done(info))
+        } else {
+            Ok(WriteResult::Continue)
+        }
     }
 
-    /// Write the metadata header. Call only after all banks are written.
-    pub fn finish(
-        self,
-        flash: &mut OnboardFlash<'_>,
-        filename: &str,
-    ) -> Result<FlashRomInfo, FlashError> {
-        let info = FlashRomInfo {
+    fn make_info(&self) -> FlashRomInfo {
+        FlashRomInfo {
             size_bytes: self.bank_count * ROM_BANK_BYTES,
             bank_count: self.bank_count,
-        };
-        let header = build_header(info, filename);
-        flash.blocking_write(ROM_SLOT_OFFSET as u32, &header)?;
-        Ok(info)
+        }
     }
 }
 

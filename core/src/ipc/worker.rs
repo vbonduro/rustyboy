@@ -87,7 +87,8 @@ impl GameBoyWorker {
     }
 
     pub fn drain_audio_samples_into_i16(&mut self, out: &mut Vec<i16>) {
-        self.apu.drain_samples_into(out);
+        out.clear();
+        self.apu.drain_samples_to(|s| out.push(s));
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
