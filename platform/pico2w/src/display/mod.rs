@@ -368,86 +368,61 @@ const SCALE:           usize = 2;   // render scale for items and title
 /// Call for every `y` in `0..320` to produce a complete menu frame.
 /// The buffer is entirely overwritten each call.
 pub fn render_menu_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
-    // ── Determine zone ───────────────────────────────────────────────────────
     let in_top_sep    = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
     let in_footer_sep = y >= FOOTER_SEP_Y && y < FOOTER_Y;
     let in_items      = y >= ITEMS_START_Y && y < FOOTER_SEP_Y;
 
-    // ── Base fill ────────────────────────────────────────────────────────────
-    let base = if in_top_sep || in_footer_sep { C2_BE } else { C3_BE };
-    fill_row(row, base);
+    fill_row(row, if in_top_sep || in_footer_sep { C2_BE } else { C3_BE });
 
-    // ── Header: title text at 2× scale, vertically centred ──────────────────
-    if y < HEADER_H {
-        let title_screen_h = (8 * SCALE) as u16;
-        let title_top = (HEADER_H - title_screen_h) / 2;
-        if y >= title_top && y < title_top + title_screen_h {
-            let glyph_row = ((y - title_top) as usize) / SCALE;
-            let title_screen_w = (frame.title.len() * CHAR_W * SCALE) as usize;
-            let title_x = (SCREEN_W as usize).saturating_sub(title_screen_w) / 2;
-            write_text_row(row, frame.title.as_bytes(), title_x, glyph_row, SCALE, C0_BE, C3_BE);
-        }
+    if y < HEADER_H       { render_menu_header_row(frame.title, y, row); }
+    if in_items           { render_menu_items_row(frame, y, row); }
+    if y >= FOOTER_Y      { render_menu_footer_row(y, row); }
+}
+
+fn render_menu_header_row(title: &str, y: u16, row: &mut [u8; 480]) {
+    let title_screen_h = (8 * SCALE) as u16;
+    let title_top = (HEADER_H - title_screen_h) / 2;
+    if y < title_top || y >= title_top + title_screen_h { return; }
+    let glyph_row = ((y - title_top) as usize) / SCALE;
+    let title_screen_w = (title.len() * CHAR_W * SCALE) as usize;
+    let title_x = (SCREEN_W as usize).saturating_sub(title_screen_w) / 2;
+    write_text_row(row, title.as_bytes(), title_x, glyph_row, SCALE, C0_BE, C3_BE);
+}
+
+fn render_menu_items_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
+    let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
+    if slot >= frame.items.len() { return; }
+    let slot_top = ITEMS_START_Y + slot as u16 * ITEM_H;
+    let selected = slot == frame.selected;
+    let enabled  = frame.enabled.get(slot).copied().unwrap_or(true);
+
+    fill_row(row, if selected { C2_BE } else { C3_BE });
+
+    let text_top    = slot_top + ITEM_TEXT_PAD;
+    let text_bottom = text_top + (8 * SCALE) as u16;
+    if y < text_top || y >= text_bottom { return; }
+
+    let glyph_row  = ((y - text_top) as usize) / SCALE;
+    let text_color = if !enabled { C2_BE } else if selected { C0_BE } else { C1_BE };
+    let item_bg    = if selected { C2_BE } else { C3_BE };
+
+    let cursor: &[u8] = if selected { b">" } else { b" " };
+    write_text_row(row, cursor, CURSOR_X, glyph_row, SCALE, text_color, item_bg);
+    write_text_row(row, frame.items[slot].as_bytes(), ITEM_TEXT_X, glyph_row, SCALE, text_color, item_bg);
+    if frame.marked == Some(slot) {
+        write_text_row(row, b"*", MARKER_X, glyph_row, SCALE, C0_BE, item_bg);
     }
+}
 
-    // ── Items ────────────────────────────────────────────────────────────────
-    if in_items {
-        let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
-        if slot < frame.items.len() {
-            let slot_top  = ITEMS_START_Y + slot as u16 * ITEM_H;
-            let selected  = slot == frame.selected;
-            let enabled   = frame.enabled.get(slot).copied().unwrap_or(true);
-
-            // Override base fill with per-item background.
-            fill_row(row, if selected { C2_BE } else { C3_BE });
-
-            // Text rows within the slot.
-            let text_top    = slot_top + ITEM_TEXT_PAD;
-            let text_bottom = text_top + (8 * SCALE) as u16;
-            if y >= text_top && y < text_bottom {
-                let glyph_row = ((y - text_top) as usize) / SCALE;
-                let text_color = if !enabled {
-                    C2_BE
-                } else if selected {
-                    C0_BE
-                } else {
-                    C1_BE
-                };
-                let item_bg = if selected { C2_BE } else { C3_BE };
-
-                // Cursor (">" for selected, " " for others).
-                let cursor: &[u8] = if selected { b">" } else { b" " };
-                write_text_row(row, cursor, CURSOR_X, glyph_row, SCALE, text_color, item_bg);
-
-                write_text_row(
-                    row,
-                    frame.items[slot].as_bytes(),
-                    ITEM_TEXT_X,
-                    glyph_row,
-                    SCALE,
-                    text_color,
-                    item_bg,
-                );
-
-                // "Loaded" marker on the right side.
-                if frame.marked == Some(slot) {
-                    write_text_row(row, b"*", MARKER_X, glyph_row, SCALE, C0_BE, item_bg);
-                }
-            }
-        }
-    }
-
-    // ── Footer: "A:SELECT  B:BACK" at 1× scale ──────────────────────────────
-    if y >= FOOTER_Y {
-        const FOOTER: &[u8] = b"A:SELECT  B:BACK";
-        let footer_text_h = 8u16;
-        let footer_top = FOOTER_Y + (SCREEN_H as u16 - FOOTER_Y - footer_text_h) / 2;
-        if y >= footer_top && y < footer_top + footer_text_h {
-            let glyph_row = (y - footer_top) as usize;
-            let footer_w = FOOTER.len() * CHAR_W;
-            let footer_x = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
-            write_text_row(row, FOOTER, footer_x, glyph_row, 1, C1_BE, C3_BE);
-        }
-    }
+fn render_menu_footer_row(y: u16, row: &mut [u8; 480]) {
+    const FOOTER: &[u8] = b"A:SELECT  B:BACK";
+    let footer_text_h = 8u16;
+    let footer_top = FOOTER_Y + (SCREEN_H as u16 - FOOTER_Y - footer_text_h) / 2;
+    if y < footer_top || y >= footer_top + footer_text_h { return; }
+    let glyph_row = (y - footer_top) as usize;
+    let footer_w  = FOOTER.len() * CHAR_W;
+    let footer_x  = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
+    write_text_row(row, FOOTER, footer_x, glyph_row, 1, C1_BE, C3_BE);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,49 +447,46 @@ pub fn render_loading_row(
     row: &mut [u8; 480],
 ) {
     let in_top_sep = y >= HEADER_H && y < HEADER_H + SEPARATOR_H;
-    let base = if in_top_sep { C2_BE } else { C3_BE };
-    fill_row(row, base);
+    fill_row(row, if in_top_sep { C2_BE } else { C3_BE });
 
-    // Header: "LOADING" title at 2× scale, centred.
-    if y < HEADER_H {
-        let title_screen_h = (8 * SCALE) as u16;
-        let title_top = (HEADER_H - title_screen_h) / 2;
-        if y >= title_top && y < title_top + title_screen_h {
-            let glyph_row = ((y - title_top) as usize) / SCALE;
-            let title = b"LOADING";
-            let title_w = title.len() * CHAR_W * SCALE;
-            let title_x = (SCREEN_W as usize).saturating_sub(title_w) / 2;
-            write_text_row(row, title, title_x, glyph_row, SCALE, C0_BE, C3_BE);
-        }
+    if y < HEADER_H                                          { render_loading_header_row(y, row); }
+    if y >= LOADING_FILENAME_Y && y < LOADING_FILENAME_Y + 8 { render_loading_filename_row(filename, y, row); }
+    if y >= LOADING_BAR_TOP    && y < LOADING_BAR_BOTTOM    { render_loading_bar_row(banks_done, total_banks, row); }
+}
+
+fn render_loading_header_row(y: u16, row: &mut [u8; 480]) {
+    let title_screen_h = (8 * SCALE) as u16;
+    let title_top = (HEADER_H - title_screen_h) / 2;
+    if y < title_top || y >= title_top + title_screen_h { return; }
+    let glyph_row = ((y - title_top) as usize) / SCALE;
+    let title = b"LOADING";
+    let title_w = title.len() * CHAR_W * SCALE;
+    let title_x = (SCREEN_W as usize).saturating_sub(title_w) / 2;
+    write_text_row(row, title, title_x, glyph_row, SCALE, C0_BE, C3_BE);
+}
+
+fn render_loading_filename_row(filename: &str, y: u16, row: &mut [u8; 480]) {
+    let glyph_row = (y - LOADING_FILENAME_Y) as usize;
+    let text = filename.as_bytes();
+    let text_w = text.len() * CHAR_W;
+    let text_x = (SCREEN_W as usize).saturating_sub(text_w) / 2;
+    write_text_row(row, text, text_x, glyph_row, 1, C1_BE, C3_BE);
+}
+
+fn render_loading_bar_row(banks_done: u32, total_banks: u32, row: &mut [u8; 480]) {
+    let bar_w = LOADING_BAR_X1 - LOADING_BAR_X0;
+    let filled = if total_banks > 0 {
+        (bar_w as u64 * banks_done as u64 / total_banks as u64) as usize
+    } else {
+        0
+    };
+    for px in LOADING_BAR_X0..LOADING_BAR_X1 {
+        row[px * 2]     = C2_BE[0];
+        row[px * 2 + 1] = C2_BE[1];
     }
-
-    // Filename at 1× scale, centred.
-    if y >= LOADING_FILENAME_Y && y < LOADING_FILENAME_Y + 8 {
-        let glyph_row = (y - LOADING_FILENAME_Y) as usize;
-        let text = filename.as_bytes();
-        let text_w = text.len() * CHAR_W;
-        let text_x = (SCREEN_W as usize).saturating_sub(text_w) / 2;
-        write_text_row(row, text, text_x, glyph_row, 1, C1_BE, C3_BE);
-    }
-
-    // Progress bar.
-    if y >= LOADING_BAR_TOP && y < LOADING_BAR_BOTTOM {
-        let bar_w = LOADING_BAR_X1 - LOADING_BAR_X0;
-        let filled = if total_banks > 0 {
-            (bar_w as u64 * banks_done as u64 / total_banks as u64) as usize
-        } else {
-            0
-        };
-        // Background
-        for px in LOADING_BAR_X0..LOADING_BAR_X1 {
-            row[px * 2]     = C2_BE[0];
-            row[px * 2 + 1] = C2_BE[1];
-        }
-        // Filled portion
-        for px in LOADING_BAR_X0..LOADING_BAR_X0 + filled.min(bar_w) {
-            row[px * 2]     = C0_BE[0];
-            row[px * 2 + 1] = C0_BE[1];
-        }
+    for px in LOADING_BAR_X0..LOADING_BAR_X0 + filled.min(bar_w) {
+        row[px * 2]     = C0_BE[0];
+        row[px * 2 + 1] = C0_BE[1];
     }
 }
 

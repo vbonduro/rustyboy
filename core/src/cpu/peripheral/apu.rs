@@ -640,12 +640,6 @@ impl ApuPeripheral {
         out
     }
 
-    /// Drain accumulated PCM samples into a caller-owned buffer.
-    pub fn drain_samples_into(&mut self, out: &mut alloc::vec::Vec<i16>) {
-        out.clear();
-        core::mem::swap(out, &mut self.sample_buffer);
-    }
-
     /// Drain accumulated PCM samples through a callback, bypassing any
     /// intermediate buffer. Clears the internal buffer when done.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
