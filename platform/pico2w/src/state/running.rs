@@ -7,8 +7,8 @@ use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::multicore::PicoGameBoy;
 
-use crate::{App, AppState, CYCLES_PER_FRAME, poll_once};
 use super::InGameMenuState;
+use crate::{poll_once, App, AppState, CYCLES_PER_FRAME};
 
 pub struct RunningState;
 

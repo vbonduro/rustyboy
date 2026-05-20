@@ -5,10 +5,10 @@ extern crate alloc;
 #[cfg(target_arch = "arm")]
 pub mod audio;
 pub mod display;
-pub mod menu;
 #[cfg(target_arch = "arm")]
 pub mod flash_rom;
 pub mod input;
+pub mod menu;
 #[cfg(target_arch = "arm")]
 pub mod multicore;
 #[cfg(target_arch = "arm")]

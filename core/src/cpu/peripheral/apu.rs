@@ -598,9 +598,7 @@ pub struct ApuPeripheral {
 
 impl ApuPeripheral {
     pub fn new() -> Self {
-        Self::new_with_sample_buffer(alloc::vec::Vec::with_capacity(
-            SAMPLE_BUFFER_CAPACITY_HINT,
-        ))
+        Self::new_with_sample_buffer(alloc::vec::Vec::with_capacity(SAMPLE_BUFFER_CAPACITY_HINT))
     }
 
     fn new_with_sample_buffer(sample_buffer: alloc::vec::Vec<i16>) -> Self {

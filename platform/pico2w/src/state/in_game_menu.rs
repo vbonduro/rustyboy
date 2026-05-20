@@ -6,8 +6,8 @@ use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{InGameMenu, MenuEffect, MenuInput, MenuLogic};
 use rustyboy_pico2w::multicore::PicoGameBoy;
 
-use crate::{App, AppState};
 use super::{MainMenuState, RunningState};
+use crate::{App, AppState};
 
 pub struct InGameMenuState {
     menu: InGameMenu,
@@ -55,8 +55,12 @@ impl InGameMenuState {
             MenuEffect::Load => {
                 if let Some(blob) = app.save_slot.as_ref() {
                     match SaveState::from_blob(blob.clone()) {
-                        Ok(save_state) => { let _ = gameboy.load_state(save_state); }
-                        Err(message)   => { warn!("load failed: {}", message); }
+                        Ok(save_state) => {
+                            let _ = gameboy.load_state(save_state);
+                        }
+                        Err(message) => {
+                            warn!("load failed: {}", message);
+                        }
                     }
                 }
                 game_disp.draw_letterbox_bars().await;

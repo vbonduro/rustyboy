@@ -385,7 +385,6 @@ impl Cartridge for XipCartridge {
         }
         consumed
     }
-
 }
 
 fn rom_bank_count_from_code(code: u8) -> Option<usize> {

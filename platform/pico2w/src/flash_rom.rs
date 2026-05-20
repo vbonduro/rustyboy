@@ -202,7 +202,8 @@ impl RomStager {
         if self.banks_written >= self.bank_count {
             let info = self.make_info();
             let header = build_header(info, &self.filename);
-            flash.blocking_write(ROM_SLOT_OFFSET as u32, &header)
+            flash
+                .blocking_write(ROM_SLOT_OFFSET as u32, &header)
                 .map_err(FlashRomStageError::Flash)?;
             Ok(WriteResult::Done(info))
         } else {

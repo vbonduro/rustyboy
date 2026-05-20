@@ -202,9 +202,13 @@ impl SharedWorkerState {
         // Safety: called only from core 1; target_slot is neither the currently
         // published slot nor marked busy, so core 0 cannot be reading it.
         unsafe {
-            scale_to_rgb565(framebuffer, &mut *self.scaled_frame_slots[target_slot].as_mut_ptr());
+            scale_to_rgb565(
+                framebuffer,
+                &mut *self.scaled_frame_slots[target_slot].as_mut_ptr(),
+            );
         }
-        self.published_frame.store(target_slot as u8, Ordering::Release);
+        self.published_frame
+            .store(target_slot as u8, Ordering::Release);
         self.published_frame_seq.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -317,20 +321,12 @@ impl Core1Transport {
         // Safety: writing to the bottom 256 bytes of core 1's stack before the
         // thread starts; no concurrent access to this memory region yet.
         unsafe {
-            stack_probe::paint_region(
-                core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8,
-                256,
-            );
+            stack_probe::paint_region(core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8, 256);
         }
 
         let shared_for_core1 = shared;
         multicore::spawn_core1(core1, core1_stack, move || {
-            run_core1_worker(
-                command_tx,
-                audio_rx,
-                shared_for_core1,
-                worker,
-            )
+            run_core1_worker(command_tx, audio_rx, shared_for_core1, worker)
         });
         Self {
             command_tx,
@@ -487,7 +483,8 @@ impl Core1Transport {
         if self.held_frame_slot == u8::MAX {
             return;
         }
-        self.shared.scaled_frame_busy[self.held_frame_slot as usize].store(false, Ordering::Release);
+        self.shared.scaled_frame_busy[self.held_frame_slot as usize]
+            .store(false, Ordering::Release);
         self.held_frame_slot = u8::MAX;
     }
 }
@@ -685,7 +682,6 @@ impl WorkerTransport for Core1Transport {
             frame_ready,
         }
     }
-
 }
 
 pub struct PicoGameBoy {
@@ -782,10 +778,7 @@ impl PicoGameBoy {
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
-fn publish_worker_state(
-    shared: &'static SharedWorkerState,
-    worker: &mut GameBoyWorker,
-) {
+fn publish_worker_state(shared: &'static SharedWorkerState, worker: &mut GameBoyWorker) {
     let state = worker.poll_output();
     if state.frame_ready {
         shared.publish_frame(worker);

@@ -5,13 +5,13 @@ use embassy_rp::watchdog::Watchdog;
 use embassy_time::Duration;
 use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::flash_rom::{
-    FlashRomInfo, OnboardFlash, RomStager, WriteResult, probe_staged_rom,
+    probe_staged_rom, FlashRomInfo, OnboardFlash, RomStager, WriteResult,
 };
 use rustyboy_pico2w::multicore::PicoGameBoy;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
-use crate::{App, AppState, PicoSdMgr};
 use super::{MainMenuState, RunningState};
+use crate::{App, AppState, PicoSdMgr};
 
 pub struct LoadingState {
     pub(crate) filename: heapless::String<64>,
@@ -42,20 +42,16 @@ impl LoadingState {
         // If the ROM is already staged in flash, skip the erase/write cycle.
         // Avoids the flash-pause handshake with the halted core1 and is
         // idempotent when the user re-selects the currently loaded ROM.
-        let already_staged = app.staged_rom_name.as_deref()
+        let already_staged = app
+            .staged_rom_name
+            .as_deref()
             .map(|n| n.eq_ignore_ascii_case(self.filename.as_str()))
             .unwrap_or(false);
 
         let stage_result: Result<FlashRomInfo, ()> = if already_staged {
             probe_staged_rom(flash).map(|(info, _)| info).ok_or(())
         } else {
-            stage_rom_from_sd(
-                self.filename.as_str(),
-                flash,
-                sd_mgr,
-                game_disp,
-                watchdog,
-            ).await
+            stage_rom_from_sd(self.filename.as_str(), flash, sd_mgr, game_disp, watchdog).await
         };
 
         match stage_result {
@@ -63,7 +59,10 @@ impl LoadingState {
                 app.staged_rom_name = Some(self.filename.clone());
                 if !had_game {
                     // First ROM load — create the GameBoy and start Running.
-                    let core1 = app.core1.take().expect("CORE1 consumed without a running game");
+                    let core1 = app
+                        .core1
+                        .take()
+                        .expect("CORE1 consumed without a running game");
                     match XipCartridge::from_staged_flash(info) {
                         Ok(cart) => {
                             *gameboy = Some(PicoGameBoy::with_cartridge(core1, Box::new(cart)));
@@ -113,7 +112,9 @@ async fn stage_rom_from_sd(
     })?;
     info!("stager begin done: {} banks", stager.total_banks());
     let total_banks = stager.total_banks();
-    game_disp.draw_loading_progress(filename, 0, total_banks as u32).await;
+    game_disp
+        .draw_loading_progress(filename, 0, total_banks as u32)
+        .await;
 
     loop {
         watchdog.feed(Duration::from_millis(5_000));
@@ -121,14 +122,18 @@ async fn stage_rom_from_sd(
             defmt::error!("bank write failed: {:?}", defmt::Debug2Format(&e));
         })? {
             WriteResult::Continue => {
-                game_disp.draw_loading_progress(
-                    filename,
-                    stager.banks_written() as u32,
-                    total_banks as u32,
-                ).await;
+                game_disp
+                    .draw_loading_progress(
+                        filename,
+                        stager.banks_written() as u32,
+                        total_banks as u32,
+                    )
+                    .await;
             }
             WriteResult::Done(info) => {
-                game_disp.draw_loading_progress(filename, total_banks as u32, total_banks as u32).await;
+                game_disp
+                    .draw_loading_progress(filename, total_banks as u32, total_banks as u32)
+                    .await;
                 return Ok(info);
             }
         }

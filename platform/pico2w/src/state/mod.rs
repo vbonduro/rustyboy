@@ -1,11 +1,11 @@
-mod running;
 mod in_game_menu;
+mod loading;
 mod main_menu;
 mod rom_list;
-mod loading;
+mod running;
 
-pub use running::RunningState;
 pub use in_game_menu::InGameMenuState;
+pub use loading::LoadingState;
 pub use main_menu::MainMenuState;
 pub use rom_list::RomListState;
-pub use loading::LoadingState;
+pub use running::RunningState;

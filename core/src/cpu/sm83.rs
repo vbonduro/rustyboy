@@ -164,7 +164,6 @@ impl Sm83 {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn bus_write(&mut self, memory: &mut GameBoyMemory, addr: u16, val: u8) {
-
         match addr {
             IO_REG_BASE..=IO_REG_END | 0xFFFF => {
                 memory.write_io(addr, val);
@@ -185,7 +184,6 @@ impl Sm83 {
         let addr = self.registers.pc;
 
         let value = if addr <= 0x7FFF {
-
             let value = memory.read_rom_fast(addr);
 
             value
@@ -1151,5 +1149,4 @@ mod tests {
         assert_eq!(cpu.read_memory(0xC000).unwrap(), 0x00);
         assert_eq!(cpu.registers().f, Flags::Z | Flags::H | Flags::C);
     }
-
 }
