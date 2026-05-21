@@ -76,7 +76,7 @@ impl XipCartridge {
             current_bank_valid: rom_bank_count > 1,
             rom_bank_count,
             mbc,
-            ram: alloc::vec![0u8; ram_bytes],
+            ram: alloc::vec![0u8; effective_ram_bytes(cart_type, ram_bytes)],
         };
         cart.refresh_mappings();
         Ok(cart)
@@ -408,6 +408,15 @@ fn ram_bytes_from_code(code: u8) -> usize {
     }
 }
 
+fn effective_ram_bytes(cart_type: u8, ram_bytes: usize) -> usize {
+    match cart_type {
+        // Match the core MBC1 cartridge path used by the web frontend. Some
+        // software touches external RAM even when the header says no RAM.
+        0x01 | 0x02 | 0x03 => ram_bytes.max(0x2000),
+        _ => ram_bytes,
+    }
+}
+
 fn mbc_state_from_header(cart_type: u8, ram_bytes: usize) -> Option<MbcState> {
     let ram_bank_count = if ram_bytes == 0 {
         0
@@ -466,6 +475,14 @@ mod tests {
         cart.write(0x2000, 0x02);
         assert_eq!(cart.current_rom_bank(), 2);
         assert_eq!(cart.read_rom(0x4000), 0x02);
+    }
+
+    #[test]
+    fn mbc1_without_ram_header_matches_core_ram_fallback() {
+        let mut cart = XipCartridge::new(leak_rom(4, 0x01, 0x00)).unwrap();
+        cart.write(0x0000, 0x0A);
+        cart.write(0xA123, 0x42);
+        assert_eq!(cart.read_ram(0x0123), 0x42);
     }
 
     #[test]
