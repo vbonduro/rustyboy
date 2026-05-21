@@ -15,7 +15,7 @@ use embassy_rp::Peri;
 use heapless::mpmc::MpMcQueue;
 use rustyboy_core::cpu::cpu::CpuError;
 use rustyboy_core::cpu::peripheral::joypad::Button;
-use rustyboy_core::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
+use rustyboy_core::cpu::peripheral::ppu::{PpuMode, FRAMEBUFFER_SIZE};
 use rustyboy_core::cpu::registers::{Flags, Registers};
 use rustyboy_core::cpu::save_state::{PpuState, SaveState};
 use rustyboy_core::gameboy::GameBoy;
@@ -29,10 +29,32 @@ use crate::stack_probe;
 const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
-const PPU_ADVANCE_BATCH_CYCLES: u16 = 912;
+const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
+const TIMING_PPU_BATCH_CYCLES: u16 = 80;
 const SCALED_FRAME_SLOT_COUNT: usize = 3;
 const IO_REG_BASE: u16 = 0xFF00;
 const IO_REG_END: u16 = 0xFF7F;
+const STAT_ADDR: u16 = 0xFF41;
+const LY_ADDR: u16 = 0xFF44;
+const VBLANK_INTERRUPT_BIT: u8 = 0;
+const STAT_INTERRUPT_BIT: u8 = 1;
+const LCDC_IO: usize = 0x40;
+const STAT_IO: usize = 0x41;
+const SCY_IO: usize = 0x42;
+const SCX_IO: usize = 0x43;
+const LY_IO: usize = 0x44;
+const LYC_IO: usize = 0x45;
+const BGP_IO: usize = 0x47;
+const OBP0_IO: usize = 0x48;
+const OBP1_IO: usize = 0x49;
+const WY_IO: usize = 0x4A;
+const WX_IO: usize = 0x4B;
+const DOTS_PER_SCANLINE: u16 = 456;
+const OAM_SCAN_DOTS: u16 = 80;
+const PIXEL_TRANSFER_DOTS: u16 = 172;
+const VISIBLE_SCANLINES: u8 = 144;
+const TOTAL_SCANLINES: u8 = 154;
+const SCREEN_HEIGHT: u8 = 144;
 
 static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
 static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
@@ -139,7 +161,6 @@ struct SharedWorkerState {
     ppu_stat: AtomicU8,
     pending_if_bits: AtomicU8,
     ppu_render_version: AtomicU32,
-    ppu_state: Mutex<RefCell<PpuState>>,
 }
 
 impl SharedWorkerState {
@@ -166,22 +187,6 @@ impl SharedWorkerState {
             ppu_stat: AtomicU8::new(0),
             pending_if_bits: AtomicU8::new(0),
             ppu_render_version: AtomicU32::new(0),
-            ppu_state: Mutex::new(RefCell::new(PpuState {
-                dot: 0,
-                ly: 0,
-                mode: rustyboy_core::cpu::peripheral::ppu::PpuMode::OamScan,
-                window_line_counter: 0,
-                lcdc: 0,
-                stat: 0,
-                scy: 0,
-                scx: 0,
-                lyc: 0,
-                bgp: 0,
-                obp0: 0,
-                obp1: 0,
-                wy: 0,
-                wx: 0,
-            })),
         }
     }
 
@@ -262,19 +267,186 @@ impl SharedWorkerState {
         });
         self.ppu_render_version.fetch_add(1, Ordering::AcqRel);
     }
+}
 
-    fn write_live_ppu_register(&self, addr: u16, value: u8) {
-        if !(IO_REG_BASE..=IO_REG_END).contains(&addr) {
-            return;
+#[derive(Clone, Copy)]
+struct TimingPpuOutput {
+    vblank_interrupt: bool,
+    stat_interrupt: bool,
+}
+
+/// Core 0 only needs CPU-visible LCD timing. Keeping this tiny mirror here
+/// avoids allocating a full framebuffer just to make LY/STAT synchronous.
+#[derive(Clone, Copy)]
+struct TimingPpu {
+    dot: u16,
+    ly: u8,
+    mode: PpuMode,
+    window_line_counter: u8,
+    prev_stat_line: bool,
+}
+
+impl TimingPpu {
+    const fn new() -> Self {
+        Self {
+            dot: 0,
+            ly: 0,
+            mode: PpuMode::OamScan,
+            window_line_counter: 0,
+            prev_stat_line: false,
         }
-        critical_section::with(|cs| {
-            self.live_ppu_snapshot.borrow(cs).borrow_mut().io[(addr - IO_REG_BASE) as usize] =
-                value;
-        });
     }
 
-    fn snapshot_ppu_state(&self) -> PpuState {
-        critical_section::with(|cs| *self.ppu_state.borrow(cs).borrow())
+    fn ly(&self) -> u8 {
+        self.ly
+    }
+
+    fn reset_ly(&mut self) {
+        self.ly = 0;
+    }
+
+    fn sync_prev_stat_line(&mut self, io: &[u8]) {
+        let lyc = io[LYC_IO];
+        let stat = io[STAT_IO];
+        let lyc_match = self.ly == lyc;
+        self.prev_stat_line = (lyc_match && (stat & 0x40 != 0))
+            || (self.mode == PpuMode::HBlank && (stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank && (stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan && (stat & 0x20 != 0));
+    }
+
+    fn load_state(&mut self, state: PpuState) {
+        self.dot = state.dot;
+        self.ly = state.ly;
+        self.mode = state.mode;
+        self.window_line_counter = state.window_line_counter;
+    }
+
+    fn to_save_state(&self, io: &[u8]) -> PpuState {
+        PpuState {
+            dot: self.dot,
+            ly: self.ly,
+            mode: self.mode,
+            window_line_counter: self.window_line_counter,
+            lcdc: io[LCDC_IO],
+            stat: io[STAT_IO],
+            scy: io[SCY_IO],
+            scx: io[SCX_IO],
+            lyc: io[LYC_IO],
+            bgp: io[BGP_IO],
+            obp0: io[OBP0_IO],
+            obp1: io[OBP1_IO],
+            wy: io[WY_IO],
+            wx: io[WX_IO],
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn tick(&mut self, cycles: u16, io: &mut [u8]) -> TimingPpuOutput {
+        if io[LCDC_IO] & 0x80 == 0 {
+            self.reset_lcd(io);
+            return TimingPpuOutput {
+                vblank_interrupt: false,
+                stat_interrupt: false,
+            };
+        }
+
+        let mut vblank_interrupt = false;
+        let mut remaining = cycles;
+
+        while remaining > 0 {
+            let threshold = match self.mode {
+                PpuMode::OamScan => OAM_SCAN_DOTS,
+                PpuMode::PixelTransfer => OAM_SCAN_DOTS + PIXEL_TRANSFER_DOTS,
+                PpuMode::HBlank | PpuMode::VBlank => DOTS_PER_SCANLINE,
+            };
+            let dots_to_threshold = threshold.saturating_sub(self.dot);
+
+            if dots_to_threshold > 0 && remaining < dots_to_threshold {
+                self.dot += remaining;
+                break;
+            }
+
+            self.dot += dots_to_threshold;
+            remaining -= dots_to_threshold;
+
+            match self.mode {
+                PpuMode::OamScan => {
+                    self.mode = PpuMode::PixelTransfer;
+                }
+                PpuMode::PixelTransfer => {
+                    self.mode = PpuMode::HBlank;
+                    if self.window_participates_on_current_line(io) {
+                        self.window_line_counter = self.window_line_counter.wrapping_add(1);
+                    }
+                }
+                PpuMode::HBlank => {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= VISIBLE_SCANLINES {
+                        self.mode = PpuMode::VBlank;
+                        vblank_interrupt = true;
+                    } else {
+                        self.mode = PpuMode::OamScan;
+                    }
+                }
+                PpuMode::VBlank => {
+                    self.dot = 0;
+                    self.ly += 1;
+                    if self.ly >= TOTAL_SCANLINES {
+                        self.ly = 0;
+                        self.mode = PpuMode::OamScan;
+                        self.window_line_counter = 0;
+                    }
+                }
+            }
+        }
+
+        let stat_interrupt = self.build_stat(io);
+        io[LY_IO] = self.ly;
+
+        TimingPpuOutput {
+            vblank_interrupt,
+            stat_interrupt,
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn reset_lcd(&mut self, io: &mut [u8]) {
+        self.dot = 0;
+        self.ly = 0;
+        self.mode = PpuMode::HBlank;
+        self.window_line_counter = 0;
+        self.prev_stat_line = false;
+        io[LY_IO] = 0;
+        io[STAT_IO] = (io[STAT_IO] & 0x78) | (PpuMode::HBlank as u8);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    fn build_stat(&mut self, io: &mut [u8]) -> bool {
+        let lyc = io[LYC_IO];
+        let lyc_match = self.ly == lyc;
+        let new_stat =
+            (io[STAT_IO] & 0x78) | if lyc_match { 0x04 } else { 0x00 } | (self.mode as u8);
+        io[STAT_IO] = new_stat;
+
+        let stat_line = (lyc_match && (new_stat & 0x40 != 0))
+            || (self.mode == PpuMode::HBlank && (new_stat & 0x08 != 0))
+            || (self.mode == PpuMode::VBlank && (new_stat & 0x10 != 0))
+            || (self.mode == PpuMode::OamScan && (new_stat & 0x20 != 0));
+
+        let interrupt = stat_line && !self.prev_stat_line;
+        self.prev_stat_line = stat_line;
+        interrupt
+    }
+
+    fn window_participates_on_current_line(&self, io: &[u8]) -> bool {
+        let lcdc = io[LCDC_IO];
+        lcdc & 0x20 != 0
+            && lcdc & 0x01 != 0
+            && self.ly < SCREEN_HEIGHT
+            && self.ly >= io[WY_IO]
+            && io[WX_IO] <= 166
     }
 }
 
@@ -293,6 +465,11 @@ struct Core1Transport {
     command_tx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
     audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
     shared: &'static SharedWorkerState,
+    timing_ppu: TimingPpu,
+    timing_io: [u8; 0x80],
+    pending_timing_cycles: u16,
+    timing_if_bits: u8,
+    timing_frame_ready: bool,
     pending_apu: Option<PendingApuAdvance>,
     pending_ppu: Option<PendingPpuAdvance>,
     next_ticket: u32,
@@ -328,6 +505,11 @@ impl Core1Transport {
             command_tx,
             audio_rx,
             shared,
+            timing_ppu: TimingPpu::new(),
+            timing_io: [0; 0x80],
+            pending_timing_cycles: 0,
+            timing_if_bits: 0,
+            timing_frame_ready: false,
             pending_apu: None,
             pending_ppu: None,
             next_ticket: 1,
@@ -358,6 +540,81 @@ impl Core1Transport {
                 }
             }
         }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn advance_timing_ppu(&mut self, cycles: u16) {
+        let mut cycles = self.pending_timing_cycles as u32 + cycles as u32;
+        if cycles < TIMING_PPU_BATCH_CYCLES as u32 {
+            self.pending_timing_cycles = cycles as u16;
+            return;
+        }
+        while cycles >= TIMING_PPU_BATCH_CYCLES as u32 {
+            self.advance_timing_ppu_now(TIMING_PPU_BATCH_CYCLES);
+            cycles -= TIMING_PPU_BATCH_CYCLES as u32;
+        }
+        self.pending_timing_cycles = cycles as u16;
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn flush_pending_timing_ppu(&mut self) {
+        let pending = self.pending_timing_cycles;
+        if pending == 0 {
+            return;
+        }
+        self.pending_timing_cycles = 0;
+        self.advance_timing_ppu_now(pending);
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn advance_timing_ppu_now(&mut self, cycles: u16) {
+        let output = self.timing_ppu.tick(cycles, &mut self.timing_io);
+        if output.vblank_interrupt {
+            self.timing_if_bits |= 1 << VBLANK_INTERRUPT_BIT;
+            self.timing_frame_ready = true;
+        }
+        if output.stat_interrupt {
+            self.timing_if_bits |= 1 << STAT_INTERRUPT_BIT;
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn write_timing_ppu_register(&mut self, addr: u16, value: u8) {
+        if !(IO_REG_BASE..=IO_REG_END).contains(&addr) {
+            return;
+        }
+        self.flush_pending_timing_ppu();
+        if addr == LY_ADDR {
+            self.timing_ppu.reset_ly();
+            self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = 0;
+            return;
+        }
+        self.timing_io[(addr - IO_REG_BASE) as usize] = value;
+    }
+
+    fn sync_timing_ppu_state(&mut self, io: &[u8]) {
+        self.timing_ppu = TimingPpu::new();
+        self.timing_io.copy_from_slice(&io[..0x80]);
+        self.timing_ppu.sync_prev_stat_line(&self.timing_io);
+        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = self.timing_ppu.ly();
+        self.pending_timing_cycles = 0;
+        self.timing_if_bits = 0;
+        self.timing_frame_ready = false;
+    }
+
+    fn load_timing_ppu_state(&mut self, state: PpuState, io: &[u8]) {
+        self.timing_ppu.load_state(state);
+        self.timing_io.copy_from_slice(&io[..0x80]);
+        self.timing_ppu.sync_prev_stat_line(&self.timing_io);
+        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = state.ly;
+        self.timing_io[(STAT_ADDR - IO_REG_BASE) as usize] = state.stat;
+        self.pending_timing_cycles = 0;
+        self.timing_if_bits = 0;
+        self.timing_frame_ready = false;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -494,18 +751,25 @@ impl WorkerTransport for Core1Transport {
                 cycles,
                 div_counter,
             } => self.queue_pending_apu(cycles, div_counter),
-            WorkerCommand::AdvancePpu { cycles } => self.queue_pending_ppu(cycles),
+            WorkerCommand::AdvancePpu { cycles } => {
+                self.advance_timing_ppu(cycles);
+                self.queue_pending_ppu(cycles);
+            }
             WorkerCommand::WriteApuRegister { .. } | WorkerCommand::WriteWaveRam { .. } => {
                 self.flush_pending_apu();
                 self.transport_profile.apu_commands =
                     self.transport_profile.apu_commands.wrapping_add(1);
                 self.enqueue_blocking(Core1Command::Worker(command));
             }
-            WorkerCommand::WritePpuRegister { .. } => {
+            WorkerCommand::WritePpuRegister { addr, value } => {
+                self.write_timing_ppu_register(addr, value);
                 self.flush_pending_ppu();
                 self.transport_profile.ppu_register_writes =
                     self.transport_profile.ppu_register_writes.wrapping_add(1);
-                self.enqueue_blocking(Core1Command::Worker(command));
+                self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
+                    addr,
+                    value,
+                }));
             }
             _ => {
                 self.enqueue_blocking(Core1Command::Worker(command));
@@ -544,8 +808,8 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_ppu_register(&mut self, addr: u16, value: u8) {
+        self.write_timing_ppu_register(addr, value);
         self.flush_pending_ppu();
-        self.shared.write_live_ppu_register(addr, value);
         self.transport_profile.ppu_register_writes =
             self.transport_profile.ppu_register_writes.wrapping_add(1);
         self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
@@ -561,19 +825,12 @@ impl WorkerTransport for Core1Transport {
             return;
         }
         self.flush_pending_ppu();
-        critical_section::with(|cs| {
-            let mut snapshot = self.shared.live_ppu_snapshot.borrow(cs).borrow_mut();
-            for &(addr, value) in regs {
-                if (IO_REG_BASE..=IO_REG_END).contains(&addr) {
-                    snapshot.io[(addr - IO_REG_BASE) as usize] = value;
-                }
-            }
-        });
         self.transport_profile.ppu_register_writes = self
             .transport_profile
             .ppu_register_writes
             .wrapping_add(regs.len() as u32);
         for &(addr, value) in regs {
+            self.write_timing_ppu_register(addr, value);
             self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
                 addr,
                 value,
@@ -627,6 +884,7 @@ impl WorkerTransport for Core1Transport {
 
     fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.flush_pending_ppu();
+        self.sync_timing_ppu_state(io);
         critical_section::with(|cs| {
             let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
             snapshots.io.copy_from_slice(&io[..0x80]);
@@ -644,6 +902,7 @@ impl WorkerTransport for Core1Transport {
 
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.flush_pending_ppu();
+        self.load_timing_ppu_state(state, io);
         critical_section::with(|cs| {
             let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
             snapshots.io.copy_from_slice(&io[..0x80]);
@@ -660,7 +919,7 @@ impl WorkerTransport for Core1Transport {
     }
 
     fn snapshot_ppu_state(&self, _io: &[u8]) -> PpuState {
-        self.shared.snapshot_ppu_state()
+        self.timing_ppu.to_save_state(&self.timing_io)
     }
 
     fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
@@ -670,12 +929,17 @@ impl WorkerTransport for Core1Transport {
         if frame_ready {
             self.last_frame_seq = frame_seq;
         }
+        let _worker_if_bits = self.shared.pending_if_bits.swap(0, Ordering::AcqRel);
+        let if_bits = self.timing_if_bits;
+        self.timing_if_bits = 0;
+        let timing_frame_ready = self.timing_frame_ready;
+        self.timing_frame_ready = false;
         WorkerOutput {
             apu_nr52: self.shared.apu_nr52.load(Ordering::Acquire),
-            ppu_ly: self.shared.ppu_ly.load(Ordering::Acquire),
-            ppu_stat: self.shared.ppu_stat.load(Ordering::Acquire),
-            if_bits: self.shared.pending_if_bits.swap(0, Ordering::AcqRel),
-            frame_ready,
+            ppu_ly: self.timing_io[(LY_ADDR - IO_REG_BASE) as usize],
+            ppu_stat: self.timing_io[(STAT_ADDR - IO_REG_BASE) as usize],
+            if_bits,
+            frame_ready: frame_ready || timing_frame_ready,
         }
     }
 }
@@ -780,9 +1044,6 @@ fn publish_worker_state(shared: &'static SharedWorkerState, worker: &mut GameBoy
         shared.publish_frame(worker);
     }
     shared.publish_worker_output(state);
-    critical_section::with(|cs| {
-        *shared.ppu_state.borrow(cs).borrow_mut() = worker.snapshot_ppu_state();
-    });
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -807,7 +1068,11 @@ fn run_core1_worker(
 
         match command {
             Core1Command::Worker(worker_command) => {
-                if matches!(worker_command, WorkerCommand::AdvancePpu { .. }) {
+                let ppu_cycles = match worker_command {
+                    WorkerCommand::AdvancePpu { cycles } => cycles as u32,
+                    _ => 0,
+                };
+                if ppu_cycles != 0 {
                     let render_version = shared.ppu_render_version.load(Ordering::Acquire);
                     if render_version != last_ppu_render_version {
                         critical_section::with(|cs| {
