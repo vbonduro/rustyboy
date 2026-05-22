@@ -15,4 +15,5 @@ pub mod multicore;
 pub mod sd;
 #[cfg(target_arch = "arm")]
 pub mod stack_probe;
+mod worker_policy;
 pub mod xip_cartridge;
