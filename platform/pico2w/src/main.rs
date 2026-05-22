@@ -338,11 +338,7 @@ async fn main(_spawner: Spawner) {
 
                 #[cfg(feature = "fps")]
                 {
-                    let profile = gameboy
-                        .as_mut()
-                        .expect("Running without GameBoy")
-                        .take_transport_profile();
-                    tracker.tick(profile);
+                    tracker.tick();
                 }
             }
 
