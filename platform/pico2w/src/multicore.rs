@@ -30,7 +30,7 @@ const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
-const TIMING_PPU_BATCH_CYCLES: u16 = 80;
+const LCD_TIMING_BATCH_CYCLES: u16 = 80;
 const SCALED_FRAME_SLOT_COUNT: usize = 3;
 const IO_REG_BASE: u16 = 0xFF00;
 const IO_REG_END: u16 = 0xFF7F;
@@ -81,19 +81,6 @@ enum Core1Command {
     Halt {
         ticket: u32,
     },
-}
-
-#[derive(Clone, Copy, Default)]
-pub struct TransportProfile {
-    pub command_enqueues: u32,
-    pub command_queue_spins: u32,
-    pub apu_commands: u32,
-    pub ppu_advance_commands: u32,
-    pub frame_publishes: u32,
-    pub ppu_vram_bytes: u32,
-    pub ppu_oam_bytes: u32,
-    pub ppu_register_writes: u32,
-    pub audio_queue_drops: u32,
 }
 
 struct PpuSnapshot {
@@ -155,7 +142,6 @@ struct SharedWorkerState {
     published_frame: AtomicU8,
     published_frame_seq: AtomicU32,
     sync_complete: AtomicU32,
-    audio_queue_drops: AtomicU32,
     apu_nr52: AtomicU8,
     ppu_ly: AtomicU8,
     ppu_stat: AtomicU8,
@@ -181,7 +167,6 @@ impl SharedWorkerState {
             published_frame: AtomicU8::new(0),
             published_frame_seq: AtomicU32::new(0),
             sync_complete: AtomicU32::new(0),
-            audio_queue_drops: AtomicU32::new(0),
             apu_nr52: AtomicU8::new(0),
             ppu_ly: AtomicU8::new(0),
             ppu_stat: AtomicU8::new(0),
@@ -270,15 +255,16 @@ impl SharedWorkerState {
 }
 
 #[derive(Clone, Copy)]
-struct TimingPpuOutput {
+struct LcdTimingOutput {
     vblank_interrupt: bool,
     stat_interrupt: bool,
 }
 
-/// Core 0 only needs CPU-visible LCD timing. Keeping this tiny mirror here
-/// avoids allocating a full framebuffer just to make LY/STAT synchronous.
+/// Core 0 only needs the LCD timing state that the CPU can observe through
+/// LY, STAT, and LCD interrupts. Keeping this tiny mirror synchronous avoids
+/// waiting on the async renderer just to answer those reads correctly.
 #[derive(Clone, Copy)]
-struct TimingPpu {
+struct LcdTiming {
     dot: u16,
     ly: u8,
     mode: PpuMode,
@@ -286,7 +272,7 @@ struct TimingPpu {
     prev_stat_line: bool,
 }
 
-impl TimingPpu {
+impl LcdTiming {
     const fn new() -> Self {
         Self {
             dot: 0,
@@ -342,10 +328,10 @@ impl TimingPpu {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
-    fn tick(&mut self, cycles: u16, io: &mut [u8]) -> TimingPpuOutput {
+    fn tick(&mut self, cycles: u16, io: &mut [u8]) -> LcdTimingOutput {
         if io[LCDC_IO] & 0x80 == 0 {
             self.reset_lcd(io);
-            return TimingPpuOutput {
+            return LcdTimingOutput {
                 vblank_interrupt: false,
                 stat_interrupt: false,
             };
@@ -405,7 +391,7 @@ impl TimingPpu {
         let stat_interrupt = self.build_stat(io);
         io[LY_IO] = self.ly;
 
-        TimingPpuOutput {
+        LcdTimingOutput {
             vblank_interrupt,
             stat_interrupt,
         }
@@ -465,7 +451,7 @@ struct Core1Transport {
     command_tx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
     audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
     shared: &'static SharedWorkerState,
-    timing_ppu: TimingPpu,
+    lcd_timing: LcdTiming,
     timing_io: [u8; 0x80],
     pending_timing_cycles: u16,
     timing_if_bits: u8,
@@ -474,9 +460,7 @@ struct Core1Transport {
     pending_ppu: Option<PendingPpuAdvance>,
     next_ticket: u32,
     last_frame_seq: u32,
-    last_profile_frame_seq: u32,
     held_frame_slot: u8,
-    transport_profile: TransportProfile,
 }
 
 impl Core1Transport {
@@ -505,7 +489,7 @@ impl Core1Transport {
             command_tx,
             audio_rx,
             shared,
-            timing_ppu: TimingPpu::new(),
+            lcd_timing: LcdTiming::new(),
             timing_io: [0; 0x80],
             pending_timing_cycles: 0,
             timing_if_bits: 0,
@@ -514,9 +498,7 @@ impl Core1Transport {
             pending_ppu: None,
             next_ticket: 1,
             last_frame_seq: 0,
-            last_profile_frame_seq: 0,
             held_frame_slot: u8::MAX,
-            transport_profile: TransportProfile::default(),
         }
     }
 
@@ -527,15 +509,11 @@ impl Core1Transport {
         loop {
             match self.command_tx.enqueue(command) {
                 Ok(()) => {
-                    self.transport_profile.command_enqueues =
-                        self.transport_profile.command_enqueues.wrapping_add(1);
                     asm::sev();
                     return;
                 }
                 Err(returned) => {
                     command = returned;
-                    self.transport_profile.command_queue_spins =
-                        self.transport_profile.command_queue_spins.wrapping_add(1);
                     core::hint::spin_loop();
                 }
             }
@@ -546,13 +524,13 @@ impl Core1Transport {
     #[inline(always)]
     fn advance_timing_ppu(&mut self, cycles: u16) {
         let mut cycles = self.pending_timing_cycles as u32 + cycles as u32;
-        if cycles < TIMING_PPU_BATCH_CYCLES as u32 {
+        if cycles < LCD_TIMING_BATCH_CYCLES as u32 {
             self.pending_timing_cycles = cycles as u16;
             return;
         }
-        while cycles >= TIMING_PPU_BATCH_CYCLES as u32 {
-            self.advance_timing_ppu_now(TIMING_PPU_BATCH_CYCLES);
-            cycles -= TIMING_PPU_BATCH_CYCLES as u32;
+        while cycles >= LCD_TIMING_BATCH_CYCLES as u32 {
+            self.advance_timing_ppu_now(LCD_TIMING_BATCH_CYCLES);
+            cycles -= LCD_TIMING_BATCH_CYCLES as u32;
         }
         self.pending_timing_cycles = cycles as u16;
     }
@@ -571,7 +549,7 @@ impl Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn advance_timing_ppu_now(&mut self, cycles: u16) {
-        let output = self.timing_ppu.tick(cycles, &mut self.timing_io);
+        let output = self.lcd_timing.tick(cycles, &mut self.timing_io);
         if output.vblank_interrupt {
             self.timing_if_bits |= 1 << VBLANK_INTERRUPT_BIT;
             self.timing_frame_ready = true;
@@ -589,7 +567,7 @@ impl Core1Transport {
         }
         self.flush_pending_timing_ppu();
         if addr == LY_ADDR {
-            self.timing_ppu.reset_ly();
+            self.lcd_timing.reset_ly();
             self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = 0;
             return;
         }
@@ -597,19 +575,19 @@ impl Core1Transport {
     }
 
     fn sync_timing_ppu_state(&mut self, io: &[u8]) {
-        self.timing_ppu = TimingPpu::new();
+        self.lcd_timing = LcdTiming::new();
         self.timing_io.copy_from_slice(&io[..0x80]);
-        self.timing_ppu.sync_prev_stat_line(&self.timing_io);
-        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = self.timing_ppu.ly();
+        self.lcd_timing.sync_prev_stat_line(&self.timing_io);
+        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = self.lcd_timing.ly();
         self.pending_timing_cycles = 0;
         self.timing_if_bits = 0;
         self.timing_frame_ready = false;
     }
 
     fn load_timing_ppu_state(&mut self, state: PpuState, io: &[u8]) {
-        self.timing_ppu.load_state(state);
+        self.lcd_timing.load_state(state);
         self.timing_io.copy_from_slice(&io[..0x80]);
-        self.timing_ppu.sync_prev_stat_line(&self.timing_io);
+        self.lcd_timing.sync_prev_stat_line(&self.timing_io);
         self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = state.ly;
         self.timing_io[(STAT_ADDR - IO_REG_BASE) as usize] = state.stat;
         self.pending_timing_cycles = 0;
@@ -621,8 +599,6 @@ impl Core1Transport {
     #[inline(always)]
     fn flush_pending_apu(&mut self) {
         if let Some(pending) = self.pending_apu.take() {
-            self.transport_profile.apu_commands =
-                self.transport_profile.apu_commands.wrapping_add(1);
             self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvanceApu {
                 cycles: pending.cycles,
                 div_counter: pending.div_counter,
@@ -661,8 +637,6 @@ impl Core1Transport {
     #[inline(always)]
     fn flush_pending_ppu(&mut self) {
         if let Some(pending) = self.pending_ppu.take() {
-            self.transport_profile.ppu_advance_commands =
-                self.transport_profile.ppu_advance_commands.wrapping_add(1);
             self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvancePpu {
                 cycles: pending.cycles,
             }));
@@ -685,8 +659,6 @@ impl Core1Transport {
             }
             None => {
                 if cycles >= PPU_ADVANCE_BATCH_CYCLES {
-                    self.transport_profile.ppu_advance_commands =
-                        self.transport_profile.ppu_advance_commands.wrapping_add(1);
                     self.enqueue_blocking(Core1Command::Worker(WorkerCommand::AdvancePpu {
                         cycles,
                     }));
@@ -707,15 +679,6 @@ impl Core1Transport {
         while self.shared.sync_complete.load(Ordering::Acquire) != ticket {
             core::hint::spin_loop();
         }
-    }
-
-    fn take_transport_profile(&mut self) -> TransportProfile {
-        let mut profile = core::mem::take(&mut self.transport_profile);
-        let frame_seq = self.shared.published_frame_seq.load(Ordering::Acquire);
-        profile.frame_publishes = frame_seq.wrapping_sub(self.last_profile_frame_seq);
-        self.last_profile_frame_seq = frame_seq;
-        profile.audio_queue_drops = self.shared.audio_queue_drops.swap(0, Ordering::AcqRel);
-        profile
     }
 
     fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
@@ -757,15 +720,11 @@ impl WorkerTransport for Core1Transport {
             }
             WorkerCommand::WriteApuRegister { .. } | WorkerCommand::WriteWaveRam { .. } => {
                 self.flush_pending_apu();
-                self.transport_profile.apu_commands =
-                    self.transport_profile.apu_commands.wrapping_add(1);
                 self.enqueue_blocking(Core1Command::Worker(command));
             }
             WorkerCommand::WritePpuRegister { addr, value } => {
                 self.write_timing_ppu_register(addr, value);
                 self.flush_pending_ppu();
-                self.transport_profile.ppu_register_writes =
-                    self.transport_profile.ppu_register_writes.wrapping_add(1);
                 self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
                     addr,
                     value,
@@ -785,10 +744,6 @@ impl WorkerTransport for Core1Transport {
         }
         self.flush_pending_ppu();
         self.shared.write_live_vram_range(start_offset, data);
-        self.transport_profile.ppu_vram_bytes = self
-            .transport_profile
-            .ppu_vram_bytes
-            .wrapping_add(data.len() as u32);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -799,10 +754,6 @@ impl WorkerTransport for Core1Transport {
         }
         self.flush_pending_ppu();
         self.shared.write_live_oam_range(start_offset, data);
-        self.transport_profile.ppu_oam_bytes = self
-            .transport_profile
-            .ppu_oam_bytes
-            .wrapping_add(data.len() as u32);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -810,8 +761,6 @@ impl WorkerTransport for Core1Transport {
     fn write_ppu_register(&mut self, addr: u16, value: u8) {
         self.write_timing_ppu_register(addr, value);
         self.flush_pending_ppu();
-        self.transport_profile.ppu_register_writes =
-            self.transport_profile.ppu_register_writes.wrapping_add(1);
         self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
             addr,
             value,
@@ -825,10 +774,6 @@ impl WorkerTransport for Core1Transport {
             return;
         }
         self.flush_pending_ppu();
-        self.transport_profile.ppu_register_writes = self
-            .transport_profile
-            .ppu_register_writes
-            .wrapping_add(regs.len() as u32);
         for &(addr, value) in regs {
             self.write_timing_ppu_register(addr, value);
             self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
@@ -897,7 +842,6 @@ impl WorkerTransport for Core1Transport {
         self.wait_for_ticket(ticket);
         self.shared.clear_published_frames();
         self.last_frame_seq = 0;
-        self.last_profile_frame_seq = 0;
     }
 
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
@@ -915,11 +859,10 @@ impl WorkerTransport for Core1Transport {
         self.wait_for_ticket(ticket);
         self.shared.clear_published_frames();
         self.last_frame_seq = 0;
-        self.last_profile_frame_seq = 0;
     }
 
     fn snapshot_ppu_state(&self, _io: &[u8]) -> PpuState {
-        self.timing_ppu.to_save_state(&self.timing_io)
+        self.lcd_timing.to_save_state(&self.timing_io)
     }
 
     fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
@@ -1018,11 +961,6 @@ impl PicoGameBoy {
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
         self.gb.load_state(state)
     }
-
-    pub fn take_transport_profile(&mut self) -> TransportProfile {
-        self.gb.transport_mut().take_transport_profile()
-    }
-
     /// Flush pending commands and halt core1 in a WFE loop.
     ///
     /// After this returns, core1 will never read from flash again, making it
@@ -1119,16 +1057,8 @@ fn run_core1_worker(
             }
         }
 
-        let mut dropped = 0u32;
         worker.drain_audio_samples_to(|sample| {
-            if audio_tx.enqueue(sample).is_err() {
-                dropped = dropped.wrapping_add(1);
-            }
+            let _ = audio_tx.enqueue(sample);
         });
-        if dropped != 0 {
-            shared
-                .audio_queue_drops
-                .fetch_add(dropped, Ordering::AcqRel);
-        }
     }
 }
