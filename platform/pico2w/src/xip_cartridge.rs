@@ -26,6 +26,13 @@ enum MbcState {
         bank_or_rtc: u8,
         ram_rtc_enabled: bool,
     },
+    Mbc5 {
+        rom_bank_lo: u8,
+        rom_bank_hi: u8,
+        ram_bank: u8,
+        ram_enabled: bool,
+        rumble: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -116,6 +123,14 @@ impl XipCartridge {
                 (fixed, bank % self.rom_bank_count)
             }
             MbcState::Mbc3 { rom_bank, .. } => (0, *rom_bank as usize),
+            MbcState::Mbc5 {
+                rom_bank_lo,
+                rom_bank_hi,
+                ..
+            } => {
+                let bank = ((*rom_bank_hi as usize) << 8) | *rom_bank_lo as usize;
+                (0, bank % self.rom_bank_count)
+            }
         };
 
         self.fixed_bank_num = fixed_bank_num;
@@ -201,6 +216,40 @@ impl XipCartridge {
                 }
                 _ => false,
             },
+            MbcState::Mbc5 {
+                rom_bank_lo,
+                rom_bank_hi,
+                ram_bank,
+                ram_enabled,
+                ..
+            } => match addr {
+                0x0000..=0x1FFF => {
+                    *ram_enabled = value & 0x0F == 0x0A;
+                    false
+                }
+                0x2000..=0x2FFF => {
+                    if *rom_bank_lo == value {
+                        false
+                    } else {
+                        *rom_bank_lo = value;
+                        true
+                    }
+                }
+                0x3000..=0x3FFF => {
+                    let bit = value & 0x01;
+                    if *rom_bank_hi == bit {
+                        false
+                    } else {
+                        *rom_bank_hi = bit;
+                        true
+                    }
+                }
+                0x4000..=0x5FFF => {
+                    *ram_bank = value & 0x0F;
+                    false
+                }
+                _ => false,
+            },
         }
     }
 
@@ -218,6 +267,24 @@ impl XipCartridge {
     }
 
     #[inline]
+    fn ram_bank(&self) -> usize {
+        match &self.mbc {
+            MbcState::Mbc1 { .. } => self.mbc1_ram_bank(),
+            MbcState::Mbc3 { bank_or_rtc, .. } => *bank_or_rtc as usize,
+            MbcState::Mbc5 {
+                ram_bank, rumble, ..
+            } => {
+                if *rumble {
+                    (*ram_bank & 0x07) as usize
+                } else {
+                    (*ram_bank & 0x0F) as usize
+                }
+            }
+            MbcState::NoMbc => 0,
+        }
+    }
+
+    #[inline]
     fn is_ram_enabled(&self) -> bool {
         match &self.mbc {
             MbcState::NoMbc => false,
@@ -227,6 +294,7 @@ impl XipCartridge {
                 bank_or_rtc,
                 ..
             } => *ram_rtc_enabled && !matches!(bank_or_rtc, 0x08..=0x0C),
+            MbcState::Mbc5 { ram_enabled, .. } => *ram_enabled,
         }
     }
 
@@ -282,14 +350,14 @@ impl Cartridge for XipCartridge {
         if !self.is_ram_enabled() || self.ram.is_empty() {
             return 0xFF;
         }
-        let offset = self.mbc1_ram_bank() * 0x2000 + addr as usize;
+        let offset = self.ram_bank() * 0x2000 + addr as usize;
         self.ram.get(offset).copied().unwrap_or(0xFF)
     }
 
     fn write(&mut self, addr: u16, value: u8) {
         if (0xA000..=0xBFFF).contains(&addr) {
             if self.is_ram_enabled() && !self.ram.is_empty() {
-                let offset = self.mbc1_ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+                let offset = self.ram_bank() * 0x2000 + (addr - 0xA000) as usize;
                 if let Some(b) = self.ram.get_mut(offset) {
                     *b = value;
                 }
@@ -342,7 +410,18 @@ impl Cartridge for XipCartridge {
                 bank_or_rtc,
                 ram_rtc_enabled,
             } => {
-                out.extend_from_slice(&[*rom_bank, *bank_or_rtc, *ram_rtc_enabled as u8]);
+                // RBSS v1 parses a fixed 4-byte MBC block before cart RAM.
+                // Keep the Pico MBC3 save payload aligned with that format.
+                out.extend_from_slice(&[*rom_bank, *bank_or_rtc, *ram_rtc_enabled as u8, 0]);
+            }
+            MbcState::Mbc5 {
+                rom_bank_lo,
+                rom_bank_hi,
+                ram_bank,
+                ram_enabled,
+                ..
+            } => {
+                out.extend_from_slice(&[*rom_bank_lo, *rom_bank_hi, *ram_bank, *ram_enabled as u8]);
             }
         }
     }
@@ -377,7 +456,27 @@ impl Cartridge for XipCartridge {
                 *rom_bank = data[offset].max(1);
                 *bank_or_rtc = data[offset + 1];
                 *ram_rtc_enabled = data[offset + 2] != 0;
-                3
+                if data.len() >= offset + 4 {
+                    4
+                } else {
+                    3
+                }
+            }
+            MbcState::Mbc5 {
+                rom_bank_lo,
+                rom_bank_hi,
+                ram_bank,
+                ram_enabled,
+                ..
+            } => {
+                if data.len() < offset + 4 {
+                    return 0;
+                }
+                *rom_bank_lo = data[offset];
+                *rom_bank_hi = data[offset + 1] & 0x01;
+                *ram_bank = data[offset + 2] & 0x0F;
+                *ram_enabled = data[offset + 3] != 0;
+                4
             }
         };
         if consumed > 0 {
@@ -437,6 +536,13 @@ fn mbc_state_from_header(cart_type: u8, ram_bytes: usize) -> Option<MbcState> {
             bank_or_rtc: 0,
             ram_rtc_enabled: false,
         }),
+        0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E => Some(MbcState::Mbc5 {
+            rom_bank_lo: 1,
+            rom_bank_hi: 0,
+            ram_bank: 0,
+            ram_enabled: false,
+            rumble: matches!(cart_type, 0x1C | 0x1D | 0x1E),
+        }),
         _ => None,
     }
 }
@@ -453,6 +559,9 @@ mod tests {
             16 => 3,
             32 => 4,
             64 => 5,
+            128 => 6,
+            256 => 7,
+            512 => 8,
             _ => 0,
         }
     }
@@ -499,6 +608,102 @@ mod tests {
         cart.write(0x2000, 0x20);
         assert_eq!(cart.current_rom_bank(), 0x20);
         assert_eq!(cart.read_rom(0x4000), 0xFF);
+    }
+
+    #[test]
+    fn mbc3_ram_bank_selects_external_ram_bank() {
+        let mut cart = XipCartridge::new(leak_rom(8, 0x13, 0x03)).unwrap();
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x01);
+        cart.write(0xA123, 0xBB);
+
+        cart.write(0x4000, 0x00);
+        assert_eq!(cart.read_ram(0x0123), 0x00);
+
+        cart.write(0x4000, 0x01);
+        assert_eq!(cart.read_ram(0x0123), 0xBB);
+    }
+
+    #[test]
+    fn mbc3_rtc_register_select_does_not_alias_ram() {
+        let mut cart = XipCartridge::new(leak_rom(8, 0x13, 0x03)).unwrap();
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x08);
+        cart.write(0xA000, 0x55);
+        assert_eq!(cart.read_ram(0x0000), 0xFF);
+
+        cart.write(0x4000, 0x00);
+        assert_eq!(cart.read_ram(0x0000), 0x00);
+    }
+
+    #[test]
+    fn mbc3_save_state_payload_stays_rbss_v1_aligned() {
+        let mut cart = XipCartridge::new(leak_rom(8, 0x13, 0x03)).unwrap();
+        cart.write(0x2000, 0x05);
+        cart.write(0x4000, 0x02);
+        cart.write(0x0000, 0x0A);
+
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+        assert_eq!(blob.len(), 4);
+
+        let mut restored = XipCartridge::new(leak_rom(8, 0x13, 0x03)).unwrap();
+        assert_eq!(restored.load_mbc_state(&blob, 0), 4);
+        assert_eq!(restored.current_rom_bank(), 5);
+        restored.write(0xA000, 0x42);
+        assert_eq!(restored.read_ram(0x0000), 0x42);
+    }
+
+    #[test]
+    fn mbc5_supports_wario_land_ii_style_header() {
+        let mut cart = XipCartridge::new(leak_rom(128, 0x1B, 0x03)).unwrap();
+        assert_eq!(cart.read_rom(0x0000), 0x00);
+        assert_eq!(cart.read_rom(0x4000), 0x01);
+
+        cart.write(0x2000, 0x42);
+        assert_eq!(cart.current_rom_bank(), 0x42);
+        assert_eq!(cart.read_rom(0x4000), 0x42);
+    }
+
+    #[test]
+    fn mbc5_allows_bank_zero_in_switchable_window() {
+        let mut cart = XipCartridge::new(leak_rom(128, 0x19, 0x00)).unwrap();
+        cart.write(0x2000, 0x00);
+        assert_eq!(cart.current_rom_bank(), 0);
+        assert_eq!(cart.read_rom(0x4000), 0x00);
+    }
+
+    #[test]
+    fn mbc5_ram_bank_selects_external_ram_bank() {
+        let mut cart = XipCartridge::new(leak_rom(128, 0x1B, 0x03)).unwrap();
+        cart.write(0x0000, 0x0A);
+        cart.write(0x4000, 0x02);
+        cart.write(0xA123, 0xCC);
+
+        cart.write(0x4000, 0x00);
+        assert_eq!(cart.read_ram(0x0123), 0x00);
+
+        cart.write(0x4000, 0x02);
+        assert_eq!(cart.read_ram(0x0123), 0xCC);
+    }
+
+    #[test]
+    fn mbc5_save_state_round_trip_restores_mapping() {
+        let mut cart = XipCartridge::new(leak_rom(128, 0x1B, 0x03)).unwrap();
+        cart.write(0x2000, 0x34);
+        cart.write(0x3000, 0x01);
+        cart.write(0x4000, 0x03);
+        cart.write(0x0000, 0x0A);
+
+        let mut blob = Vec::new();
+        cart.save_mbc_state(&mut blob);
+        assert_eq!(blob.len(), 4);
+
+        let mut restored = XipCartridge::new(leak_rom(128, 0x1B, 0x03)).unwrap();
+        assert_eq!(restored.load_mbc_state(&blob, 0), 4);
+        assert_eq!(restored.current_rom_bank(), 0x34);
+        restored.write(0xA000, 0x5A);
+        assert_eq!(restored.read_ram(0x0000), 0x5A);
     }
 
     #[test]
