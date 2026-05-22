@@ -625,6 +625,8 @@ fn mbc_state_from_header(cart_type: u8, ram_bytes: usize) -> Option<MbcState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
+    use rustyboy_core::memory::{GameBoyMemory, Memory};
 
     fn rom_size_code_for(num_banks: usize) -> u8 {
         match num_banks {
@@ -650,6 +652,114 @@ mod tests {
         rom[ROM_SIZE] = rom_size_code_for(num_banks);
         rom[RAM_SIZE] = ram_size_code;
         Box::leak(rom.into_boxed_slice())
+    }
+
+    #[test]
+    fn mapper_header_dispatch_selects_expected_implementation() {
+        assert!(matches!(
+            mbc_state_from_header(0x00, 0),
+            Some(MbcState::NoMbc(_))
+        ));
+        assert!(matches!(
+            mbc_state_from_header(0x01, 0),
+            Some(MbcState::Mbc1(_))
+        ));
+        assert!(matches!(
+            mbc_state_from_header(0x13, 0x8000),
+            Some(MbcState::Mbc3(_))
+        ));
+
+        let Some(MbcState::Mbc5(plain)) = mbc_state_from_header(0x1B, 0x8000) else {
+            panic!("MBC5+RAM+BATTERY should construct an MBC5 mapper");
+        };
+        assert!(!plain.rumble);
+
+        let Some(MbcState::Mbc5(rumble)) = mbc_state_from_header(0x1E, 0x8000) else {
+            panic!("MBC5+RUMBLE+RAM+BATTERY should construct an MBC5 mapper");
+        };
+        assert!(rumble.rumble);
+
+        assert!(mbc_state_from_header(0xFF, 0).is_none());
+    }
+
+    #[test]
+    fn no_mbc_mapper_ignores_register_and_state_writes() {
+        let mut mbc = NoMbc;
+        let mapping = mbc.rom_mapping(2);
+        assert_eq!(mapping.fixed_bank, 0);
+        assert_eq!(mapping.switchable_bank, 1);
+
+        assert!(!mbc.write_register(0x2000, 0x7F));
+        assert_eq!(mbc.ram_bank(), 0);
+        assert!(!mbc.ram_enabled());
+
+        let mut blob = Vec::new();
+        mbc.save_state(&mut blob);
+        assert!(blob.is_empty());
+        assert_eq!(mbc.load_state(&[1, 2, 3], 0), 0);
+    }
+
+    #[test]
+    fn mbc1_reports_mapping_changes_only_for_mapping_registers() {
+        let mut mbc = Mbc1::new(0x8000);
+
+        assert!(!mbc.write_register(0x0000, 0x0A));
+        assert!(mbc.ram_enabled());
+
+        assert!(mbc.write_register(0x2000, 0x02));
+        assert!(!mbc.write_register(0x2000, 0x02));
+        assert!(mbc.write_register(0x4000, 0x01));
+        assert!(mbc.write_register(0x6000, 0x01));
+
+        let mapping = mbc.rom_mapping(64);
+        assert_eq!(mapping.fixed_bank, 32);
+        assert_eq!(mapping.switchable_bank, 34);
+        assert_eq!(mbc.ram_bank(), 1);
+    }
+
+    #[test]
+    fn mbc3_loads_legacy_three_byte_state_payloads() {
+        let mut mbc = Mbc3::new();
+
+        assert_eq!(mbc.load_state(&[0x05, 0x02, 0x01], 0), 3);
+        assert_eq!(mbc.rom_mapping(8).switchable_bank, 5);
+        assert_eq!(mbc.ram_bank(), 2);
+        assert!(mbc.ram_enabled());
+
+        let mut blob = Vec::new();
+        mbc.save_state(&mut blob);
+        assert_eq!(blob, [0x05, 0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn mbc5_reports_mapping_changes_only_for_rom_bank_registers() {
+        let mut mbc = Mbc5::new(false);
+
+        assert!(!mbc.write_register(0x0000, 0x0A));
+        assert!(mbc.ram_enabled());
+
+        assert!(mbc.write_register(0x2000, 0x02));
+        assert!(!mbc.write_register(0x2000, 0x02));
+        assert!(mbc.write_register(0x3000, 0x01));
+        assert!(!mbc.write_register(0x3000, 0x01));
+
+        assert!(!mbc.write_register(0x4000, 0x08));
+        assert_eq!(mbc.ram_bank(), 8);
+        assert_eq!(mbc.rom_mapping(512).switchable_bank, 0x102);
+    }
+
+    #[test]
+    fn mbc5_rumble_mapper_masks_rumble_bit_from_ram_bank() {
+        let mut plain = Mbc5::new(false);
+        plain.write_register(0x4000, 0x0F);
+        assert_eq!(plain.ram_bank(), 0x0F);
+
+        let mut rumble = Mbc5::new(true);
+        rumble.write_register(0x4000, 0x0F);
+        assert_eq!(rumble.ram_bank(), 0x07);
+
+        rumble.write_register(0x4000, 0x08);
+        assert_eq!(rumble.ram_bank(), 0);
     }
 
     #[test]
@@ -738,6 +848,27 @@ mod tests {
         cart.write(0x2000, 0x42);
         assert_eq!(cart.current_rom_bank(), 0x42);
         assert_eq!(cart.read_rom(0x4000), 0x42);
+    }
+
+    #[test]
+    fn wario_land_ii_door_bank_switch_updates_cached_memory_window() {
+        let cart = XipCartridge::new(leak_rom(64, 0x1B, 0x03)).unwrap();
+        let mut memory = GameBoyMemory::with_cartridge(Box::new(cart));
+
+        assert_eq!(memory.current_rom_bank(), 1);
+        assert_eq!(memory.read(0x4000).unwrap(), 1);
+        assert_eq!(memory.read_fast(0x4567), 1);
+
+        // The first-door regression was an ignored MBC5 bank switch on the
+        // cached XIP path, leaving the CPU fetching from the old bank.
+        memory.write(0x2000, 0x24).unwrap();
+        assert_eq!(memory.current_rom_bank(), 0x24);
+        assert_eq!(memory.read(0x4000).unwrap(), 0x24);
+        assert_eq!(memory.read_fast(0x4567), 0x24);
+
+        memory.write_fast(0x2000, 0x3F);
+        assert_eq!(memory.current_rom_bank(), 0x3F);
+        assert_eq!(memory.read_fast(0x4000), 0x3F);
     }
 
     #[test]
