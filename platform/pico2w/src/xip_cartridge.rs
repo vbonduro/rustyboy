@@ -12,27 +12,396 @@ const CART_TYPE: usize = 0x0147;
 const ROM_SIZE: usize = 0x0148;
 const RAM_SIZE: usize = 0x0149;
 
+#[derive(Clone, Copy)]
+struct RomMapping {
+    fixed_bank: usize,
+    switchable_bank: usize,
+}
+
+struct NoMbc;
+
+struct Mbc1 {
+    rom_bank_lo: u8,
+    upper_bits: u8,
+    ram_mode: bool,
+    ram_enabled: bool,
+    ram_bank_count: usize,
+}
+
+struct Mbc3 {
+    rom_bank: u8,
+    bank_or_rtc: u8,
+    ram_rtc_enabled: bool,
+}
+
+struct Mbc5 {
+    rom_bank_lo: u8,
+    rom_bank_hi: u8,
+    ram_bank: u8,
+    ram_enabled: bool,
+    rumble: bool,
+}
+
 enum MbcState {
-    NoMbc,
-    Mbc1 {
-        rom_bank_lo: u8,
-        upper_bits: u8,
-        ram_mode: bool,
-        ram_enabled: bool,
-        ram_bank_count: usize,
-    },
-    Mbc3 {
-        rom_bank: u8,
-        bank_or_rtc: u8,
-        ram_rtc_enabled: bool,
-    },
-    Mbc5 {
-        rom_bank_lo: u8,
-        rom_bank_hi: u8,
-        ram_bank: u8,
-        ram_enabled: bool,
-        rumble: bool,
-    },
+    NoMbc(NoMbc),
+    Mbc1(Mbc1),
+    Mbc3(Mbc3),
+    Mbc5(Mbc5),
+}
+
+impl NoMbc {
+    fn rom_mapping(&self, _rom_bank_count: usize) -> RomMapping {
+        RomMapping {
+            fixed_bank: 0,
+            switchable_bank: 1,
+        }
+    }
+
+    fn write_register(&mut self, _addr: u16, _value: u8) -> bool {
+        false
+    }
+
+    fn ram_bank(&self) -> usize {
+        0
+    }
+
+    fn ram_enabled(&self) -> bool {
+        false
+    }
+
+    fn save_state(&self, _out: &mut Vec<u8>) {}
+
+    fn load_state(&mut self, _data: &[u8], _offset: usize) -> usize {
+        0
+    }
+}
+
+impl Mbc1 {
+    fn new(ram_bytes: usize) -> Self {
+        let ram_bank_count = if ram_bytes == 0 {
+            0
+        } else {
+            (ram_bytes / 0x2000).max(1)
+        };
+        Self {
+            rom_bank_lo: 1,
+            upper_bits: 0,
+            ram_mode: false,
+            ram_enabled: false,
+            ram_bank_count,
+        }
+    }
+
+    fn rom_mapping(&self, rom_bank_count: usize) -> RomMapping {
+        let fixed_bank = if self.ram_mode {
+            ((self.upper_bits as usize) << 5) % rom_bank_count
+        } else {
+            0
+        };
+        let bank = ((self.upper_bits as usize) << 5) | (self.rom_bank_lo as usize);
+        let bank = if bank == 0 { 1 } else { bank };
+        RomMapping {
+            fixed_bank,
+            switchable_bank: bank % rom_bank_count,
+        }
+    }
+
+    fn write_register(&mut self, addr: u16, value: u8) -> bool {
+        match addr {
+            0x0000..=0x1FFF => {
+                self.ram_enabled = value & 0x0F == 0x0A;
+                false
+            }
+            0x2000..=0x3FFF => {
+                let mut bank = value & 0x1F;
+                if bank == 0 {
+                    bank = 1;
+                }
+                if self.rom_bank_lo == bank {
+                    false
+                } else {
+                    self.rom_bank_lo = bank;
+                    true
+                }
+            }
+            0x4000..=0x5FFF => {
+                let bits = value & 0x03;
+                if self.upper_bits == bits {
+                    false
+                } else {
+                    self.upper_bits = bits;
+                    true
+                }
+            }
+            0x6000..=0x7FFF => {
+                let new_ram_mode = value & 0x01 != 0;
+                if self.ram_mode == new_ram_mode {
+                    false
+                } else {
+                    self.ram_mode = new_ram_mode;
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn ram_bank(&self) -> usize {
+        if self.ram_mode {
+            (self.upper_bits as usize) % self.ram_bank_count.max(1)
+        } else {
+            0
+        }
+    }
+
+    fn ram_enabled(&self) -> bool {
+        self.ram_enabled
+    }
+
+    fn save_state(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[
+            self.rom_bank_lo,
+            self.upper_bits,
+            self.ram_mode as u8,
+            self.ram_enabled as u8,
+        ]);
+    }
+
+    fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        if data.len() < offset + 4 {
+            return 0;
+        }
+        self.rom_bank_lo = data[offset].max(1);
+        self.upper_bits = data[offset + 1] & 0x03;
+        self.ram_mode = data[offset + 2] != 0;
+        self.ram_enabled = data[offset + 3] != 0;
+        4
+    }
+}
+
+impl Mbc3 {
+    fn new() -> Self {
+        Self {
+            rom_bank: 1,
+            bank_or_rtc: 0,
+            ram_rtc_enabled: false,
+        }
+    }
+
+    fn rom_mapping(&self, _rom_bank_count: usize) -> RomMapping {
+        RomMapping {
+            fixed_bank: 0,
+            switchable_bank: self.rom_bank as usize,
+        }
+    }
+
+    fn write_register(&mut self, addr: u16, value: u8) -> bool {
+        match addr {
+            0x0000..=0x1FFF => {
+                self.ram_rtc_enabled = value & 0x0F == 0x0A;
+                false
+            }
+            0x2000..=0x3FFF => {
+                let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
+                if self.rom_bank == bank {
+                    false
+                } else {
+                    self.rom_bank = bank;
+                    true
+                }
+            }
+            0x4000..=0x5FFF => {
+                self.bank_or_rtc = value;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn ram_bank(&self) -> usize {
+        self.bank_or_rtc as usize
+    }
+
+    fn ram_enabled(&self) -> bool {
+        self.ram_rtc_enabled && !matches!(self.bank_or_rtc, 0x08..=0x0C)
+    }
+
+    fn save_state(&self, out: &mut Vec<u8>) {
+        // RBSS v1 parses a fixed 4-byte MBC block before cart RAM.
+        // Keep the Pico MBC3 save payload aligned with that format.
+        out.extend_from_slice(&[
+            self.rom_bank,
+            self.bank_or_rtc,
+            self.ram_rtc_enabled as u8,
+            0,
+        ]);
+    }
+
+    fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        if data.len() < offset + 3 {
+            return 0;
+        }
+        self.rom_bank = data[offset].max(1);
+        self.bank_or_rtc = data[offset + 1];
+        self.ram_rtc_enabled = data[offset + 2] != 0;
+        if data.len() >= offset + 4 {
+            4
+        } else {
+            3
+        }
+    }
+}
+
+impl Mbc5 {
+    fn new(rumble: bool) -> Self {
+        Self {
+            rom_bank_lo: 1,
+            rom_bank_hi: 0,
+            ram_bank: 0,
+            ram_enabled: false,
+            rumble,
+        }
+    }
+
+    fn rom_mapping(&self, rom_bank_count: usize) -> RomMapping {
+        let bank = ((self.rom_bank_hi as usize) << 8) | self.rom_bank_lo as usize;
+        RomMapping {
+            fixed_bank: 0,
+            switchable_bank: bank % rom_bank_count,
+        }
+    }
+
+    fn write_register(&mut self, addr: u16, value: u8) -> bool {
+        match addr {
+            0x0000..=0x1FFF => {
+                self.ram_enabled = value & 0x0F == 0x0A;
+                false
+            }
+            0x2000..=0x2FFF => {
+                if self.rom_bank_lo == value {
+                    false
+                } else {
+                    self.rom_bank_lo = value;
+                    true
+                }
+            }
+            0x3000..=0x3FFF => {
+                let bit = value & 0x01;
+                if self.rom_bank_hi == bit {
+                    false
+                } else {
+                    self.rom_bank_hi = bit;
+                    true
+                }
+            }
+            0x4000..=0x5FFF => {
+                self.ram_bank = value & 0x0F;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn ram_bank(&self) -> usize {
+        if self.rumble {
+            (self.ram_bank & 0x07) as usize
+        } else {
+            (self.ram_bank & 0x0F) as usize
+        }
+    }
+
+    fn ram_enabled(&self) -> bool {
+        self.ram_enabled
+    }
+
+    fn save_state(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&[
+            self.rom_bank_lo,
+            self.rom_bank_hi,
+            self.ram_bank,
+            self.ram_enabled as u8,
+        ]);
+    }
+
+    fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        if data.len() < offset + 4 {
+            return 0;
+        }
+        self.rom_bank_lo = data[offset];
+        self.rom_bank_hi = data[offset + 1] & 0x01;
+        self.ram_bank = data[offset + 2] & 0x0F;
+        self.ram_enabled = data[offset + 3] != 0;
+        4
+    }
+}
+
+impl MbcState {
+    fn from_header(cart_type: u8, ram_bytes: usize) -> Option<Self> {
+        match cart_type {
+            0x00 => Some(Self::NoMbc(NoMbc)),
+            0x01 | 0x02 | 0x03 => Some(Self::Mbc1(Mbc1::new(ram_bytes))),
+            0x0F | 0x10 | 0x11 | 0x12 | 0x13 => Some(Self::Mbc3(Mbc3::new())),
+            0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E => Some(Self::Mbc5(Mbc5::new(matches!(
+                cart_type,
+                0x1C | 0x1D | 0x1E
+            )))),
+            _ => None,
+        }
+    }
+
+    fn rom_mapping(&self, rom_bank_count: usize) -> RomMapping {
+        match self {
+            Self::NoMbc(mbc) => mbc.rom_mapping(rom_bank_count),
+            Self::Mbc1(mbc) => mbc.rom_mapping(rom_bank_count),
+            Self::Mbc3(mbc) => mbc.rom_mapping(rom_bank_count),
+            Self::Mbc5(mbc) => mbc.rom_mapping(rom_bank_count),
+        }
+    }
+
+    fn write_register(&mut self, addr: u16, value: u8) -> bool {
+        match self {
+            Self::NoMbc(mbc) => mbc.write_register(addr, value),
+            Self::Mbc1(mbc) => mbc.write_register(addr, value),
+            Self::Mbc3(mbc) => mbc.write_register(addr, value),
+            Self::Mbc5(mbc) => mbc.write_register(addr, value),
+        }
+    }
+
+    fn ram_bank(&self) -> usize {
+        match self {
+            Self::NoMbc(mbc) => mbc.ram_bank(),
+            Self::Mbc1(mbc) => mbc.ram_bank(),
+            Self::Mbc3(mbc) => mbc.ram_bank(),
+            Self::Mbc5(mbc) => mbc.ram_bank(),
+        }
+    }
+
+    fn ram_enabled(&self) -> bool {
+        match self {
+            Self::NoMbc(mbc) => mbc.ram_enabled(),
+            Self::Mbc1(mbc) => mbc.ram_enabled(),
+            Self::Mbc3(mbc) => mbc.ram_enabled(),
+            Self::Mbc5(mbc) => mbc.ram_enabled(),
+        }
+    }
+
+    fn save_state(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::NoMbc(mbc) => mbc.save_state(out),
+            Self::Mbc1(mbc) => mbc.save_state(out),
+            Self::Mbc3(mbc) => mbc.save_state(out),
+            Self::Mbc5(mbc) => mbc.save_state(out),
+        }
+    }
+
+    fn load_state(&mut self, data: &[u8], offset: usize) -> usize {
+        match self {
+            Self::NoMbc(mbc) => mbc.load_state(data, offset),
+            Self::Mbc1(mbc) => mbc.load_state(data, offset),
+            Self::Mbc3(mbc) => mbc.load_state(data, offset),
+            Self::Mbc5(mbc) => mbc.load_state(data, offset),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -105,197 +474,15 @@ impl XipCartridge {
 
     #[inline]
     fn refresh_mappings(&mut self) {
-        let (fixed_bank_num, current_bank_num) = match &self.mbc {
-            MbcState::NoMbc => (0, 1),
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ..
-            } => {
-                let fixed = if *ram_mode {
-                    ((*upper_bits as usize) << 5) % self.rom_bank_count
-                } else {
-                    0
-                };
-                let bank = ((*upper_bits as usize) << 5) | (*rom_bank_lo as usize);
-                let bank = if bank == 0 { 1 } else { bank };
-                (fixed, bank % self.rom_bank_count)
-            }
-            MbcState::Mbc3 { rom_bank, .. } => (0, *rom_bank as usize),
-            MbcState::Mbc5 {
-                rom_bank_lo,
-                rom_bank_hi,
-                ..
-            } => {
-                let bank = ((*rom_bank_hi as usize) << 8) | *rom_bank_lo as usize;
-                (0, bank % self.rom_bank_count)
-            }
-        };
+        let mapping = self.mbc.rom_mapping(self.rom_bank_count);
 
-        self.fixed_bank_num = fixed_bank_num;
-        self.fixed_bank_valid = fixed_bank_num < self.rom_bank_count;
-        self.fixed_bank_base = fixed_bank_num * ROM_BANK_BYTES;
+        self.fixed_bank_num = mapping.fixed_bank;
+        self.fixed_bank_valid = mapping.fixed_bank < self.rom_bank_count;
+        self.fixed_bank_base = mapping.fixed_bank * ROM_BANK_BYTES;
 
-        self.current_bank_num = current_bank_num;
-        self.current_bank_valid = current_bank_num < self.rom_bank_count;
-        self.current_bank_base = current_bank_num * ROM_BANK_BYTES;
-    }
-
-    /// Apply an MBC register write.
-    ///
-    /// Returns true only when the write changes the visible ROM mapping.
-    #[inline]
-    fn handle_mbc_write(&mut self, addr: u16, value: u8) -> bool {
-        match &mut self.mbc {
-            MbcState::NoMbc => false,
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => match addr {
-                0x0000..=0x1FFF => {
-                    *ram_enabled = value & 0x0F == 0x0A;
-                    false
-                }
-                0x2000..=0x3FFF => {
-                    let mut bank = value & 0x1F;
-                    if bank == 0 {
-                        bank = 1;
-                    }
-                    if *rom_bank_lo == bank {
-                        false
-                    } else {
-                        *rom_bank_lo = bank;
-                        true
-                    }
-                }
-                0x4000..=0x5FFF => {
-                    let bits = value & 0x03;
-                    if *upper_bits == bits {
-                        false
-                    } else {
-                        *upper_bits = bits;
-                        true
-                    }
-                }
-                0x6000..=0x7FFF => {
-                    let new_ram_mode = value & 0x01 != 0;
-                    if *ram_mode == new_ram_mode {
-                        false
-                    } else {
-                        *ram_mode = new_ram_mode;
-                        true
-                    }
-                }
-                _ => false,
-            },
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => match addr {
-                0x0000..=0x1FFF => {
-                    *ram_rtc_enabled = value & 0x0F == 0x0A;
-                    false
-                }
-                0x2000..=0x3FFF => {
-                    let bank = if value & 0x7F == 0 { 1 } else { value & 0x7F };
-                    if *rom_bank == bank {
-                        false
-                    } else {
-                        *rom_bank = bank;
-                        true
-                    }
-                }
-                0x4000..=0x5FFF => {
-                    *bank_or_rtc = value;
-                    false
-                }
-                _ => false,
-            },
-            MbcState::Mbc5 {
-                rom_bank_lo,
-                rom_bank_hi,
-                ram_bank,
-                ram_enabled,
-                ..
-            } => match addr {
-                0x0000..=0x1FFF => {
-                    *ram_enabled = value & 0x0F == 0x0A;
-                    false
-                }
-                0x2000..=0x2FFF => {
-                    if *rom_bank_lo == value {
-                        false
-                    } else {
-                        *rom_bank_lo = value;
-                        true
-                    }
-                }
-                0x3000..=0x3FFF => {
-                    let bit = value & 0x01;
-                    if *rom_bank_hi == bit {
-                        false
-                    } else {
-                        *rom_bank_hi = bit;
-                        true
-                    }
-                }
-                0x4000..=0x5FFF => {
-                    *ram_bank = value & 0x0F;
-                    false
-                }
-                _ => false,
-            },
-        }
-    }
-
-    #[inline]
-    fn mbc1_ram_bank(&self) -> usize {
-        match &self.mbc {
-            MbcState::Mbc1 {
-                upper_bits,
-                ram_mode: true,
-                ram_bank_count,
-                ..
-            } => (*upper_bits as usize) % (*ram_bank_count).max(1),
-            _ => 0,
-        }
-    }
-
-    #[inline]
-    fn ram_bank(&self) -> usize {
-        match &self.mbc {
-            MbcState::Mbc1 { .. } => self.mbc1_ram_bank(),
-            MbcState::Mbc3 { bank_or_rtc, .. } => *bank_or_rtc as usize,
-            MbcState::Mbc5 {
-                ram_bank, rumble, ..
-            } => {
-                if *rumble {
-                    (*ram_bank & 0x07) as usize
-                } else {
-                    (*ram_bank & 0x0F) as usize
-                }
-            }
-            MbcState::NoMbc => 0,
-        }
-    }
-
-    #[inline]
-    fn is_ram_enabled(&self) -> bool {
-        match &self.mbc {
-            MbcState::NoMbc => false,
-            MbcState::Mbc1 { ram_enabled, .. } => *ram_enabled,
-            MbcState::Mbc3 {
-                ram_rtc_enabled,
-                bank_or_rtc,
-                ..
-            } => *ram_rtc_enabled && !matches!(bank_or_rtc, 0x08..=0x0C),
-            MbcState::Mbc5 { ram_enabled, .. } => *ram_enabled,
-        }
+        self.current_bank_num = mapping.switchable_bank;
+        self.current_bank_valid = mapping.switchable_bank < self.rom_bank_count;
+        self.current_bank_base = mapping.switchable_bank * ROM_BANK_BYTES;
     }
 
     #[inline(always)]
@@ -347,17 +534,17 @@ impl Cartridge for XipCartridge {
     }
 
     fn read_ram(&self, addr: u16) -> u8 {
-        if !self.is_ram_enabled() || self.ram.is_empty() {
+        if !self.mbc.ram_enabled() || self.ram.is_empty() {
             return 0xFF;
         }
-        let offset = self.ram_bank() * 0x2000 + addr as usize;
+        let offset = self.mbc.ram_bank() * 0x2000 + addr as usize;
         self.ram.get(offset).copied().unwrap_or(0xFF)
     }
 
     fn write(&mut self, addr: u16, value: u8) {
         if (0xA000..=0xBFFF).contains(&addr) {
-            if self.is_ram_enabled() && !self.ram.is_empty() {
-                let offset = self.ram_bank() * 0x2000 + (addr - 0xA000) as usize;
+            if self.mbc.ram_enabled() && !self.ram.is_empty() {
+                let offset = self.mbc.ram_bank() * 0x2000 + (addr - 0xA000) as usize;
                 if let Some(b) = self.ram.get_mut(offset) {
                     *b = value;
                 }
@@ -365,7 +552,7 @@ impl Cartridge for XipCartridge {
             return;
         }
 
-        let changed = self.handle_mbc_write(addr, value);
+        let changed = self.mbc.write_register(addr, value);
         if changed {
             self.refresh_mappings();
         }
@@ -389,96 +576,11 @@ impl Cartridge for XipCartridge {
     }
 
     fn save_mbc_state(&self, out: &mut Vec<u8>) {
-        match &self.mbc {
-            MbcState::NoMbc => {}
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => {
-                out.extend_from_slice(&[
-                    *rom_bank_lo,
-                    *upper_bits,
-                    *ram_mode as u8,
-                    *ram_enabled as u8,
-                ]);
-            }
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => {
-                // RBSS v1 parses a fixed 4-byte MBC block before cart RAM.
-                // Keep the Pico MBC3 save payload aligned with that format.
-                out.extend_from_slice(&[*rom_bank, *bank_or_rtc, *ram_rtc_enabled as u8, 0]);
-            }
-            MbcState::Mbc5 {
-                rom_bank_lo,
-                rom_bank_hi,
-                ram_bank,
-                ram_enabled,
-                ..
-            } => {
-                out.extend_from_slice(&[*rom_bank_lo, *rom_bank_hi, *ram_bank, *ram_enabled as u8]);
-            }
-        }
+        self.mbc.save_state(out);
     }
 
     fn load_mbc_state(&mut self, data: &[u8], offset: usize) -> usize {
-        let consumed = match &mut self.mbc {
-            MbcState::NoMbc => 0,
-            MbcState::Mbc1 {
-                rom_bank_lo,
-                upper_bits,
-                ram_mode,
-                ram_enabled,
-                ..
-            } => {
-                if data.len() < offset + 4 {
-                    return 0;
-                }
-                *rom_bank_lo = data[offset].max(1);
-                *upper_bits = data[offset + 1] & 0x03;
-                *ram_mode = data[offset + 2] != 0;
-                *ram_enabled = data[offset + 3] != 0;
-                4
-            }
-            MbcState::Mbc3 {
-                rom_bank,
-                bank_or_rtc,
-                ram_rtc_enabled,
-            } => {
-                if data.len() < offset + 3 {
-                    return 0;
-                }
-                *rom_bank = data[offset].max(1);
-                *bank_or_rtc = data[offset + 1];
-                *ram_rtc_enabled = data[offset + 2] != 0;
-                if data.len() >= offset + 4 {
-                    4
-                } else {
-                    3
-                }
-            }
-            MbcState::Mbc5 {
-                rom_bank_lo,
-                rom_bank_hi,
-                ram_bank,
-                ram_enabled,
-                ..
-            } => {
-                if data.len() < offset + 4 {
-                    return 0;
-                }
-                *rom_bank_lo = data[offset];
-                *rom_bank_hi = data[offset + 1] & 0x01;
-                *ram_bank = data[offset + 2] & 0x0F;
-                *ram_enabled = data[offset + 3] != 0;
-                4
-            }
-        };
+        let consumed = self.mbc.load_state(data, offset);
         if consumed > 0 {
             self.refresh_mappings();
         }
@@ -517,34 +619,7 @@ fn effective_ram_bytes(cart_type: u8, ram_bytes: usize) -> usize {
 }
 
 fn mbc_state_from_header(cart_type: u8, ram_bytes: usize) -> Option<MbcState> {
-    let ram_bank_count = if ram_bytes == 0 {
-        0
-    } else {
-        (ram_bytes / 0x2000).max(1)
-    };
-    match cart_type {
-        0x00 => Some(MbcState::NoMbc),
-        0x01 | 0x02 | 0x03 => Some(MbcState::Mbc1 {
-            rom_bank_lo: 1,
-            upper_bits: 0,
-            ram_mode: false,
-            ram_enabled: false,
-            ram_bank_count,
-        }),
-        0x0F | 0x10 | 0x11 | 0x12 | 0x13 => Some(MbcState::Mbc3 {
-            rom_bank: 1,
-            bank_or_rtc: 0,
-            ram_rtc_enabled: false,
-        }),
-        0x19 | 0x1A | 0x1B | 0x1C | 0x1D | 0x1E => Some(MbcState::Mbc5 {
-            rom_bank_lo: 1,
-            rom_bank_hi: 0,
-            ram_bank: 0,
-            ram_enabled: false,
-            rumble: matches!(cart_type, 0x1C | 0x1D | 0x1E),
-        }),
-        _ => None,
-    }
+    MbcState::from_header(cart_type, ram_bytes)
 }
 
 #[cfg(test)]
