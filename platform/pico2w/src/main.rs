@@ -337,9 +337,7 @@ async fn main(_spawner: Spawner) {
                     .await;
 
                 #[cfg(feature = "fps")]
-                {
-                    tracker.tick();
-                }
+                tracker.tick();
             }
 
             AppState::InGameMenu(menu_state) => {
