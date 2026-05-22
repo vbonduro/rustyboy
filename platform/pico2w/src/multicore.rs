@@ -529,7 +529,7 @@ impl Core1Transport {
             return;
         }
         while cycles >= LCD_TIMING_BATCH_CYCLES as u32 {
-            self.advance_timing_ppu_now(LCD_TIMING_BATCH_CYCLES);
+            self.tick_timing_ppu(LCD_TIMING_BATCH_CYCLES);
             cycles -= LCD_TIMING_BATCH_CYCLES as u32;
         }
         self.pending_timing_cycles = cycles as u16;
@@ -543,12 +543,12 @@ impl Core1Transport {
             return;
         }
         self.pending_timing_cycles = 0;
-        self.advance_timing_ppu_now(pending);
+        self.tick_timing_ppu(pending);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn advance_timing_ppu_now(&mut self, cycles: u16) {
+    fn tick_timing_ppu(&mut self, cycles: u16) {
         let output = self.lcd_timing.tick(cycles, &mut self.timing_io);
         if output.vblank_interrupt {
             self.timing_if_bits |= 1 << VBLANK_INTERRUPT_BIT;
