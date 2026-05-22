@@ -452,10 +452,10 @@ struct Core1Transport {
     audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
     shared: &'static SharedWorkerState,
     lcd_timing: LcdTiming,
-    timing_io: [u8; 0x80],
-    pending_timing_cycles: u16,
-    timing_if_bits: u8,
-    timing_frame_ready: bool,
+    lcd_timing_io: [u8; 0x80],
+    pending_lcd_timing_cycles: u16,
+    lcd_timing_if_bits: u8,
+    lcd_timing_frame_ready: bool,
     pending_apu: Option<PendingApuAdvance>,
     pending_ppu: Option<PendingPpuAdvance>,
     next_ticket: u32,
@@ -490,10 +490,10 @@ impl Core1Transport {
             audio_rx,
             shared,
             lcd_timing: LcdTiming::new(),
-            timing_io: [0; 0x80],
-            pending_timing_cycles: 0,
-            timing_if_bits: 0,
-            timing_frame_ready: false,
+            lcd_timing_io: [0; 0x80],
+            pending_lcd_timing_cycles: 0,
+            lcd_timing_if_bits: 0,
+            lcd_timing_frame_ready: false,
             pending_apu: None,
             pending_ppu: None,
             next_ticket: 1,
@@ -522,77 +522,77 @@ impl Core1Transport {
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn advance_timing_ppu(&mut self, cycles: u16) {
-        let mut cycles = self.pending_timing_cycles as u32 + cycles as u32;
+    fn advance_lcd_timing(&mut self, cycles: u16) {
+        let mut cycles = self.pending_lcd_timing_cycles as u32 + cycles as u32;
         if cycles < LCD_TIMING_BATCH_CYCLES as u32 {
-            self.pending_timing_cycles = cycles as u16;
+            self.pending_lcd_timing_cycles = cycles as u16;
             return;
         }
         while cycles >= LCD_TIMING_BATCH_CYCLES as u32 {
-            self.tick_timing_ppu(LCD_TIMING_BATCH_CYCLES);
+            self.tick_lcd_timing(LCD_TIMING_BATCH_CYCLES);
             cycles -= LCD_TIMING_BATCH_CYCLES as u32;
         }
-        self.pending_timing_cycles = cycles as u16;
+        self.pending_lcd_timing_cycles = cycles as u16;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn flush_pending_timing_ppu(&mut self) {
-        let pending = self.pending_timing_cycles;
+    fn flush_pending_lcd_timing(&mut self) {
+        let pending = self.pending_lcd_timing_cycles;
         if pending == 0 {
             return;
         }
-        self.pending_timing_cycles = 0;
-        self.tick_timing_ppu(pending);
+        self.pending_lcd_timing_cycles = 0;
+        self.tick_lcd_timing(pending);
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn tick_timing_ppu(&mut self, cycles: u16) {
-        let output = self.lcd_timing.tick(cycles, &mut self.timing_io);
+    fn tick_lcd_timing(&mut self, cycles: u16) {
+        let output = self.lcd_timing.tick(cycles, &mut self.lcd_timing_io);
         if output.vblank_interrupt {
-            self.timing_if_bits |= 1 << VBLANK_INTERRUPT_BIT;
-            self.timing_frame_ready = true;
+            self.lcd_timing_if_bits |= 1 << VBLANK_INTERRUPT_BIT;
+            self.lcd_timing_frame_ready = true;
         }
         if output.stat_interrupt {
-            self.timing_if_bits |= 1 << STAT_INTERRUPT_BIT;
+            self.lcd_timing_if_bits |= 1 << STAT_INTERRUPT_BIT;
         }
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
-    fn write_timing_ppu_register(&mut self, addr: u16, value: u8) {
+    fn write_lcd_timing_register(&mut self, addr: u16, value: u8) {
         if !(IO_REG_BASE..=IO_REG_END).contains(&addr) {
             return;
         }
-        self.flush_pending_timing_ppu();
+        self.flush_pending_lcd_timing();
         if addr == LY_ADDR {
             self.lcd_timing.reset_ly();
-            self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = 0;
+            self.lcd_timing_io[(LY_ADDR - IO_REG_BASE) as usize] = 0;
             return;
         }
-        self.timing_io[(addr - IO_REG_BASE) as usize] = value;
+        self.lcd_timing_io[(addr - IO_REG_BASE) as usize] = value;
     }
 
-    fn sync_timing_ppu_state(&mut self, io: &[u8]) {
+    fn sync_lcd_timing_state(&mut self, io: &[u8]) {
         self.lcd_timing = LcdTiming::new();
-        self.timing_io.copy_from_slice(&io[..0x80]);
-        self.lcd_timing.sync_prev_stat_line(&self.timing_io);
-        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = self.lcd_timing.ly();
-        self.pending_timing_cycles = 0;
-        self.timing_if_bits = 0;
-        self.timing_frame_ready = false;
+        self.lcd_timing_io.copy_from_slice(&io[..0x80]);
+        self.lcd_timing.sync_prev_stat_line(&self.lcd_timing_io);
+        self.lcd_timing_io[(LY_ADDR - IO_REG_BASE) as usize] = self.lcd_timing.ly();
+        self.pending_lcd_timing_cycles = 0;
+        self.lcd_timing_if_bits = 0;
+        self.lcd_timing_frame_ready = false;
     }
 
-    fn load_timing_ppu_state(&mut self, state: PpuState, io: &[u8]) {
+    fn load_lcd_timing_state(&mut self, state: PpuState, io: &[u8]) {
         self.lcd_timing.load_state(state);
-        self.timing_io.copy_from_slice(&io[..0x80]);
-        self.lcd_timing.sync_prev_stat_line(&self.timing_io);
-        self.timing_io[(LY_ADDR - IO_REG_BASE) as usize] = state.ly;
-        self.timing_io[(STAT_ADDR - IO_REG_BASE) as usize] = state.stat;
-        self.pending_timing_cycles = 0;
-        self.timing_if_bits = 0;
-        self.timing_frame_ready = false;
+        self.lcd_timing_io.copy_from_slice(&io[..0x80]);
+        self.lcd_timing.sync_prev_stat_line(&self.lcd_timing_io);
+        self.lcd_timing_io[(LY_ADDR - IO_REG_BASE) as usize] = state.ly;
+        self.lcd_timing_io[(STAT_ADDR - IO_REG_BASE) as usize] = state.stat;
+        self.pending_lcd_timing_cycles = 0;
+        self.lcd_timing_if_bits = 0;
+        self.lcd_timing_frame_ready = false;
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
@@ -715,7 +715,7 @@ impl WorkerTransport for Core1Transport {
                 div_counter,
             } => self.queue_pending_apu(cycles, div_counter),
             WorkerCommand::AdvancePpu { cycles } => {
-                self.advance_timing_ppu(cycles);
+                self.advance_lcd_timing(cycles);
                 self.queue_pending_ppu(cycles);
             }
             WorkerCommand::WriteApuRegister { .. } | WorkerCommand::WriteWaveRam { .. } => {
@@ -723,7 +723,7 @@ impl WorkerTransport for Core1Transport {
                 self.enqueue_blocking(Core1Command::Worker(command));
             }
             WorkerCommand::WritePpuRegister { addr, value } => {
-                self.write_timing_ppu_register(addr, value);
+                self.write_lcd_timing_register(addr, value);
                 self.flush_pending_ppu();
                 self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
                     addr,
@@ -759,7 +759,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_ppu_register(&mut self, addr: u16, value: u8) {
-        self.write_timing_ppu_register(addr, value);
+        self.write_lcd_timing_register(addr, value);
         self.flush_pending_ppu();
         self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
             addr,
@@ -775,7 +775,7 @@ impl WorkerTransport for Core1Transport {
         }
         self.flush_pending_ppu();
         for &(addr, value) in regs {
-            self.write_timing_ppu_register(addr, value);
+            self.write_lcd_timing_register(addr, value);
             self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
                 addr,
                 value,
@@ -829,7 +829,7 @@ impl WorkerTransport for Core1Transport {
 
     fn sync_ppu_state(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.flush_pending_ppu();
-        self.sync_timing_ppu_state(io);
+        self.sync_lcd_timing_state(io);
         critical_section::with(|cs| {
             let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
             snapshots.io.copy_from_slice(&io[..0x80]);
@@ -846,7 +846,7 @@ impl WorkerTransport for Core1Transport {
 
     fn load_ppu_state(&mut self, state: PpuState, io: &[u8], vram: &[u8], oam: &[u8]) {
         self.flush_pending_ppu();
-        self.load_timing_ppu_state(state, io);
+        self.load_lcd_timing_state(state, io);
         critical_section::with(|cs| {
             let mut snapshots = self.shared.sync_snapshot.borrow(cs).borrow_mut();
             snapshots.io.copy_from_slice(&io[..0x80]);
@@ -862,7 +862,7 @@ impl WorkerTransport for Core1Transport {
     }
 
     fn snapshot_ppu_state(&self, _io: &[u8]) -> PpuState {
-        self.lcd_timing.to_save_state(&self.timing_io)
+        self.lcd_timing.to_save_state(&self.lcd_timing_io)
     }
 
     fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
@@ -873,16 +873,16 @@ impl WorkerTransport for Core1Transport {
             self.last_frame_seq = frame_seq;
         }
         let _worker_if_bits = self.shared.pending_if_bits.swap(0, Ordering::AcqRel);
-        let if_bits = self.timing_if_bits;
-        self.timing_if_bits = 0;
-        let timing_frame_ready = self.timing_frame_ready;
-        self.timing_frame_ready = false;
+        let if_bits = self.lcd_timing_if_bits;
+        self.lcd_timing_if_bits = 0;
+        let lcd_timing_frame_ready = self.lcd_timing_frame_ready;
+        self.lcd_timing_frame_ready = false;
         WorkerOutput {
             apu_nr52: self.shared.apu_nr52.load(Ordering::Acquire),
-            ppu_ly: self.timing_io[(LY_ADDR - IO_REG_BASE) as usize],
-            ppu_stat: self.timing_io[(STAT_ADDR - IO_REG_BASE) as usize],
+            ppu_ly: self.lcd_timing_io[(LY_ADDR - IO_REG_BASE) as usize],
+            ppu_stat: self.lcd_timing_io[(STAT_ADDR - IO_REG_BASE) as usize],
             if_bits,
-            frame_ready: frame_ready || timing_frame_ready,
+            frame_ready: frame_ready || lcd_timing_frame_ready,
         }
     }
 }
