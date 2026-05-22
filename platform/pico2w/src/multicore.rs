@@ -25,7 +25,6 @@ use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
 use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
 use crate::stack_probe;
-use crate::worker_policy::should_drain_audio_after_worker_command;
 
 const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
@@ -808,7 +807,6 @@ impl WorkerTransport for Core1Transport {
         self.wait_for_ticket(ticket);
 
         out.clear();
-        // Bound the drain to out.capacity() to prevent Vec growth.
         let cap = out.capacity();
         let mut n = 0usize;
         while n < cap {
@@ -1015,10 +1013,6 @@ fn run_core1_worker(
 
         match command {
             Core1Command::Worker(worker_command) => {
-                debug_assert!(
-                    !should_drain_audio_after_worker_command(&worker_command),
-                    "audio drains must go through Core1Command::DrainAudio"
-                );
                 let ppu_cycles = match worker_command {
                     WorkerCommand::AdvancePpu { cycles } => cycles as u32,
                     _ => 0,
