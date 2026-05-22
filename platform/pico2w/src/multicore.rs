@@ -25,6 +25,7 @@ use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
 use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
 use crate::stack_probe;
+use crate::worker_policy::should_drain_audio_after_worker_command;
 
 const CORE1_STACK_SIZE: usize = 8192;
 const COMMAND_QUEUE_CAPACITY: usize = 512;
@@ -67,6 +68,9 @@ static CORE1_WORKER: StaticStorage<GameBoyWorker> = StaticStorage::new();
 enum Core1Command {
     Worker(WorkerCommand),
     SyncApu {
+        ticket: u32,
+    },
+    DrainAudio {
         ticket: u32,
     },
     SyncPpu {
@@ -797,9 +801,14 @@ impl WorkerTransport for Core1Transport {
     #[inline(always)]
     fn drain_audio_samples_into_i16(&mut self, out: &mut Vec<i16>) {
         self.flush_pending_apu();
+        // Serialize queue access: core 1 enqueues all samples before core 0
+        // starts dequeuing, avoiding concurrent MPMC traffic in the hot loop.
+        let ticket = self.issue_ticket();
+        self.enqueue_blocking(Core1Command::DrainAudio { ticket });
+        self.wait_for_ticket(ticket);
+
         out.clear();
-        // Bound the drain to out.capacity() to prevent Vec growth: Core 1 may
-        // enqueue new samples concurrently, so an unbounded loop can exceed cap.
+        // Bound the drain to out.capacity() to prevent Vec growth.
         let cap = out.capacity();
         let mut n = 0usize;
         while n < cap {
@@ -1006,6 +1015,10 @@ fn run_core1_worker(
 
         match command {
             Core1Command::Worker(worker_command) => {
+                debug_assert!(
+                    !should_drain_audio_after_worker_command(&worker_command),
+                    "audio drains must go through Core1Command::DrainAudio"
+                );
                 let ppu_cycles = match worker_command {
                     WorkerCommand::AdvancePpu { cycles } => cycles as u32,
                     _ => 0,
@@ -1022,6 +1035,12 @@ fn run_core1_worker(
                 }
                 worker.send(worker_command);
                 publish_worker_state(shared, &mut worker);
+            }
+            Core1Command::DrainAudio { ticket } => {
+                worker.drain_audio_samples_to(|sample| {
+                    let _ = audio_tx.enqueue(sample);
+                });
+                shared.sync_complete.store(ticket, Ordering::Release);
             }
             Core1Command::SyncApu { ticket } => {
                 critical_section::with(|cs| {
@@ -1056,9 +1075,5 @@ fn run_core1_worker(
                 }
             }
         }
-
-        worker.drain_audio_samples_to(|sample| {
-            let _ = audio_tx.enqueue(sample);
-        });
     }
 }
