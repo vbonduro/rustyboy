@@ -6,12 +6,13 @@ use auth::{AuthUser, DbExt, JwtSecretExt};
 use axum::{
     body::Bytes,
     extract::{Path, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
     Router,
 };
+use rustyboy_core::storage::{BatterySaveBytes, RomId, SaveStateBytes};
 use std::{path::PathBuf, sync::Arc};
 use tower_http::services::ServeDir;
 
@@ -171,9 +172,18 @@ async fn api_auth_method(State(state): State<Arc<AppState>>) -> impl IntoRespons
 async fn get_battery_save(
     auth: AuthUser,
     Path(rom_name): Path<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match state.db.get_battery_save(&auth.user_id, &rom_name).await {
+    let rom_id = match rom_id_from_headers(&headers) {
+        Ok(rom_id) => rom_id,
+        Err(status) => return status.into_response(),
+    };
+    match state
+        .db
+        .get_battery_save_with_rom_id(&auth.user_id, rom_id.as_deref(), &rom_name)
+        .await
+    {
         Ok(Some(bs)) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
@@ -188,15 +198,20 @@ async fn get_battery_save(
 async fn put_battery_save(
     auth: AuthUser,
     Path(rom_name): Path<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if body.is_empty() {
+    if BatterySaveBytes::new(&body).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let rom_id = match rom_id_from_headers(&headers) {
+        Ok(rom_id) => rom_id,
+        Err(status) => return status.into_response(),
+    };
     match state
         .db
-        .upsert_battery_save(&auth.user_id, &rom_name, body.to_vec())
+        .upsert_battery_save_with_rom_id(&auth.user_id, rom_id.as_deref(), &rom_name, body.to_vec())
         .await
     {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
@@ -227,15 +242,25 @@ async fn list_roms_with_saves(
 async fn list_save_states(
     auth: AuthUser,
     Path(rom_name): Path<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match state.db.list_save_states(&auth.user_id, &rom_name).await {
+    let rom_id = match rom_id_from_headers(&headers) {
+        Ok(rom_id) => rom_id,
+        Err(status) => return status.into_response(),
+    };
+    match state
+        .db
+        .list_save_states_with_rom_id(&auth.user_id, rom_id.as_deref(), &rom_name)
+        .await
+    {
         Ok(saves) => {
             let items: Vec<_> = saves
                 .into_iter()
                 .map(|s| {
                     serde_json::json!({
                         "id": s.id,
+                        "rom_id": s.rom_id,
                         "slot_name": s.slot_name,
                         "created_at": s.created_at,
                         "updated_at": s.updated_at,
@@ -252,15 +277,21 @@ async fn list_save_states(
 async fn get_latest_save_state(
     auth: AuthUser,
     Path(rom_name): Path<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    let rom_id = match rom_id_from_headers(&headers) {
+        Ok(rom_id) => rom_id,
+        Err(status) => return status.into_response(),
+    };
     match state
         .db
-        .get_latest_save_state(&auth.user_id, &rom_name)
+        .get_latest_save_state_with_rom_id(&auth.user_id, rom_id.as_deref(), &rom_name)
         .await
     {
         Ok(Some(s)) => Json(serde_json::json!({
             "id": s.id,
+            "rom_id": s.rom_id,
             "slot_name": s.slot_name,
             "created_at": s.created_at,
             "updated_at": s.updated_at,
@@ -275,29 +306,41 @@ async fn get_latest_save_state(
 async fn post_save_state(
     auth: AuthUser,
     Path(rom_name): Path<String>,
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if body.is_empty() {
+    if SaveStateBytes::new(&body).is_err() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let rom_id = match rom_id_from_headers(&headers) {
+        Ok(rom_id) => rom_id,
+        Err(status) => return status.into_response(),
+    };
     // Auto-generate slot name from current unix timestamp
     let slot_name = now_unix_secs().to_string();
     match state
         .db
-        .upsert_save_state(&auth.user_id, &rom_name, &slot_name, body.to_vec())
+        .upsert_save_state_with_rom_id(
+            &auth.user_id,
+            rom_id.as_deref(),
+            &rom_name,
+            &slot_name,
+            body.to_vec(),
+        )
         .await
     {
         Ok(s) => {
             // Keep only the 5 most recent saves per user+rom; silently ignore prune errors
             let _ = state
                 .db
-                .prune_save_states(&auth.user_id, &rom_name, 5)
+                .prune_save_states_with_rom_id(&auth.user_id, rom_id.as_deref(), &rom_name, 5)
                 .await;
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "id": s.id,
+                    "rom_id": s.rom_id,
                     "slot_name": s.slot_name,
                     "created_at": s.created_at,
                     "updated_at": s.updated_at,
@@ -307,6 +350,15 @@ async fn post_save_state(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+fn rom_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get("x-rustyboy-rom-id") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    RomId::from_hex(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Some(value.to_ascii_lowercase()))
 }
 
 /// GET /api/save-states/by-id/:id/data — download save state blob

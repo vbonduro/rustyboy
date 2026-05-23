@@ -3,7 +3,7 @@
 mod common;
 
 use rustyboy_core::cpu::registers::{Flags, Registers};
-use rustyboy_core::cpu::save_state::SaveState;
+use rustyboy_core::cpu::save_state::{SaveState, VERSION_V1, VERSION_V2};
 use rustyboy_core::GameBoy;
 
 /// Build a minimal in-memory ROM with a NOP + JR -2 loop at 0x0100.
@@ -338,6 +338,107 @@ fn test_save_state_from_blob_rejects_bad_magic() {
 fn test_save_state_from_blob_rejects_too_short() {
     let blob = vec![0u8; 10];
     assert!(SaveState::from_blob(blob).is_err());
+}
+
+#[test]
+fn test_save_state_v1_blob_still_loads_after_v2_support() {
+    let rom = make_rom(0x03, 0, 0x02);
+    let mut gb = make_emulator(rom.clone());
+
+    for _ in 0..40 {
+        gb.step().unwrap();
+    }
+    let mut ram = vec![0u8; 0x2000];
+    ram[..4].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+    gb.set_external_ram(&ram);
+
+    let blob = gb.save_state_v1();
+    assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), VERSION_V1);
+
+    let parsed = SaveState::from_blob(blob).expect("v1 blob should still parse");
+    assert_eq!(parsed.format_version(), VERSION_V1);
+    assert_eq!(
+        parsed.cart_ram().expect("cart RAM should be present")[..4],
+        [0xCA, 0xFE, 0xBA, 0xBE]
+    );
+
+    let mut restored = make_emulator(rom);
+    restored.load_state(parsed).expect("v1 load should work");
+    assert_eq!(
+        restored.external_ram().expect("restored cart RAM")[..4],
+        [0xCA, 0xFE, 0xBA, 0xBE]
+    );
+}
+
+#[test]
+fn test_save_state_v1_mbc3_extended_tail_is_detected() {
+    let mut rom = vec![0u8; 0x8000];
+    rom[0x0147] = 0x13; // MBC3+RAM+BATTERY
+    rom[0x0148] = 0x00;
+    rom[0x0149] = 0x02; // 8 KiB RAM
+    rom[0x0100] = 0x00;
+    rom[0x0101] = 0x18;
+    rom[0x0102] = 0xFE;
+
+    let mut gb = make_emulator(rom.clone());
+    gb.set_external_ram(&[0x5A; 0x2000]);
+
+    let blob = gb.save_state_v1();
+    let parsed = SaveState::from_blob(blob).expect("v1 MBC3 blob should parse");
+    assert_eq!(parsed.format_version(), VERSION_V1);
+    assert_eq!(
+        parsed
+            .mbc_payload()
+            .expect("MBC3 payload should be present")
+            .len(),
+        18
+    );
+    assert_eq!(
+        parsed.cart_ram().expect("cart RAM should be present").len(),
+        0x2000
+    );
+
+    let mut restored = make_emulator(rom);
+    restored
+        .load_state(parsed)
+        .expect("v1 MBC3 load should work");
+    assert_eq!(restored.external_ram().expect("restored cart RAM")[0], 0x5A);
+}
+
+#[test]
+fn test_save_state_v2_roundtrips_128k_cart_ram() {
+    let mut rom = vec![0u8; 0x8000];
+    rom[0x0147] = 0x13; // MBC3+RAM+BATTERY
+    rom[0x0148] = 0x00;
+    rom[0x0149] = 0x04; // 128 KiB RAM
+    rom[0x0100] = 0x00;
+    rom[0x0101] = 0x18;
+    rom[0x0102] = 0xFE;
+
+    let mut gb = make_emulator(rom.clone());
+    let mut ram = vec![0u8; 128 * 1024];
+    ram[0] = 0x11;
+    ram[0x7FFF] = 0x22;
+    ram[0x1_FFFF] = 0x33;
+    gb.set_external_ram(&ram);
+
+    let blob = gb.save_state();
+    assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), VERSION_V2);
+
+    let parsed = SaveState::from_blob(blob).expect("v2 blob should parse");
+    assert_eq!(parsed.format_version(), VERSION_V2);
+    assert_eq!(
+        parsed.cart_ram().expect("cart RAM should be present").len(),
+        128 * 1024
+    );
+
+    let mut restored = make_emulator(rom);
+    restored.load_state(parsed).expect("v2 load should work");
+    let restored_ram = restored.external_ram().expect("restored cart RAM");
+    assert_eq!(restored_ram.len(), 128 * 1024);
+    assert_eq!(restored_ram[0], 0x11);
+    assert_eq!(restored_ram[0x7FFF], 0x22);
+    assert_eq!(restored_ram[0x1_FFFF], 0x33);
 }
 
 // ── Cycle counter preserved ───────────────────────────────────────────────────

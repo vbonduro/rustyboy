@@ -87,6 +87,7 @@ const state = {
   user:         null,   // logged-in user object | null
   activeMenu:   null,   // MenuRenderer | null (canvas-based menu)
   currentRomName: null, // name of the currently loaded ROM
+  currentRomId: null,   // SHA-256 hex of the currently loaded ROM bytes
   batterySaveTimer: null, // setInterval id for periodic battery save upload
   paused:       false,  // true when emulation loop is suspended for in-game menu
   menuPending:  false,  // true while showInGameMenu fetch is in-flight; blocks re-entry
@@ -154,9 +155,24 @@ function stopAudio() {
 
 // ── Battery saves ──────────────────────────────────────────────────────────
 
-async function loadBatterySave(romName) {
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)]
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+function romScopedHeaders(romId = state.currentRomId, extra = {}) {
+  const headers = { ...extra };
+  if (romId) headers['x-rustyboy-rom-id'] = romId;
+  return headers;
+}
+
+async function loadBatterySave(romName, romId = state.currentRomId) {
   try {
-    const res = await fetch(`/api/battery-saves/${encodeURIComponent(romName)}`);
+    const res = await fetch(`/api/battery-saves/${encodeURIComponent(romName)}`, {
+      headers: romScopedHeaders(romId),
+    });
     if (res.ok) {
       const buf = await res.arrayBuffer();
       if (buf.byteLength > 0) {
@@ -169,14 +185,14 @@ async function loadBatterySave(romName) {
   }
 }
 
-async function uploadBatterySave(romName) {
+async function uploadBatterySave(romName, romId = state.currentRomId) {
   if (!state.emulator) return;
   const data = state.emulator.get_battery_save();
   if (!data || data.length === 0) return;
   try {
     await fetch(`/api/battery-saves/${encodeURIComponent(romName)}`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/octet-stream' },
+      headers: romScopedHeaders(romId, { 'content-type': 'application/octet-stream' }),
       body: data,
     });
     log.debug(`battery save uploaded: ${data.length} bytes`);
@@ -378,10 +394,12 @@ async function showLoginError() {
 // ── Main menu / ROM list ───────────────────────────────────────────────────
 
 /** Returns the ID of the most recent save state for a ROM, or null if none. */
-async function fetchLatestSaveId(romName) {
+async function fetchLatestSaveId(romName, romId = state.currentRomId) {
   if (!romName) return null;
   try {
-    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}/latest`);
+    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}/latest`, {
+      headers: romScopedHeaders(romId),
+    });
     if (!res.ok) return null;
     const data = await res.json();
     return data.id || null;
@@ -391,12 +409,14 @@ async function fetchLatestSaveId(romName) {
 }
 
 /** Returns true if any save states exist. Pass a romName to scope to that ROM. */
-async function fetchHasSaves(romName) {
+async function fetchHasSaves(romName, romId = state.currentRomId) {
   try {
     const url = romName
       ? `/api/save-states/${encodeURIComponent(romName)}`
       : '/api/save-states';
-    const res = await fetch(url);
+    const res = await fetch(url, {
+      headers: romName ? romScopedHeaders(romId) : {},
+    });
     if (!res.ok) return false;
     const data = await res.json();
     return data.length > 0;
@@ -448,11 +468,7 @@ async function continueLatestSave() {
     const roms = await res.json(); // [{rom_name, last_saved}, ...] sorted newest first
     if (roms.length === 0) { showMainMenu(); return; }
     const romName = roms[0].rom_name;
-    // Get the latest save state for that ROM
-    const latestRes = await fetch(`/api/save-states/${encodeURIComponent(romName)}/latest`);
-    if (!latestRes.ok) { showMainMenu(); return; }
-    const latestMeta = await latestRes.json();
-    await launchRomWithSaveState(romName, latestMeta.id);
+    await launchRom(romName);
   } catch (_) {
     showMainMenu();
   }
@@ -517,17 +533,7 @@ function showCanvasError(msg) {
 // ── Launch / stop ──────────────────────────────────────────────────────────
 
 async function launchRom(name) {
-  // Check for a latest save state to auto-load
-  let saveStateId = null;
-  try {
-    const res = await fetch(`/api/save-states/${encodeURIComponent(name)}/latest`);
-    if (res.ok) {
-      const meta = await res.json();
-      saveStateId = meta.id;
-    }
-  } catch (_) {}
-
-  await launchRomWithSaveState(name, saveStateId);
+  await launchRomWithSaveState(name, undefined);
 }
 
 async function launchRomWithSaveState(name, saveStateId) {
@@ -542,6 +548,11 @@ async function launchRomWithSaveState(name, saveStateId) {
     showCanvasError('LOAD ERROR');
     log.error(err);
     return;
+  }
+  const romId = await sha256Hex(bytes);
+
+  if (saveStateId === undefined) {
+    saveStateId = await fetchLatestSaveId(name, romId);
   }
 
   // Tear down previous
@@ -558,6 +569,7 @@ async function launchRomWithSaveState(name, saveStateId) {
 
   state.lastRomName = name;
   state.currentRomName = name;
+  state.currentRomId = romId;
   localStorage.setItem('lastRom', name);
   state.running = true;
   state.paused = false;
@@ -575,7 +587,7 @@ async function launchRomWithSaveState(name, saveStateId) {
       log.warn(`save state load failed: ${e}`);
     }
   } else {
-    await loadBatterySave(name);
+    await loadBatterySave(name, romId);
   }
   startBatterySaveTimer(name);
 
@@ -609,6 +621,7 @@ async function stopEmulation() {
     state.emulator = null;
   }
   state.currentRomName = null;
+  state.currentRomId = null;
   state.running = false;
   state.paused = false;
   state.menuPending = false;
@@ -743,7 +756,7 @@ async function saveCurrentState() {
     const blob = state.emulator.save_state();
     await fetch(`/api/save-states/${encodeURIComponent(state.currentRomName)}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/octet-stream' },
+      headers: romScopedHeaders(state.currentRomId, { 'content-type': 'application/octet-stream' }),
       body: blob,
     });
     showSavedOverlay();
@@ -772,7 +785,9 @@ function showSavedOverlay() {
 async function showSaveStateSlots(romName, onBack) {
   let saves = [];
   try {
-    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}`);
+    const res = await fetch(`/api/save-states/${encodeURIComponent(romName)}`, {
+      headers: romScopedHeaders(),
+    });
     if (res.ok) saves = await res.json();
   } catch (_) {}
 

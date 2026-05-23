@@ -11,7 +11,9 @@ use rustyboy_pico2w::multicore::PicoGameBoy;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 use super::{MainMenuState, RunningState};
-use crate::{App, AppState, PicoSdMgr};
+use crate::{
+    flush_battery_save, load_battery_save, refresh_save_slot_available, App, AppState, PicoSdMgr,
+};
 
 pub struct LoadingState {
     pub(crate) filename: heapless::String<64>,
@@ -28,6 +30,9 @@ impl LoadingState {
         game_disp: &mut GameDisplay<'static>,
         watchdog: &mut Watchdog,
     ) {
+        if let Some(existing_gb) = gameboy.as_ref() {
+            flush_battery_save(app, sd_mgr, existing_gb);
+        }
         let had_game = halt_running_game(gameboy);
         let stage_result = self
             .ensure_rom_staged(app, flash, sd_mgr, game_disp, watchdog)
@@ -35,7 +40,7 @@ impl LoadingState {
 
         match stage_result {
             Ok(info) => {
-                self.enter_staged_rom(app, gameboy, game_disp, watchdog, had_game, info)
+                self.enter_staged_rom(app, gameboy, sd_mgr, game_disp, watchdog, had_game, info)
                     .await;
             }
             Err(_) => {
@@ -75,16 +80,18 @@ impl LoadingState {
         &self,
         app: &mut App,
         gameboy: &mut Option<PicoGameBoy>,
+        sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
         watchdog: &mut Watchdog,
         had_game: bool,
         info: FlashRomInfo,
     ) {
         app.staged_rom_name = Some(self.filename.clone());
+        app.staged_rom_id = info.rom_id;
         if had_game {
             restart_after_rom_switch(watchdog);
         } else {
-            start_first_rom(app, gameboy, game_disp, info).await;
+            start_first_rom(app, gameboy, sd_mgr, game_disp, info).await;
         }
     }
 }
@@ -114,6 +121,7 @@ fn rom_matches_staged(app: &App, filename: &str) -> bool {
 async fn start_first_rom(
     app: &mut App,
     gameboy: &mut Option<PicoGameBoy>,
+    sd_mgr: &mut PicoSdMgr,
     game_disp: &mut GameDisplay<'static>,
     info: FlashRomInfo,
 ) {
@@ -123,7 +131,10 @@ async fn start_first_rom(
         .expect("CORE1 consumed without a running game");
     match XipCartridge::from_staged_flash(info) {
         Ok(cart) => {
-            *gameboy = Some(PicoGameBoy::with_cartridge(core1, Box::new(cart)));
+            let mut gb = PicoGameBoy::with_cartridge(core1, Box::new(cart));
+            load_battery_save(app, sd_mgr, &mut gb);
+            *gameboy = Some(gb);
+            refresh_save_slot_available(app, sd_mgr);
             game_disp.draw_letterbox_bars().await;
             app.transition_to(AppState::Running(RunningState));
         }

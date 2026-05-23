@@ -8,7 +8,10 @@ use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::multicore::PicoGameBoy;
 
 use super::InGameMenuState;
-use crate::{poll_once, App, AppState, CYCLES_PER_FRAME};
+use crate::{
+    flush_battery_save, poll_once, refresh_save_slot_available, App, AppState, PicoSdMgr,
+    CYCLES_PER_FRAME,
+};
 
 pub struct RunningState;
 
@@ -20,6 +23,7 @@ impl RunningState {
         game_disp: &mut GameDisplay<'static>,
         i2s: &mut PioI2sOut<'static, PIO0, 0>,
         input: &mut InputHandler<'static>,
+        sd_mgr: &mut PicoSdMgr,
         audio_buffers: &mut AudioBuffers,
         audio_samples: &mut Vec<i16>,
     ) {
@@ -56,6 +60,8 @@ impl RunningState {
         };
 
         if open_menu {
+            flush_battery_save(app, sd_mgr, gameboy);
+            refresh_save_slot_available(app, sd_mgr);
             let next = InGameMenuState::new(game_disp, app).await;
             app.transition_to(AppState::InGameMenu(next));
         }

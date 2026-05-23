@@ -11,6 +11,7 @@ pub mod input;
 pub mod menu;
 #[cfg(target_arch = "arm")]
 pub mod multicore;
+pub mod save_storage;
 #[cfg(target_arch = "arm")]
 pub mod sd;
 #[cfg(target_arch = "arm")]

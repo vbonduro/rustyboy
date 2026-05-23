@@ -961,6 +961,14 @@ impl PicoGameBoy {
         self.gb.read_memory(address)
     }
 
+    pub fn external_ram(&self) -> Option<&[u8]> {
+        self.gb.external_ram()
+    }
+
+    pub fn set_external_ram(&mut self, data: &[u8]) {
+        self.gb.set_external_ram(data);
+    }
+
     pub fn save_state(&self) -> Vec<u8> {
         self.gb.save_state()
     }

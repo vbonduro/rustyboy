@@ -6,8 +6,12 @@ use embedded_sdmmc::{
     VolumeIdx, VolumeManager,
 };
 
+use crate::save_storage::{
+    battery_save_filename, rom_save_dir_name, save_state_filename, SaveSlot, SAVE_ROOT_DIR,
+};
 use core::cmp::Ordering;
 use rustyboy_core::memory::RomReader;
+use rustyboy_core::storage::{BatterySaveBytes, RomId, SaveStateBytes, StorageValueError};
 
 // ── Time source ───────────────────────────────────────────────────────────────
 
@@ -23,6 +27,7 @@ impl TimeSource for DummyClock {
 #[derive(Debug)]
 pub enum SdError<E: core::fmt::Debug> {
     Sdmmc(embedded_sdmmc::Error<E>),
+    InvalidValue(StorageValueError),
     NoRomFound,
     OutOfMemory,
 }
@@ -178,6 +183,129 @@ where
             }
         }
     }
+
+    pub fn write_battery_save(&self, rom_id: &RomId, data: &[u8]) -> Result<(), SdError<D::Error>> {
+        BatterySaveBytes::new(data).map_err(SdError::InvalidValue)?;
+        self.with_rom_save_dir(rom_id, true, |mgr, dir| {
+            write_file(mgr, dir, battery_save_filename(), data)
+        })
+    }
+
+    pub fn read_battery_save(&self, rom_id: &RomId) -> Result<Option<Vec<u8>>, SdError<D::Error>> {
+        let Some(data) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
+            read_file_optional(mgr, dir, battery_save_filename())
+        })?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(data) = data.as_ref() {
+            BatterySaveBytes::new(data).map_err(SdError::InvalidValue)?;
+        }
+        Ok(data)
+    }
+
+    pub fn write_save_state(
+        &self,
+        rom_id: &RomId,
+        slot: SaveSlot,
+        data: &[u8],
+    ) -> Result<(), SdError<D::Error>> {
+        SaveStateBytes::new(data).map_err(SdError::InvalidValue)?;
+        let filename = save_state_filename(slot);
+        self.with_rom_save_dir(rom_id, true, |mgr, dir| {
+            write_file(mgr, dir, filename.as_str(), data)
+        })
+    }
+
+    pub fn read_save_state(
+        &self,
+        rom_id: &RomId,
+        slot: SaveSlot,
+    ) -> Result<Option<Vec<u8>>, SdError<D::Error>> {
+        let filename = save_state_filename(slot);
+        let Some(data) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
+            read_file_optional(mgr, dir, filename.as_str())
+        })?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(data) = data.as_ref() {
+            SaveStateBytes::new(data).map_err(SdError::InvalidValue)?;
+        }
+        Ok(data)
+    }
+
+    pub fn save_state_exists(
+        &self,
+        rom_id: &RomId,
+        slot: SaveSlot,
+    ) -> Result<bool, SdError<D::Error>> {
+        let filename = save_state_filename(slot);
+        let Some(exists) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
+            file_exists(mgr, dir, filename.as_str())
+        })?
+        else {
+            return Ok(false);
+        };
+        Ok(exists)
+    }
+
+    fn with_rom_save_dir<R>(
+        &self,
+        rom_id: &RomId,
+        create: bool,
+        f: impl FnOnce(&VolumeManager<D, T>, RawDirectory) -> Result<R, SdError<D::Error>>,
+    ) -> Result<R, SdError<D::Error>> {
+        let volume = self.mgr.open_raw_volume(VolumeIdx(0))?;
+        let root = match self.mgr.open_root_dir(volume) {
+            Ok(root) => root,
+            Err(e) => {
+                let _ = self.mgr.close_volume(volume);
+                return Err(SdError::Sdmmc(e));
+            }
+        };
+
+        let saves = match open_save_dir(&self.mgr, root, SAVE_ROOT_DIR, create) {
+            Ok(dir) => dir,
+            Err(e) => {
+                let _ = self.mgr.close_dir(root);
+                let _ = self.mgr.close_volume(volume);
+                return Err(e);
+            }
+        };
+
+        let rom_dir_name = rom_save_dir_name(rom_id);
+        let rom_dir = match open_save_dir(&self.mgr, saves, rom_dir_name.as_str(), create) {
+            Ok(dir) => dir,
+            Err(e) => {
+                let _ = self.mgr.close_dir(saves);
+                let _ = self.mgr.close_dir(root);
+                let _ = self.mgr.close_volume(volume);
+                return Err(e);
+            }
+        };
+
+        let mut result = f(&self.mgr, rom_dir);
+        close_dir_if_ok(&self.mgr, rom_dir, &mut result);
+        close_dir_if_ok(&self.mgr, saves, &mut result);
+        close_dir_if_ok(&self.mgr, root, &mut result);
+        close_volume_if_ok(&self.mgr, volume, &mut result);
+        result
+    }
+
+    fn with_existing_rom_save_dir<R>(
+        &self,
+        rom_id: &RomId,
+        f: impl FnOnce(&VolumeManager<D, T>, RawDirectory) -> Result<R, SdError<D::Error>>,
+    ) -> Result<Option<R>, SdError<D::Error>> {
+        match self.with_rom_save_dir(rom_id, false, f) {
+            Ok(value) => Ok(Some(value)),
+            Err(SdError::Sdmmc(embedded_sdmmc::Error::NotFound)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // ── SdRomReader ───────────────────────────────────────────────────────────────
@@ -292,6 +420,170 @@ fn ascii_upper(byte: u8) -> u8 {
         byte - 32
     } else {
         byte
+    }
+}
+
+fn open_save_dir<D, T>(
+    mgr: &VolumeManager<D, T>,
+    parent: RawDirectory,
+    name: &str,
+    create: bool,
+) -> Result<RawDirectory, SdError<D::Error>>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    match mgr.open_dir(parent, name) {
+        Ok(dir) => Ok(dir),
+        Err(embedded_sdmmc::Error::NotFound) if create => {
+            match mgr.make_dir_in_dir(parent, name) {
+                Ok(()) | Err(embedded_sdmmc::Error::DirAlreadyExists) => {}
+                Err(e) => return Err(SdError::Sdmmc(e)),
+            }
+            mgr.open_dir(parent, name).map_err(SdError::Sdmmc)
+        }
+        Err(e) => Err(SdError::Sdmmc(e)),
+    }
+}
+
+fn write_file<D, T>(
+    mgr: &VolumeManager<D, T>,
+    dir: RawDirectory,
+    name: &str,
+    data: &[u8],
+) -> Result<(), SdError<D::Error>>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    let file = mgr.open_file_in_dir(dir, name, Mode::ReadWriteCreateOrTruncate)?;
+    let mut result = mgr.write(file, data).map_err(SdError::Sdmmc);
+    close_file_if_ok(mgr, file, &mut result);
+    result
+}
+
+fn read_file_optional<D, T>(
+    mgr: &VolumeManager<D, T>,
+    dir: RawDirectory,
+    name: &str,
+) -> Result<Option<Vec<u8>>, SdError<D::Error>>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    let file = match mgr.open_file_in_dir(dir, name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(None),
+        Err(e) => return Err(SdError::Sdmmc(e)),
+    };
+
+    let result = read_open_file(mgr, file);
+    let mut result = result.map(Some);
+    close_file_if_ok(mgr, file, &mut result);
+    result
+}
+
+fn file_exists<D, T>(
+    mgr: &VolumeManager<D, T>,
+    dir: RawDirectory,
+    name: &str,
+) -> Result<bool, SdError<D::Error>>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    let file = match mgr.open_file_in_dir(dir, name, Mode::ReadOnly) {
+        Ok(file) => file,
+        Err(embedded_sdmmc::Error::NotFound) => return Ok(false),
+        Err(e) => return Err(SdError::Sdmmc(e)),
+    };
+    let mut result = Ok(true);
+    close_file_if_ok(mgr, file, &mut result);
+    result
+}
+
+fn read_open_file<D, T>(
+    mgr: &VolumeManager<D, T>,
+    file: RawFile,
+) -> Result<Vec<u8>, SdError<D::Error>>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    let len = mgr.file_length(file)? as usize;
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|_| SdError::OutOfMemory)?;
+    data.resize(len, 0);
+
+    let mut total = 0;
+    while total < len {
+        let read = mgr.read(file, &mut data[total..])?;
+        if read == 0 {
+            break;
+        }
+        total += read;
+    }
+    data.truncate(total);
+    Ok(data)
+}
+
+fn close_file_if_ok<D, T, R>(
+    mgr: &VolumeManager<D, T>,
+    file: RawFile,
+    result: &mut Result<R, SdError<D::Error>>,
+) where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    if result.is_ok() {
+        if let Err(e) = mgr.close_file(file) {
+            *result = Err(SdError::Sdmmc(e));
+        }
+    } else {
+        let _ = mgr.close_file(file);
+    }
+}
+
+fn close_dir_if_ok<D, T, R>(
+    mgr: &VolumeManager<D, T>,
+    dir: RawDirectory,
+    result: &mut Result<R, SdError<D::Error>>,
+) where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    if result.is_ok() {
+        if let Err(e) = mgr.close_dir(dir) {
+            *result = Err(SdError::Sdmmc(e));
+        }
+    } else {
+        let _ = mgr.close_dir(dir);
+    }
+}
+
+fn close_volume_if_ok<D, T, R>(
+    mgr: &VolumeManager<D, T>,
+    volume: RawVolume,
+    result: &mut Result<R, SdError<D::Error>>,
+) where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+    T: TimeSource,
+{
+    if result.is_ok() {
+        if let Err(e) = mgr.close_volume(volume) {
+            *result = Err(SdError::Sdmmc(e));
+        }
+    } else {
+        let _ = mgr.close_volume(volume);
     }
 }
 
