@@ -3,11 +3,15 @@ use rustyboy_pico2w::display::{
     hw::GameDisplay, menu_item_needs_marquee, MENU_MARQUEE_REDRAW_FRAMES,
 };
 use rustyboy_pico2w::input::InputHandler;
-use rustyboy_pico2w::menu::{MenuFrame, MenuInput, RomListEffect, RomListLogic};
+use rustyboy_pico2w::menu::{
+    rom_page_request, MenuFrame, MenuInput, RomListEffect, RomListLogic, RomPageSelection,
+};
 use rustyboy_pico2w::sd::RomListEntry;
 
 use super::{LoadingState, MainMenuState};
 use crate::{App, AppState, PicoSdMgr};
+
+const ROM_PAGE_SIZE: usize = 7;
 
 pub struct RomListState {
     page: heapless::Vec<RomListEntry, 7>,
@@ -18,9 +22,10 @@ pub struct RomListState {
     marquee_frame: u32,
 }
 
-enum PageSelection {
-    First,
-    Last,
+struct RomMenuFrame<'a> {
+    items: heapless::Vec<&'a str, 7>,
+    enabled: heapless::Vec<bool, 7>,
+    marked: Option<usize>,
 }
 
 impl RomListState {
@@ -29,8 +34,8 @@ impl RomListState {
         game_disp: &mut GameDisplay<'static>,
         sd_mgr: &mut PicoSdMgr,
     ) -> Self {
-        let (page, has_next, total_roms) = match sd_mgr.list_rom_page(0, 7) {
-            Ok(result) => result,
+        let (page, has_next, total_roms) = match sd_mgr.list_rom_page(0, ROM_PAGE_SIZE) {
+            Ok(result) => (result.entries, result.has_next, result.total),
             Err(e) => {
                 defmt::error!("SD list failed: {:?}", defmt::Debug2Format(&e));
                 (heapless::Vec::new(), false, 0)
@@ -51,30 +56,8 @@ impl RomListState {
     }
 
     async fn draw(&self, app: &App, game_disp: &mut GameDisplay<'static>) {
-        let mut items_arr: heapless::Vec<&str, 7> = heapless::Vec::new();
-        let mut enabled_arr: heapless::Vec<bool, 7> = heapless::Vec::new();
-        for entry in self.page.iter() {
-            let _ = items_arr.push(entry.display_name.as_str());
-            let _ = enabled_arr.push(true);
-        }
-
-        let marked = app.staged_rom_name.as_ref().and_then(|staged| {
-            self.page.iter().position(|entry| {
-                entry
-                    .filename
-                    .as_str()
-                    .eq_ignore_ascii_case(staged.as_str())
-            })
-        });
-
-        let frame = MenuFrame {
-            title: "ROMS",
-            items: items_arr.as_slice(),
-            selected: self.logic.selected(),
-            marquee_frame: self.marquee_frame,
-            enabled: enabled_arr.as_slice(),
-            marked,
-        };
+        let frame_data = self.menu_frame_data(app);
+        let frame = self.menu_frame(&frame_data);
         game_disp.draw_menu(&frame).await;
     }
 
@@ -85,11 +68,21 @@ impl RomListState {
         slot: usize,
         text_only: bool,
     ) {
-        let mut items_arr: heapless::Vec<&str, 7> = heapless::Vec::new();
-        let mut enabled_arr: heapless::Vec<bool, 7> = heapless::Vec::new();
+        let frame_data = self.menu_frame_data(app);
+        let frame = self.menu_frame(&frame_data);
+        if text_only {
+            game_disp.draw_menu_item_text(&frame, slot).await;
+        } else {
+            game_disp.draw_menu_item(&frame, slot).await;
+        }
+    }
+
+    fn menu_frame_data<'a>(&'a self, app: &App) -> RomMenuFrame<'a> {
+        let mut items = heapless::Vec::new();
+        let mut enabled = heapless::Vec::new();
         for entry in self.page.iter() {
-            let _ = items_arr.push(entry.display_name.as_str());
-            let _ = enabled_arr.push(true);
+            let _ = items.push(entry.display_name.as_str());
+            let _ = enabled.push(true);
         }
 
         let marked = app.staged_rom_name.as_ref().and_then(|staged| {
@@ -101,18 +94,21 @@ impl RomListState {
             })
         });
 
-        let frame = MenuFrame {
+        RomMenuFrame {
+            items,
+            enabled,
+            marked,
+        }
+    }
+
+    fn menu_frame<'a>(&self, frame_data: &'a RomMenuFrame<'a>) -> MenuFrame<'a> {
+        MenuFrame {
             title: "ROMS",
-            items: items_arr.as_slice(),
+            items: frame_data.items.as_slice(),
             selected: self.logic.selected(),
             marquee_frame: self.marquee_frame,
-            enabled: enabled_arr.as_slice(),
-            marked,
-        };
-        if text_only {
-            game_disp.draw_menu_item_text(&frame, slot).await;
-        } else {
-            game_disp.draw_menu_item(&frame, slot).await;
+            enabled: frame_data.enabled.as_slice(),
+            marked: frame_data.marked,
         }
     }
 
@@ -138,17 +134,17 @@ impl RomListState {
         &mut self,
         new_offset: usize,
         sd_mgr: &mut PicoSdMgr,
-        selection: PageSelection,
+        selection: RomPageSelection,
     ) {
-        match sd_mgr.list_rom_page(new_offset, 7) {
-            Ok((page, has_next, total_roms)) => {
-                let page_len: usize = page.len();
-                self.page = page;
+        match sd_mgr.list_rom_page(new_offset, ROM_PAGE_SIZE) {
+            Ok(result) => {
+                let page_len: usize = result.entries.len();
+                self.page = result.entries;
                 self.page_offset = new_offset;
-                self.has_next = has_next;
-                self.total_roms = total_roms;
+                self.has_next = result.has_next;
+                self.total_roms = result.total;
                 self.logic.reset(page_len);
-                if matches!(selection, PageSelection::Last) {
+                if matches!(selection, RomPageSelection::Last) {
                     self.logic.select_last();
                 }
             }
@@ -202,27 +198,27 @@ impl RomListState {
             }
             RomListEffect::NextPage => {
                 self.marquee_frame = 0;
-                if self.has_next {
-                    let new_offset = self.page_offset + 7;
-                    self.flip_page(new_offset, sd_mgr, PageSelection::First)
-                        .await;
-                    self.draw(app, game_disp).await;
-                } else if self.total_roms > 0 {
-                    self.flip_page(0, sd_mgr, PageSelection::First).await;
+                if let Some(page) = rom_page_request(
+                    RomListEffect::NextPage,
+                    self.page_offset,
+                    ROM_PAGE_SIZE,
+                    self.total_roms,
+                    self.has_next,
+                ) {
+                    self.flip_page(page.offset, sd_mgr, page.selection).await;
                     self.draw(app, game_disp).await;
                 }
             }
             RomListEffect::PrevPage => {
                 self.marquee_frame = 0;
-                if self.page_offset > 0 {
-                    let new_offset = self.page_offset.saturating_sub(7);
-                    self.flip_page(new_offset, sd_mgr, PageSelection::Last)
-                        .await;
-                    self.draw(app, game_disp).await;
-                } else if self.total_roms > 0 {
-                    let last_page_offset = (self.total_roms.saturating_sub(1) / 7) * 7;
-                    self.flip_page(last_page_offset, sd_mgr, PageSelection::Last)
-                        .await;
+                if let Some(page) = rom_page_request(
+                    RomListEffect::PrevPage,
+                    self.page_offset,
+                    ROM_PAGE_SIZE,
+                    self.total_roms,
+                    self.has_next,
+                ) {
+                    self.flip_page(page.offset, sd_mgr, page.selection).await;
                     self.draw(app, game_disp).await;
                 }
             }

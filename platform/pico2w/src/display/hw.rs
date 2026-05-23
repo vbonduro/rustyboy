@@ -235,57 +235,29 @@ impl<'d> GameDisplay<'d> {
         total_banks: u32,
         marquee_frame: u32,
     ) {
-        self.set_window(0, 0, DISPLAY_X_END, DISPLAY_Y_END).await;
-        self.write_command(0x2C, &[]).await;
-
-        let mut row = [0u8; ROW_BYTES];
-        self.dc.set_high();
-        self.cs.set_low();
-        for y in 0u16..320 {
-            render_loading_row(
-                filename,
-                banks_done,
-                total_banks,
-                marquee_frame,
-                y,
-                &mut row,
-            );
-            self.spi.write(&row).await.ok();
-        }
-        self.cs.set_high();
+        self.draw_rendered_rows(0, DISPLAY_X_END + 1, 0, DISPLAY_Y_END + 1, |y, row| {
+            render_loading_row(filename, banks_done, total_banks, marquee_frame, y, row);
+        })
+        .await;
     }
 
     /// Repaint only the loading progress bar. The title/filename stay static.
     pub async fn draw_loading_bar(&mut self, banks_done: u32, total_banks: u32) {
         let (y_start, y_end) = loading_bar_y_range();
-        self.set_window(0, y_start, DISPLAY_X_END, y_end - 1).await;
-        self.write_command(0x2C, &[]).await;
-
-        let mut row = [0u8; ROW_BYTES];
-        self.dc.set_high();
-        self.cs.set_low();
-        for y in y_start..y_end {
-            render_loading_row("", banks_done, total_banks, 0, y, &mut row);
-            self.spi.write(&row).await.ok();
-        }
-        self.cs.set_high();
+        self.draw_rendered_rows(0, DISPLAY_X_END + 1, y_start, y_end, |y, row| {
+            render_loading_row("", banks_done, total_banks, 0, y, row);
+        })
+        .await;
     }
 
     /// Paint the full 240×320 screen with a menu, row by row.
     ///
     /// Uses a 480-byte stack buffer; no heap allocation.
     pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
-        self.set_window(0, 0, DISPLAY_X_END, DISPLAY_Y_END).await;
-        self.write_command(0x2C, &[]).await;
-
-        let mut row = [0u8; ROW_BYTES];
-        self.dc.set_high();
-        self.cs.set_low();
-        for y in 0u16..320 {
-            render_menu_row(frame, y, &mut row);
-            self.spi.write(&row).await.ok();
-        }
-        self.cs.set_high();
+        self.draw_rendered_rows(0, DISPLAY_X_END + 1, 0, DISPLAY_Y_END + 1, |y, row| {
+            render_menu_row(frame, y, row);
+        })
+        .await;
     }
 
     /// Repaint a single menu item row. Used by marquee animation to avoid
@@ -295,17 +267,10 @@ impl<'d> GameDisplay<'d> {
             return;
         };
 
-        self.set_window(0, y_start, DISPLAY_X_END, y_end - 1).await;
-        self.write_command(0x2C, &[]).await;
-
-        let mut row = [0u8; ROW_BYTES];
-        self.dc.set_high();
-        self.cs.set_low();
-        for y in y_start..y_end {
-            render_menu_row(frame, y, &mut row);
-            self.spi.write(&row).await.ok();
-        }
-        self.cs.set_high();
+        self.draw_rendered_rows(0, DISPLAY_X_END + 1, y_start, y_end, |y, row| {
+            render_menu_row(frame, y, row);
+        })
+        .await;
     }
 
     /// Repaint only the text window inside a menu item. This keeps marquee
@@ -316,21 +281,10 @@ impl<'d> GameDisplay<'d> {
             return;
         };
 
-        self.set_window(x_start, y_start, x_end - 1, y_end - 1)
-            .await;
-        self.write_command(0x2C, &[]).await;
-
-        let mut row = [0u8; ROW_BYTES];
-        let byte_start = x_start as usize * 2;
-        let byte_end = x_end as usize * 2;
-
-        self.dc.set_high();
-        self.cs.set_low();
-        for y in y_start..y_end {
-            render_menu_row(frame, y, &mut row);
-            self.spi.write(&row[byte_start..byte_end]).await.ok();
-        }
-        self.cs.set_high();
+        self.draw_rendered_rows(x_start, x_end, y_start, y_end, |y, row| {
+            render_menu_row(frame, y, row);
+        })
+        .await;
     }
 
     // --- helpers ---
@@ -350,6 +304,37 @@ impl<'d> GameDisplay<'d> {
         if !params.is_empty() {
             self.dc.set_high();
             self.spi.write(params).await.ok();
+        }
+        self.cs.set_high();
+    }
+
+    async fn draw_rendered_rows<F>(
+        &mut self,
+        x_start: u16,
+        x_end: u16,
+        y_start: u16,
+        y_end: u16,
+        mut render_row: F,
+    ) where
+        F: FnMut(u16, &mut [u8; ROW_BYTES]),
+    {
+        if x_start >= x_end || y_start >= y_end {
+            return;
+        }
+
+        self.set_window(x_start, y_start, x_end - 1, y_end - 1)
+            .await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        let byte_start = x_start as usize * 2;
+        let byte_end = x_end as usize * 2;
+
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in y_start..y_end {
+            render_row(y, &mut row);
+            self.spi.write(&row[byte_start..byte_end]).await.ok();
         }
         self.cs.set_high();
     }
