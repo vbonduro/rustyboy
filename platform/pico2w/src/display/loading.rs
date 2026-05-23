@@ -117,3 +117,69 @@ fn progress_bar_fill_width(progress: LoadingProgress, bar_w: usize) -> usize {
     (bar_w as u64 * progress.banks_done as u64 / progress.total_banks as u64).min(bar_w as u64)
         as usize
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pixel(row: &[u8; 480], x: usize) -> [u8; 2] {
+        [row[x * 2], row[x * 2 + 1]]
+    }
+
+    fn render_row(frame: &LoadingFrame<'_>, y: u16) -> [u8; 480] {
+        let mut row = [0; 480];
+        render_loading_row(frame, y, &mut row);
+        row
+    }
+
+    #[test]
+    fn loading_bar_window_covers_only_progress_rows() {
+        assert_eq!(
+            loading_bar_window(),
+            RenderWindow::full_width_rows(LOADING_BAR_TOP, LOADING_BAR_BOTTOM)
+        );
+    }
+
+    #[test]
+    fn progress_width_handles_zero_total_and_caps_overflow() {
+        assert_eq!(progress_bar_fill_width(LoadingProgress::new(1, 0), 200), 0);
+        assert_eq!(progress_bar_fill_width(LoadingProgress::new(1, 4), 200), 50);
+        assert_eq!(
+            progress_bar_fill_width(LoadingProgress::new(5, 4), 200),
+            200
+        );
+    }
+
+    #[test]
+    fn zero_total_loading_bar_renders_empty_progress() {
+        let frame = LoadingFrame::new("ROM.GB", LoadingProgress::new(0, 0), 0);
+        let row = render_row(&frame, LOADING_BAR_TOP);
+
+        assert_eq!(pixel(&row, LOADING_BAR_X0), C2_BE);
+        assert_eq!(pixel(&row, LOADING_BAR_X1 - 1), C2_BE);
+    }
+
+    #[test]
+    fn loading_header_row_contains_title_pixels() {
+        let frame = LoadingFrame::new("ROM.GB", LoadingProgress::new(0, 0), 0);
+        let title_row = (HEADER_H - (8 * SCALE) as u16) / 2;
+        let row = render_row(&frame, title_row);
+
+        assert!(row.chunks_exact(2).any(|pixel| pixel == C0_BE));
+    }
+
+    #[test]
+    fn short_loading_filename_is_centered() {
+        let frame = LoadingFrame::new("A.GB", LoadingProgress::new(0, 0), 0);
+        let row = render_row(&frame, LOADING_FILENAME_Y);
+        let text_w = text_screen_width(b"A.GB", 1);
+        let text_x = (SCREEN_W as usize).saturating_sub(text_w) / 2;
+
+        assert!(row[..text_x * 2]
+            .chunks_exact(2)
+            .all(|pixel| pixel == C3_BE));
+        assert!(row[text_x * 2..(text_x + text_w) * 2]
+            .chunks_exact(2)
+            .any(|pixel| pixel == C1_BE));
+    }
+}
