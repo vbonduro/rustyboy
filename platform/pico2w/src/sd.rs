@@ -41,6 +41,12 @@ pub struct RomListEntry {
     pub display_name: heapless::String<64>,
 }
 
+pub struct RomPage {
+    pub entries: heapless::Vec<RomListEntry, 7>,
+    pub has_next: bool,
+    pub total: usize,
+}
+
 struct RomDirEntry {
     filename: ShortFileName,
     display_name: heapless::String<64>,
@@ -79,7 +85,7 @@ where
         &self,
         page_offset: usize,
         page_size: usize,
-    ) -> Result<(heapless::Vec<RomListEntry, 7>, bool, usize), SdError<D::Error>> {
+    ) -> Result<RomPage, SdError<D::Error>> {
         let mut names: Vec<RomDirEntry> = Vec::new();
         names
             .try_reserve_exact(100)
@@ -120,7 +126,11 @@ where
             });
         }
 
-        Ok((page, has_next, total))
+        Ok(RomPage {
+            entries: page,
+            has_next,
+            total,
+        })
     }
 
     /// Open a specific ROM file by FAT filename (case-insensitive).
