@@ -64,6 +64,8 @@ pub struct MenuFrame<'a> {
     pub title: &'a str,
     pub items: &'a [&'a str],
     pub selected: usize,
+    /// Monotonic frame used by renderers for selected-item marquee animation.
+    pub marquee_frame: u32,
     /// Parallel to `items`; false = greyed out (e.g. Load with no save slot).
     pub enabled: &'a [bool],
     /// Index of the item that carries a "currently loaded" indicator, if any.
@@ -104,6 +106,7 @@ impl MenuLogic for InGameMenu {
             title: "PAUSED",
             items: INGAME_ITEMS,
             selected: self.selected,
+            marquee_frame: 0,
             enabled: if save_available {
                 &ALL_ENABLED
             } else {
@@ -193,6 +196,7 @@ impl MenuLogic for MainMenu {
                 title: "MAIN MENU",
                 items: MAIN_ITEMS_FULL,
                 selected: self.selected,
+                marquee_frame: 0,
                 enabled: &FULL_ENABLED,
                 marked: None,
             }
@@ -201,6 +205,7 @@ impl MenuLogic for MainMenu {
                 title: "MAIN MENU",
                 items: MAIN_ITEMS_ROMS,
                 selected: 0,
+                marquee_frame: 0,
                 enabled: &ROMS_ENABLED,
                 marked: None,
             }
@@ -237,6 +242,9 @@ impl RomListLogic {
         if input.back {
             return RomListEffect::Back;
         }
+        if self.page_len == 0 {
+            return RomListEffect::None;
+        }
         if input.up {
             if self.selected > 0 {
                 self.selected -= 1;
@@ -265,6 +273,11 @@ impl RomListLogic {
     pub fn reset(&mut self, new_page_len: usize) {
         self.selected = 0;
         self.page_len = new_page_len;
+    }
+
+    /// Move selection to the final item on the current page.
+    pub fn select_last(&mut self) {
+        self.selected = self.page_len.saturating_sub(1);
     }
 }
 

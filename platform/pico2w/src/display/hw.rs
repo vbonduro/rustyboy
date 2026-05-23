@@ -17,7 +17,10 @@ use mipidsi::models::ILI9341Rgb565;
 use mipidsi::options::{ColorOrder, Orientation};
 use mipidsi::Builder;
 
-use super::{render_loading_row, render_menu_row, Display, ScaledFrame};
+use super::{
+    loading_bar_y_range, menu_item_text_window, menu_item_y_range, render_loading_row,
+    render_menu_row, Display, ScaledFrame,
+};
 use crate::menu::MenuFrame;
 
 // Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
@@ -230,6 +233,7 @@ impl<'d> GameDisplay<'d> {
         filename: &str,
         banks_done: u32,
         total_banks: u32,
+        marquee_frame: u32,
     ) {
         self.set_window(0, 0, DISPLAY_X_END, DISPLAY_Y_END).await;
         self.write_command(0x2C, &[]).await;
@@ -238,7 +242,30 @@ impl<'d> GameDisplay<'d> {
         self.dc.set_high();
         self.cs.set_low();
         for y in 0u16..320 {
-            render_loading_row(filename, banks_done, total_banks, y, &mut row);
+            render_loading_row(
+                filename,
+                banks_done,
+                total_banks,
+                marquee_frame,
+                y,
+                &mut row,
+            );
+            self.spi.write(&row).await.ok();
+        }
+        self.cs.set_high();
+    }
+
+    /// Repaint only the loading progress bar. The title/filename stay static.
+    pub async fn draw_loading_bar(&mut self, banks_done: u32, total_banks: u32) {
+        let (y_start, y_end) = loading_bar_y_range();
+        self.set_window(0, y_start, DISPLAY_X_END, y_end - 1).await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in y_start..y_end {
+            render_loading_row("", banks_done, total_banks, 0, y, &mut row);
             self.spi.write(&row).await.ok();
         }
         self.cs.set_high();
@@ -257,6 +284,51 @@ impl<'d> GameDisplay<'d> {
         for y in 0u16..320 {
             render_menu_row(frame, y, &mut row);
             self.spi.write(&row).await.ok();
+        }
+        self.cs.set_high();
+    }
+
+    /// Repaint a single menu item row. Used by marquee animation to avoid
+    /// full-screen refresh jitter while the rest of the ROM menu is static.
+    pub async fn draw_menu_item(&mut self, frame: &MenuFrame<'_>, slot: usize) {
+        let Some((y_start, y_end)) = menu_item_y_range(slot) else {
+            return;
+        };
+
+        self.set_window(0, y_start, DISPLAY_X_END, y_end - 1).await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in y_start..y_end {
+            render_menu_row(frame, y, &mut row);
+            self.spi.write(&row).await.ok();
+        }
+        self.cs.set_high();
+    }
+
+    /// Repaint only the text window inside a menu item. This keeps marquee
+    /// animation from touching static rows, cursor, or loaded marker pixels.
+    pub async fn draw_menu_item_text(&mut self, frame: &MenuFrame<'_>, slot: usize) {
+        let marked = frame.marked == Some(slot);
+        let Some((x_start, x_end, y_start, y_end)) = menu_item_text_window(slot, marked) else {
+            return;
+        };
+
+        self.set_window(x_start, y_start, x_end - 1, y_end - 1)
+            .await;
+        self.write_command(0x2C, &[]).await;
+
+        let mut row = [0u8; ROW_BYTES];
+        let byte_start = x_start as usize * 2;
+        let byte_end = x_end as usize * 2;
+
+        self.dc.set_high();
+        self.cs.set_low();
+        for y in y_start..y_end {
+            render_menu_row(frame, y, &mut row);
+            self.spi.write(&row[byte_start..byte_end]).await.ok();
         }
         self.cs.set_high();
     }

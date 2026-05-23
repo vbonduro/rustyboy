@@ -15,6 +15,7 @@ use crate::{App, AppState, PicoSdMgr};
 
 pub struct LoadingState {
     pub(crate) filename: heapless::String<64>,
+    pub(crate) display_name: heapless::String<64>,
 }
 
 impl LoadingState {
@@ -51,7 +52,15 @@ impl LoadingState {
         let stage_result: Result<FlashRomInfo, ()> = if already_staged {
             probe_staged_rom(flash).map(|(info, _)| info).ok_or(())
         } else {
-            stage_rom_from_sd(self.filename.as_str(), flash, sd_mgr, game_disp, watchdog).await
+            stage_rom_from_sd(
+                self.filename.as_str(),
+                self.display_name.as_str(),
+                flash,
+                sd_mgr,
+                game_disp,
+                watchdog,
+            )
+            .await
         };
 
         match stage_result {
@@ -95,6 +104,7 @@ impl LoadingState {
 
 async fn stage_rom_from_sd(
     filename: &str,
+    display_name: &str,
     flash: &mut OnboardFlash<'_>,
     sd_mgr: &mut PicoSdMgr,
     game_disp: &mut GameDisplay<'static>,
@@ -103,6 +113,7 @@ async fn stage_rom_from_sd(
     let mut reader = sd_mgr.open_rom_reader(filename).map_err(|e| {
         defmt::error!("sd open failed: {:?}", defmt::Debug2Format(&e));
     })?;
+    game_disp.draw_loading_progress(display_name, 0, 0, 0).await;
 
     // RP2350 watchdog maximum is 16,777,215 µs (~16.7 s). Use 16 s so the
     // erase phase (which can take several seconds) does not starve the watchdog.
@@ -113,7 +124,7 @@ async fn stage_rom_from_sd(
     info!("stager begin done: {} banks", stager.total_banks());
     let total_banks = stager.total_banks();
     game_disp
-        .draw_loading_progress(filename, 0, total_banks as u32)
+        .draw_loading_bar(stager.banks_written() as u32, total_banks as u32)
         .await;
 
     loop {
@@ -123,16 +134,12 @@ async fn stage_rom_from_sd(
         })? {
             WriteResult::Continue => {
                 game_disp
-                    .draw_loading_progress(
-                        filename,
-                        stager.banks_written() as u32,
-                        total_banks as u32,
-                    )
+                    .draw_loading_bar(stager.banks_written() as u32, total_banks as u32)
                     .await;
             }
             WriteResult::Done(info) => {
                 game_disp
-                    .draw_loading_progress(filename, total_banks as u32, total_banks as u32)
+                    .draw_loading_bar(total_banks as u32, total_banks as u32)
                     .await;
                 return Ok(info);
             }
