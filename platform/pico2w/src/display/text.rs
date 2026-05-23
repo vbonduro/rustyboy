@@ -7,6 +7,59 @@ pub(crate) const C3_BE: [u8; 2] = [0x08, 0xC4]; // #081820
 
 pub(crate) const CHAR_W: usize = 8;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextStyle {
+    pub scale: usize,
+    pub fg: [u8; 2],
+    pub bg: [u8; 2],
+}
+
+impl TextStyle {
+    pub const fn new(scale: usize, fg: [u8; 2], bg: [u8; 2]) -> Self {
+        Self { scale, fg, bg }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextRun {
+    pub x_start: usize,
+    pub glyph_row: usize,
+    pub style: TextStyle,
+}
+
+impl TextRun {
+    pub const fn new(x_start: usize, glyph_row: usize, style: TextStyle) -> Self {
+        Self {
+            x_start,
+            glyph_row,
+            style,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextWindow {
+    pub x_start: usize,
+    pub x_end: usize,
+    pub glyph_row: usize,
+    pub style: TextStyle,
+}
+
+impl TextWindow {
+    pub const fn new(x_start: usize, x_end: usize, glyph_row: usize, style: TextStyle) -> Self {
+        Self {
+            x_start,
+            x_end,
+            glyph_row,
+            style,
+        }
+    }
+
+    pub fn width(self) -> usize {
+        self.x_end.saturating_sub(self.x_start)
+    }
+}
+
 pub(crate) fn fill_row(row: &mut [u8; 480], color: [u8; 2]) {
     let mut i = 0;
     while i < 480 {
@@ -16,25 +69,17 @@ pub(crate) fn fill_row(row: &mut [u8; 480], color: [u8; 2]) {
     }
 }
 
-pub(crate) fn write_text_row(
-    row: &mut [u8; 480],
-    text: &[u8],
-    x_start: usize,
-    glyph_row: usize,
-    scale: usize,
-    fg: [u8; 2],
-    bg: [u8; 2],
-) {
-    let char_screen_w = CHAR_W * scale;
+pub(crate) fn write_text_row(row: &mut [u8; 480], text: &[u8], run: TextRun) {
+    let char_screen_w = CHAR_W * run.style.scale;
     for (char_idx, &ch) in text.iter().enumerate() {
-        let bitmap = font::glyph_row(ch, glyph_row);
-        let char_x = x_start + char_idx * char_screen_w;
+        let bitmap = font::glyph_row(ch, run.glyph_row);
+        let char_x = run.x_start + char_idx * char_screen_w;
         for glyph_x in 0..CHAR_W {
             // Font bitmaps use bit 0 = leftmost pixel (LSB-first convention).
             let lit = (bitmap >> glyph_x) & 1 != 0;
-            let color = if lit { fg } else { bg };
-            for sx in 0..scale {
-                let px = char_x + glyph_x * scale + sx;
+            let color = if lit { run.style.fg } else { run.style.bg };
+            for sx in 0..run.style.scale {
+                let px = char_x + glyph_x * run.style.scale + sx;
                 if px < SCREEN_W as usize {
                     row[px * 2] = color[0];
                     row[px * 2 + 1] = color[1];
@@ -44,24 +89,19 @@ pub(crate) fn write_text_row(
     }
 }
 
-pub(crate) fn write_truncated_text_row(
-    row: &mut [u8; 480],
-    text: &[u8],
-    x_start: usize,
-    x_end: usize,
-    glyph_row: usize,
-    scale: usize,
-    fg: [u8; 2],
-    bg: [u8; 2],
-) {
-    let char_screen_w = CHAR_W * scale;
+pub(crate) fn write_truncated_text_row(row: &mut [u8; 480], text: &[u8], window: TextWindow) {
+    let char_screen_w = CHAR_W * window.style.scale;
     if char_screen_w == 0 {
         return;
     }
 
-    let max_chars = x_end.saturating_sub(x_start) / char_screen_w;
+    let max_chars = window.width() / char_screen_w;
     let visible = text.len().min(max_chars);
-    write_text_row(row, &text[..visible], x_start, glyph_row, scale, fg, bg);
+    write_text_row(
+        row,
+        &text[..visible],
+        TextRun::new(window.x_start, window.glyph_row, window.style),
+    );
 }
 
 pub(crate) fn text_pixel_lit(

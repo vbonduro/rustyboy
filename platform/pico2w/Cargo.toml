@@ -10,8 +10,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "rustyboy-pico2w"
 path = "src/main.rs"
+required-features = ["firmware-bin"]
+test = false
 
 [features]
+default = ["firmware-bin"]
+# Keeps the embedded firmware binary enabled for normal builds while allowing
+# host integration tests to exercise the library without compiling ARM-only code.
+firmware-bin = []
 # Re-exported for display-viewer which depends on this crate.
 std = []
 oc-266 = []
