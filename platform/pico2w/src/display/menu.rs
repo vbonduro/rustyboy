@@ -175,7 +175,11 @@ fn menu_item_for_row<'a>(frame: &MenuFrame<'a>, y: u16) -> Option<MenuItemRow<'a
     let slot_top = ITEMS_START_Y + slot as u16 * ITEM_H;
     let text_top = slot_top + ITEM_TEXT_PAD;
     let text_bottom = text_top + (8 * SCALE) as u16;
-    let glyph_row = (y >= text_top && y < text_bottom).then_some(((y - text_top) as usize) / SCALE);
+    let glyph_row = if y >= text_top && y < text_bottom {
+        Some(((y - text_top) as usize) / SCALE)
+    } else {
+        None
+    };
 
     Some(MenuItemRow {
         selected: slot == frame.selected,
@@ -284,12 +288,137 @@ fn menu_item_text_window_width(marked: bool) -> usize {
 mod tests {
     use super::*;
 
+    fn frame<'a>(
+        items: &'a [&'a str],
+        selected: usize,
+        marquee_frame: u32,
+        enabled: &'a [bool],
+        marked: Option<usize>,
+    ) -> MenuFrame<'a> {
+        MenuFrame {
+            title: "ROMS",
+            items,
+            selected,
+            marquee_frame,
+            enabled,
+            marked,
+        }
+    }
+
+    fn render_row(frame: &MenuFrame<'_>, y: u16) -> [u8; 480] {
+        let mut row = [0; 480];
+        render_menu_row(frame, y, &mut row);
+        row
+    }
+
+    fn pixel(row: &[u8; 480], x: usize) -> [u8; 2] {
+        [row[x * 2], row[x * 2 + 1]]
+    }
+
+    fn row_range_contains(row: &[u8; 480], x_start: usize, x_end: usize, color: [u8; 2]) -> bool {
+        row[x_start * 2..x_end * 2]
+            .chunks_exact(2)
+            .any(|pixel| pixel == color)
+    }
+
     #[test]
     fn menu_item_marquee_threshold_reserves_marker_space() {
         assert!(!menu_item_needs_marquee("1234567890123", false));
         assert!(menu_item_needs_marquee("12345678901234", false));
         assert!(!menu_item_needs_marquee("1234567890", true));
         assert!(menu_item_needs_marquee("12345678901", true));
+    }
+
+    #[test]
+    fn menu_item_windows_use_exclusive_bounds() {
+        assert_eq!(
+            menu_item_window(0),
+            Some(RenderWindow::full_width_rows(
+                ITEMS_START_Y,
+                ITEMS_START_Y + ITEM_H
+            ))
+        );
+        assert_eq!(
+            menu_item_text_window(0, false),
+            Some(RenderWindow::new(
+                ITEM_TEXT_X as u16,
+                ITEM_TEXT_RIGHT_X as u16,
+                ITEMS_START_Y + ITEM_TEXT_PAD,
+                ITEMS_START_Y + ITEM_TEXT_PAD + (8 * SCALE) as u16,
+            ))
+        );
+    }
+
+    #[test]
+    fn marked_menu_text_window_reserves_marker_column() {
+        assert_eq!(
+            menu_item_text_window(0, true).unwrap().x_end as usize,
+            MARKER_X - ITEM_MARKER_GAP
+        );
+    }
+
+    #[test]
+    fn menu_item_window_returns_none_after_item_area() {
+        let first_slot_past_footer = ((FOOTER_SEP_Y - ITEMS_START_Y) / ITEM_H + 1) as usize;
+        assert_eq!(menu_item_window(first_slot_past_footer), None);
+    }
+
+    #[test]
+    fn selected_item_row_uses_selected_background() {
+        let items = ["FIRST", "SECOND"];
+        let enabled = [true, true];
+        let menu = frame(&items, 1, 0, &enabled, None);
+
+        let selected = menu_item_window(1).unwrap();
+        let unselected = menu_item_window(0).unwrap();
+        assert_eq!(pixel(&render_row(&menu, selected.y_start + 1), 0), C2_BE);
+        assert_eq!(pixel(&render_row(&menu, unselected.y_start + 1), 0), C3_BE);
+    }
+
+    #[test]
+    fn disabled_unselected_item_renders_muted_text() {
+        let items = ["FIRST", "SECOND"];
+        let enabled = [true, false];
+        let menu = frame(&items, 0, 0, &enabled, None);
+        let text_window = menu_item_text_window(1, false).unwrap();
+
+        let row = render_row(&menu, text_window.y_start);
+        assert!(row_range_contains(
+            &row,
+            ITEM_TEXT_X,
+            ITEM_TEXT_X + CHAR_W * SCALE,
+            C2_BE
+        ));
+    }
+
+    #[test]
+    fn marked_item_renders_marker_pixels() {
+        let items = ["FIRST"];
+        let enabled = [true];
+        let menu = frame(&items, 0, 0, &enabled, Some(0));
+        let text_window = menu_item_text_window(0, true).unwrap();
+
+        let row = render_row(&menu, text_window.y_start + SCALE as u16);
+        assert!(row_range_contains(
+            &row,
+            MARKER_X,
+            MARKER_X + CHAR_W * SCALE,
+            C0_BE
+        ));
+    }
+
+    #[test]
+    fn short_selected_item_does_not_marquee() {
+        let items = ["SHORT"];
+        let enabled = [true];
+        let first = frame(&items, 0, 0, &enabled, None);
+        let later = frame(&items, 0, 100, &enabled, None);
+        let text_window = menu_item_text_window(0, false).unwrap();
+
+        assert_eq!(
+            render_row(&first, text_window.y_start),
+            render_row(&later, text_window.y_start)
+        );
     }
 
     #[test]

@@ -110,6 +110,10 @@ pub(crate) fn text_pixel_lit(
     scale: usize,
     source_px: usize,
 ) -> bool {
+    if scale == 0 {
+        return false;
+    }
+
     let char_screen_w = CHAR_W * scale;
     let char_idx = source_px / char_screen_w;
     let Some(&ch) = text.get(char_idx) else {
@@ -122,4 +126,65 @@ pub(crate) fn text_pixel_lit(
 
 pub(crate) fn text_screen_width(text: &[u8], scale: usize) -> usize {
     text.len() * CHAR_W * scale
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pixel(row: &[u8; 480], x: usize) -> [u8; 2] {
+        [row[x * 2], row[x * 2 + 1]]
+    }
+
+    fn sentinel_row() -> [u8; 480] {
+        let mut row = [0; 480];
+        fill_row(&mut row, [0x12, 0x34]);
+        row
+    }
+
+    #[test]
+    fn text_window_width_saturates_when_end_is_before_start() {
+        let window = TextWindow::new(20, 10, 0, TextStyle::new(1, C0_BE, C3_BE));
+        assert_eq!(window.width(), 0);
+    }
+
+    #[test]
+    fn write_text_row_clips_at_screen_edge() {
+        let mut row = sentinel_row();
+        write_text_row(
+            &mut row,
+            b"A",
+            TextRun::new(238, 0, TextStyle::new(2, C0_BE, C3_BE)),
+        );
+
+        assert_ne!(pixel(&row, 238), [0x12, 0x34]);
+        assert_ne!(pixel(&row, 239), [0x12, 0x34]);
+    }
+
+    #[test]
+    fn write_truncated_text_row_limits_visible_chars_to_window() {
+        let mut row = sentinel_row();
+        write_truncated_text_row(
+            &mut row,
+            b"AAA",
+            TextWindow::new(0, CHAR_W * 2, 0, TextStyle::new(1, C0_BE, C3_BE)),
+        );
+
+        assert_ne!(pixel(&row, 3), [0x12, 0x34]);
+        assert_eq!(pixel(&row, CHAR_W * 2 + 3), [0x12, 0x34]);
+    }
+
+    #[test]
+    fn text_pixel_lit_reports_scaled_pixels_and_out_of_bounds_as_unlit() {
+        assert!(text_pixel_lit(b"A", 0, 2, 6));
+        assert!(text_pixel_lit(b"A", 0, 2, 7));
+        assert!(!text_pixel_lit(b"A", 0, 2, CHAR_W * 2));
+        assert!(!text_pixel_lit(b"A", 0, 0, 0));
+    }
+
+    #[test]
+    fn text_screen_width_accounts_for_scale() {
+        assert_eq!(text_screen_width(b"ABC", 1), 24);
+        assert_eq!(text_screen_width(b"ABC", 2), 48);
+    }
 }

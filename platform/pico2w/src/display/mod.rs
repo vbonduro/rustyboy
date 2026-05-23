@@ -402,6 +402,34 @@ mod tests {
     }
 
     #[test]
+    fn render_window_screen_matches_display_dimensions() {
+        assert_eq!(RenderWindow::screen(), RenderWindow::new(0, 240, 0, 320));
+    }
+
+    #[test]
+    fn render_window_converts_exclusive_bounds_for_display_controller() {
+        let window = RenderWindow::new(4, 12, 9, 20);
+
+        assert_eq!(window.inclusive_bounds(), Some((4, 11, 9, 19)));
+        assert_eq!(window.byte_range(), 8..24);
+    }
+
+    #[test]
+    fn render_window_reports_empty_windows_without_underflowing_bounds() {
+        assert!(RenderWindow::new(5, 5, 0, 1).is_empty());
+        assert!(RenderWindow::new(0, 1, 7, 3).is_empty());
+        assert_eq!(RenderWindow::new(5, 5, 0, 1).inclusive_bounds(), None);
+    }
+
+    #[test]
+    fn render_window_full_width_rows_keeps_requested_y_range() {
+        assert_eq!(
+            RenderWindow::full_width_rows(12, 34),
+            RenderWindow::new(0, SCREEN_W as u16, 12, 34)
+        );
+    }
+
+    #[test]
     fn dmg_color_palette() {
         assert_eq!(dmg_color(0), C0);
         assert_eq!(dmg_color(1), C1);

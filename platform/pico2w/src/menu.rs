@@ -418,6 +418,15 @@ mod tests {
         assert!(!input.back, "release should not count as a press");
     }
 
+    #[test]
+    fn menu_input_any_reports_only_actual_edges() {
+        assert!(!no_input().any());
+        assert!(press_up().any());
+        assert!(press_down().any());
+        assert!(press_a().any());
+        assert!(press_b().any());
+    }
+
     // --- InGameMenu navigation ---
 
     #[test]
@@ -520,6 +529,20 @@ mod tests {
     }
 
     #[test]
+    fn main_without_game_goes_to_roms_even_after_navigation_input() {
+        let mut menu = MainMenu::new();
+        assert_eq!(menu.handle_main(press_down(), false), MenuEffect::None);
+        assert_eq!(menu.handle_main(press_a(), false), MenuEffect::ShowRoms);
+    }
+
+    #[test]
+    fn main_back_is_noop() {
+        let mut menu = MainMenu::new();
+        assert_eq!(menu.handle_main(press_b(), true), MenuEffect::None);
+        assert_eq!(menu.handle_main(press_b(), false), MenuEffect::None);
+    }
+
+    #[test]
     fn main_down_does_not_exceed_last_item() {
         let mut menu = MainMenu::new();
         for _ in 0..10 {
@@ -601,6 +624,22 @@ mod tests {
     }
 
     #[test]
+    fn romlist_select_last_handles_empty_page() {
+        let mut logic = RomListLogic::new(0);
+        logic.select_last();
+        assert_eq!(logic.selected(), 0);
+    }
+
+    #[test]
+    fn romlist_reset_updates_page_len_for_boundary_navigation() {
+        let mut logic = RomListLogic::new(5);
+        logic.reset(1);
+
+        assert_eq!(logic.handle(press_down()), RomListEffect::NextPage);
+        assert_eq!(logic.selected(), 0);
+    }
+
+    #[test]
     fn romlist_no_input_returns_none() {
         let mut logic = RomListLogic::new(3);
         assert_eq!(logic.handle(no_input()), RomListEffect::None);
@@ -644,5 +683,38 @@ mod tests {
                 selection: RomPageSelection::Last,
             })
         );
+    }
+
+    #[test]
+    fn rom_page_request_wraps_prev_to_final_partial_page() {
+        assert_eq!(
+            page(0, 7, 20, true).request(RomListEffect::PrevPage),
+            Some(RomPageRequest {
+                offset: 14,
+                selection: RomPageSelection::Last,
+            })
+        );
+    }
+
+    #[test]
+    fn rom_page_request_wraps_prev_to_final_full_page() {
+        assert_eq!(
+            page(0, 7, 14, true).request(RomListEffect::PrevPage),
+            Some(RomPageRequest {
+                offset: 7,
+                selection: RomPageSelection::Last,
+            })
+        );
+    }
+
+    #[test]
+    fn rom_page_request_ignores_non_page_effects_and_empty_contexts() {
+        assert_eq!(page(0, 7, 12, true).request(RomListEffect::None), None);
+        assert_eq!(
+            page(0, 7, 12, true).request(RomListEffect::SelectItem),
+            None
+        );
+        assert_eq!(page(0, 0, 12, true).request(RomListEffect::NextPage), None);
+        assert_eq!(page(0, 7, 0, false).request(RomListEffect::PrevPage), None);
     }
 }
