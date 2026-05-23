@@ -44,6 +44,7 @@ use embassy_rp::{bind_interrupts, dma};
 use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::SdCard;
+use rustyboy_core::storage::RomId;
 use {defmt_rtt as _, panic_probe as _};
 
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
@@ -51,6 +52,7 @@ use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::flash_rom::{new_onboard_flash, probe_staged_rom};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::multicore::PicoGameBoy;
+use rustyboy_pico2w::save_storage::SaveSlot;
 use rustyboy_pico2w::sd::{self, DummyClock};
 use rustyboy_pico2w::stack_probe;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
@@ -123,9 +125,10 @@ pub(crate) fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 pub(crate) struct App {
     pub(crate) state: AppState,
     pub(crate) next_state: Option<AppState>,
-    pub(crate) save_slot: Option<Vec<u8>>,
+    pub(crate) save_slot_available: bool,
     pub(crate) previous_buttons: ButtonState,
     pub(crate) staged_rom_name: Option<heapless::String<64>>,
+    pub(crate) staged_rom_id: Option<RomId>,
     pub(crate) core1: Option<Peri<'static, CORE1>>,
 }
 
@@ -133,6 +136,35 @@ impl App {
     pub(crate) fn transition_to(&mut self, next: AppState) {
         self.next_state = Some(next);
     }
+}
+
+pub(crate) fn load_battery_save(app: &App, sd_mgr: &PicoSdMgr, gameboy: &mut PicoGameBoy) {
+    let Some(rom_id) = app.staged_rom_id else {
+        return;
+    };
+    match sd_mgr.read_battery_save(&rom_id) {
+        Ok(Some(data)) => gameboy.set_external_ram(&data),
+        Ok(None) => {}
+        Err(e) => defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)),
+    }
+}
+
+pub(crate) fn flush_battery_save(app: &App, sd_mgr: &PicoSdMgr, gameboy: &PicoGameBoy) {
+    let (Some(rom_id), Some(ram)) = (app.staged_rom_id, gameboy.external_ram()) else {
+        return;
+    };
+    if let Err(e) = sd_mgr.write_battery_save(&rom_id, ram) {
+        defmt::warn!("battery save failed: {:?}", defmt::Debug2Format(&e));
+    }
+}
+
+pub(crate) fn refresh_save_slot_available(app: &mut App, sd_mgr: &PicoSdMgr) {
+    let Some(rom_id) = app.staged_rom_id else {
+        app.save_slot_available = false;
+        return;
+    };
+    let slot = SaveSlot::new(0).expect("slot 0 is valid");
+    app.save_slot_available = sd_mgr.save_state_exists(&rom_id, slot).unwrap_or(false);
 }
 
 pub(crate) enum AppState {
@@ -249,7 +281,7 @@ async fn main(_spawner: Spawner) {
     let mut audio_samples = Vec::with_capacity(2048);
 
     // Build initial state: Running if a ROM is staged, else MainMenu.
-    let (initial_state, gameboy_init, staged_rom_name, core1_token) = match staged {
+    let (initial_state, gameboy_init, staged_rom_name, staged_rom_id, core1_token) = match staged {
         Some((info, name)) => {
             info!(
                 "staged ROM found in flash: {} banks ({} KiB)",
@@ -264,22 +296,38 @@ async fn main(_spawner: Spawner) {
                         "building GameBoy, clk={}",
                         embassy_rp::clocks::clk_sys_freq()
                     );
-                    let gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
+                    let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
+                    if let Some(rom_id) = info.rom_id {
+                        match sd_mgr.read_battery_save(&rom_id) {
+                            Ok(Some(data)) => gb.set_external_ram(&data),
+                            Ok(None) => {}
+                            Err(e) => {
+                                defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e))
+                            }
+                        }
+                    }
                     info!("ROM loaded, entering main loop");
-                    (AppState::Running(RunningState), Some(gb), name, None)
+                    (
+                        AppState::Running(RunningState),
+                        Some(gb),
+                        name,
+                        info.rom_id,
+                        None,
+                    )
                 }
                 Err(e) => {
                     defmt::error!("flash ROM mapping failed: {:?}", defmt::Debug2Format(&e));
                     let stub_app = App {
                         state: AppState::Running(RunningState),
                         next_state: None,
-                        save_slot: None,
+                        save_slot_available: false,
                         previous_buttons: ButtonState::default(),
                         staged_rom_name: None,
+                        staged_rom_id: None,
                         core1: None,
                     };
                     let next = MainMenuState::new(&mut game_disp, &stub_app).await;
-                    (AppState::MainMenu(next), None, None, Some(p.CORE1))
+                    (AppState::MainMenu(next), None, None, None, Some(p.CORE1))
                 }
             }
         }
@@ -288,13 +336,20 @@ async fn main(_spawner: Spawner) {
             let stub_app = App {
                 state: AppState::Running(RunningState),
                 next_state: None,
-                save_slot: None,
+                save_slot_available: false,
                 previous_buttons: ButtonState::default(),
                 staged_rom_name: None,
+                staged_rom_id: None,
                 core1: None,
             };
             let menu_state = MainMenuState::new(&mut game_disp, &stub_app).await;
-            (AppState::MainMenu(menu_state), None, None, Some(p.CORE1))
+            (
+                AppState::MainMenu(menu_state),
+                None,
+                None,
+                None,
+                Some(p.CORE1),
+            )
         }
     };
 
@@ -306,11 +361,13 @@ async fn main(_spawner: Spawner) {
     let mut app = App {
         state: initial_state,
         next_state: None,
-        save_slot: None,
+        save_slot_available: false,
         previous_buttons: ButtonState::default(),
         staged_rom_name,
+        staged_rom_id,
         core1: core1_token,
     };
+    refresh_save_slot_available(&mut app, &sd_mgr);
 
     #[cfg(feature = "fps")]
     let mut tracker = perf::PerfTracker::new();
@@ -331,6 +388,7 @@ async fn main(_spawner: Spawner) {
                         &mut game_disp,
                         &mut i2s,
                         &mut input,
+                        &mut sd_mgr,
                         &mut audio_buffers,
                         &mut audio_samples,
                     )
@@ -347,6 +405,7 @@ async fn main(_spawner: Spawner) {
                         gameboy.as_mut().expect("InGameMenu without GameBoy"),
                         &mut game_disp,
                         &mut input,
+                        &mut sd_mgr,
                     )
                     .await;
             }

@@ -8,7 +8,7 @@ use super::map::{
     ECHO_BASE, ECHO_END, EXT_RAM_BASE, EXT_RAM_END, IO_REG_BASE, IO_REG_END, OAM_BASE, OAM_END,
     ROM_BANKED_BASE, ROM_BANKED_END, ROM_FIXED_END, VRAM_BASE, VRAM_END, WRAM_BASE, WRAM_END,
 };
-use crate::cpu::save_state::SaveState;
+use crate::cpu::save_state::{write_cart_ram_section, write_mbc_section, SaveState};
 
 /// An event produced when a write occurs to a worker-mirrored address.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -492,17 +492,9 @@ impl GameBoyMemory {
         self.ie = value;
     }
 
-    /// Serialize memory state into `out`.
-    /// IO registers (0x80 bytes) + IE (1 byte) + WRAM + HRAM + VRAM + OAM.
-    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
-        for i in 0..0x80u16 {
-            out.push(self.read_io(0xFF00 + i));
-        }
-        out.push(self.ie);
-        out.extend_from_slice(self.wram());
-        out.extend_from_slice(self.hram());
-        out.extend_from_slice(self.vram());
-        out.extend_from_slice(self.oam());
+    /// Serialize memory state into the RBSS v1 tail.
+    pub fn save_state_v1(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.save_fixed_regions(out);
         self.cartridge.save_mbc_state(out);
         // External RAM (cart SRAM): prefix with u16 LE length so load_state
         // can handle carts with no RAM (len=0) and varying RAM sizes.
@@ -517,6 +509,37 @@ impl GameBoyMemory {
         }
     }
 
+    /// Serialize memory state into the RBSS v2 tail.
+    pub fn save_state_v2(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.save_fixed_regions(out);
+
+        let mut mbc = alloc::vec::Vec::new();
+        self.cartridge.save_mbc_state(&mut mbc);
+        write_mbc_section(out, &mbc);
+
+        if let Some(ram) = self.cartridge.external_ram() {
+            write_cart_ram_section(out, ram);
+        }
+    }
+
+    /// Backward-compatible alias for older call sites.
+    pub fn save_state(&self, out: &mut alloc::vec::Vec<u8>) {
+        self.save_state_v1(out);
+    }
+
+    /// Serialize fixed memory regions shared by RBSS v1 and v2.
+    /// IO registers (0x80 bytes) + IE (1 byte) + WRAM + HRAM + VRAM + OAM.
+    fn save_fixed_regions(&self, out: &mut alloc::vec::Vec<u8>) {
+        for i in 0..0x80u16 {
+            out.push(self.read_io(0xFF00 + i));
+        }
+        out.push(self.ie);
+        out.extend_from_slice(self.wram());
+        out.extend_from_slice(self.hram());
+        out.extend_from_slice(self.vram());
+        out.extend_from_slice(self.oam());
+    }
+
     /// Apply memory state from a parsed [`SaveState`]. Zero-copy for large regions.
     pub fn load_state(&mut self, state: &SaveState) {
         let io = state.io_registers();
@@ -528,7 +551,10 @@ impl GameBoyMemory {
         self.set_hram(state.hram());
         self.set_vram(state.vram());
         self.set_oam(state.oam());
-        if let Some(mbc) = state.mbc() {
+        if let Some(payload) = state.mbc_payload() {
+            self.cartridge.load_mbc_state(payload, 0);
+            self.refresh_rom_windows();
+        } else if let Some(mbc) = state.mbc() {
             // Reconstruct MBC register state via the existing load path.
             // We build a minimal 4-byte buffer and reuse load_mbc_state.
             let buf = [

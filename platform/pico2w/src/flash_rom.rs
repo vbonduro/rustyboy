@@ -5,6 +5,7 @@ use embassy_rp::peripherals::FLASH;
 use embassy_rp::Peri;
 
 use rustyboy_core::memory::RomReader;
+use rustyboy_core::storage::{RomHasher, RomId};
 
 pub const FLASH_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
 pub const FIRMWARE_SLOT_BYTES: usize = 512 * 1024;
@@ -15,7 +16,9 @@ pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSE
 
 const ROM_BANK_BYTES: usize = 0x4000;
 const HEADER_MAGIC: [u8; 8] = *b"RBROM1\0\0";
-const HEADER_VERSION: u32 = 1;
+const HEADER_VERSION_V1: u32 = 1;
+const HEADER_VERSION_V2: u32 = 2;
+const HEADER_VERSION: u32 = HEADER_VERSION_V2;
 // Layout:
 //   [0..8]   magic
 //   [8..12]  version
@@ -24,9 +27,11 @@ const HEADER_VERSION: u32 = 1;
 //   [20..24] bank_count
 //   [24..32] reserved (0xFF padding)
 //   [32..96] filename (null-terminated UTF-8, max 63 chars + null)
-const HEADER_LEN: usize = 96;
+//   [96..128] rom_id SHA-256 bytes (v2+, 0xFF padding if absent)
+const HEADER_LEN: usize = 128;
 const FILENAME_OFFSET: usize = 32;
 const FILENAME_MAX_BYTES: usize = 63; // + 1 null terminator
+const ROM_ID_OFFSET: usize = 96;
 const ROM_SIZE_CODE_OFFSET: usize = 0x0148;
 
 pub type OnboardFlash<'d> = Flash<'d, FLASH, Blocking, FLASH_CAPACITY_BYTES>;
@@ -35,6 +40,7 @@ pub type OnboardFlash<'d> = Flash<'d, FLASH, Blocking, FLASH_CAPACITY_BYTES>;
 pub struct FlashRomInfo {
     pub size_bytes: usize,
     pub bank_count: usize,
+    pub rom_id: Option<RomId>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +127,8 @@ pub struct RomStager {
     banks_written: usize,
     buf: alloc::boxed::Box<[u8; ROM_BANK_BYTES]>,
     filename: alloc::string::String,
+    rom_hasher: Option<RomHasher>,
+    rom_id: Option<RomId>,
 }
 
 impl RomStager {
@@ -137,6 +145,8 @@ impl RomStager {
         reader
             .read_bank(0, &mut *buf)
             .map_err(FlashRomStageError::Reader)?;
+        let mut rom_hasher = RomHasher::new();
+        rom_hasher.update(&*buf);
 
         let rom_size_code = buf[ROM_SIZE_CODE_OFFSET];
         let bank_count = rom_bank_count_from_code(rom_size_code)
@@ -164,6 +174,8 @@ impl RomStager {
             banks_written: 1,
             buf,
             filename: alloc::string::String::from(filename),
+            rom_hasher: Some(rom_hasher),
+            rom_id: None,
         })
     }
 
@@ -192,6 +204,9 @@ impl RomStager {
         reader
             .read_bank(self.banks_written, &mut *self.buf)
             .map_err(FlashRomStageError::Reader)?;
+        if let Some(hasher) = self.rom_hasher.as_mut() {
+            hasher.update(&*self.buf);
+        }
         flash
             .blocking_write(
                 (ROM_DATA_OFFSET + self.banks_written * ROM_BANK_BYTES) as u32,
@@ -211,11 +226,25 @@ impl RomStager {
         }
     }
 
-    fn make_info(&self) -> FlashRomInfo {
+    fn make_info(&mut self) -> FlashRomInfo {
         FlashRomInfo {
             size_bytes: self.bank_count * ROM_BANK_BYTES,
             bank_count: self.bank_count,
+            rom_id: Some(self.finalize_rom_id()),
         }
+    }
+
+    fn finalize_rom_id(&mut self) -> RomId {
+        if let Some(rom_id) = self.rom_id {
+            return rom_id;
+        }
+        let rom_id = self
+            .rom_hasher
+            .take()
+            .expect("ROM hasher finalized twice")
+            .finalize();
+        self.rom_id = Some(rom_id);
+        rom_id
     }
 }
 
@@ -235,7 +264,7 @@ fn parse_header(header: &[u8; HEADER_LEN]) -> Option<(FlashRomInfo, Option<heapl
     }
 
     let version = u32::from_le_bytes(header[8..12].try_into().ok()?);
-    if version != HEADER_VERSION {
+    if version != HEADER_VERSION_V1 && version != HEADER_VERSION_V2 {
         return None;
     }
 
@@ -259,6 +288,7 @@ fn parse_header(header: &[u8; HEADER_LEN]) -> Option<(FlashRomInfo, Option<heapl
     let info = FlashRomInfo {
         size_bytes,
         bank_count,
+        rom_id: parse_rom_id(header, version),
     };
 
     // Parse filename from bytes [FILENAME_OFFSET..FILENAME_OFFSET+64].
@@ -295,7 +325,22 @@ fn build_header(info: FlashRomInfo, filename: &str) -> [u8; HEADER_LEN] {
     let copy_len = name_bytes.len().min(FILENAME_MAX_BYTES);
     header[FILENAME_OFFSET..FILENAME_OFFSET + copy_len].copy_from_slice(&name_bytes[..copy_len]);
     header[FILENAME_OFFSET + copy_len] = 0;
+    if let Some(rom_id) = info.rom_id {
+        header[ROM_ID_OFFSET..ROM_ID_OFFSET + 32].copy_from_slice(rom_id.as_bytes());
+    }
     header
+}
+
+fn parse_rom_id(header: &[u8; HEADER_LEN], version: u32) -> Option<RomId> {
+    if version < HEADER_VERSION_V2 {
+        return None;
+    }
+    let bytes: [u8; 32] = header[ROM_ID_OFFSET..ROM_ID_OFFSET + 32].try_into().ok()?;
+    if bytes.iter().all(|&b| b == 0xFF) {
+        None
+    } else {
+        Some(RomId::from_bytes(bytes))
+    }
 }
 
 fn rom_bank_count_from_code(code: u8) -> Option<usize> {

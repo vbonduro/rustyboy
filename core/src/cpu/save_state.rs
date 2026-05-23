@@ -1,4 +1,4 @@
-//! Typed save state representation for the RBSS v1 format.
+//! Typed save state representation for RBSS save-state blobs.
 //!
 //! On the **save path**, `Sm83::save_state()` writes directly to a `Vec<u8>` —
 //! no `SaveState` instance is created.
@@ -21,7 +21,9 @@ use crate::memory::memory::GameBoyMemory;
 // ── Format constants ──────────────────────────────────────────────────────────
 
 pub const MAGIC: &[u8; 4] = b"RBSS";
-pub const VERSION: u16 = 1;
+pub const VERSION_V1: u16 = 1;
+pub const VERSION_V2: u16 = 2;
+pub const VERSION: u16 = VERSION_V2;
 
 const MAGIC_SIZE: usize = 4;
 const VERSION_SIZE: usize = size_of::<u16>();
@@ -51,8 +53,12 @@ const WRAM_SIZE: usize = 0x2000;
 const HRAM_SIZE: usize = 0x7F;
 const VRAM_SIZE: usize = 0x2000;
 const OAM_SIZE: usize = 0xA0;
-const MBC_SIZE: usize = 4 * size_of::<u8>(); // rom_bank_lo upper_bits ram_mode ram_enabled
-const CART_RAM_LEN_SIZE: usize = size_of::<u16>();
+const MBC_SIZE_V1_LEGACY: usize = 4 * size_of::<u8>(); // rom_bank_lo upper_bits ram_mode ram_enabled
+const MBC_SIZE_V1_MBC3_RTC: usize = 18;
+const CART_RAM_LEN_SIZE_V1: usize = size_of::<u16>();
+const SECTION_HEADER_SIZE: usize = 8; // 4-byte tag + u32 length
+const SECTION_MBC: &[u8; 4] = b"MBC\0";
+const SECTION_CART_RAM: &[u8; 4] = b"CRAM";
 
 /// Minimum valid blob length: everything up through OAM, without optional MBC/cart RAM.
 pub const MIN_BLOB_SIZE: usize = HEADER_SIZE
@@ -263,7 +269,7 @@ impl MbcState {
             ram_mode: b[2] != 0,
             ram_enabled: b[3] != 0,
         };
-        (state, MBC_SIZE)
+        (state, MBC_SIZE_V1_LEGACY)
     }
 }
 
@@ -276,11 +282,13 @@ impl MbcState {
 /// `load_state` method.
 pub struct SaveState {
     blob: Vec<u8>,
+    version: u16,
 
     pub cpu: CpuState,
     pub timer: TimerState,
     pub ppu: PpuState,
     mbc: Option<MbcState>,
+    mbc_payload_range: Option<Range<usize>>,
 
     io_range: Range<usize>,
     ie_offset: usize,
@@ -292,7 +300,7 @@ pub struct SaveState {
 }
 
 impl SaveState {
-    /// Serialize emulator state into an RBSS v1 blob.
+    /// Serialize emulator state into the default RBSS format.
     ///
     /// Called by `Sm83::save_state` which constructs the typed state structs
     /// from its own fields and passes them here. This function owns the format.
@@ -302,17 +310,53 @@ impl SaveState {
         ppu: PpuState,
         memory: &GameBoyMemory,
     ) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MIN_BLOB_SIZE);
+        Self::serialize_v2(cpu, timer, ppu, memory)
+    }
+
+    /// Serialize emulator state into an RBSS v1 blob.
+    pub fn serialize_v1(
+        cpu: CpuState,
+        timer: TimerState,
+        ppu: PpuState,
+        memory: &GameBoyMemory,
+    ) -> Vec<u8> {
+        let cart_ram_len = memory.external_ram().map_or(0, |r| r.len());
+        // v1 tail: MBC state (≤ 18 bytes) + u16 RAM length prefix + cart RAM
+        let capacity = MIN_BLOB_SIZE + 18 + 2 + cart_ram_len;
+        let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&VERSION_V1.to_le_bytes());
         cpu.serialize(&mut out);
         timer.serialize(&mut out);
         ppu.serialize(&mut out);
-        memory.save_state(&mut out);
+        memory.save_state_v1(&mut out);
         out
     }
 
-    /// Parse and validate a raw RBSS v1 blob.
+    /// Serialize emulator state into an RBSS v2 blob.
+    pub fn serialize_v2(
+        cpu: CpuState,
+        timer: TimerState,
+        ppu: PpuState,
+        memory: &GameBoyMemory,
+    ) -> Vec<u8> {
+        // Pre-size to avoid realloc: fixed fields + worst-case MBC section
+        // (MBC3+RTC = 18 bytes + 8-byte header) + cart RAM section if present.
+        let cart_ram_len = memory.external_ram().map_or(0, |r| r.len());
+        let capacity = MIN_BLOB_SIZE
+            + SECTION_HEADER_SIZE + 18
+            + if cart_ram_len > 0 { SECTION_HEADER_SIZE + cart_ram_len } else { 0 };
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION_V2.to_le_bytes());
+        cpu.serialize(&mut out);
+        timer.serialize(&mut out);
+        ppu.serialize(&mut out);
+        memory.save_state_v2(&mut out);
+        out
+    }
+
+    /// Parse and validate a raw RBSS blob.
     ///
     /// Returns `Err` if the blob is too short, has a bad magic, or has an
     /// unsupported version. No emulator state is modified.
@@ -324,7 +368,7 @@ impl SaveState {
             return Err("invalid save state magic");
         }
         let version = u16::from_le_bytes([blob[MAGIC_SIZE], blob[MAGIC_SIZE + 1]]);
-        if version != VERSION {
+        if version != VERSION_V1 && version != VERSION_V2 {
             return Err("unsupported save state version");
         }
 
@@ -350,32 +394,28 @@ impl SaveState {
         let oam_range = cur..cur + OAM_SIZE;
         cur += OAM_SIZE;
 
-        let mbc = if cur + MBC_SIZE <= blob.len() {
-            let (m, n) = MbcState::parse(&blob, cur);
-            cur += n;
-            Some(m)
-        } else {
-            None
+        let (mbc_payload_range, cart_ram_range) = match version {
+            VERSION_V1 => parse_v1_tail(&blob, cur)?,
+            VERSION_V2 => parse_v2_sections(&blob, cur)?,
+            _ => unreachable!(),
         };
 
-        let cart_ram_range = if cur + CART_RAM_LEN_SIZE <= blob.len() {
-            let ram_len = u16::from_le_bytes([blob[cur], blob[cur + 1]]) as usize;
-            cur += CART_RAM_LEN_SIZE;
-            if ram_len > 0 && cur + ram_len <= blob.len() {
-                Some(cur..cur + ram_len)
+        let mbc = mbc_payload_range.as_ref().and_then(|range| {
+            if range.len() >= MBC_SIZE_V1_LEGACY {
+                Some(MbcState::parse(&blob, range.start).0)
             } else {
                 None
             }
-        } else {
-            None
-        };
+        });
 
         Ok(SaveState {
             blob,
+            version,
             cpu,
             timer,
             ppu,
             mbc,
+            mbc_payload_range,
             io_range,
             ie_offset,
             wram_range,
@@ -390,6 +430,16 @@ impl SaveState {
 
     pub fn mbc(&self) -> Option<&MbcState> {
         self.mbc.as_ref()
+    }
+
+    pub fn format_version(&self) -> u16 {
+        self.version
+    }
+
+    pub fn mbc_payload(&self) -> Option<&[u8]> {
+        self.mbc_payload_range
+            .as_ref()
+            .map(|r| &self.blob[r.clone()])
     }
 
     pub fn io_registers(&self) -> &[u8] {
@@ -412,5 +462,101 @@ impl SaveState {
     }
     pub fn cart_ram(&self) -> Option<&[u8]> {
         self.cart_ram_range.as_ref().map(|r| &self.blob[r.clone()])
+    }
+}
+
+fn parse_v1_tail(
+    blob: &[u8],
+    tail_start: usize,
+) -> Result<(Option<Range<usize>>, Option<Range<usize>>), &'static str> {
+    if tail_start == blob.len() {
+        return Ok((None, None));
+    }
+
+    for &mbc_len in &[MBC_SIZE_V1_MBC3_RTC, MBC_SIZE_V1_LEGACY, 0] {
+        let Some(len_offset) = tail_start.checked_add(mbc_len) else {
+            continue;
+        };
+        if len_offset + CART_RAM_LEN_SIZE_V1 > blob.len() {
+            continue;
+        }
+
+        let ram_len = u16::from_le_bytes([blob[len_offset], blob[len_offset + 1]]) as usize;
+        let ram_start = len_offset + CART_RAM_LEN_SIZE_V1;
+        let ram_end = ram_start + ram_len;
+        if ram_end == blob.len() {
+            let mbc = if mbc_len > 0 {
+                Some(tail_start..tail_start + mbc_len)
+            } else {
+                None
+            };
+            let ram = if ram_len > 0 {
+                Some(ram_start..ram_end)
+            } else {
+                None
+            };
+            return Ok((mbc, ram));
+        }
+    }
+
+    Err("invalid v1 save state tail")
+}
+
+fn parse_v2_sections(
+    blob: &[u8],
+    mut cur: usize,
+) -> Result<(Option<Range<usize>>, Option<Range<usize>>), &'static str> {
+    let mut mbc_payload_range = None;
+    let mut cart_ram_range = None;
+
+    while cur < blob.len() {
+        if cur + SECTION_HEADER_SIZE > blob.len() {
+            return Err("truncated v2 save state section header");
+        }
+
+        let tag = &blob[cur..cur + 4];
+        let len = u32::from_le_bytes(
+            blob[cur + 4..cur + 8]
+                .try_into()
+                .map_err(|_| "invalid v2 save state section length")?,
+        ) as usize;
+        cur += SECTION_HEADER_SIZE;
+
+        let end = cur
+            .checked_add(len)
+            .ok_or("v2 save state section length overflow")?;
+        if end > blob.len() {
+            return Err("truncated v2 save state section payload");
+        }
+
+        if tag == SECTION_MBC {
+            if len > 0 {
+                mbc_payload_range = Some(cur..end);
+            }
+        } else if tag == SECTION_CART_RAM && len > 0 {
+            cart_ram_range = Some(cur..end);
+        }
+
+        cur = end;
+    }
+
+    Ok((mbc_payload_range, cart_ram_range))
+}
+
+pub(crate) fn write_v2_section(out: &mut Vec<u8>, tag: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(tag);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+}
+
+pub(crate) fn write_mbc_section(out: &mut Vec<u8>, payload: &[u8]) {
+    if !payload.is_empty() {
+        write_v2_section(out, SECTION_MBC, payload);
+    }
+}
+
+pub(crate) fn write_cart_ram_section(out: &mut Vec<u8>, payload: &[u8]) {
+    if !payload.is_empty() {
+        write_v2_section(out, SECTION_CART_RAM, payload);
     }
 }

@@ -318,6 +318,48 @@ async fn test_put_battery_save_overwrites() {
     assert_eq!(body.as_ref(), &[9u8, 8, 7]);
 }
 
+#[tokio::test]
+async fn test_battery_saves_can_be_scoped_by_rom_id() {
+    let (app, cookie) = authed_app().await;
+    let rom_id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let rom_id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for (rom_id, data) in [(rom_id_a, vec![1u8, 2, 3]), (rom_id_b, vec![4u8, 5, 6])] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/battery-saves/pokemon.gb")
+                    .header("cookie", &cookie)
+                    .header("x-rustyboy-rom-id", rom_id)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/battery-saves/pokemon.gb")
+                .header("cookie", &cookie)
+                .header("x-rustyboy-rom-id", rom_id_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), &[1, 2, 3]);
+}
+
 // ── Save state endpoint tests ─────────────────────────────────────────────────
 
 #[tokio::test]
@@ -600,6 +642,66 @@ async fn test_get_latest_save_state() {
     // The second upload has a unique slot_name (timestamp); both may share the same
     // second, but the id of the last insert should match.
     assert_eq!(latest["id"].as_str().unwrap(), id2);
+}
+
+#[tokio::test]
+async fn test_save_states_can_be_scoped_by_rom_id() {
+    let (app, cookie) = authed_app().await;
+    let rom_id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let rom_id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    for (rom_id, data) in [(rom_id_a, vec![1u8]), (rom_id_b, vec![2u8])] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/save-states/tetris.gb")
+                    .header("cookie", &cookie)
+                    .header("x-rustyboy-rom-id", rom_id)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    let latest = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/save-states/tetris.gb/latest")
+                .header("cookie", &cookie)
+                .header("x-rustyboy-rom-id", rom_id_a)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(latest.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["rom_id"].as_str(), Some(rom_id_a));
+    let id = meta["id"].as_str().unwrap();
+
+    let data = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/save-states/by-id/{id}/data"))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(data.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), &[1]);
 }
 
 #[tokio::test]

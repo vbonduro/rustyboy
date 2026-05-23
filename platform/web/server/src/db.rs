@@ -29,10 +29,12 @@ pub struct User {
 pub struct SaveState {
     pub id: String,
     pub user_id: String,
+    pub rom_id: Option<String>,
     pub rom_name: String,
     pub slot_name: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub payload_hash: Option<String>,
     pub data: Vec<u8>,
 }
 
@@ -40,7 +42,9 @@ pub struct SaveState {
 pub struct BatterySave {
     pub id: String,
     pub user_id: String,
+    pub rom_id: Option<String>,
     pub rom_name: String,
+    pub payload_hash: Option<String>,
     pub data: Vec<u8>,
     pub updated_at: i64,
 }
@@ -188,46 +192,77 @@ impl Database {
         slot_name: &str,
         data: Vec<u8>,
     ) -> Result<SaveState, sqlx::Error> {
+        self.upsert_save_state_with_rom_id(user_id, None, rom_name, slot_name, data)
+            .await
+    }
+
+    pub async fn upsert_save_state_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+        slot_name: &str,
+        data: Vec<u8>,
+    ) -> Result<SaveState, sqlx::Error> {
         let now = now_secs();
 
         // Check if a save state already exists for this slot
-        let existing = sqlx::query(
-            "SELECT id, created_at FROM save_states
+        let existing = if let Some(rom_id) = rom_id {
+            sqlx::query(
+                "SELECT id, created_at FROM save_states
+             WHERE user_id = ? AND rom_id = ? AND slot_name = ?",
+            )
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(slot_name)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, created_at FROM save_states
              WHERE user_id = ? AND rom_name = ? AND slot_name = ?",
-        )
-        .bind(user_id)
-        .bind(rom_name)
-        .bind(slot_name)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(user_id)
+            .bind(rom_name)
+            .bind(slot_name)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         if let Some(row) = existing {
             let id: String = row.get("id");
             let created_at: i64 = row.get("created_at");
-            sqlx::query("UPDATE save_states SET data = ?, updated_at = ? WHERE id = ?")
-                .bind(&data)
-                .bind(now)
-                .bind(&id)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE save_states SET rom_id = ?, rom_name = ?, data = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(rom_id)
+            .bind(rom_name)
+            .bind(&data)
+            .bind(now)
+            .bind(&id)
+            .execute(&self.pool)
+            .await?;
             return Ok(SaveState {
                 id,
                 user_id: user_id.to_string(),
+                rom_id: rom_id.map(str::to_string),
                 rom_name: rom_name.to_string(),
                 slot_name: slot_name.to_string(),
                 created_at,
                 updated_at: now,
+                payload_hash: None,
                 data,
             });
         }
 
         let id = new_id();
         sqlx::query(
-            "INSERT INTO save_states (id, user_id, rom_name, slot_name, created_at, updated_at, data)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO save_states (id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         )
         .bind(&id)
         .bind(user_id)
+        .bind(rom_id)
         .bind(rom_name)
         .bind(slot_name)
         .bind(now)
@@ -239,10 +274,12 @@ impl Database {
         Ok(SaveState {
             id,
             user_id: user_id.to_string(),
+            rom_id: rom_id.map(str::to_string),
             rom_name: rom_name.to_string(),
             slot_name: slot_name.to_string(),
             created_at: now,
             updated_at: now,
+            payload_hash: None,
             data,
         })
     }
@@ -252,25 +289,51 @@ impl Database {
         user_id: &str,
         rom_name: &str,
     ) -> Result<Vec<SaveState>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT id, user_id, rom_name, slot_name, created_at, updated_at, data
+        self.list_save_states_with_rom_id(user_id, None, rom_name)
+            .await
+    }
+
+    pub async fn list_save_states_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+    ) -> Result<Vec<SaveState>, sqlx::Error> {
+        let rows = if let Some(rom_id) = rom_id {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data
+             FROM save_states
+             WHERE user_id = ? AND (rom_id = ? OR (rom_id IS NULL AND rom_name = ?))
+             ORDER BY rom_id IS NOT NULL DESC, updated_at DESC",
+            )
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(rom_name)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data
              FROM save_states WHERE user_id = ? AND rom_name = ?
              ORDER BY updated_at DESC",
-        )
-        .bind(user_id)
-        .bind(rom_name)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(user_id)
+            .bind(rom_name)
+            .fetch_all(&self.pool)
+            .await?
+        };
 
         Ok(rows
             .into_iter()
             .map(|r| SaveState {
                 id: r.get("id"),
                 user_id: r.get("user_id"),
+                rom_id: r.get("rom_id"),
                 rom_name: r.get("rom_name"),
                 slot_name: r.get("slot_name"),
                 created_at: r.get("created_at"),
                 updated_at: r.get("updated_at"),
+                payload_hash: r.get("payload_hash"),
                 data: r.get("data"),
             })
             .collect())
@@ -278,7 +341,7 @@ impl Database {
 
     pub async fn get_save_state(&self, id: &str) -> Result<Option<SaveState>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT id, user_id, rom_name, slot_name, created_at, updated_at, data
+            "SELECT id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data
              FROM save_states WHERE id = ?",
         )
         .bind(id)
@@ -288,10 +351,12 @@ impl Database {
         Ok(row.map(|r| SaveState {
             id: r.get("id"),
             user_id: r.get("user_id"),
+            rom_id: r.get("rom_id"),
             rom_name: r.get("rom_name"),
             slot_name: r.get("slot_name"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
+            payload_hash: r.get("payload_hash"),
             data: r.get("data"),
         }))
     }
@@ -302,23 +367,50 @@ impl Database {
         user_id: &str,
         rom_name: &str,
     ) -> Result<Option<SaveState>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT id, user_id, rom_name, slot_name, created_at, updated_at, data
+        self.get_latest_save_state_with_rom_id(user_id, None, rom_name)
+            .await
+    }
+
+    pub async fn get_latest_save_state_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+    ) -> Result<Option<SaveState>, sqlx::Error> {
+        let row = if let Some(rom_id) = rom_id {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data
+             FROM save_states
+             WHERE user_id = ? AND (rom_id = ? OR (rom_id IS NULL AND rom_name = ?))
+             ORDER BY rom_id IS NOT NULL DESC, updated_at DESC
+             LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(rom_name)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, slot_name, created_at, updated_at, payload_hash, data
              FROM save_states WHERE user_id = ? AND rom_name = ?
              ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(rom_name)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(user_id)
+            .bind(rom_name)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         Ok(row.map(|r| SaveState {
             id: r.get("id"),
             user_id: r.get("user_id"),
+            rom_id: r.get("rom_id"),
             rom_name: r.get("rom_name"),
             slot_name: r.get("slot_name"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
+            payload_hash: r.get("payload_hash"),
             data: r.get("data"),
         }))
     }
@@ -338,6 +430,38 @@ impl Database {
         rom_name: &str,
         keep: usize,
     ) -> Result<(), sqlx::Error> {
+        self.prune_save_states_with_rom_id(user_id, None, rom_name, keep)
+            .await
+    }
+
+    pub async fn prune_save_states_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+        keep: usize,
+    ) -> Result<(), sqlx::Error> {
+        if let Some(rom_id) = rom_id {
+            sqlx::query(
+                "DELETE FROM save_states
+             WHERE user_id = ? AND rom_id = ?
+               AND id NOT IN (
+                 SELECT id FROM save_states
+                 WHERE user_id = ? AND rom_id = ?
+                 ORDER BY updated_at DESC
+                 LIMIT ?
+               )",
+            )
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(keep as i64)
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+
         sqlx::query(
             "DELETE FROM save_states
              WHERE user_id = ? AND rom_name = ?
@@ -387,18 +511,40 @@ impl Database {
         rom_name: &str,
         data: Vec<u8>,
     ) -> Result<BatterySave, sqlx::Error> {
+        self.upsert_battery_save_with_rom_id(user_id, None, rom_name, data)
+            .await
+    }
+
+    pub async fn upsert_battery_save_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+        data: Vec<u8>,
+    ) -> Result<BatterySave, sqlx::Error> {
         let now = now_secs();
 
-        let existing =
+        let existing = if let Some(rom_id) = rom_id {
+            sqlx::query("SELECT id FROM battery_saves WHERE user_id = ? AND rom_id = ?")
+                .bind(user_id)
+                .bind(rom_id)
+                .fetch_optional(&self.pool)
+                .await?
+        } else {
             sqlx::query("SELECT id FROM battery_saves WHERE user_id = ? AND rom_name = ?")
                 .bind(user_id)
                 .bind(rom_name)
                 .fetch_optional(&self.pool)
-                .await?;
+                .await?
+        };
 
         if let Some(row) = existing {
             let id: String = row.get("id");
-            sqlx::query("UPDATE battery_saves SET data = ?, updated_at = ? WHERE id = ?")
+            sqlx::query(
+                "UPDATE battery_saves SET rom_id = ?, rom_name = ?, data = ?, updated_at = ? WHERE id = ?",
+            )
+                .bind(rom_id)
+                .bind(rom_name)
                 .bind(&data)
                 .bind(now)
                 .bind(&id)
@@ -407,7 +553,9 @@ impl Database {
             return Ok(BatterySave {
                 id,
                 user_id: user_id.to_string(),
+                rom_id: rom_id.map(str::to_string),
                 rom_name: rom_name.to_string(),
+                payload_hash: None,
                 data,
                 updated_at: now,
             });
@@ -415,11 +563,12 @@ impl Database {
 
         let id = new_id();
         sqlx::query(
-            "INSERT INTO battery_saves (id, user_id, rom_name, data, updated_at)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO battery_saves (id, user_id, rom_id, rom_name, payload_hash, data, updated_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?)",
         )
         .bind(&id)
         .bind(user_id)
+        .bind(rom_id)
         .bind(rom_name)
         .bind(&data)
         .bind(now)
@@ -429,7 +578,9 @@ impl Database {
         Ok(BatterySave {
             id,
             user_id: user_id.to_string(),
+            rom_id: rom_id.map(str::to_string),
             rom_name: rom_name.to_string(),
+            payload_hash: None,
             data,
             updated_at: now,
         })
@@ -464,19 +615,46 @@ impl Database {
         user_id: &str,
         rom_name: &str,
     ) -> Result<Option<BatterySave>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT id, user_id, rom_name, data, updated_at
+        self.get_battery_save_with_rom_id(user_id, None, rom_name)
+            .await
+    }
+
+    pub async fn get_battery_save_with_rom_id(
+        &self,
+        user_id: &str,
+        rom_id: Option<&str>,
+        rom_name: &str,
+    ) -> Result<Option<BatterySave>, sqlx::Error> {
+        let row = if let Some(rom_id) = rom_id {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, payload_hash, data, updated_at
+             FROM battery_saves
+             WHERE user_id = ? AND (rom_id = ? OR (rom_id IS NULL AND rom_name = ?))
+             ORDER BY rom_id IS NOT NULL DESC, updated_at DESC
+             LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(rom_id)
+            .bind(rom_name)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT id, user_id, rom_id, rom_name, payload_hash, data, updated_at
              FROM battery_saves WHERE user_id = ? AND rom_name = ?",
-        )
-        .bind(user_id)
-        .bind(rom_name)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(user_id)
+            .bind(rom_name)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         Ok(row.map(|r| BatterySave {
             id: r.get("id"),
             user_id: r.get("user_id"),
+            rom_id: r.get("rom_id"),
             rom_name: r.get("rom_name"),
+            payload_hash: r.get("payload_hash"),
             data: r.get("data"),
             updated_at: r.get("updated_at"),
         }))
@@ -702,6 +880,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_battery_saves_with_rom_id_do_not_collide_on_rom_name() {
+        let db = new_db().await;
+        let user = db
+            .upsert_user("sub_rom_id", "romid@example.com", "Rom Id", None)
+            .await
+            .unwrap();
+        let rom_id_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let rom_id_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        db.upsert_battery_save_with_rom_id(&user.id, Some(rom_id_a), "pokemon.gb", vec![1])
+            .await
+            .unwrap();
+        db.upsert_battery_save_with_rom_id(&user.id, Some(rom_id_b), "pokemon.gb", vec![2])
+            .await
+            .unwrap();
+
+        let fetched = db
+            .get_battery_save_with_rom_id(&user.id, Some(rom_id_a), "pokemon.gb")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.data, vec![1]);
+        assert_eq!(fetched.rom_id.as_deref(), Some(rom_id_a));
     }
 
     #[tokio::test]

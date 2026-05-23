@@ -250,6 +250,22 @@ impl<W: WorkerTransport> GameBoy<W> {
     }
 
     pub fn save_state(&self) -> Vec<u8> {
+        self.serialize_save_state(SaveState::serialize)
+    }
+
+    pub fn save_state_v1(&self) -> Vec<u8> {
+        self.serialize_save_state(SaveState::serialize_v1)
+    }
+
+    fn serialize_save_state(
+        &self,
+        serialize: fn(
+            CpuState,
+            crate::cpu::save_state::TimerState,
+            crate::cpu::save_state::PpuState,
+            &GameBoyMemory,
+        ) -> Vec<u8>,
+    ) -> Vec<u8> {
         let cpu_state = CpuState {
             a: self.cpu.registers.a,
             b: self.cpu.registers.b,
@@ -266,7 +282,7 @@ impl<W: WorkerTransport> GameBoy<W> {
             cycle_counter: self.cycle_counter(),
         };
         let ppu_state = self.transport.snapshot_ppu_state(self.memory.io_slice());
-        SaveState::serialize(
+        serialize(
             cpu_state,
             self.timer.to_save_state(),
             ppu_state,
