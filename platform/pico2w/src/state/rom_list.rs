@@ -4,7 +4,7 @@ use rustyboy_pico2w::display::{
 };
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{
-    rom_page_request, MenuFrame, MenuInput, RomListEffect, RomListLogic, RomPageSelection,
+    MenuFrame, MenuInput, RomListEffect, RomListLogic, RomPageContext, RomPageSelection,
 };
 use rustyboy_pico2w::sd::RomListEntry;
 
@@ -130,6 +130,15 @@ impl RomListState {
         menu_item_needs_marquee(entry.display_name.as_str(), marked)
     }
 
+    fn page_context(&self) -> RomPageContext {
+        RomPageContext::new(
+            self.page_offset,
+            ROM_PAGE_SIZE,
+            self.total_roms,
+            self.has_next,
+        )
+    }
+
     async fn flip_page(
         &mut self,
         new_offset: usize,
@@ -163,64 +172,53 @@ impl RomListState {
     ) {
         Timer::after(Duration::from_millis(33)).await;
 
-        let (current_buttons, _) = input.poll();
-        let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);
-        app.previous_buttons = current_buttons;
-
+        let menu_input = poll_menu_input(app, input);
         if !menu_input.any() {
-            if self.selected_needs_marquee(app) {
-                self.marquee_frame = self.marquee_frame.wrapping_add(1);
-                if self.marquee_frame % MENU_MARQUEE_REDRAW_FRAMES == 0 {
-                    self.draw_row(app, game_disp, self.logic.selected(), true)
-                        .await;
-                }
-            }
+            self.tick_marquee(app, game_disp).await;
             return;
         }
 
         let previous_selected = self.logic.selected();
-        match self.logic.handle(menu_input) {
+        let effect = self.logic.handle(menu_input);
+        self.apply_effect(effect, previous_selected, app, game_disp, sd_mgr)
+            .await;
+    }
+
+    async fn tick_marquee(&mut self, app: &App, game_disp: &mut GameDisplay<'static>) {
+        if !self.selected_needs_marquee(app) {
+            return;
+        }
+        self.marquee_frame = self.marquee_frame.wrapping_add(1);
+        if self.marquee_frame % MENU_MARQUEE_REDRAW_FRAMES == 0 {
+            self.draw_row(app, game_disp, self.logic.selected(), true)
+                .await;
+        }
+    }
+
+    async fn apply_effect(
+        &mut self,
+        effect: RomListEffect,
+        previous_selected: usize,
+        app: &mut App,
+        game_disp: &mut GameDisplay<'static>,
+        sd_mgr: &mut PicoSdMgr,
+    ) {
+        match effect {
             RomListEffect::None => {
                 self.marquee_frame = 0;
-                let selected = self.logic.selected();
-                if selected != previous_selected {
-                    self.draw_row(app, game_disp, previous_selected, false)
-                        .await;
-                    self.draw_row(app, game_disp, selected, false).await;
-                }
+                self.redraw_selection_change(app, game_disp, previous_selected)
+                    .await;
             }
             RomListEffect::SelectItem => {
-                let entry = self.page[self.logic.selected()].clone();
-                app.transition_to(AppState::Loading(alloc::boxed::Box::new(LoadingState {
-                    filename: entry.filename,
-                    display_name: entry.display_name,
-                })));
+                self.transition_to_selected_rom(app);
             }
             RomListEffect::NextPage => {
-                self.marquee_frame = 0;
-                if let Some(page) = rom_page_request(
-                    RomListEffect::NextPage,
-                    self.page_offset,
-                    ROM_PAGE_SIZE,
-                    self.total_roms,
-                    self.has_next,
-                ) {
-                    self.flip_page(page.offset, sd_mgr, page.selection).await;
-                    self.draw(app, game_disp).await;
-                }
+                self.flip_requested_page(RomListEffect::NextPage, sd_mgr, app, game_disp)
+                    .await;
             }
             RomListEffect::PrevPage => {
-                self.marquee_frame = 0;
-                if let Some(page) = rom_page_request(
-                    RomListEffect::PrevPage,
-                    self.page_offset,
-                    ROM_PAGE_SIZE,
-                    self.total_roms,
-                    self.has_next,
-                ) {
-                    self.flip_page(page.offset, sd_mgr, page.selection).await;
-                    self.draw(app, game_disp).await;
-                }
+                self.flip_requested_page(RomListEffect::PrevPage, sd_mgr, app, game_disp)
+                    .await;
             }
             RomListEffect::Back => {
                 let next = MainMenuState::new(game_disp, app).await;
@@ -228,4 +226,53 @@ impl RomListState {
             }
         }
     }
+
+    async fn redraw_selection_change(
+        &self,
+        app: &App,
+        game_disp: &mut GameDisplay<'static>,
+        previous_selected: usize,
+    ) {
+        let selected = self.logic.selected();
+        if selected == previous_selected {
+            return;
+        }
+
+        self.draw_row(app, game_disp, previous_selected, false)
+            .await;
+        self.draw_row(app, game_disp, selected, false).await;
+    }
+
+    fn transition_to_selected_rom(&self, app: &mut App) {
+        let Some(entry) = self.page.get(self.logic.selected()).cloned() else {
+            return;
+        };
+        app.transition_to(AppState::Loading(alloc::boxed::Box::new(LoadingState {
+            filename: entry.filename,
+            display_name: entry.display_name,
+        })));
+    }
+
+    async fn flip_requested_page(
+        &mut self,
+        effect: RomListEffect,
+        sd_mgr: &mut PicoSdMgr,
+        app: &App,
+        game_disp: &mut GameDisplay<'static>,
+    ) {
+        self.marquee_frame = 0;
+        let Some(page) = self.page_context().request(effect) else {
+            return;
+        };
+
+        self.flip_page(page.offset, sd_mgr, page.selection).await;
+        self.draw(app, game_disp).await;
+    }
+}
+
+fn poll_menu_input(app: &mut App, input: &mut InputHandler<'static>) -> MenuInput {
+    let (current_buttons, _) = input.poll();
+    let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);
+    app.previous_buttons = current_buttons;
+    menu_input
 }

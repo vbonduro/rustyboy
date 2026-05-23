@@ -18,12 +18,13 @@ mod loading;
 mod menu;
 mod text;
 
-pub use loading::{loading_bar_y_range, render_loading_row};
+pub use loading::{loading_bar_window, render_loading_row, LoadingFrame, LoadingProgress};
 pub use menu::{
-    menu_item_needs_marquee, menu_item_text_window, menu_item_y_range, render_menu_row,
+    menu_item_needs_marquee, menu_item_text_window, menu_item_window, render_menu_row,
     MENU_MARQUEE_REDRAW_FRAMES,
 };
 
+use core::ops::Range;
 use embedded_graphics::draw_target::DrawTarget;
 use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::Rgb565;
@@ -56,6 +57,46 @@ pub const SCREEN_H: i32 = 320;
 const Y_OFFSET: i32 = (SCREEN_H - SCALED_H) / 2; // 52
 pub const SCALED_FRAME_PIXELS: usize = (SCALED_W as usize) * (SCALED_H as usize);
 pub type ScaledFrame = [u16; SCALED_FRAME_PIXELS];
+
+/// A display update rectangle using inclusive starts and exclusive ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenderWindow {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub y_start: u16,
+    pub y_end: u16,
+}
+
+impl RenderWindow {
+    pub const fn new(x_start: u16, x_end: u16, y_start: u16, y_end: u16) -> Self {
+        Self {
+            x_start,
+            x_end,
+            y_start,
+            y_end,
+        }
+    }
+
+    pub const fn screen() -> Self {
+        Self::new(0, SCREEN_W as u16, 0, SCREEN_H as u16)
+    }
+
+    pub const fn full_width_rows(y_start: u16, y_end: u16) -> Self {
+        Self::new(0, SCREEN_W as u16, y_start, y_end)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.x_start >= self.x_end || self.y_start >= self.y_end
+    }
+
+    pub fn inclusive_bounds(self) -> Option<(u16, u16, u16, u16)> {
+        (!self.is_empty()).then_some((self.x_start, self.x_end - 1, self.y_start, self.y_end - 1))
+    }
+
+    pub fn byte_range(self) -> Range<usize> {
+        self.x_start as usize * 2..self.x_end as usize * 2
+    }
+}
 
 // Splash animation geometry
 pub const GLYPH_W: i32 = 16; // 8px × 2 scale

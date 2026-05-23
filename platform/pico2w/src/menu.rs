@@ -68,6 +68,29 @@ pub struct RomPageRequest {
     pub selection: RomPageSelection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RomPageContext {
+    pub offset: usize,
+    pub page_size: usize,
+    pub total_roms: usize,
+    pub has_next: bool,
+}
+
+impl RomPageContext {
+    pub const fn new(offset: usize, page_size: usize, total_roms: usize, has_next: bool) -> Self {
+        Self {
+            offset,
+            page_size,
+            total_roms,
+            has_next,
+        }
+    }
+
+    pub fn request(self, effect: RomListEffect) -> Option<RomPageRequest> {
+        rom_page_request(effect, self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Render descriptor
 // ---------------------------------------------------------------------------
@@ -293,32 +316,26 @@ impl RomListLogic {
     }
 }
 
-pub fn rom_page_request(
-    effect: RomListEffect,
-    page_offset: usize,
-    page_size: usize,
-    total_roms: usize,
-    has_next: bool,
-) -> Option<RomPageRequest> {
-    if page_size == 0 || total_roms == 0 {
+pub fn rom_page_request(effect: RomListEffect, page: RomPageContext) -> Option<RomPageRequest> {
+    if page.page_size == 0 || page.total_roms == 0 {
         return None;
     }
 
     match effect {
-        RomListEffect::NextPage if has_next => Some(RomPageRequest {
-            offset: page_offset + page_size,
+        RomListEffect::NextPage if page.has_next => Some(RomPageRequest {
+            offset: page.offset + page.page_size,
             selection: RomPageSelection::First,
         }),
         RomListEffect::NextPage => Some(RomPageRequest {
             offset: 0,
             selection: RomPageSelection::First,
         }),
-        RomListEffect::PrevPage if page_offset > 0 => Some(RomPageRequest {
-            offset: page_offset.saturating_sub(page_size),
+        RomListEffect::PrevPage if page.offset > 0 => Some(RomPageRequest {
+            offset: page.offset.saturating_sub(page.page_size),
             selection: RomPageSelection::Last,
         }),
         RomListEffect::PrevPage => Some(RomPageRequest {
-            offset: (total_roms.saturating_sub(1) / page_size) * page_size,
+            offset: (page.total_roms.saturating_sub(1) / page.page_size) * page.page_size,
             selection: RomPageSelection::Last,
         }),
         _ => None,
@@ -359,6 +376,9 @@ mod tests {
     }
     fn no_input() -> MenuInput {
         MenuInput::default()
+    }
+    fn page(offset: usize, page_size: usize, total_roms: usize, has_next: bool) -> RomPageContext {
+        RomPageContext::new(offset, page_size, total_roms, has_next)
     }
 
     // --- MenuInput::from_diff ---
@@ -589,7 +609,7 @@ mod tests {
     #[test]
     fn rom_page_request_down_moves_to_next_page_top() {
         assert_eq!(
-            rom_page_request(RomListEffect::NextPage, 0, 7, 12, true),
+            page(0, 7, 12, true).request(RomListEffect::NextPage),
             Some(RomPageRequest {
                 offset: 7,
                 selection: RomPageSelection::First,
@@ -600,7 +620,7 @@ mod tests {
     #[test]
     fn rom_page_request_up_moves_to_previous_page_bottom() {
         assert_eq!(
-            rom_page_request(RomListEffect::PrevPage, 7, 7, 12, true),
+            page(7, 7, 12, true).request(RomListEffect::PrevPage),
             Some(RomPageRequest {
                 offset: 0,
                 selection: RomPageSelection::Last,
@@ -611,14 +631,14 @@ mod tests {
     #[test]
     fn rom_page_request_wraps_ends() {
         assert_eq!(
-            rom_page_request(RomListEffect::NextPage, 7, 7, 12, false),
+            page(7, 7, 12, false).request(RomListEffect::NextPage),
             Some(RomPageRequest {
                 offset: 0,
                 selection: RomPageSelection::First,
             })
         );
         assert_eq!(
-            rom_page_request(RomListEffect::PrevPage, 0, 7, 12, true),
+            page(0, 7, 12, true).request(RomListEffect::PrevPage),
             Some(RomPageRequest {
                 offset: 7,
                 selection: RomPageSelection::Last,

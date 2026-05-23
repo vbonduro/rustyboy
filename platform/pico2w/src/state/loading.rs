@@ -3,7 +3,7 @@ use alloc::boxed::Box;
 use defmt::info;
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::Duration;
-use rustyboy_pico2w::display::hw::GameDisplay;
+use rustyboy_pico2w::display::{hw::GameDisplay, LoadingFrame, LoadingProgress};
 use rustyboy_pico2w::flash_rom::{
     probe_staged_rom, FlashRomInfo, OnboardFlash, RomStager, WriteResult,
 };
@@ -159,7 +159,13 @@ async fn stage_rom_from_sd(
     let mut reader = sd_mgr.open_rom_reader(filename).map_err(|e| {
         defmt::error!("sd open failed: {:?}", defmt::Debug2Format(&e));
     })?;
-    game_disp.draw_loading_progress(display_name, 0, 0, 0).await;
+    game_disp
+        .draw_loading_progress(LoadingFrame::new(
+            display_name,
+            LoadingProgress::new(0, 0),
+            0,
+        ))
+        .await;
 
     // RP2350 watchdog maximum is 16,777,215 µs (~16.7 s). Use 16 s so the
     // erase phase (which can take several seconds) does not starve the watchdog.
@@ -170,7 +176,10 @@ async fn stage_rom_from_sd(
     info!("stager begin done: {} banks", stager.total_banks());
     let total_banks = stager.total_banks();
     game_disp
-        .draw_loading_bar(stager.banks_written() as u32, total_banks as u32)
+        .draw_loading_bar(LoadingProgress::new(
+            stager.banks_written() as u32,
+            total_banks as u32,
+        ))
         .await;
 
     loop {
@@ -180,12 +189,15 @@ async fn stage_rom_from_sd(
         })? {
             WriteResult::Continue => {
                 game_disp
-                    .draw_loading_bar(stager.banks_written() as u32, total_banks as u32)
+                    .draw_loading_bar(LoadingProgress::new(
+                        stager.banks_written() as u32,
+                        total_banks as u32,
+                    ))
                     .await;
             }
             WriteResult::Done(info) => {
                 game_disp
-                    .draw_loading_bar(total_banks as u32, total_banks as u32)
+                    .draw_loading_bar(LoadingProgress::new(total_banks as u32, total_banks as u32))
                     .await;
                 return Ok(info);
             }

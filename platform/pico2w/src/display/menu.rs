@@ -1,10 +1,10 @@
 use crate::menu::MenuFrame;
 
 use super::text::{
-    fill_row, text_pixel_lit, text_screen_width, write_text_row, write_truncated_text_row, C0_BE,
-    C1_BE, C2_BE, C3_BE, CHAR_W,
+    fill_row, text_pixel_lit, text_screen_width, write_text_row, write_truncated_text_row, TextRun,
+    TextStyle, TextWindow, C0_BE, C1_BE, C2_BE, C3_BE, CHAR_W,
 };
-use super::{SCREEN_H, SCREEN_W};
+use super::{RenderWindow, SCREEN_H, SCREEN_W};
 
 // Layout constants (pixels on the 240x320 display).
 const HEADER_H: u16 = 40;
@@ -30,24 +30,27 @@ pub fn menu_item_needs_marquee(text: &str, marked: bool) -> bool {
     text_screen_width(text.as_bytes(), SCALE) > menu_item_text_window_width(marked)
 }
 
-pub fn menu_item_y_range(slot: usize) -> Option<(u16, u16)> {
+pub fn menu_item_window(slot: usize) -> Option<RenderWindow> {
     let y_start = ITEMS_START_Y.checked_add(slot.checked_mul(ITEM_H as usize)? as u16)?;
     if y_start >= FOOTER_SEP_Y {
         return None;
     }
-    Some((y_start, (y_start + ITEM_H).min(FOOTER_SEP_Y)))
+    Some(RenderWindow::full_width_rows(
+        y_start,
+        (y_start + ITEM_H).min(FOOTER_SEP_Y),
+    ))
 }
 
-pub fn menu_item_text_window(slot: usize, marked: bool) -> Option<(u16, u16, u16, u16)> {
-    let (item_y_start, item_y_end) = menu_item_y_range(slot)?;
-    let y_start = item_y_start + ITEM_TEXT_PAD;
-    let y_end = (y_start + (8 * SCALE) as u16).min(item_y_end);
+pub fn menu_item_text_window(slot: usize, marked: bool) -> Option<RenderWindow> {
+    let item_window = menu_item_window(slot)?;
+    let y_start = item_window.y_start + ITEM_TEXT_PAD;
+    let y_end = (y_start + (8 * SCALE) as u16).min(item_window.y_end);
     let x_start = ITEM_TEXT_X as u16;
     let x_end = menu_item_text_window_end(marked) as u16;
     if x_end <= x_start || y_end <= y_start {
         return None;
     }
-    Some((x_start, x_end, y_start, y_end))
+    Some(RenderWindow::new(x_start, x_end, y_start, y_end))
 }
 
 pub fn render_menu_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
@@ -87,72 +90,23 @@ fn render_menu_header_row(title: &str, y: u16, row: &mut [u8; 480]) {
     write_text_row(
         row,
         title.as_bytes(),
-        title_x,
-        glyph_row,
-        SCALE,
-        C0_BE,
-        C3_BE,
+        TextRun::new(title_x, glyph_row, TextStyle::new(SCALE, C0_BE, C3_BE)),
     );
 }
 
 fn render_menu_items_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
-    let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
-    if slot >= frame.items.len() {
+    let Some(item) = menu_item_for_row(frame, y) else {
         return;
-    }
-    let slot_top = ITEMS_START_Y + slot as u16 * ITEM_H;
-    let selected = slot == frame.selected;
-    let enabled = frame.enabled.get(slot).copied().unwrap_or(true);
-
-    fill_row(row, if selected { C2_BE } else { C3_BE });
-
-    let text_top = slot_top + ITEM_TEXT_PAD;
-    let text_bottom = text_top + (8 * SCALE) as u16;
-    if y < text_top || y >= text_bottom {
-        return;
-    }
-
-    let glyph_row = ((y - text_top) as usize) / SCALE;
-    let text_color = if !enabled {
-        C2_BE
-    } else if selected {
-        C0_BE
-    } else {
-        C1_BE
     };
-    let item_bg = if selected { C2_BE } else { C3_BE };
 
-    let cursor: &[u8] = if selected { b">" } else { b" " };
-    write_text_row(row, cursor, CURSOR_X, glyph_row, SCALE, text_color, item_bg);
-    let text = frame.items[slot].as_bytes();
-    let text_right = menu_item_text_window_end(frame.marked == Some(slot));
-    if selected && text_screen_width(text, SCALE) > text_right.saturating_sub(ITEM_TEXT_X) {
-        write_marquee_text_row(
-            row,
-            text,
-            ITEM_TEXT_X,
-            text_right,
-            glyph_row,
-            SCALE,
-            frame.marquee_frame,
-            text_color,
-            item_bg,
-        );
-    } else {
-        write_truncated_text_row(
-            row,
-            text,
-            ITEM_TEXT_X,
-            text_right,
-            glyph_row,
-            SCALE,
-            text_color,
-            item_bg,
-        );
-    }
-    if frame.marked == Some(slot) {
-        write_text_row(row, b"*", MARKER_X, glyph_row, SCALE, C0_BE, item_bg);
-    }
+    fill_row(row, item.bg());
+    let Some(glyph_row) = item.glyph_row else {
+        return;
+    };
+
+    render_item_cursor(row, item, glyph_row);
+    render_item_label(row, item, glyph_row);
+    render_item_marker(row, item, glyph_row);
 }
 
 fn render_menu_footer_row(y: u16, row: &mut [u8; 480]) {
@@ -165,39 +119,130 @@ fn render_menu_footer_row(y: u16, row: &mut [u8; 480]) {
     let glyph_row = (y - footer_top) as usize;
     let footer_w = FOOTER.len() * CHAR_W;
     let footer_x = (SCREEN_W as usize).saturating_sub(footer_w) / 2;
-    write_text_row(row, FOOTER, footer_x, glyph_row, 1, C1_BE, C3_BE);
+    write_text_row(
+        row,
+        FOOTER,
+        TextRun::new(footer_x, glyph_row, TextStyle::new(1, C1_BE, C3_BE)),
+    );
+}
+
+#[derive(Clone, Copy)]
+struct MenuItemRow<'a> {
+    selected: bool,
+    enabled: bool,
+    marked: bool,
+    text: &'a [u8],
+    glyph_row: Option<usize>,
+    marquee_frame: u32,
+}
+
+impl MenuItemRow<'_> {
+    fn bg(self) -> [u8; 2] {
+        if self.selected {
+            C2_BE
+        } else {
+            C3_BE
+        }
+    }
+
+    fn text_style(self) -> TextStyle {
+        let text_color = if !self.enabled {
+            C2_BE
+        } else if self.selected {
+            C0_BE
+        } else {
+            C1_BE
+        };
+        TextStyle::new(SCALE, text_color, self.bg())
+    }
+
+    fn text_window(self, glyph_row: usize) -> TextWindow {
+        TextWindow::new(
+            ITEM_TEXT_X,
+            menu_item_text_window_end(self.marked),
+            glyph_row,
+            self.text_style(),
+        )
+    }
+}
+
+fn menu_item_for_row<'a>(frame: &MenuFrame<'a>, y: u16) -> Option<MenuItemRow<'a>> {
+    if !(ITEMS_START_Y..FOOTER_SEP_Y).contains(&y) {
+        return None;
+    }
+    let slot = ((y - ITEMS_START_Y) / ITEM_H) as usize;
+    let text = frame.items.get(slot)?.as_bytes();
+    let slot_top = ITEMS_START_Y + slot as u16 * ITEM_H;
+    let text_top = slot_top + ITEM_TEXT_PAD;
+    let text_bottom = text_top + (8 * SCALE) as u16;
+    let glyph_row = (y >= text_top && y < text_bottom).then_some(((y - text_top) as usize) / SCALE);
+
+    Some(MenuItemRow {
+        selected: slot == frame.selected,
+        enabled: frame.enabled.get(slot).copied().unwrap_or(true),
+        marked: frame.marked == Some(slot),
+        text,
+        glyph_row,
+        marquee_frame: frame.marquee_frame,
+    })
+}
+
+fn render_item_cursor(row: &mut [u8; 480], item: MenuItemRow<'_>, glyph_row: usize) {
+    let cursor: &[u8] = if item.selected { b">" } else { b" " };
+    write_text_row(
+        row,
+        cursor,
+        TextRun::new(CURSOR_X, glyph_row, item.text_style()),
+    );
+}
+
+fn render_item_label(row: &mut [u8; 480], item: MenuItemRow<'_>, glyph_row: usize) {
+    let text_window = item.text_window(glyph_row);
+    if item.selected && text_screen_width(item.text, SCALE) > text_window.width() {
+        write_marquee_text_row(row, item.text, text_window, item.marquee_frame);
+    } else {
+        write_truncated_text_row(row, item.text, text_window);
+    }
+}
+
+fn render_item_marker(row: &mut [u8; 480], item: MenuItemRow<'_>, glyph_row: usize) {
+    if !item.marked {
+        return;
+    }
+    write_text_row(
+        row,
+        b"*",
+        TextRun::new(MARKER_X, glyph_row, TextStyle::new(SCALE, C0_BE, item.bg())),
+    );
 }
 
 fn write_marquee_text_row(
     row: &mut [u8; 480],
     text: &[u8],
-    x_start: usize,
-    x_end: usize,
-    glyph_row: usize,
-    scale: usize,
+    window: TextWindow,
     marquee_frame: u32,
-    fg: [u8; 2],
-    bg: [u8; 2],
 ) {
-    let scroll_px = marquee_scroll_px(text, scale, marquee_frame);
-    let x0 = x_start.min(SCREEN_W as usize);
-    let x1 = x_end.min(SCREEN_W as usize);
-    if x1 <= x0 || text.is_empty() || scale == 0 {
+    let scroll_px = marquee_scroll_px(text, window.style.scale, marquee_frame);
+    let x0 = window.x_start.min(SCREEN_W as usize);
+    let x1 = window.x_end.min(SCREEN_W as usize);
+    if x1 <= x0 || text.is_empty() || window.style.scale == 0 {
         return;
     }
 
-    let text_w = text_screen_width(text, scale);
+    let text_w = text_screen_width(text, window.style.scale);
     if text_w == 0 {
         return;
     }
-    let period_w = text_w + MARQUEE_GAP_CHARS * CHAR_W * scale;
+    let period_w = text_w + MARQUEE_GAP_CHARS * CHAR_W * window.style.scale;
 
     for px in x0..x1 {
         let source_px = (px - x0 + scroll_px) % period_w;
-        let color = if source_px < text_w && text_pixel_lit(text, glyph_row, scale, source_px) {
-            fg
+        let color = if source_px < text_w
+            && text_pixel_lit(text, window.glyph_row, window.style.scale, source_px)
+        {
+            window.style.fg
         } else {
-            bg
+            window.style.bg
         };
         row[px * 2] = color[0];
         row[px * 2 + 1] = color[1];

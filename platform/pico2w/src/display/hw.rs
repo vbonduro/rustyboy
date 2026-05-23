@@ -18,8 +18,8 @@ use mipidsi::options::{ColorOrder, Orientation};
 use mipidsi::Builder;
 
 use super::{
-    loading_bar_y_range, menu_item_text_window, menu_item_y_range, render_loading_row,
-    render_menu_row, Display, ScaledFrame,
+    loading_bar_window, menu_item_text_window, menu_item_window, render_loading_row,
+    render_menu_row, Display, LoadingFrame, LoadingProgress, RenderWindow, ScaledFrame,
 };
 use crate::menu::MenuFrame;
 
@@ -193,15 +193,26 @@ impl<'d> GameDisplay<'d> {
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
-        self.set_window(0, 0, DISPLAY_X_END, TOP_BAR_Y_END).await;
+        self.set_window(RenderWindow::new(
+            0,
+            DISPLAY_X_END + 1,
+            0,
+            TOP_BAR_Y_END + 1,
+        ))
+        .await;
         self.write_command(0x2C, &[]).await;
         self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE)
             .await;
         info!("display: top bar done");
 
         // Bottom bar: rows 268..319, colour black
-        self.set_window(0, BOTTOM_BAR_Y_START, DISPLAY_X_END, DISPLAY_Y_END)
-            .await;
+        self.set_window(RenderWindow::new(
+            0,
+            DISPLAY_X_END + 1,
+            BOTTOM_BAR_Y_START,
+            DISPLAY_Y_END + 1,
+        ))
+        .await;
         self.write_command(0x2C, &[]).await;
         self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE)
             .await;
@@ -214,8 +225,13 @@ impl<'d> GameDisplay<'d> {
     /// [`super::scale_to_rgb565`]. Returns a future; `.await` it after doing
     /// other work to overlap the ~13 ms transfer with emulation.
     pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
-        self.set_window(0, GAME_Y_START, DISPLAY_X_END, GAME_Y_END)
-            .await;
+        self.set_window(RenderWindow::new(
+            0,
+            DISPLAY_X_END + 1,
+            GAME_Y_START,
+            GAME_Y_END + 1,
+        ))
+        .await;
         self.write_command(0x2C, &[]).await;
 
         self.dc.set_high();
@@ -228,24 +244,18 @@ impl<'d> GameDisplay<'d> {
     /// Paint the full 240×320 screen with a ROM loading progress screen.
     ///
     /// Uses a 480-byte stack buffer; no heap allocation.
-    pub async fn draw_loading_progress(
-        &mut self,
-        filename: &str,
-        banks_done: u32,
-        total_banks: u32,
-        marquee_frame: u32,
-    ) {
-        self.draw_rendered_rows(0, DISPLAY_X_END + 1, 0, DISPLAY_Y_END + 1, |y, row| {
-            render_loading_row(filename, banks_done, total_banks, marquee_frame, y, row);
+    pub async fn draw_loading_progress(&mut self, frame: LoadingFrame<'_>) {
+        self.draw_rendered_rows(RenderWindow::screen(), |y, row| {
+            render_loading_row(&frame, y, row);
         })
         .await;
     }
 
     /// Repaint only the loading progress bar. The title/filename stay static.
-    pub async fn draw_loading_bar(&mut self, banks_done: u32, total_banks: u32) {
-        let (y_start, y_end) = loading_bar_y_range();
-        self.draw_rendered_rows(0, DISPLAY_X_END + 1, y_start, y_end, |y, row| {
-            render_loading_row("", banks_done, total_banks, 0, y, row);
+    pub async fn draw_loading_bar(&mut self, progress: LoadingProgress) {
+        let frame = LoadingFrame::new("", progress, 0);
+        self.draw_rendered_rows(loading_bar_window(), |y, row| {
+            render_loading_row(&frame, y, row);
         })
         .await;
     }
@@ -254,7 +264,7 @@ impl<'d> GameDisplay<'d> {
     ///
     /// Uses a 480-byte stack buffer; no heap allocation.
     pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
-        self.draw_rendered_rows(0, DISPLAY_X_END + 1, 0, DISPLAY_Y_END + 1, |y, row| {
+        self.draw_rendered_rows(RenderWindow::screen(), |y, row| {
             render_menu_row(frame, y, row);
         })
         .await;
@@ -263,11 +273,11 @@ impl<'d> GameDisplay<'d> {
     /// Repaint a single menu item row. Used by marquee animation to avoid
     /// full-screen refresh jitter while the rest of the ROM menu is static.
     pub async fn draw_menu_item(&mut self, frame: &MenuFrame<'_>, slot: usize) {
-        let Some((y_start, y_end)) = menu_item_y_range(slot) else {
+        let Some(window) = menu_item_window(slot) else {
             return;
         };
 
-        self.draw_rendered_rows(0, DISPLAY_X_END + 1, y_start, y_end, |y, row| {
+        self.draw_rendered_rows(window, |y, row| {
             render_menu_row(frame, y, row);
         })
         .await;
@@ -277,11 +287,11 @@ impl<'d> GameDisplay<'d> {
     /// animation from touching static rows, cursor, or loaded marker pixels.
     pub async fn draw_menu_item_text(&mut self, frame: &MenuFrame<'_>, slot: usize) {
         let marked = frame.marked == Some(slot);
-        let Some((x_start, x_end, y_start, y_end)) = menu_item_text_window(slot, marked) else {
+        let Some(window) = menu_item_text_window(slot, marked) else {
             return;
         };
 
-        self.draw_rendered_rows(x_start, x_end, y_start, y_end, |y, row| {
+        self.draw_rendered_rows(window, |y, row| {
             render_menu_row(frame, y, row);
         })
         .await;
@@ -289,7 +299,10 @@ impl<'d> GameDisplay<'d> {
 
     // --- helpers ---
 
-    async fn set_window(&mut self, x0: u16, y0: u16, x1: u16, y1: u16) {
+    async fn set_window(&mut self, window: RenderWindow) {
+        let Some((x0, x1, y0, y1)) = window.inclusive_bounds() else {
+            return;
+        };
         let x_params = [(x0 >> 8) as u8, x0 as u8, (x1 >> 8) as u8, x1 as u8];
         self.write_command(0x2A, &x_params).await;
         let y_params = [(y0 >> 8) as u8, y0 as u8, (y1 >> 8) as u8, y1 as u8];
@@ -308,33 +321,25 @@ impl<'d> GameDisplay<'d> {
         self.cs.set_high();
     }
 
-    async fn draw_rendered_rows<F>(
-        &mut self,
-        x_start: u16,
-        x_end: u16,
-        y_start: u16,
-        y_end: u16,
-        mut render_row: F,
-    ) where
+    async fn draw_rendered_rows<F>(&mut self, window: RenderWindow, mut render_row: F)
+    where
         F: FnMut(u16, &mut [u8; ROW_BYTES]),
     {
-        if x_start >= x_end || y_start >= y_end {
+        if window.is_empty() {
             return;
         }
 
-        self.set_window(x_start, y_start, x_end - 1, y_end - 1)
-            .await;
+        self.set_window(window).await;
         self.write_command(0x2C, &[]).await;
 
         let mut row = [0u8; ROW_BYTES];
-        let byte_start = x_start as usize * 2;
-        let byte_end = x_end as usize * 2;
+        let byte_range = window.byte_range();
 
         self.dc.set_high();
         self.cs.set_low();
-        for y in y_start..y_end {
+        for y in window.y_start..window.y_end {
             render_row(y, &mut row);
-            self.spi.write(&row[byte_start..byte_end]).await.ok();
+            self.spi.write(&row[byte_range.clone()]).await.ok();
         }
         self.cs.set_high();
     }
