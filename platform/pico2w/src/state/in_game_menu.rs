@@ -59,8 +59,8 @@ impl InGameMenuState {
                         Err(e) => warn!("state save failed: {:?}", defmt::Debug2Format(&e)),
                     }
                 }
-                let frame = self.menu.frame(app.save_slot_available);
-                game_disp.draw_menu(&frame).await;
+                game_disp.draw_letterbox_bars().await;
+                app.transition_to(AppState::Running(RunningState));
             }
             MenuEffect::Load => {
                 if let Some(rom_id) = app.staged_rom_id {
