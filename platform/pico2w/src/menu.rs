@@ -38,6 +38,7 @@ pub enum MenuEffect {
     Resume,
     Save,
     Load,
+    Reset,
     Quit,
     Continue,
     ShowRoms,
@@ -120,7 +121,7 @@ pub trait MenuLogic {
 // In-game pause menu
 // ---------------------------------------------------------------------------
 
-const INGAME_ITEMS: &[&str] = &["RESUME", "SAVE", "LOAD", "QUIT"];
+const INGAME_ITEMS: &[&str] = &["RESUME", "SAVE", "LOAD", "RESET", "QUIT"];
 
 pub struct InGameMenu {
     selected: usize,
@@ -135,8 +136,8 @@ impl InGameMenu {
 impl MenuLogic for InGameMenu {
     /// `context_flag` = save slot available (enables Load).
     fn frame(&self, save_available: bool) -> MenuFrame<'_> {
-        static ALL_ENABLED: [bool; 4] = [true, true, true, true];
-        static LOAD_DISABLED: [bool; 4] = [true, true, false, true];
+        static ALL_ENABLED: [bool; 5] = [true, true, true, true, true];
+        static LOAD_DISABLED: [bool; 5] = [true, true, false, true, true];
         MenuFrame {
             title: "PAUSED",
             items: INGAME_ITEMS,
@@ -168,7 +169,8 @@ impl MenuLogic for InGameMenu {
                 0 => MenuEffect::Resume,
                 1 => MenuEffect::Save,
                 2 => MenuEffect::Load,
-                3 => MenuEffect::Quit,
+                3 => MenuEffect::Reset,
+                4 => MenuEffect::Quit,
                 _ => MenuEffect::None,
             };
         }
@@ -449,7 +451,7 @@ mod tests {
         for _ in 0..10 {
             menu.handle(press_down());
         }
-        assert_eq!(menu.selected, INGAME_ITEMS.len() - 1);
+        assert_eq!(menu.selected, INGAME_ITEMS.len() - 1); // QUIT
     }
 
     #[test]
@@ -474,9 +476,18 @@ mod tests {
     }
 
     #[test]
-    fn ingame_confirm_on_quit_returns_quit() {
+    fn ingame_confirm_on_reset_returns_reset() {
         let mut menu = InGameMenu::new();
         for _ in 0..3 {
+            menu.handle(press_down());
+        } // -> RESET
+        assert_eq!(menu.handle(press_a()), MenuEffect::Reset);
+    }
+
+    #[test]
+    fn ingame_confirm_on_quit_returns_quit() {
+        let mut menu = InGameMenu::new();
+        for _ in 0..4 {
             menu.handle(press_down());
         } // -> QUIT
         assert_eq!(menu.handle(press_a()), MenuEffect::Quit);
@@ -500,17 +511,16 @@ mod tests {
     fn ingame_frame_disables_load_without_save() {
         let menu = InGameMenu::new();
         let frame = menu.frame(false);
-        assert!(
-            !frame.enabled[2],
-            "LOAD should be disabled with no save slot"
-        );
+        let load_idx = INGAME_ITEMS.iter().position(|&s| s == "LOAD").unwrap();
+        assert!(!frame.enabled[load_idx], "LOAD should be disabled with no save slot");
     }
 
     #[test]
     fn ingame_frame_enables_load_with_save() {
         let menu = InGameMenu::new();
         let frame = menu.frame(true);
-        assert!(frame.enabled[2], "LOAD should be enabled with a save slot");
+        let load_idx = INGAME_ITEMS.iter().position(|&s| s == "LOAD").unwrap();
+        assert!(frame.enabled[load_idx], "LOAD should be enabled with a save slot");
     }
 
     // --- MainMenu navigation ---
