@@ -52,7 +52,7 @@ use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::flash_rom::{new_onboard_flash, probe_staged_rom};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::multicore::PicoGameBoy;
-use rustyboy_pico2w::save_storage::SaveSlot;
+use rustyboy_pico2w::save_storage::{boot_load_saves, BootSaves, SaveSlot};
 use rustyboy_pico2w::sd::{self, DummyClock};
 use rustyboy_pico2w::stack_probe;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
@@ -165,28 +165,6 @@ pub(crate) fn refresh_save_slot_available(app: &mut App, sd_mgr: &PicoSdMgr) {
     };
     let slot = SaveSlot::new(0).expect("slot 0 is valid");
     app.save_slot_available = sd_mgr.save_state_exists(&rom_id, slot).unwrap_or(false);
-}
-
-pub(crate) fn boot_load_saves(rom_id: RomId, sd_mgr: &PicoSdMgr, gameboy: &mut PicoGameBoy) {
-    match sd_mgr.read_battery_save(&rom_id) {
-        Ok(Some(data)) => gameboy.set_external_ram(&data),
-        Ok(None) => {}
-        Err(e) => defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)),
-    }
-    let slot = SaveSlot::new(0).expect("slot 0 is valid");
-    match sd_mgr.read_save_state(&rom_id, slot) {
-        Ok(Some(blob)) => {
-            match rustyboy_core::cpu::save_state::SaveState::from_blob(blob) {
-                Ok(state) => {
-                    let _ = gameboy.load_state(state);
-                    info!("save state loaded on boot");
-                }
-                Err(msg) => defmt::warn!("boot save state parse failed: {}", msg),
-            }
-        }
-        Ok(None) => {}
-        Err(e) => defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)),
-    }
 }
 
 pub(crate) enum AppState {
@@ -320,7 +298,24 @@ async fn main(_spawner: Spawner) {
                     );
                     let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
                     if let Some(rom_id) = info.rom_id {
-                        boot_load_saves(rom_id, &sd_mgr, &mut gb);
+                        let battery_data = sd_mgr.read_battery_save(&rom_id)
+                            .unwrap_or_else(|e| { defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)); None });
+                        let slot = SaveSlot::new(0).expect("slot 0 is valid");
+                        let save_state_blob = sd_mgr.read_save_state(&rom_id, slot)
+                            .unwrap_or_else(|e| { defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)); None });
+                        match boot_load_saves(battery_data, save_state_blob) {
+                            None => {}
+                            Some(BootSaves::BatterySave(data)) => gb.set_external_ram(&data),
+                            Some(BootSaves::SaveState(state)) => {
+                                let _ = gb.load_state(state);
+                                info!("save state loaded on boot");
+                            }
+                            Some(BootSaves::Both { battery, save_state }) => {
+                                gb.set_external_ram(&battery);
+                                let _ = gb.load_state(save_state);
+                                info!("save state loaded on boot");
+                            }
+                        }
                     }
                     info!("ROM loaded, entering main loop");
                     (

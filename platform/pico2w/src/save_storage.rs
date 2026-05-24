@@ -1,5 +1,7 @@
 use alloc::string::String;
+use alloc::vec::Vec;
 
+use rustyboy_core::cpu::save_state::SaveState;
 use rustyboy_core::storage::RomId;
 
 pub const SAVE_ROOT_DIR: &str = "SAVES";
@@ -44,6 +46,34 @@ pub fn save_state_filename(slot: SaveSlot) -> String {
     name.push((b'0' + slot.index()) as char);
     name.push_str(SAVE_STATE_EXT);
     name
+}
+
+pub enum BootSaves {
+    BatterySave(Vec<u8>),
+    SaveState(SaveState),
+    Both { battery: Vec<u8>, save_state: SaveState },
+}
+
+/// Determine the boot start state from raw SD data.
+///
+/// `battery_data` and `save_state_blob` are the raw bytes read from the SD
+/// card (or `None` if the file was absent or the read failed). Returns `None`
+/// when neither file was present; otherwise returns the variant that describes
+/// which mutations the caller should apply to the GameBoy.
+pub fn boot_load_saves(
+    battery_data: Option<Vec<u8>>,
+    save_state_blob: Option<Vec<u8>>,
+) -> Option<BootSaves> {
+    let save_state = save_state_blob.and_then(|blob| SaveState::from_blob(blob).ok());
+    match (battery_data, save_state) {
+        (None, None) => None,
+        (Some(data), None) => Some(BootSaves::BatterySave(data)),
+        (None, Some(state)) => Some(BootSaves::SaveState(state)),
+        (Some(data), Some(state)) => Some(BootSaves::Both {
+            battery: data,
+            save_state: state,
+        }),
+    }
 }
 
 fn upper_ascii(value: &str) -> String {
