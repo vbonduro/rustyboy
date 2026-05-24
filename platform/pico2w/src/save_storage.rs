@@ -83,3 +83,79 @@ fn upper_ascii(value: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustyboy_core::cpu::registers::{Flags, Registers};
+    use rustyboy_core::GameBoy;
+
+    fn make_save_state_blob() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x0100] = 0x00;
+        rom[0x0101] = 0x18;
+        rom[0x0102] = 0xFE;
+        GameBoy::new(rom)
+            .with_registers(Registers {
+                a: 0x01,
+                f: Flags::from_bits_truncate(0xB0),
+                b: 0x00,
+                c: 0x13,
+                d: 0x00,
+                e: 0xD8,
+                h: 0x01,
+                l: 0x4D,
+                pc: 0x0100,
+                sp: 0xFFFE,
+            })
+            .with_dmg_state()
+            .save_state()
+    }
+
+    #[test]
+    fn returns_none_when_both_absent() {
+        assert!(boot_load_saves(None, None).is_none());
+    }
+
+    #[test]
+    fn returns_battery_save_when_only_battery_present() {
+        let battery = vec![0xAA; 64];
+        match boot_load_saves(Some(battery.clone()), None).unwrap() {
+            BootSaves::BatterySave(data) => assert_eq!(data, battery),
+            _ => panic!("expected BatterySave variant"),
+        }
+    }
+
+    #[test]
+    fn returns_save_state_when_only_blob_present() {
+        let blob = make_save_state_blob();
+        assert!(matches!(
+            boot_load_saves(None, Some(blob)).unwrap(),
+            BootSaves::SaveState(_)
+        ));
+    }
+
+    #[test]
+    fn returns_both_when_both_present() {
+        let battery = vec![0xBB; 32];
+        let blob = make_save_state_blob();
+        match boot_load_saves(Some(battery.clone()), Some(blob)).unwrap() {
+            BootSaves::Both { battery: b, .. } => assert_eq!(b, battery),
+            _ => panic!("expected Both variant"),
+        }
+    }
+
+    #[test]
+    fn returns_none_when_blob_is_invalid_and_battery_absent() {
+        assert!(boot_load_saves(None, Some(vec![0xFF; 16])).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_battery_when_blob_is_invalid() {
+        let battery = vec![0xCC; 8];
+        match boot_load_saves(Some(battery.clone()), Some(vec![0xFF; 16])).unwrap() {
+            BootSaves::BatterySave(data) => assert_eq!(data, battery),
+            _ => panic!("expected BatterySave fallback variant"),
+        }
+    }
+}
