@@ -167,6 +167,28 @@ pub(crate) fn refresh_save_slot_available(app: &mut App, sd_mgr: &PicoSdMgr) {
     app.save_slot_available = sd_mgr.save_state_exists(&rom_id, slot).unwrap_or(false);
 }
 
+pub(crate) fn boot_load_saves(rom_id: RomId, sd_mgr: &PicoSdMgr, gameboy: &mut PicoGameBoy) {
+    match sd_mgr.read_battery_save(&rom_id) {
+        Ok(Some(data)) => gameboy.set_external_ram(&data),
+        Ok(None) => {}
+        Err(e) => defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)),
+    }
+    let slot = SaveSlot::new(0).expect("slot 0 is valid");
+    match sd_mgr.read_save_state(&rom_id, slot) {
+        Ok(Some(blob)) => {
+            match rustyboy_core::cpu::save_state::SaveState::from_blob(blob) {
+                Ok(state) => {
+                    let _ = gameboy.load_state(state);
+                    info!("save state loaded on boot");
+                }
+                Err(msg) => defmt::warn!("boot save state parse failed: {}", msg),
+            }
+        }
+        Ok(None) => {}
+        Err(e) => defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)),
+    }
+}
+
 pub(crate) enum AppState {
     Running(RunningState),
     InGameMenu(InGameMenuState),
@@ -298,27 +320,7 @@ async fn main(_spawner: Spawner) {
                     );
                     let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
                     if let Some(rom_id) = info.rom_id {
-                        match sd_mgr.read_battery_save(&rom_id) {
-                            Ok(Some(data)) => gb.set_external_ram(&data),
-                            Ok(None) => {}
-                            Err(e) => {
-                                defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e))
-                            }
-                        }
-                        let slot = SaveSlot::new(0).expect("slot 0 is valid");
-                        match sd_mgr.read_save_state(&rom_id, slot) {
-                            Ok(Some(blob)) => {
-                                match rustyboy_core::cpu::save_state::SaveState::from_blob(blob) {
-                                    Ok(state) => {
-                                        let _ = gb.load_state(state);
-                                        info!("save state loaded on boot");
-                                    }
-                                    Err(msg) => defmt::warn!("boot save state parse failed: {}", msg),
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)),
-                        }
+                        boot_load_saves(rom_id, &sd_mgr, &mut gb);
                     }
                     info!("ROM loaded, entering main loop");
                     (
