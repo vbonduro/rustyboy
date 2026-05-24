@@ -81,6 +81,11 @@ impl InGameMenuState {
                 game_disp.draw_letterbox_bars().await;
                 app.transition_to(AppState::Running(RunningState));
             }
+            MenuEffect::Reset => {
+                gameboy.reset();
+                game_disp.draw_letterbox_bars().await;
+                app.transition_to(AppState::Running(RunningState));
+            }
             MenuEffect::Quit => {
                 flush_battery_save(app, sd_mgr, gameboy);
                 let next = MainMenuState::new(game_disp, app).await;

@@ -135,6 +135,28 @@ impl<W: WorkerTransport> GameBoy<W> {
         self
     }
 
+    /// Reset the emulator to power-on state, preserving the cartridge ROM and battery RAM.
+    pub fn reset(&mut self) {
+        self.memory.soft_reset();
+        self.cpu.registers = Registers {
+            a: 0x01,
+            f: crate::cpu::registers::Flags::from_bits_truncate(0xB0),
+            b: 0x00,
+            c: 0x13,
+            d: 0x00,
+            e: 0xD8,
+            h: 0x01,
+            l: 0x4D,
+            pc: 0x0100,
+            sp: 0xFFFE,
+        };
+        self.cpu.halted = false;
+        self.cpu.ime = crate::cpu::sm83::ImeState::Disabled;
+        self.cycle_counter = 0;
+        self.apply_dmg_state();
+        self.push_worker_state();
+    }
+
     /// Seed IO registers to DMG post-boot-ROM state and sync the worker.
     pub fn apply_dmg_state(&mut self) {
         self.memory.write_io(LCDC_ADDR, 0x91);

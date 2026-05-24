@@ -305,6 +305,20 @@ async fn main(_spawner: Spawner) {
                                 defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e))
                             }
                         }
+                        let slot = SaveSlot::new(0).expect("slot 0 is valid");
+                        match sd_mgr.read_save_state(&rom_id, slot) {
+                            Ok(Some(blob)) => {
+                                match rustyboy_core::cpu::save_state::SaveState::from_blob(blob) {
+                                    Ok(state) => {
+                                        let _ = gb.load_state(state);
+                                        info!("save state loaded on boot");
+                                    }
+                                    Err(msg) => defmt::warn!("boot save state parse failed: {}", msg),
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)),
+                        }
                     }
                     info!("ROM loaded, entering main loop");
                     (

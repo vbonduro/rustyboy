@@ -581,6 +581,17 @@ impl GameBoyMemory {
         self.cartridge.set_external_ram(data);
     }
 
+    /// Reset RAM regions and MBC registers to power-on state. Cart RAM is preserved.
+    pub fn soft_reset(&mut self) {
+        self.wram.fill(0);
+        self.vram.fill(0);
+        self.hram.fill(0);
+        self.oam.fill(0);
+        self.io.fill(0);
+        self.ie = 0;
+        self.cartridge.reset_mbc();
+    }
+
     /// Direct read of an IO register. No bus events.
     /// Handles 0xFF00-0xFF7F from io array, 0xFFFF from ie field.
     pub fn read_io(&self, address: u16) -> u8 {

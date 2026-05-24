@@ -976,6 +976,10 @@ impl PicoGameBoy {
     pub fn load_state(&mut self, state: SaveState) -> Result<(), &'static str> {
         self.gb.load_state(state)
     }
+
+    pub fn reset(&mut self) {
+        self.gb.reset();
+    }
     /// Flush pending commands and halt core1 in a WFE loop.
     ///
     /// After this returns, core1 will never read from flash again, making it

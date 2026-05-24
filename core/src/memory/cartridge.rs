@@ -60,6 +60,8 @@ pub trait Cartridge {
     fn load_mbc_state(&mut self, _data: &[u8], _offset: usize) -> usize {
         0
     }
+    /// Reset MBC bank registers to power-on defaults. Cart RAM is preserved.
+    fn reset_mbc(&mut self) {}
 }
 
 // ── Header helpers ───────────────────────────────────────────────────────────
@@ -395,6 +397,13 @@ impl Cartridge for Mbc1 {
         self.ram_enabled = data[offset + 3] != 0;
         4
     }
+
+    fn reset_mbc(&mut self) {
+        self.rom_bank_lo = 1;
+        self.upper_bits = 0;
+        self.ram_mode = false;
+        self.ram_enabled = false;
+    }
 }
 
 // ── MBC1 Multicart ───────────────────────────────────────────────────────────
@@ -568,6 +577,13 @@ impl Cartridge for Mbc1Multicart {
         self.ram_mode = data[offset + 2] != 0;
         self.ram_enabled = data[offset + 3] != 0;
         4
+    }
+
+    fn reset_mbc(&mut self) {
+        self.rom_bank_lo = 1;
+        self.upper_bits = 0;
+        self.ram_mode = false;
+        self.ram_enabled = false;
     }
 }
 
@@ -876,6 +892,13 @@ impl Cartridge for Mbc3 {
         self.rtc_latched.day_hi = d[13];
         self.rtc_cycles = u32::from_le_bytes([d[14], d[15], d[16], d[17]]);
         SIZE
+    }
+
+    fn reset_mbc(&mut self) {
+        self.rom_bank = 1;
+        self.bank_or_rtc = 0;
+        self.ram_rtc_enabled = false;
+        self.latch_armed = false;
     }
 }
 
