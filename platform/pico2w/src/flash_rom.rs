@@ -12,7 +12,14 @@ pub const FIRMWARE_SLOT_BYTES: usize = 512 * 1024;
 pub const ROM_METADATA_BYTES: usize = ERASE_SIZE;
 pub const ROM_SLOT_OFFSET: usize = FIRMWARE_SLOT_BYTES;
 pub const ROM_DATA_OFFSET: usize = ROM_SLOT_OFFSET + ROM_METADATA_BYTES;
-pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSET;
+
+/// One 4 KiB sector at the very end of flash is reserved for crash records.
+/// This is written by `crash::storage::check_and_commit` on each boot when a
+/// crash was detected.  ROM data must not be staged here.
+pub const CRASH_LOG_OFFSET: usize = FLASH_CAPACITY_BYTES - ERASE_SIZE;
+
+/// ROM data capacity is the full flash minus firmware, metadata, and crash log.
+pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSET - ERASE_SIZE;
 
 const ROM_BANK_BYTES: usize = 0x4000;
 const HEADER_MAGIC: [u8; 8] = *b"RBROM1\0\0";

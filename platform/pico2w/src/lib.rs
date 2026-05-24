@@ -4,6 +4,7 @@ extern crate alloc;
 
 #[cfg(target_arch = "arm")]
 pub mod audio;
+pub mod crash;
 pub mod display;
 #[cfg(target_arch = "arm")]
 pub mod flash_rom;

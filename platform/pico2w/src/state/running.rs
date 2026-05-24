@@ -56,6 +56,18 @@ impl RunningState {
             gameboy.release_scaled_frame();
             audio_future.as_mut().await;
 
+            // Update the crash context once per frame so the fault handler
+            // always has a recent snapshot of the emulator state.
+            let rom_id_prefix = app
+                .staged_rom_id
+                .map(|id| {
+                    let mut p = [0u8; 4];
+                    p.copy_from_slice(&id.as_bytes()[..4]);
+                    p
+                })
+                .unwrap_or([0u8; 4]);
+            gameboy.update_crash_context(rom_id_prefix);
+
             open_menu
         };
 

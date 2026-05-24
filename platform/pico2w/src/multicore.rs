@@ -23,6 +23,7 @@ use rustyboy_core::ipc::{GameBoyWorker, WorkerCommand, WorkerOutput, WorkerTrans
 use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
+use crate::crash::CRASH_CONTEXT;
 use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
 use crate::stack_probe;
 
@@ -980,6 +981,45 @@ impl PicoGameBoy {
     pub fn reset(&mut self) {
         self.gb.reset();
     }
+
+    /// Expose the currently mapped ROM bank number.
+    pub fn current_rom_bank(&self) -> usize {
+        self.gb.current_rom_bank()
+    }
+
+    /// Snapshot the emulator state into the global crash context.
+    ///
+    /// Called once per frame from the running state so that the fault handler
+    /// always has a recent (≤ 1 frame stale) copy of the emulator state.
+    ///
+    /// `rom_id_prefix` is the first 4 bytes of the ROM's SHA-256 hash.
+    pub fn update_crash_context(&self, rom_id_prefix: [u8; 4]) {
+        let regs = self.gb.registers();
+        let cycle_lo = self.gb.cycle_counter() as u32;
+        let rom_bank = self.gb.current_rom_bank() as u16;
+        let ppu_ly = SHARED_WORKER_STATE.ppu_ly.load(Ordering::Relaxed);
+        let ppu_stat = SHARED_WORKER_STATE.ppu_stat.load(Ordering::Relaxed);
+
+        CRASH_CONTEXT.update(
+            rom_id_prefix,
+            rom_bank,
+            0, // ram_bank: not directly accessible without cartridge ref
+            regs.a,
+            regs.f.bits(),
+            regs.b,
+            regs.c,
+            regs.d,
+            regs.e,
+            regs.h,
+            regs.l,
+            regs.sp,
+            regs.pc,
+            cycle_lo,
+            ppu_ly,
+            ppu_stat,
+        );
+    }
+
     /// Flush pending commands and halt core1 in a WFE loop.
     ///
     /// After this returns, core1 will never read from flash again, making it

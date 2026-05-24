@@ -72,7 +72,8 @@ rp-pac = { git = "https://github.com/embassy-rs/rp-pac", rev = "c2e27609b021c444
 
 defmt = "1"
 defmt-rtt = "1"
-panic-probe = { version = "1", features = ["print-defmt"] }
+# panic-probe removed: crash::handler provides our own #[panic_handler] that
+# writes a crash record to scratch registers before resetting.
 
 embedded-alloc = "0.5"
 embedded-sdmmc = "0.9.0"

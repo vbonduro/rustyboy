@@ -6,17 +6,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::future::Future;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use cortex_m_rt::ExceptionFrame;
-#[cortex_m_rt::exception]
-unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
-    defmt::error!(
-        "HardFault: PC=0x{:08x} LR=0x{:08x} PSR=0x{:08x}",
-        ef.pc(),
-        ef.lr(),
-        ef.xpsr()
-    );
-    loop {}
-}
+// HardFault and #[panic_handler] are provided by crash::handler.
 
 #[cfg(feature = "fps")]
 mod perf;
@@ -45,7 +35,11 @@ use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::SdCard;
 use rustyboy_core::storage::RomId;
-use {defmt_rtt as _, panic_probe as _};
+// defmt_rtt provides the RTT logging transport; the panic handler is our own
+// crash::handler implementation (panic-probe removed from Cargo.toml).
+use defmt_rtt as _;
+
+use rustyboy_pico2w::crash;
 
 use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
@@ -240,6 +234,12 @@ async fn main(_spawner: Spawner) {
 
     let mut onboard_flash = new_onboard_flash(p.FLASH);
 
+    // Commit any pending crash record before doing anything else with flash.
+    // Core 1 is not yet running, so single-core flash writes are safe here.
+    if crash::storage::check_and_commit(&mut onboard_flash) {
+        defmt::warn!("crash record from previous session was committed to flash");
+    }
+
     // Check whether a ROM is already staged in flash.
     let staged = probe_staged_rom(&mut onboard_flash);
 
@@ -298,11 +298,21 @@ async fn main(_spawner: Spawner) {
                     );
                     let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
                     if let Some(rom_id) = info.rom_id {
-                        let battery_data = sd_mgr.read_battery_save(&rom_id)
-                            .unwrap_or_else(|e| { defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)); None });
+                        // Read save state first while heap pressure is lowest; a
+                        // successful save state read contains cart RAM already so
+                        // we skip the battery save in that case.  Reading battery
+                        // first consumes ~32 KB of the heap, leaving too little
+                        // for the ~48 KB save state blob.
                         let slot = SaveSlot::new(0).expect("slot 0 is valid");
                         let save_state_blob = sd_mgr.read_save_state(&rom_id, slot)
                             .unwrap_or_else(|e| { defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)); None });
+                        let has_save_state = save_state_blob.is_some();
+                        let battery_data = if has_save_state {
+                            None // save state includes cart RAM; skip battery read
+                        } else {
+                            sd_mgr.read_battery_save(&rom_id)
+                                .unwrap_or_else(|e| { defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)); None })
+                        };
                         match boot_load_saves(battery_data, save_state_blob) {
                             None => {}
                             Some(BootSaves::BatterySave(data)) => gb.set_external_ram(&data),
