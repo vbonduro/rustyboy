@@ -221,6 +221,23 @@ syslog_host = "192.168.1.10"   # optional
 syslog_port = 514               # optional, default 514
 ```
 
+## Crash reporting
+
+When the firmware crashes (HardFault or panic), the fault handler writes a
+snapshot to the RP2350's scratch registers and resets.  On the next boot the
+crash is committed to a reserved flash sector and can be decoded offline.
+
+See **[docs/crash-reporting.md](docs/crash-reporting.md)** for the full
+architecture, flash sector layout, `CrashRecord` byte map, and
+`crash_decoder.py` usage guide.
+
+Quick decode (debug probe attached):
+
+```sh
+uv run --script tools/crash_decoder.py --probe \
+    --elf target/thumbv8m.main-none-eabihf/release/rustyboy-pico2w
+```
+
 ## Platform implementation status
 
 | Bead | Feature | Status |
