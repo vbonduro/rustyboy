@@ -79,6 +79,26 @@ The frame sequencer clocks length counters, volume envelopes, and the frequency 
 | `0x01–0x03` (64-bank multicart) | `Mbc1Multicart` | Multicart with 4-bit sub-banking |
 | `0x0F–0x13` | `Mbc3` | Up to 2 MiB ROM / 32 KiB RAM + RTC stub |
 
+## Save states
+
+`Sm83::save_state()` serialises the complete emulator state (CPU registers,
+timer, PPU, all memory regions, and MBC + cart RAM) into a flat byte blob.
+`Sm83::load_state(&SaveState)` applies a previously parsed blob atomically —
+`SaveState::from_blob` validates magic, version, and length before any state
+is touched.
+
+```rust
+// Save
+let blob: Vec<u8> = gameboy.save_state();
+
+// Load
+let ss = SaveState::from_blob(blob).expect("valid RBSS blob");
+gameboy.load_state(&ss);
+```
+
+The format is documented in full in **[docs/save-state-format.md](../docs/save-state-format.md)** — byte offsets, all
+component sections, v1/v2 differences, and the extension guide.
+
 ## Running tests
 
 ```sh
