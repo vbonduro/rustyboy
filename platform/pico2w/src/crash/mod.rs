@@ -296,6 +296,20 @@ pub enum CrashDecodeError {
 
 pub const SECTOR_FULL: u8 = 0xFF;
 
+// ---------------------------------------------------------------------------
+// Slot discovery (pure, testable without hardware)
+// ---------------------------------------------------------------------------
+
+/// Return the index of the first slot whose 4-byte magic does not equal
+/// `RECORD_MAGIC`, or `None` if every slot is occupied.
+///
+/// The caller reads the leading 4 bytes of each record slot from flash and
+/// passes them here.  Keeping this logic pure (no I/O) lets it be unit-tested
+/// on the host without any embedded hardware or flash driver.
+pub fn find_next_empty_slot(slot_magics: &[[u8; 4]; MAX_RECORDS_PER_SECTOR]) -> Option<usize> {
+    slot_magics.iter().position(|m| m != &RECORD_MAGIC)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SectorHeader {
     pub erase_count: u32,
@@ -853,6 +867,32 @@ mod tests {
         assert_eq!(decoded1, r1);
 
         println!("Fixture written to {}", fixture_path.display());
+    }
+
+    // -----------------------------------------------------------------------
+    // find_next_empty_slot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn find_next_empty_slot_all_empty() {
+        // Erased flash = 0xFF bytes; every slot is free.
+        let magics = [[0xFFu8; 4]; MAX_RECORDS_PER_SECTOR];
+        assert_eq!(find_next_empty_slot(&magics), Some(0));
+    }
+
+    #[test]
+    fn find_next_empty_slot_some_occupied() {
+        let mut magics = [[0xFFu8; 4]; MAX_RECORDS_PER_SECTOR];
+        magics[0] = RECORD_MAGIC;
+        magics[1] = RECORD_MAGIC;
+        assert_eq!(find_next_empty_slot(&magics), Some(2));
+    }
+
+    #[test]
+    fn find_next_empty_slot_all_occupied() {
+        // All 31 slots contain RCRP — sector is full.
+        let magics = [RECORD_MAGIC; MAX_RECORDS_PER_SECTOR];
+        assert_eq!(find_next_empty_slot(&magics), None);
     }
 
     // -----------------------------------------------------------------------
