@@ -854,4 +854,46 @@ mod tests {
 
         println!("Fixture written to {}", fixture_path.display());
     }
+
+    // -----------------------------------------------------------------------
+    // CrashKind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crash_kind_from_u8_all_variants() {
+        assert_eq!(CrashKind::from_u8(0), CrashKind::HardFault);
+        assert_eq!(CrashKind::from_u8(1), CrashKind::Panic);
+        assert_eq!(CrashKind::from_u8(2), CrashKind::Unknown);
+        assert_eq!(CrashKind::from_u8(0xFF), CrashKind::Unknown);
+    }
+
+    #[test]
+    fn crash_kind_name_strings() {
+        let mut rec = sample_record(0);
+        rec.crash_kind = 0;
+        assert_eq!(rec.crash_kind_name(), "HardFault");
+        rec.crash_kind = 1;
+        assert_eq!(rec.crash_kind_name(), "Panic");
+        rec.crash_kind = 0xFF;
+        assert_eq!(rec.crash_kind_name(), "Unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // SectorHeader
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sector_header_fresh() {
+        let h = SectorHeader::fresh(7);
+        assert_eq!(h.erase_count, 7);
+        assert_eq!(h.next_slot, 0);
+        assert!(!h.is_full());
+    }
+
+    #[test]
+    fn sector_header_bad_magic_rejected() {
+        let mut buf = [0u8; RECORD_SIZE];
+        buf[0..4].copy_from_slice(b"NOPE");
+        assert!(SectorHeader::from_bytes(&buf).is_err());
+    }
 }
