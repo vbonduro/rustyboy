@@ -28,8 +28,8 @@ use crate::flash_rom::OnboardFlash;
 
 #[cfg(target_arch = "arm")]
 use super::{
-    CrashRecord, SectorDecodeError, SectorHeader, ScratchRegs, RECORD_MAGIC, RECORD_SIZE,
-    SECTOR_HEADER_SIZE, MAX_RECORDS_PER_SECTOR,
+    find_next_empty_slot, CrashRecord, SectorDecodeError, SectorHeader, ScratchRegs,
+    RECORD_SIZE, SECTOR_HEADER_SIZE, MAX_RECORDS_PER_SECTOR,
 };
 
 /// Byte offset from the start of flash to the crash log sector.
@@ -152,22 +152,14 @@ fn commit_record(
     let existing_header = read_sector_header(flash).ok();
     let erase_count = existing_header.map(|h| h.erase_count).unwrap_or(0);
 
-    // Find the next empty slot by scanning for the first slot that does NOT start
-    // with RCRP magic.  This is NOR-flash safe: the scan never writes anything.
-    //
-    // We cannot rely on SectorHeader::next_slot here.  NOR flash can only clear
-    // bits (1→0); updating next_slot from slot N to N+1 often requires setting a
-    // bit from 0→1, which leaves the field AND-corrupted on real hardware.
-    let mut next_slot: Option<usize> = None;
-    for slot in 0..MAX_RECORDS_PER_SECTOR {
-        let offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + slot * RECORD_SIZE;
-        let mut magic = [0u8; 4];
-        let _ = flash.blocking_read(offset as u32, &mut magic);
-        if magic != RECORD_MAGIC {
-            next_slot = Some(slot);
-            break;
-        }
+    // Read the leading 4 bytes of each slot from flash, then find the first
+    // empty one via the pure `find_next_empty_slot` helper (testable on host).
+    let mut slot_magics = [[0u8; 4]; MAX_RECORDS_PER_SECTOR];
+    for (i, magic) in slot_magics.iter_mut().enumerate() {
+        let offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + i * RECORD_SIZE;
+        let _ = flash.blocking_read(offset as u32, magic);
     }
+    let next_slot = find_next_empty_slot(&slot_magics);
 
     let (slot, erase_count) = match next_slot {
         Some(s) => (s as u8, erase_count),
