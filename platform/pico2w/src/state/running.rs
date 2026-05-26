@@ -42,11 +42,15 @@ impl RunningState {
             // The pixel DMA then runs concurrently with the ~16 ms emulation below.
             let mut disp_future =
                 core::pin::pin!(game_disp.send_frame(frame_buf, &dirty_rows));
-            let _ = poll_once(disp_future.as_mut());
+            // Capture the Ready/Pending result.  Polling a future after it has
+            // already returned Poll::Ready is undefined behaviour (the async state
+            // machine panics with "polled after completion").  We must skip the
+            // trailing `.await` whenever the first poll already resolved.
+            let disp_ready = poll_once(disp_future.as_mut());
 
             let (front_buf, back_buf) = audio_buffers.front_back_buffers();
             let mut audio_future = core::pin::pin!(i2s.write(front_buf));
-            let _ = poll_once(audio_future.as_mut());
+            let audio_ready = poll_once(audio_future.as_mut());
 
             let frame_start = gameboy.cycle_counter();
             while gameboy.cycle_counter().wrapping_sub(frame_start) < CYCLES_PER_FRAME {
@@ -62,12 +66,17 @@ impl RunningState {
             gameboy.drain_audio_samples_into_i16(audio_samples);
             audio_buffers.queue_next_frame_i16(audio_samples, back_buf);
 
-            // If send_frame returned Ready on the first poll (identical frame),
-            // this await is instant.  Otherwise the DMA is already done
-            // (~11 ms < ~16 ms emulation) and this returns almost immediately.
-            disp_future.as_mut().await;
+            // Only await futures that are still Pending.  If the first poll already
+            // returned Ready (identical frame skip, or audio finished instantly),
+            // polling again would be UB.  The DMA is already done for Pending cases
+            // (~11 ms < ~16 ms emulation) so this returns almost immediately.
+            if !disp_ready {
+                disp_future.as_mut().await;
+            }
             gameboy.release_scaled_frame();
-            audio_future.as_mut().await;
+            if !audio_ready {
+                audio_future.as_mut().await;
+            }
 
             // Update the crash context once per frame so the fault handler
             // always has a recent snapshot of the emulator state.
