@@ -106,6 +106,8 @@ pub struct MenuFrame<'a> {
     pub enabled: &'a [bool],
     /// Index of the item that carries a "currently loaded" indicator, if any.
     pub marked: Option<usize>,
+    /// Show the crash-report badge in the status bar when `true`.
+    pub crash_pending: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -149,6 +151,7 @@ impl MenuLogic for InGameMenu {
                 &LOAD_DISABLED
             },
             marked: None,
+            crash_pending: false,
         }
     }
 
@@ -236,6 +239,7 @@ impl MenuLogic for MainMenu {
                 marquee_frame: 0,
                 enabled: &FULL_ENABLED,
                 marked: None,
+                crash_pending: false,
             }
         } else {
             MenuFrame {
@@ -245,6 +249,7 @@ impl MenuLogic for MainMenu {
                 marquee_frame: 0,
                 enabled: &ROMS_ENABLED,
                 marked: None,
+                crash_pending: false,
             }
         }
     }

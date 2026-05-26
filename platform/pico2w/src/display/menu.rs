@@ -24,6 +24,14 @@ const MARQUEE_HOLD_FRAMES: u32 = 30;
 const MARQUEE_GAP_CHARS: usize = 3;
 const MARQUEE_FRAMES_PER_STEP: u32 = 1;
 
+// Crash badge — rendered in the header's top-right corner when a crash report
+// is waiting to be read by the host decoder tool.
+const CRASH_ICON_CHAR: u8 = b'!';
+const CRASH_ICON_SCALE: usize = SCALE;
+const CRASH_ICON_H: u16 = (8 * CRASH_ICON_SCALE) as u16; // 16
+const CRASH_ICON_TOP: u16 = (HEADER_H - CRASH_ICON_H) / 2; // 12
+const CRASH_ICON_X: usize = super::SCREEN_W as usize - CHAR_W * CRASH_ICON_SCALE - 6; // 218
+
 pub const MENU_MARQUEE_REDRAW_FRAMES: u32 = MARQUEE_FRAMES_PER_STEP;
 
 pub fn menu_item_needs_marquee(text: &str, marked: bool) -> bool {
@@ -69,6 +77,9 @@ pub fn render_menu_row(frame: &MenuFrame<'_>, y: u16, row: &mut [u8; 480]) {
 
     if y < HEADER_H {
         render_menu_header_row(frame.title, y, row);
+        if frame.crash_pending {
+            render_crash_badge_row(y, row);
+        }
     }
     if in_items {
         render_menu_items_row(frame, y, row);
@@ -91,6 +102,27 @@ fn render_menu_header_row(title: &str, y: u16, row: &mut [u8; 480]) {
         row,
         title.as_bytes(),
         TextRun::new(title_x, glyph_row, TextStyle::new(SCALE, C0_BE, C3_BE)),
+    );
+}
+
+/// Render the crash-report badge (a `!` with a C2 background block) in the
+/// right side of the header when a crash log is waiting to be decoded.
+///
+/// The badge uses C2 (dark green) as background and C0 (light) as foreground,
+/// giving it visual contrast against the C3 (darkest) header background.
+fn render_crash_badge_row(y: u16, row: &mut [u8; 480]) {
+    if y < CRASH_ICON_TOP || y >= CRASH_ICON_TOP + CRASH_ICON_H {
+        return;
+    }
+    let glyph_row = ((y - CRASH_ICON_TOP) as usize) / CRASH_ICON_SCALE;
+    write_text_row(
+        row,
+        &[CRASH_ICON_CHAR],
+        TextRun::new(
+            CRASH_ICON_X,
+            glyph_row,
+            TextStyle::new(CRASH_ICON_SCALE, C0_BE, C2_BE),
+        ),
     );
 }
 
@@ -302,6 +334,7 @@ mod tests {
             marquee_frame,
             enabled,
             marked,
+            crash_pending: false,
         }
     }
 
@@ -459,5 +492,58 @@ mod tests {
             ),
             0
         );
+    }
+
+    // --- Crash badge ---
+
+    #[test]
+    fn crash_badge_changes_header_row_when_pending() {
+        let items = ["ROMS"];
+        let enabled = [true];
+        let no_crash = frame(&items, 0, 0, &enabled, None); // crash_pending = false
+        let mut with_crash = frame(&items, 0, 0, &enabled, None);
+        with_crash.crash_pending = true;
+
+        // Pick a row inside the badge's vertical span.
+        let y = CRASH_ICON_TOP + CRASH_ICON_SCALE as u16;
+        let row_no = render_row(&no_crash, y);
+        let row_yes = render_row(&with_crash, y);
+        assert_ne!(row_no, row_yes, "header should differ when crash is pending");
+    }
+
+    #[test]
+    fn crash_badge_is_absent_outside_icon_rows() {
+        let items = ["ROMS"];
+        let enabled = [true];
+        let no_crash = frame(&items, 0, 0, &enabled, None);
+        let mut with_crash = frame(&items, 0, 0, &enabled, None);
+        with_crash.crash_pending = true;
+
+        // Rows above the badge span must be identical regardless of crash_pending.
+        for y in 0..CRASH_ICON_TOP {
+            assert_eq!(
+                render_row(&no_crash, y),
+                render_row(&with_crash, y),
+                "row {y} above badge should be unaffected"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_badge_renders_within_header_bounds() {
+        let items = ["ROMS"];
+        let enabled = [true];
+        let mut with_crash = frame(&items, 0, 0, &enabled, None);
+        with_crash.crash_pending = true;
+
+        // All rows below the header must be identical to the non-crash version.
+        let no_crash = frame(&items, 0, 0, &enabled, None);
+        for y in HEADER_H..ITEMS_START_Y {
+            assert_eq!(
+                render_row(&no_crash, y),
+                render_row(&with_crash, y),
+                "row {y} in separator should be unaffected by crash badge"
+            );
+        }
     }
 }

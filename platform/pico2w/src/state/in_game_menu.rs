@@ -17,7 +17,8 @@ pub struct InGameMenuState {
 impl InGameMenuState {
     pub async fn new(game_disp: &mut GameDisplay<'static>, app: &App) -> Self {
         let menu = InGameMenu::new();
-        let frame = menu.frame(app.save_slot_available);
+        let mut frame = menu.frame(app.save_slot_available);
+        frame.crash_pending = app.crash_pending;
         game_disp.draw_menu(&frame).await;
         Self { menu }
     }
@@ -42,7 +43,8 @@ impl InGameMenuState {
 
         match self.menu.handle(menu_input) {
             MenuEffect::None => {
-                let frame = self.menu.frame(app.save_slot_available);
+                let mut frame = self.menu.frame(app.save_slot_available);
+                frame.crash_pending = app.crash_pending;
                 game_disp.draw_menu(&frame).await;
             }
             MenuEffect::Resume => {

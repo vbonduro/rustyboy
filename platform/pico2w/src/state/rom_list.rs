@@ -57,7 +57,7 @@ impl RomListState {
 
     async fn draw(&self, app: &App, game_disp: &mut GameDisplay<'static>) {
         let frame_data = self.menu_frame_data(app);
-        let frame = self.menu_frame(&frame_data);
+        let frame = self.menu_frame(&frame_data, app.crash_pending);
         game_disp.draw_menu(&frame).await;
     }
 
@@ -69,7 +69,7 @@ impl RomListState {
         text_only: bool,
     ) {
         let frame_data = self.menu_frame_data(app);
-        let frame = self.menu_frame(&frame_data);
+        let frame = self.menu_frame(&frame_data, app.crash_pending);
         if text_only {
             game_disp.draw_menu_item_text(&frame, slot).await;
         } else {
@@ -101,7 +101,7 @@ impl RomListState {
         }
     }
 
-    fn menu_frame<'a>(&self, frame_data: &'a RomMenuFrame<'a>) -> MenuFrame<'a> {
+    fn menu_frame<'a>(&self, frame_data: &'a RomMenuFrame<'a>, crash_pending: bool) -> MenuFrame<'a> {
         MenuFrame {
             title: "ROMS",
             items: frame_data.items.as_slice(),
@@ -109,6 +109,7 @@ impl RomListState {
             marquee_frame: self.marquee_frame,
             enabled: frame_data.enabled.as_slice(),
             marked: frame_data.marked,
+            crash_pending,
         }
     }
 
