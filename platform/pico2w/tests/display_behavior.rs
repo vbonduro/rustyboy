@@ -32,6 +32,7 @@ fn rom_menu_frame<'a>(
         marquee_frame,
         enabled,
         marked: None,
+        crash_pending: false,
     }
 }
 

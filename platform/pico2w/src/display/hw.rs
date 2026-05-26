@@ -195,22 +195,15 @@ impl<'d> GameDisplay<'d> {
     }
 
     /// Paint the static letterbox bars (top C3, bottom black) once before the
-    /// game loop. The bars are never repainted — `send_frame_raw` only touches
-    /// the 240×216 game area.
+    /// game loop. The bars are never repainted — `send_frame` only touches the
+    /// 240×216 game area.
     pub async fn draw_letterbox_bars(&mut self) {
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
-        self.set_window(RenderWindow::new(
-            0,
-            DISPLAY_X_END + 1,
-            0,
-            TOP_BAR_Y_END + 1,
-        ))
-        .await;
-        self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE)
-            .await;
+        self.set_window(RenderWindow::new(0, DISPLAY_X_END + 1, 0, TOP_BAR_Y_END + 1));
+        self.write_command(0x2C, &[]);
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE).await;
         info!("display: top bar done");
 
         // Bottom bar: rows 268..319, colour black
@@ -219,121 +212,59 @@ impl<'d> GameDisplay<'d> {
             DISPLAY_X_END + 1,
             BOTTOM_BAR_Y_START,
             DISPLAY_Y_END + 1,
-        ))
-        .await;
-        self.write_command(0x2C, &[]).await;
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE)
-            .await;
+        ));
+        self.write_command(0x2C, &[]);
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE).await;
         info!("display: letterbox bars done");
     }
 
-    /// Push the ILI9341 panel scan from the default ~70 Hz to ~94 Hz via
-    /// FRMCTR1 (0xB1), to break the resonance between the scan rate and our
-    /// frame rate that makes tearing appear as visible horizontal bouncing.
+    /// Transfer a pre-scaled 240×216 frame to the display, handling dirty-row
+    /// detection, hash-based skip, and the DMA / emulation overlap pattern.
     ///
-    /// # Why ~94 Hz?
+    /// # How to use in the game loop
     ///
-    /// Our frame period is ~16.74 ms (paced by the 44100 Hz audio DMA).  At the
-    /// default 70 Hz scan (14.3 ms period) the fractional phase drift per frame
-    /// is only 0.17 periods, so the tear line oscillates at ~10 Hz — squarely
-    /// in the range the eye perceives as spatial motion.
+    /// ```ignore
+    /// let mut f = core::pin::pin!(game_disp.send_frame(frame_buf, &dirty_rows));
+    /// let _ = poll_once(f.as_mut());   // ← starts DMA; returns immediately
+    /// // ... emulate, handle audio ...
+    /// f.as_mut().await;                // ← DMA already done; returns ~instantly
+    /// ```
     ///
-    /// At ~94 Hz (scan period ~10.6 ms) the drift becomes 0.58 periods/frame,
-    /// pushing the apparent oscillation to ~34 Hz.  Above ~30 Hz the eye
-    /// integrates the flickering tear into a constant slightly-dim band rather
-    /// than tracking it as a moving edge.
+    /// # How it works
     ///
-    /// Going *faster* than default is safe: the LCD cells are refreshed more
-    /// often, which keeps them better charged.  Halving the scan rate (35 Hz)
-    /// caused progressive degradation because the cells had too long to drift
-    /// between refreshes.
+    /// On the **first poll** (via `poll_once`):
+    /// - Computes the frame hash.  If identical to the previous frame, returns
+    ///   `Poll::Ready` immediately — no DMA, no tearing.
+    /// - Otherwise computes the dirty display-row range, programs CASET/RASET/
+    ///   RAMWR **synchronously** (blocking TX-FIFO writes, ~2 µs for 15 bytes at
+    ///   75 MHz), then arms the pixel DMA and returns `Poll::Pending`.
     ///
-    /// Call once after [`Self::new_after_splash`], before the first frame.
-    pub async fn configure_scan_rate(&mut self) {
-        // FRMCTR1 (0xB1): Normal-mode frame rate control.
-        //   Byte 0 — DIVA[1:0] = 0x00 → no division (default oscillator speed).
-        //   Byte 1 — RTNA[4:0] = 0x10 (16) → 32 clocks/line vs default 43.
-        //            f ≈ f_default × (43 / 32) ≈ 70 × 1.34 ≈ 94 Hz.
-        self.write_command(0xB1, &[0x00, 0x10]).await;
-    }
-
-    /// Send the CASET / RASET / RAMWR window-setup commands for a contiguous
-    /// range of display rows within the 240×216 game area.
-    ///
-    /// `sy_start` and `sy_end` are **game-area-relative** display row indices
-    /// (0 = top of game area, 215 = bottom).  `sy_end` is exclusive.
-    ///
-    /// Use `(0, 216)` for a full-frame write.  For dirty-row DMA, pass the
-    /// range returned by [`dirty_display_range`] to write only the rows that
-    /// changed.
-    ///
-    /// Leaves CS LOW and DC HIGH ready for pixel data.
-    pub async fn setup_frame_range(&mut self, sy_start: usize, sy_end: usize) {
-        debug_assert!(sy_start < sy_end && sy_end <= 216, "invalid row range");
-        let abs_y0 = GAME_Y_START + sy_start as u16;
-        let abs_y1 = GAME_Y_START + sy_end as u16 - 1; // inclusive for RASET
-        let x_params = [0, 0, (DISPLAY_X_END >> 8) as u8, DISPLAY_X_END as u8];
-        self.write_command(0x2A, &x_params).await;
-        let y_params = [
-            (abs_y0 >> 8) as u8,
-            abs_y0 as u8,
-            (abs_y1 >> 8) as u8,
-            abs_y1 as u8,
-        ];
-        self.write_command(0x2B, &y_params).await;
-        self.write_command(0x2C, &[]).await;
-        // Leave CS LOW and DC HIGH: the ILI9341 is ready to stream pixel data.
-        self.dc.set_high();
-        self.cs.set_low();
-    }
-
-    /// Send the pixel data for display rows `sy_start..sy_end` and raise CS HIGH.
-    ///
-    /// **Precondition:** [`setup_frame_range`] must have been called this frame
-    /// with the same range so CS is LOW and DC is HIGH.
-    ///
-    /// In the game loop, start this with `poll_once` right after
-    /// [`setup_frame_range`] so the DMA runs concurrently with emulation.
-    pub async fn send_frame_range_pixels(
-        &mut self,
-        buf: &ScaledFrame,
-        sy_start: usize,
-        sy_end: usize,
-    ) {
-        let pix_start = sy_start * 240;
-        let pix_end = sy_end * 240;
-        // buf stores big-endian u16s; cast to bytes for the correct SPI byte order.
-        self.spi
-            .write(bytemuck::cast_slice(&buf[pix_start..pix_end]))
-            .await
-            .ok();
-        self.cs.set_high();
-    }
-
-    /// Send the CASET / RASET / RAMWR window-setup commands for the 240×216
-    /// game area, then leave CS LOW and DC HIGH ready for pixel data.
-    ///
-    /// Convenience wrapper around [`setup_frame_range`] for a full-frame write.
-    pub async fn setup_frame(&mut self) {
-        self.setup_frame_range(0, 216).await;
-    }
-
-    /// Send the 240×216 pixel data and raise CS HIGH.
-    ///
-    /// Convenience wrapper around [`send_frame_range_pixels`] for a full-frame
-    /// write.  See that method for the `poll_once` overlap pattern.
-    pub async fn send_frame_pixels(&mut self, buf: &ScaledFrame) {
-        self.send_frame_range_pixels(buf, 0, 216).await;
+    /// On the **second poll** (the `.await` after emulation):
+    /// - The DMA has been running concurrently with ~16 ms of emulation.
+    ///   Raises CS HIGH and returns `Poll::Ready`.
+    pub async fn send_frame(&mut self, buf: &ScaledFrame, dirty: &[u32; 5]) {
+        let hash = Self::hash_frame(buf);
+        if !self.frame_changed(hash) {
+            return; // identical frame — display GRAM already shows this content
+        }
+        let (sy_start, sy_end) = Self::dirty_display_range(dirty).unwrap_or((0, 216));
+        self.commit_frame_hash(hash);
+        // Blocking setup: CASET + RASET + RAMWR (~2 µs).  Completing synchronously
+        // here ensures that the pixel-DMA future below is reached and armed within
+        // the same `poll_once` call, so the DMA runs during the emulation step.
+        self.setup_frame_range(sy_start, sy_end);
+        // Async pixel DMA: returns Poll::Pending after arming DMA hardware.
+        self.send_frame_range_pixels(buf, sy_start, sy_end).await;
     }
 
     /// Transfer a pre-scaled 240×216 frame to the display via async DMA.
     ///
-    /// Convenience wrapper that calls [`setup_frame`] + [`send_frame_pixels`]
-    /// sequentially (no emulation overlap).  Prefer the two-step API in the
-    /// hot game-loop path for proper DMA / emulation overlap.
+    /// Convenience wrapper that does a full-frame write without dirty-row
+    /// narrowing.  Uses blocking setup + async pixel DMA; compatible with the
+    /// `poll_once` / emulation-overlap pattern.
     pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
-        self.setup_frame().await;
-        self.send_frame_pixels(buf).await;
+        self.setup_frame_range(0, 216);
+        self.send_frame_range_pixels(buf, 0, 216).await;
     }
 
     /// Paint the full 240×320 screen with a ROM loading progress screen.
@@ -392,6 +323,23 @@ impl<'d> GameDisplay<'d> {
         .await;
     }
 
+    // --- low-level pixel DMA (used by send_frame / send_frame_raw) ---
+
+    /// Send display rows `sy_start..sy_end` via async DMA and raise CS HIGH.
+    ///
+    /// **Precondition:** [`setup_frame_range`] must have been called this frame
+    /// so CS is LOW and DC is HIGH.
+    async fn send_frame_range_pixels(&mut self, buf: &ScaledFrame, sy_start: usize, sy_end: usize) {
+        let pix_start = sy_start * 240;
+        let pix_end = sy_end * 240;
+        // buf stores big-endian u16s; cast_slice gives the correct SPI byte order.
+        self.spi
+            .write(bytemuck::cast_slice(&buf[pix_start..pix_end]))
+            .await
+            .ok();
+        self.cs.set_high();
+    }
+
     // --- differential DMA helpers ---
 
     /// Compute the display-row range `[sy_start, sy_end)` that covers all dirty
@@ -410,7 +358,7 @@ impl<'d> GameDisplay<'d> {
     ///
     /// Returns `None` when no rows are dirty (frame is identical; DMA can be
     /// skipped).  Returns `Some((0, 216))` when every scanline is dirty.
-    pub fn dirty_display_range(dirty: &[u32; 5]) -> Option<(usize, usize)> {
+    fn dirty_display_range(dirty: &[u32; 5]) -> Option<(usize, usize)> {
         let mut first_gb: Option<usize> = None;
         let mut last_gb: Option<usize> = None;
 
@@ -439,12 +387,12 @@ impl<'d> GameDisplay<'d> {
     /// giving one multiply per 4 bytes instead of FNV-1a's four.  At 300 MHz
     /// on Cortex-M33 this takes ~345 µs (2 % of a 16.7 ms frame budget).
     ///
-    /// Used to detect identical consecutive frames so the 11 ms pixel DMA can
-    /// be skipped when the display content hasn't changed.
+    /// Used to detect identical consecutive frames so the pixel DMA can
+    /// be skipped entirely when the display content hasn't changed.
     ///
     /// Collision probability: ~1 in 4 × 10⁹ per frame — negligible in
     /// practice; a false skip shows a stale frame for one 16 ms period.
-    pub fn hash_frame(buf: &ScaledFrame) -> u32 {
+    fn hash_frame(buf: &ScaledFrame) -> u32 {
         // Fibonacci/Knuth multiplicative hash constant.
         const M: u32 = 0x9e37_79b9;
         // buf has an even number of u16 values (240 × 216 = 51 840), so
@@ -458,48 +406,101 @@ impl<'d> GameDisplay<'d> {
         })
     }
 
-    /// Return `true` if `hash` differs from the last committed frame's hash,
-    /// meaning a new DMA transfer is required.
-    ///
-    /// A `false` return means the display already shows this content; the
-    /// caller can skip [`setup_frame`] + [`send_frame_pixels`] entirely.
     #[inline]
-    pub fn frame_changed(&self, hash: u32) -> bool {
+    fn frame_changed(&self, hash: u32) -> bool {
         hash != self.prev_frame_hash
     }
 
-    /// Record `hash` as the hash of the frame now committed to the display.
-    ///
-    /// Call this before issuing the DMA (the hash is already computed; storing
-    /// it here before the transfer avoids any borrow-checker conflict with the
-    /// pinned DMA future).
     #[inline]
-    pub fn commit_frame_hash(&mut self, hash: u32) {
+    fn commit_frame_hash(&mut self, hash: u32) {
         self.prev_frame_hash = hash;
     }
 
     // --- helpers ---
 
-    async fn set_window(&mut self, window: RenderWindow) {
+    /// Program the CASET + RASET window for the dirty display-row range.
+    ///
+    /// `sy_start` / `sy_end` are game-area-relative (0 = top of game area).
+    /// Leaves CS LOW and DC HIGH so the caller can stream pixel data immediately.
+    ///
+    /// Uses **blocking** TX-FIFO writes (≈ 2 µs for 15 bytes at 75 MHz) so that
+    /// this function completes synchronously within the first `poll_once` call on
+    /// [`send_frame`], allowing the pixel DMA to be armed before the emulation
+    /// step begins.
+    fn setup_frame_range(&mut self, sy_start: usize, sy_end: usize) {
+        debug_assert!(sy_start < sy_end && sy_end <= 216, "invalid row range");
+        let abs_y0 = GAME_Y_START + sy_start as u16;
+        let abs_y1 = GAME_Y_START + sy_end as u16 - 1; // inclusive for RASET
+        let x_params = [0, 0, (DISPLAY_X_END >> 8) as u8, DISPLAY_X_END as u8];
+        self.write_command(0x2A, &x_params);
+        let y_params = [
+            (abs_y0 >> 8) as u8,
+            abs_y0 as u8,
+            (abs_y1 >> 8) as u8,
+            abs_y1 as u8,
+        ];
+        self.write_command(0x2B, &y_params);
+        self.write_command(0x2C, &[]);
+        self.dc.set_high();
+        self.cs.set_low();
+    }
+
+    fn set_window(&mut self, window: RenderWindow) {
         let Some((x0, x1, y0, y1)) = window.inclusive_bounds() else {
             return;
         };
         let x_params = [(x0 >> 8) as u8, x0 as u8, (x1 >> 8) as u8, x1 as u8];
-        self.write_command(0x2A, &x_params).await;
+        self.write_command(0x2A, &x_params);
         let y_params = [(y0 >> 8) as u8, y0 as u8, (y1 >> 8) as u8, y1 as u8];
-        self.write_command(0x2B, &y_params).await;
+        self.write_command(0x2B, &y_params);
     }
 
-    async fn write_command(&mut self, cmd: u8, params: &[u8]) {
-        let cmd_buf = [cmd];
+    /// Send an ILI9341 command byte followed by optional parameter bytes.
+    ///
+    /// Uses direct TX-FIFO register polling rather than `Spi::blocking_write`.
+    /// `blocking_write` uses an RX-lockstep loop (one RX read per TX byte) that
+    /// has undefined interaction with the DMA-managed RX FIFO state on
+    /// `Spi<Async>`.  Direct TX polling is correct here: fill TX FIFO, wait for
+    /// TFE + !BSY (all bytes shifted out), then drain the RX FIFO.
+    /// Command payloads are always tiny (≤ 5 bytes) so the spin time is
+    /// negligible (< 1 µs per call at 75 MHz).
+    fn write_command(&mut self, cmd: u8, params: &[u8]) {
         self.cs.set_low();
         self.dc.set_low();
-        self.spi.write(&cmd_buf).await.ok();
+        Self::spi1_tx_bytes(&[cmd]);
         if !params.is_empty() {
             self.dc.set_high();
-            self.spi.write(params).await.ok();
+            Self::spi1_tx_bytes(params);
         }
         self.cs.set_high();
+    }
+
+    /// Write `data` to the SPI1 TX FIFO synchronously.
+    ///
+    /// Fills the TX FIFO byte-by-byte (polling TNF = TX FIFO not full), then
+    /// waits for TFE (TX FIFO empty) and !BSY (shift register idle) to confirm
+    /// all bytes have been sent.  Finally drains any bytes that accumulated in
+    /// the RX FIFO (MISO is floating/unconnected on this board).
+    ///
+    /// Does **not** use the RX-lockstep loop from `Spi::blocking_write`, which
+    /// assumes one RX byte arrives for each TX byte written — an assumption that
+    /// can be violated after a preceding async DMA transfer leaves the RX FIFO
+    /// in an indeterminate state.
+    #[inline]
+    fn spi1_tx_bytes(data: &[u8]) {
+        let spi = rp_pac::SPI1;
+        for &b in data {
+            while !spi.sr().read().tnf() {}
+            spi.dr().write(|w| w.set_data(b as u16));
+        }
+        // Wait for TX FIFO empty (all bytes moved to shift register)
+        while !spi.sr().read().tfe() {}
+        // Wait for shift register idle (last bit clocked out)
+        while spi.sr().read().bsy() {}
+        // Drain RX FIFO: bytes shifted in from floating MISO during transmission
+        while spi.sr().read().rne() {
+            let _ = spi.dr().read();
+        }
     }
 
     async fn draw_rendered_rows<F>(&mut self, window: RenderWindow, mut render_row: F)
@@ -510,8 +511,8 @@ impl<'d> GameDisplay<'d> {
             return;
         }
 
-        self.set_window(window).await;
-        self.write_command(0x2C, &[]).await;
+        self.set_window(window);
+        self.write_command(0x2C, &[]);
 
         let mut row = [0u8; ROW_BYTES];
         let byte_range = window.byte_range();
