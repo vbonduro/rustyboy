@@ -260,9 +260,20 @@ impl SharedWorkerState {
         // Using per-row hashes (576 bytes) instead of a full raw-frame copy
         // (22.5 KB) keeps the .bss footprint within the 520 KB SRAM budget.
         //
-        // Safety: prev_row_hashes and dirty_rows are accessed only from Core 1.
-        // This is the only place they are written, and publish_frame is only
-        // ever called from Core 1's run_core1_worker loop.
+        // # Why `unsafe`
+        //
+        // `SharedPrevRowHashes` and `SharedDirtyBitmap` wrap `UnsafeCell<T>`,
+        // whose `get()` method returns a raw `*mut T`.  Dereferencing a raw
+        // pointer requires `unsafe` because the compiler cannot verify aliasing
+        // rules automatically — that responsibility falls on us.
+        //
+        // The aliasing invariant we are upholding: `publish_frame` is only ever
+        // called from Core 1's `run_core1_worker` loop, and Core 0 never reads
+        // `prev_row_hashes`.  Core 0 does read `dirty_rows`, but only after
+        // the `published_frame.store(Release)` below; the Acquire load on Core 0
+        // side (in `published_scaled_frame`) establishes a happens-before edge
+        // that makes the writes here visible before they are read.  No two
+        // threads can hold a mutable reference to the same data simultaneously.
         unsafe {
             let hashes = &mut *self.prev_row_hashes.as_mut_ptr();
             let dirty = &mut *self.dirty_rows.as_mut_ptr();
