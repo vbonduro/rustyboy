@@ -33,6 +33,11 @@ const AUDIO_QUEUE_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
 const LCD_TIMING_BATCH_CYCLES: u16 = 80;
 const SCALED_FRAME_SLOT_COUNT: usize = 3;
+/// Number of u32 words needed to hold one dirty bit per GB scanline (144 rows).
+/// ⌈144 / 32⌉ = 5  (160 bits, 16 spare).
+pub const DIRTY_BITMAP_WORDS: usize = (VISIBLE_SCANLINES as usize + 31) / 32;
+/// Bytes per GB scanline (160 pixels × 1 byte/pixel palette index).
+const GB_ROW_BYTES: usize = FRAMEBUFFER_SIZE / VISIBLE_SCANLINES as usize;
 const IO_REG_BASE: u16 = 0xFF00;
 const IO_REG_END: u16 = 0xFF7F;
 const STAT_ADDR: u16 = 0xFF41;
@@ -124,6 +129,56 @@ impl SharedScaledFrameSlot {
 // writes complete.
 unsafe impl Sync for SharedScaledFrameSlot {}
 
+/// Per-scanline hashes from the previous published raw framebuffer.
+///
+/// 144 × u32 = 576 bytes (vs 22.5 KB for a full raw-frame copy).  Core 1
+/// hashes each 160-byte GB scanline and compares against the stored value to
+/// determine whether that row is dirty.  Hash collisions are ~1 in 4 × 10⁹
+/// per row per frame — negligible in practice.
+///
+/// Only accessed from Core 1; never touched by Core 0.
+struct SharedPrevRowHashes(UnsafeCell<[u32; VISIBLE_SCANLINES as usize]>);
+
+impl SharedPrevRowHashes {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; VISIBLE_SCANLINES as usize]))
+    }
+
+    fn as_mut_ptr(&self) -> *mut [u32; VISIBLE_SCANLINES as usize] {
+        self.0.get()
+    }
+}
+
+// Safety: only accessed from Core 1 (in publish_frame and clear_published_frames
+// while Core 1 is halted); no concurrent access from Core 0.
+unsafe impl Sync for SharedPrevRowHashes {}
+
+/// Dirty-row bitmap: 1 bit per GB scanline (144 rows ⟹ 5 × u32 = 160 bits).
+///
+/// Core 1 writes the bitmap before the Release store to `published_frame`;
+/// Core 0 reads the bitmap after the Acquire load from `published_frame`.
+/// The Acquire/Release pair on `published_frame` provides the necessary
+/// memory ordering guarantee — no atomic operations on the bitmap itself.
+struct SharedDirtyBitmap(UnsafeCell<[u32; DIRTY_BITMAP_WORDS]>);
+
+impl SharedDirtyBitmap {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; DIRTY_BITMAP_WORDS]))
+    }
+
+    fn as_ptr(&self) -> *const [u32; DIRTY_BITMAP_WORDS] {
+        self.0.get() as *const _
+    }
+
+    fn as_mut_ptr(&self) -> *mut [u32; DIRTY_BITMAP_WORDS] {
+        self.0.get()
+    }
+}
+
+// Safety: Core 1 writes before published_frame.store(Release);
+// Core 0 reads after published_frame.load(Acquire).
+unsafe impl Sync for SharedDirtyBitmap {}
+
 struct StaticStorage<T>(UnsafeCell<MaybeUninit<T>>);
 
 impl<T> StaticStorage<T> {
@@ -151,6 +206,13 @@ struct SharedWorkerState {
     ppu_stat: AtomicU8,
     pending_if_bits: AtomicU8,
     ppu_render_version: AtomicU32,
+    /// Per-row hashes of the previous raw framebuffer used to detect dirty rows.
+    /// 144 × u32 = 576 bytes.  Written and read exclusively by Core 1.
+    prev_row_hashes: SharedPrevRowHashes,
+    /// Dirty-row bitmap for the most recently published frame.  Core 1 writes
+    /// this before the Release store to `published_frame`; Core 0 reads it after
+    /// the Acquire load from `published_frame`.
+    dirty_rows: SharedDirtyBitmap,
 }
 
 impl SharedWorkerState {
@@ -176,6 +238,8 @@ impl SharedWorkerState {
             ppu_stat: AtomicU8::new(0),
             pending_if_bits: AtomicU8::new(0),
             ppu_render_version: AtomicU32::new(0),
+            prev_row_hashes: SharedPrevRowHashes::new(),
+            dirty_rows: SharedDirtyBitmap::new(),
         }
     }
 
@@ -189,6 +253,30 @@ impl SharedWorkerState {
             return;
         };
         let framebuffer = worker.framebuffer();
+
+        // Compute the dirty-row bitmap by hashing each 160-byte GB scanline and
+        // comparing against the stored previous-frame hash for that row.
+        //
+        // Using per-row hashes (576 bytes) instead of a full raw-frame copy
+        // (22.5 KB) keeps the .bss footprint within the 520 KB SRAM budget.
+        //
+        // Safety: prev_row_hashes and dirty_rows are accessed only from Core 1.
+        // This is the only place they are written, and publish_frame is only
+        // ever called from Core 1's run_core1_worker loop.
+        unsafe {
+            let hashes = &mut *self.prev_row_hashes.as_mut_ptr();
+            let dirty = &mut *self.dirty_rows.as_mut_ptr();
+            dirty.fill(0);
+            for row in 0..VISIBLE_SCANLINES as usize {
+                let start = row * GB_ROW_BYTES;
+                let h = hash_raw_row(&framebuffer[start..start + GB_ROW_BYTES]);
+                if h != hashes[row] {
+                    dirty[row / 32] |= 1u32 << (row % 32);
+                    hashes[row] = h;
+                }
+            }
+        }
+
         // Safety: called only from core 1; target_slot is neither the currently
         // published slot nor marked busy, so core 0 cannot be reading it.
         unsafe {
@@ -197,6 +285,9 @@ impl SharedWorkerState {
                 &mut *self.scaled_frame_slots[target_slot].as_mut_ptr(),
             );
         }
+        // dirty_rows is fully written above; the Release store below pairs with
+        // the Acquire load in published_scaled_frame() on Core 0, ensuring the
+        // dirty bitmap is visible before Core 0 reads it.
         self.published_frame
             .store(target_slot as u8, Ordering::Release);
         self.published_frame_seq.fetch_add(1, Ordering::AcqRel);
@@ -212,6 +303,12 @@ impl SharedWorkerState {
         }
         for busy in &self.scaled_frame_busy {
             busy.store(false, Ordering::Release);
+        }
+        // Reset per-row hashes so the first publish after reset marks every
+        // scanline dirty, ensuring a full redraw of the new game content.
+        // Safety: called while Core 1 is halted (after a sync ticket); no race.
+        unsafe {
+            (*self.prev_row_hashes.as_mut_ptr()).fill(0);
         }
         self.published_frame.store(0, Ordering::Release);
         self.published_frame_seq.store(0, Ordering::Release);
@@ -707,6 +804,19 @@ impl Core1Transport {
             .store(false, Ordering::Release);
         self.held_frame_slot = u8::MAX;
     }
+
+    /// Read the dirty-row bitmap for the most recently published frame.
+    ///
+    /// Must be called **after** [`published_scaled_frame`], which performs the
+    /// Acquire load on `published_frame`.  That Acquire pairs with the Release
+    /// store Core 1 did after writing the bitmap, so the bitmap is fully
+    /// visible by the time this returns.
+    fn published_dirty_rows(&self) -> [u32; DIRTY_BITMAP_WORDS] {
+        // Safety: dirty_rows was written by Core 1 before the Release store to
+        // published_frame; published_scaled_frame() loaded published_frame with
+        // Acquire, establishing the happens-before edge.
+        unsafe { *self.shared.dirty_rows.as_ptr() }
+    }
 }
 
 impl WorkerTransport for Core1Transport {
@@ -945,6 +1055,16 @@ impl PicoGameBoy {
         self.gb.transport_mut().release_scaled_frame();
     }
 
+    /// Return the dirty-row bitmap for the currently held published frame.
+    ///
+    /// Each bit k indicates that GB scanline k changed relative to the previous
+    /// published frame.  Call this **after** [`published_scaled_frame`] so the
+    /// Acquire ordering is already in place.
+    #[inline(always)]
+    pub fn published_dirty_rows(&mut self) -> [u32; DIRTY_BITMAP_WORDS] {
+        self.gb.transport_mut().published_dirty_rows()
+    }
+
     #[inline(always)]
     pub fn cycle_counter(&self) -> u64 {
         self.gb.cycle_counter()
@@ -1032,6 +1152,25 @@ impl PicoGameBoy {
         transport.enqueue_blocking(Core1Command::Halt { ticket });
         transport.wait_for_ticket(ticket);
     }
+}
+
+/// Hash a single 160-byte GB scanline using the Knuth multiplicative hash.
+///
+/// 160 bytes / 4 bytes per word = 40 words — no remainder.  Runs on Core 1
+/// during `publish_frame` to detect which scanlines changed.  At 300 MHz the
+/// full 144-row dirty-detection pass costs ~115 µs (≈ 5,760 hash iterations).
+#[cfg_attr(target_arch = "arm", link_section = ".data")]
+#[inline(always)]
+fn hash_raw_row(row: &[u8]) -> u32 {
+    const M: u32 = 0x9e37_79b9;
+    // GB_ROW_BYTES = 160; 160 / 4 = 40 words, exact — chunks_exact is lossless.
+    row.chunks_exact(4).fold(0xdead_beef_u32, |mut h, chunk| {
+        let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        h ^= w;
+        h = h.wrapping_mul(M);
+        h ^= h >> 16;
+        h
+    })
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]

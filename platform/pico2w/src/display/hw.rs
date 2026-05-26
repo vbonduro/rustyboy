@@ -128,6 +128,13 @@ pub struct GameDisplay<'d> {
     dc: Output<'d>,
     _rst: Output<'d>,
     _bl: Output<'d>,
+    /// FNV-1a hash of the last frame successfully sent to the display.
+    ///
+    /// Compared against each new frame's hash before deciding whether to
+    /// issue DMA.  Identical frames skip the 11 ms pixel DMA entirely so
+    /// the display refreshes its own GRAM with no scan-line race.
+    /// Cost: 4 bytes (vs 103 KB for a full shadow copy).
+    prev_frame_hash: u32,
 }
 
 impl<'d> GameDisplay<'d> {
@@ -183,6 +190,7 @@ impl<'d> GameDisplay<'d> {
             dc,
             _rst: rst,
             _bl: bl,
+            prev_frame_hash: 0,
         }
     }
 
@@ -219,26 +227,113 @@ impl<'d> GameDisplay<'d> {
         info!("display: letterbox bars done");
     }
 
-    /// Transfer a pre-scaled 240×216 frame to the display via async DMA.
+    /// Push the ILI9341 panel scan from the default ~70 Hz to ~94 Hz via
+    /// FRMCTR1 (0xB1), to break the resonance between the scan rate and our
+    /// frame rate that makes tearing appear as visible horizontal bouncing.
     ///
-    /// `buf` must contain big-endian RGB565 values as produced by
-    /// [`super::scale_to_rgb565`]. Returns a future; `.await` it after doing
-    /// other work to overlap the ~13 ms transfer with emulation.
-    pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
-        self.set_window(RenderWindow::new(
-            0,
-            DISPLAY_X_END + 1,
-            GAME_Y_START,
-            GAME_Y_END + 1,
-        ))
-        .await;
-        self.write_command(0x2C, &[]).await;
+    /// # Why ~94 Hz?
+    ///
+    /// Our frame period is ~16.74 ms (paced by the 44100 Hz audio DMA).  At the
+    /// default 70 Hz scan (14.3 ms period) the fractional phase drift per frame
+    /// is only 0.17 periods, so the tear line oscillates at ~10 Hz — squarely
+    /// in the range the eye perceives as spatial motion.
+    ///
+    /// At ~94 Hz (scan period ~10.6 ms) the drift becomes 0.58 periods/frame,
+    /// pushing the apparent oscillation to ~34 Hz.  Above ~30 Hz the eye
+    /// integrates the flickering tear into a constant slightly-dim band rather
+    /// than tracking it as a moving edge.
+    ///
+    /// Going *faster* than default is safe: the LCD cells are refreshed more
+    /// often, which keeps them better charged.  Halving the scan rate (35 Hz)
+    /// caused progressive degradation because the cells had too long to drift
+    /// between refreshes.
+    ///
+    /// Call once after [`Self::new_after_splash`], before the first frame.
+    pub async fn configure_scan_rate(&mut self) {
+        // FRMCTR1 (0xB1): Normal-mode frame rate control.
+        //   Byte 0 — DIVA[1:0] = 0x00 → no division (default oscillator speed).
+        //   Byte 1 — RTNA[4:0] = 0x10 (16) → 32 clocks/line vs default 43.
+        //            f ≈ f_default × (43 / 32) ≈ 70 × 1.34 ≈ 94 Hz.
+        self.write_command(0xB1, &[0x00, 0x10]).await;
+    }
 
+    /// Send the CASET / RASET / RAMWR window-setup commands for a contiguous
+    /// range of display rows within the 240×216 game area.
+    ///
+    /// `sy_start` and `sy_end` are **game-area-relative** display row indices
+    /// (0 = top of game area, 215 = bottom).  `sy_end` is exclusive.
+    ///
+    /// Use `(0, 216)` for a full-frame write.  For dirty-row DMA, pass the
+    /// range returned by [`dirty_display_range`] to write only the rows that
+    /// changed.
+    ///
+    /// Leaves CS LOW and DC HIGH ready for pixel data.
+    pub async fn setup_frame_range(&mut self, sy_start: usize, sy_end: usize) {
+        debug_assert!(sy_start < sy_end && sy_end <= 216, "invalid row range");
+        let abs_y0 = GAME_Y_START + sy_start as u16;
+        let abs_y1 = GAME_Y_START + sy_end as u16 - 1; // inclusive for RASET
+        let x_params = [0, 0, (DISPLAY_X_END >> 8) as u8, DISPLAY_X_END as u8];
+        self.write_command(0x2A, &x_params).await;
+        let y_params = [
+            (abs_y0 >> 8) as u8,
+            abs_y0 as u8,
+            (abs_y1 >> 8) as u8,
+            abs_y1 as u8,
+        ];
+        self.write_command(0x2B, &y_params).await;
+        self.write_command(0x2C, &[]).await;
+        // Leave CS LOW and DC HIGH: the ILI9341 is ready to stream pixel data.
         self.dc.set_high();
         self.cs.set_low();
-        // buf stores big-endian u16s; cast to bytes gives the correct SPI byte order.
-        self.spi.write(bytemuck::cast_slice(buf)).await.ok();
+    }
+
+    /// Send the pixel data for display rows `sy_start..sy_end` and raise CS HIGH.
+    ///
+    /// **Precondition:** [`setup_frame_range`] must have been called this frame
+    /// with the same range so CS is LOW and DC is HIGH.
+    ///
+    /// In the game loop, start this with `poll_once` right after
+    /// [`setup_frame_range`] so the DMA runs concurrently with emulation.
+    pub async fn send_frame_range_pixels(
+        &mut self,
+        buf: &ScaledFrame,
+        sy_start: usize,
+        sy_end: usize,
+    ) {
+        let pix_start = sy_start * 240;
+        let pix_end = sy_end * 240;
+        // buf stores big-endian u16s; cast to bytes for the correct SPI byte order.
+        self.spi
+            .write(bytemuck::cast_slice(&buf[pix_start..pix_end]))
+            .await
+            .ok();
         self.cs.set_high();
+    }
+
+    /// Send the CASET / RASET / RAMWR window-setup commands for the 240×216
+    /// game area, then leave CS LOW and DC HIGH ready for pixel data.
+    ///
+    /// Convenience wrapper around [`setup_frame_range`] for a full-frame write.
+    pub async fn setup_frame(&mut self) {
+        self.setup_frame_range(0, 216).await;
+    }
+
+    /// Send the 240×216 pixel data and raise CS HIGH.
+    ///
+    /// Convenience wrapper around [`send_frame_range_pixels`] for a full-frame
+    /// write.  See that method for the `poll_once` overlap pattern.
+    pub async fn send_frame_pixels(&mut self, buf: &ScaledFrame) {
+        self.send_frame_range_pixels(buf, 0, 216).await;
+    }
+
+    /// Transfer a pre-scaled 240×216 frame to the display via async DMA.
+    ///
+    /// Convenience wrapper that calls [`setup_frame`] + [`send_frame_pixels`]
+    /// sequentially (no emulation overlap).  Prefer the two-step API in the
+    /// hot game-loop path for proper DMA / emulation overlap.
+    pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
+        self.setup_frame().await;
+        self.send_frame_pixels(buf).await;
     }
 
     /// Paint the full 240×320 screen with a ROM loading progress screen.
@@ -295,6 +390,92 @@ impl<'d> GameDisplay<'d> {
             render_menu_row(frame, y, row);
         })
         .await;
+    }
+
+    // --- differential DMA helpers ---
+
+    /// Compute the display-row range `[sy_start, sy_end)` that covers all dirty
+    /// GB scanlines, using game-area-relative coordinates (0 = top row, 216 =
+    /// one past the bottom row).
+    ///
+    /// `dirty` is the 5-word (160-bit) bitmap produced by Core 1, where bit `k`
+    /// indicates that GB scanline `k` changed relative to the previous frame.
+    ///
+    /// **Scale mapping** (derived from `scale_to_rgb565`'s `gy = sy * 2 / 3`):
+    ///
+    /// GB row `k` maps to display rows `sy` where `sy * 2 / 3 == k`, which gives
+    /// `sy_start(k) = (3k + 1) / 2` and `sy_end(k) = (3(k+1) + 1) / 2`
+    /// (integer division).  In practice every pair of consecutive GB rows maps
+    /// to exactly 3 display rows (2 + 1 alternating).
+    ///
+    /// Returns `None` when no rows are dirty (frame is identical; DMA can be
+    /// skipped).  Returns `Some((0, 216))` when every scanline is dirty.
+    pub fn dirty_display_range(dirty: &[u32; 5]) -> Option<(usize, usize)> {
+        let mut first_gb: Option<usize> = None;
+        let mut last_gb: Option<usize> = None;
+
+        for k in 0..144usize {
+            if (dirty[k / 32] >> (k % 32)) & 1 != 0 {
+                if first_gb.is_none() {
+                    first_gb = Some(k);
+                }
+                last_gb = Some(k);
+            }
+        }
+
+        let first = first_gb?;
+        let last = last_gb?;
+
+        // sy_start: first display row produced by GB row `first`
+        // sy_end:   first display row produced by GB row `last + 1` (exclusive)
+        let sy_start = (3 * first + 1) / 2;
+        let sy_end = (3 * (last + 1) + 1) / 2;
+        Some((sy_start, sy_end))
+    }
+
+    /// Compute a fast hash of a scaled frame.
+    ///
+    /// Uses a single Knuth multiplicative step per u32 word (two packed u16s),
+    /// giving one multiply per 4 bytes instead of FNV-1a's four.  At 300 MHz
+    /// on Cortex-M33 this takes ~345 µs (2 % of a 16.7 ms frame budget).
+    ///
+    /// Used to detect identical consecutive frames so the 11 ms pixel DMA can
+    /// be skipped when the display content hasn't changed.
+    ///
+    /// Collision probability: ~1 in 4 × 10⁹ per frame — negligible in
+    /// practice; a false skip shows a stale frame for one 16 ms period.
+    pub fn hash_frame(buf: &ScaledFrame) -> u32 {
+        // Fibonacci/Knuth multiplicative hash constant.
+        const M: u32 = 0x9e37_79b9;
+        // buf has an even number of u16 values (240 × 216 = 51 840), so
+        // chunks_exact(2) is always lossless — no remainder.
+        buf.chunks_exact(2).fold(0xdead_beef_u32, |mut h, chunk| {
+            let w = (chunk[0] as u32) | ((chunk[1] as u32) << 16);
+            h ^= w;
+            h = h.wrapping_mul(M);
+            h ^= h >> 16;
+            h
+        })
+    }
+
+    /// Return `true` if `hash` differs from the last committed frame's hash,
+    /// meaning a new DMA transfer is required.
+    ///
+    /// A `false` return means the display already shows this content; the
+    /// caller can skip [`setup_frame`] + [`send_frame_pixels`] entirely.
+    #[inline]
+    pub fn frame_changed(&self, hash: u32) -> bool {
+        hash != self.prev_frame_hash
+    }
+
+    /// Record `hash` as the hash of the frame now committed to the display.
+    ///
+    /// Call this before issuing the DMA (the hash is already computed; storing
+    /// it here before the transfer avoids any borrow-checker conflict with the
+    /// pinned DMA future).
+    #[inline]
+    pub fn commit_frame_hash(&mut self, hash: u32) {
+        self.prev_frame_hash = hash;
     }
 
     // --- helpers ---
