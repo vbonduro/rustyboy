@@ -13,7 +13,8 @@ pub struct MainMenuState {
 impl MainMenuState {
     pub async fn new(game_disp: &mut GameDisplay<'static>, app: &App) -> Self {
         let menu = MainMenu::new();
-        let frame = menu.frame(app.staged_rom_name.is_some());
+        let mut frame = menu.frame(app.staged_rom_name.is_some());
+        frame.crash_pending = app.crash_pending;
         game_disp.draw_menu(&frame).await;
         Self { menu }
     }
@@ -38,7 +39,8 @@ impl MainMenuState {
         let game_available = app.staged_rom_name.is_some();
         match self.menu.handle_main(menu_input, game_available) {
             MenuEffect::None => {
-                let frame = self.menu.frame(game_available);
+                let mut frame = self.menu.frame(game_available);
+                frame.crash_pending = app.crash_pending;
                 game_disp.draw_menu(&frame).await;
             }
             MenuEffect::Continue => {

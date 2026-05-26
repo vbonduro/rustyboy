@@ -26,6 +26,9 @@ Usage examples
 
 # Read directly via probe-rs (requires connected debug probe):
 ./tools/crash_decoder.py --probe --elf path/to/firmware.elf
+
+# Read AND mark as read so the in-menu crash badge clears on next boot:
+./tools/crash_decoder.py --probe --mark-read
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ RECORD_MAGIC = b"RCRP"
 SECTOR_MAGIC = b"RCLG"
 CRASH_MAGIC = 0xCF_4A_53_11
 
-CRASH_KIND_NAMES = {0: "HardFault", 1: "Panic"}
+CRASH_KIND_NAMES = {0: "HardFault", 1: "Panic", 2: "WatchdogTimeout"}
 
 FLAG_HAS_ARM_REGS = 0x01
 FLAG_HAS_GB_STATE = 0x02
@@ -353,6 +356,89 @@ def symbolize_record(record: CrashRecord, elf_path: Optional[str]) -> dict[str, 
 # Flash acquisition
 # ---------------------------------------------------------------------------
 
+def mark_read_via_probe() -> None:
+    """Invalidate the crash sector header so the firmware badge clears on next boot.
+
+    Strategy: read the 4 KiB crash sector, zero out the first four bytes
+    (the b"RCLG" magic), then write the patched sector back using
+    ``probe-rs download``.  ``download`` performs a proper erase+program
+    cycle through the flash driver, which ``probe-rs write`` does not —
+    writing to the XIP-mapped address (0x10xxxxxx) via a raw memory write
+    is silently ignored by the hardware.
+
+    After the write the sector header magic is 0x00000000, causing
+    ``SectorHeader::from_bytes`` to return ``BadMagic``.  The firmware's
+    ``has_records()`` check then returns ``false``, clearing the badge on
+    the next boot.  The crash records themselves remain intact in the
+    sector and are readable via ``--raw`` if the sector binary is saved.
+
+    Only usable with ``--probe`` since it needs a live debug connection.
+    """
+    import tempfile, os
+
+    addr = CRASH_LOG_ADDR
+
+    # Step 1: read the full 4 KiB sector into a temp file.
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as f:
+        sector_path = f.name
+    try:
+        read_result = subprocess.run(
+            [
+                "probe-rs", "read",
+                "--chip", "RP235x",
+                "-o", sector_path,
+                "-f", "binary",
+                "b8",
+                f"0x{addr:08x}",
+                "4096",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if read_result.returncode != 0:
+            raise RuntimeError(
+                f"mark-read: sector read failed (exit {read_result.returncode}):\n"
+                f"  {read_result.stderr.strip()}"
+            )
+
+        with open(sector_path, "rb") as f:
+            sector = bytearray(f.read())
+
+        if len(sector) != 4096:
+            raise RuntimeError(
+                f"mark-read: expected 4096 bytes, got {len(sector)}"
+            )
+
+        # Step 2: zero out the RCLG magic so SectorHeader::from_bytes returns BadMagic.
+        sector[0:4] = b"\x00\x00\x00\x00"
+
+        with open(sector_path, "wb") as f:
+            f.write(sector)
+
+        # Step 3: write back via probe-rs download (erase + program).
+        write_result = subprocess.run(
+            [
+                "probe-rs", "download",
+                "--chip", "RP235x",
+                "--binary-format", "bin",
+                "--base-address", f"0x{addr:08x}",
+                sector_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if write_result.returncode != 0:
+            raise RuntimeError(
+                f"mark-read: sector write failed (exit {write_result.returncode}):\n"
+                f"  {write_result.stderr.strip()}\n\n"
+                f"Tip: ensure the target is halted and the probe is connected."
+            )
+    finally:
+        os.unlink(sector_path)
+
+
 def read_from_probe() -> bytes:
     """Read the crash sector directly from the target via probe-rs.
 
@@ -439,7 +525,7 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
     for rec in records:
         syms = symbolize_record(rec, elf_path)
         crc_badge = "[green]CRC OK[/]" if rec.crc_ok else "[bold red]CRC MISMATCH[/]"
-        kind_color = "red" if rec.crash_kind == 0 else "yellow"
+        kind_color = "red" if rec.crash_kind == 0 else ("magenta" if rec.crash_kind == 2 else "yellow")
         kind_str = f"[bold {kind_color}]{rec.crash_kind_name}[/]"
 
         header_line = (
@@ -577,8 +663,20 @@ def main() -> None:
                     help="Firmware ELF for address symbolisation (arm-none-eabi-addr2line)")
     ap.add_argument("--json", dest="json_out", action="store_true",
                     help="Output machine-readable JSON instead of rich text")
+    ap.add_argument(
+        "--mark-read",
+        action="store_true",
+        help=(
+            "After printing the report, invalidate the crash sector header so the "
+            "in-menu crash badge clears on next boot.  Only valid with --probe "
+            "(requires a live debug connection to write to flash)."
+        ),
+    )
 
     args = ap.parse_args()
+
+    if args.mark_read and not args.probe:
+        ap.error("--mark-read requires --probe (a live debug connection is needed to write flash)")
 
     # Acquire raw sector bytes.
     if args.probe:
@@ -599,6 +697,13 @@ def main() -> None:
         print_json(header, records, args.elf)
     else:
         print_report(header, records, args.elf)
+
+    if args.mark_read:
+        if not records:
+            print("No crash records found; nothing to mark as read.")
+        else:
+            mark_read_via_probe()
+            print(f"✓ Crash sector header invalidated — badge will clear on next boot.")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,10 @@ pub const MAX_RECORDS_PER_SECTOR: usize = 31; // (4096 / 128) - 1
 pub enum CrashKind {
     HardFault = 0,
     Panic = 1,
+    /// The hardware watchdog timer expired before the firmware fed it.
+    /// No ARM exception frame is available — the CPU was reset by hardware,
+    /// not by the fault handler.
+    WatchdogTimeout = 2,
     Unknown = 0xFF,
 }
 
@@ -71,6 +75,7 @@ impl CrashKind {
         match v {
             0 => Self::HardFault,
             1 => Self::Panic,
+            2 => Self::WatchdogTimeout,
             _ => Self::Unknown,
         }
     }
@@ -274,6 +279,7 @@ impl CrashRecord {
         match CrashKind::from_u8(self.crash_kind) {
             CrashKind::HardFault => "HardFault",
             CrashKind::Panic => "Panic",
+            CrashKind::WatchdogTimeout => "WatchdogTimeout",
             CrashKind::Unknown => "Unknown",
         }
     }
@@ -903,7 +909,8 @@ mod tests {
     fn crash_kind_from_u8_all_variants() {
         assert_eq!(CrashKind::from_u8(0), CrashKind::HardFault);
         assert_eq!(CrashKind::from_u8(1), CrashKind::Panic);
-        assert_eq!(CrashKind::from_u8(2), CrashKind::Unknown);
+        assert_eq!(CrashKind::from_u8(2), CrashKind::WatchdogTimeout);
+        assert_eq!(CrashKind::from_u8(3), CrashKind::Unknown);
         assert_eq!(CrashKind::from_u8(0xFF), CrashKind::Unknown);
     }
 
@@ -914,6 +921,8 @@ mod tests {
         assert_eq!(rec.crash_kind_name(), "HardFault");
         rec.crash_kind = 1;
         assert_eq!(rec.crash_kind_name(), "Panic");
+        rec.crash_kind = 2;
+        assert_eq!(rec.crash_kind_name(), "WatchdogTimeout");
         rec.crash_kind = 0xFF;
         assert_eq!(rec.crash_kind_name(), "Unknown");
     }

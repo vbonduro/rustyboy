@@ -124,6 +124,10 @@ pub(crate) struct App {
     pub(crate) staged_rom_name: Option<heapless::String<64>>,
     pub(crate) staged_rom_id: Option<RomId>,
     pub(crate) core1: Option<Peri<'static, CORE1>>,
+    /// `true` while the crash log contains records that have not yet been read
+    /// by the host decoder tool.  Set once at boot; clears automatically on the
+    /// next boot after the decoder runs `--mark-read`.
+    pub(crate) crash_pending: bool,
 }
 
 impl App {
@@ -239,6 +243,16 @@ async fn main(_spawner: Spawner) {
     if crash::storage::check_and_commit(&mut onboard_flash) {
         defmt::warn!("crash record from previous session was committed to flash");
     }
+    // Also check for a bare watchdog timeout (no HardFault handler ran).
+    if crash::storage::check_watchdog_reset(&mut onboard_flash) {
+        defmt::warn!("watchdog timeout from previous session was committed to flash");
+    }
+
+    // Check for unread crash records so menus can show the crash-report badge.
+    let crash_pending = crash::storage::has_records(&mut onboard_flash);
+    if crash_pending {
+        defmt::info!("crash: unread records found in flash — showing badge");
+    }
 
     // Check whether a ROM is already staged in flash.
     let staged = probe_staged_rom(&mut onboard_flash);
@@ -276,7 +290,6 @@ async fn main(_spawner: Spawner) {
             Irqs,
         )
     };
-
     let mut audio_buffers = AudioBuffers::new();
     let mut audio_samples = Vec::with_capacity(2048);
 
@@ -346,6 +359,7 @@ async fn main(_spawner: Spawner) {
                         staged_rom_name: None,
                         staged_rom_id: None,
                         core1: None,
+                        crash_pending,
                     };
                     let next = MainMenuState::new(&mut game_disp, &stub_app).await;
                     (AppState::MainMenu(next), None, None, None, Some(p.CORE1))
@@ -362,6 +376,7 @@ async fn main(_spawner: Spawner) {
                 staged_rom_name: None,
                 staged_rom_id: None,
                 core1: None,
+                crash_pending,
             };
             let menu_state = MainMenuState::new(&mut game_disp, &stub_app).await;
             (
@@ -387,6 +402,7 @@ async fn main(_spawner: Spawner) {
         staged_rom_name,
         staged_rom_id,
         core1: core1_token,
+        crash_pending,
     };
     refresh_save_slot_available(&mut app, &sd_mgr);
 
