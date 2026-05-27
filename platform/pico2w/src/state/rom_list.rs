@@ -239,9 +239,25 @@ impl RomListState {
             return;
         }
 
+        // Write destination first, then source.
+        //
+        // At 75 MHz SPI we write at 51.2 µs/row; the ILI9341 scans at ~52 µs/row.
+        // Our write is fractionally faster, so if we start writing a row just
+        // before the scan arrives we outpace it and every row shows new content
+        // before the scan reads it.
+        //
+        // By writing the destination item (the row the cursor is moving TO) first:
+        //   • The scan is typically still in the source area — destination hasn't
+        //     been reached yet, so we write it cleanly ahead of the scan.
+        //   • By the time we write the source, the scan has advanced past it and
+        //     new content appears on the next scan pass without a torn line.
+        //
+        // Writing source first (old order) had the opposite problem: the scan
+        // was often inside the source rows, leaving a horizontal tear on the
+        // item the cursor was leaving, visible right as the marquee started.
+        self.draw_row(app, game_disp, selected, false).await;
         self.draw_row(app, game_disp, previous_selected, false)
             .await;
-        self.draw_row(app, game_disp, selected, false).await;
     }
 
     fn transition_to_selected_rom(&self, app: &mut App) {
