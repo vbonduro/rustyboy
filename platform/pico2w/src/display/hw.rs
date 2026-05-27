@@ -128,13 +128,24 @@ pub struct GameDisplay<'d> {
     dc: Output<'d>,
     _rst: Output<'d>,
     _bl: Output<'d>,
-    /// FNV-1a hash of the last frame successfully sent to the display.
+    /// Multiplicative hash of the last frame successfully sent to the display.
     ///
     /// Compared against each new frame's hash before deciding whether to
     /// issue DMA.  Identical frames skip the 11 ms pixel DMA entirely so
     /// the display refreshes its own GRAM with no scan-line race.
     /// Cost: 4 bytes (vs 103 KB for a full shadow copy).
     prev_frame_hash: u32,
+    /// Hash of the last [`MenuFrame`] passed to [`draw_menu`].
+    ///
+    /// Hashed at the struct level (before any rendering) using the same Knuth
+    /// multiplicative step as [`knuth_hash`].  If the incoming frame hashes
+    /// identically to this cached value, `draw_menu` returns immediately
+    /// without rendering or DMA-ing anything — the display already shows the
+    /// correct content.
+    ///
+    /// Zeroed in `draw_letterbox_bars` so the first `draw_menu` call after a
+    /// game session always performs a full repaint.  Cost: 4 bytes.
+    prev_menu_frame_hash: u32,
 }
 
 impl<'d> GameDisplay<'d> {
@@ -191,13 +202,18 @@ impl<'d> GameDisplay<'d> {
             _rst: rst,
             _bl: bl,
             prev_frame_hash: 0,
+            prev_menu_frame_hash: 0,
         }
     }
 
     /// Paint the static letterbox bars (top C3, bottom black) once before the
     /// game loop. The bars are never repainted — `send_frame` only touches the
     /// 240×216 game area.
+    ///
+    /// Also resets the menu frame hash so the next `draw_menu` call (if any)
+    /// performs a full repaint rather than comparing against stale content.
     pub async fn draw_letterbox_bars(&mut self) {
+        self.prev_menu_frame_hash = 0;
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
@@ -288,8 +304,23 @@ impl<'d> GameDisplay<'d> {
 
     /// Paint the full 240×320 screen with a menu, row by row.
     ///
+    /// Hashes the [`MenuFrame`] descriptor **before** rendering.  If the frame
+    /// is identical to the previously rendered one (same title, items, selected
+    /// cursor, enabled mask, marked slot, and crash badge state), the function
+    /// returns immediately without issuing any DMA — the display already shows
+    /// the correct content.
+    ///
+    /// The skip is transparent to all callers; no state-machine code needs to
+    /// change.  The cached hash is reset in `draw_letterbox_bars` so the first
+    /// `draw_menu` call after a game session always performs a full repaint.
+    ///
     /// Uses a 480-byte stack buffer; no heap allocation.
     pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
+        let hash = Self::hash_menu_frame(frame);
+        if hash == self.prev_menu_frame_hash {
+            return; // identical frame — display already shows this content
+        }
+        self.prev_menu_frame_hash = hash;
         self.draw_rendered_rows(RenderWindow::screen(), |y, row| {
             render_menu_row(frame, y, row);
         })
@@ -381,11 +412,41 @@ impl<'d> GameDisplay<'d> {
         Some((sy_start, sy_end))
     }
 
+    /// Knuth multiplicative hash over an arbitrary byte slice.
+    ///
+    /// Processes 4 bytes at a time (one u32 XOR + multiply + avalanche per
+    /// word), with a trailing byte loop for non-aligned tails.
+    ///
+    /// - **Seed** `0xdead_beef` ensures an all-zero slice never hashes to 0,
+    ///   keeping 0 as a safe "cache miss / invalidated" sentinel.
+    /// - **Constant** `M = 0x9e37_79b9` is the Fibonacci / Knuth multiplicative
+    ///   hash constant for 32-bit words.
+    /// - **Avalanche** `h ^= h >> 16` after each multiply spreads the high bits
+    ///   into the low half, improving distribution for short inputs.
+    fn knuth_hash(bytes: &[u8]) -> u32 {
+        const M: u32 = 0x9e37_79b9;
+        let chunks = bytes.chunks_exact(4);
+        let remainder = chunks.remainder();
+        let mut h = chunks.fold(0xdead_beef_u32, |mut h, chunk| {
+            let w = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            h ^= w;
+            h = h.wrapping_mul(M);
+            h ^= h >> 16;
+            h
+        });
+        for &b in remainder {
+            h ^= b as u32;
+            h = h.wrapping_mul(M);
+            h ^= h >> 16;
+        }
+        h
+    }
+
     /// Compute a fast hash of a scaled frame.
     ///
-    /// Uses a single Knuth multiplicative step per u32 word (two packed u16s),
-    /// giving one multiply per 4 bytes instead of FNV-1a's four.  At 300 MHz
-    /// on Cortex-M33 this takes ~345 µs (2 % of a 16.7 ms frame budget).
+    /// Delegates to [`knuth_hash`] over the frame's raw bytes (~104 KB).
+    /// At 300 MHz on Cortex-M33 this takes ~345 µs (2 % of a 16.7 ms frame
+    /// budget).
     ///
     /// Used to detect identical consecutive frames so the pixel DMA can
     /// be skipped entirely when the display content hasn't changed.
@@ -393,17 +454,7 @@ impl<'d> GameDisplay<'d> {
     /// Collision probability: ~1 in 4 × 10⁹ per frame — negligible in
     /// practice; a false skip shows a stale frame for one 16 ms period.
     fn hash_frame(buf: &ScaledFrame) -> u32 {
-        // Fibonacci/Knuth multiplicative hash constant.
-        const M: u32 = 0x9e37_79b9;
-        // buf has an even number of u16 values (240 × 216 = 51 840), so
-        // chunks_exact(2) is always lossless — no remainder.
-        buf.chunks_exact(2).fold(0xdead_beef_u32, |mut h, chunk| {
-            let w = (chunk[0] as u32) | ((chunk[1] as u32) << 16);
-            h ^= w;
-            h = h.wrapping_mul(M);
-            h ^= h >> 16;
-            h
-        })
+        Self::knuth_hash(bytemuck::cast_slice(buf))
     }
 
     #[inline]
@@ -414,6 +465,53 @@ impl<'d> GameDisplay<'d> {
     #[inline]
     fn commit_frame_hash(&mut self, hash: u32) {
         self.prev_frame_hash = hash;
+    }
+
+    /// Compute a fast hash of a [`MenuFrame`] descriptor.
+    ///
+    /// Hashes each field that affects rendering: title text, item strings,
+    /// cursor position (`selected`), animation counter (`marquee_frame`),
+    /// enabled mask, marked slot, and crash badge flag.
+    ///
+    /// Feeds each field's bytes through [`knuth_hash`], mixing the results
+    /// together with the same Knuth multiplicative step.  The result is
+    /// non-zero as long as any field contains non-zero bytes (seeded from
+    /// `knuth_hash`'s `0xdead_beef` seed), keeping 0 safe as the
+    /// "never-rendered" / "invalidated" sentinel stored in
+    /// `prev_menu_frame_hash`.
+    fn hash_menu_frame(frame: &MenuFrame<'_>) -> u32 {
+        const M: u32 = 0x9e37_79b9;
+        // Start from the title bytes.
+        let mut h = Self::knuth_hash(frame.title.as_bytes());
+        // Mix in each item string.
+        for item in frame.items {
+            h ^= Self::knuth_hash(item.as_bytes());
+            h = h.wrapping_mul(M);
+            h ^= h >> 16;
+        }
+        // Mix in selected cursor index.
+        h ^= frame.selected as u32;
+        h = h.wrapping_mul(M);
+        h ^= h >> 16;
+        // Mix in marquee animation counter.
+        h ^= frame.marquee_frame;
+        h = h.wrapping_mul(M);
+        h ^= h >> 16;
+        // Mix in the enabled-flag bitmask (one bool per item).
+        for &enabled in frame.enabled {
+            h ^= enabled as u32;
+            h = h.wrapping_mul(M);
+            h ^= h >> 16;
+        }
+        // Mix in the "currently loaded" marker (None → 0, Some(n) → n+1).
+        h ^= frame.marked.map_or(0u32, |n| n as u32 + 1);
+        h = h.wrapping_mul(M);
+        h ^= h >> 16;
+        // Mix in crash-badge flag.
+        h ^= frame.crash_pending as u32;
+        h = h.wrapping_mul(M);
+        h ^= h >> 16;
+        h
     }
 
     // --- helpers ---
@@ -503,6 +601,16 @@ impl<'d> GameDisplay<'d> {
         }
     }
 
+    /// Render and DMA all rows in `window`.
+    ///
+    /// For each row, calls `render_row(y, &mut row_buf)` to fill a 480-byte
+    /// pixel buffer, then streams the window's x-column slice to the display
+    /// via async SPI DMA.  A single CASET/RASET/RAMWR setup covers the entire
+    /// window; the ILI9341 auto-increments its write pointer across rows.
+    ///
+    /// Frame-level deduplication (whole-menu skip when nothing changed) is
+    /// handled by the callers — see [`draw_menu`].  This function always
+    /// renders and transfers every row it is given.
     async fn draw_rendered_rows<F>(&mut self, window: RenderWindow, mut render_row: F)
     where
         F: FnMut(u16, &mut [u8; ROW_BYTES]),
@@ -513,16 +621,16 @@ impl<'d> GameDisplay<'d> {
 
         self.set_window(window);
         self.write_command(0x2C, &[]);
+        self.dc.set_high();
+        self.cs.set_low();
 
         let mut row = [0u8; ROW_BYTES];
         let byte_range = window.byte_range();
-
-        self.dc.set_high();
-        self.cs.set_low();
         for y in window.y_start..window.y_end {
             render_row(y, &mut row);
             self.spi.write(&row[byte_range.clone()]).await.ok();
         }
+
         self.cs.set_high();
     }
 
