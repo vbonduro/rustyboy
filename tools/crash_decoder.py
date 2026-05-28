@@ -59,6 +59,7 @@ FLAG_HAS_ARM_REGS = 0x01
 FLAG_HAS_GB_STATE = 0x02
 FLAG_HAS_ROM_INFO = 0x04
 FLAG_HAS_PANIC_LOC = 0x08
+FLAG_HAS_STACK_OVERFLOW = 0x10  # MSP was below _stack_end at crash time
 
 # Flash offset of the crash log sector inside the 4 MiB address space.
 CRASH_LOG_FLASH_OFFSET = 0x3FF000  # relative to flash base 0x10000000
@@ -95,7 +96,8 @@ CRASH_LOG_ADDR = 0x10000000 + CRASH_LOG_FLASH_OFFSET
 # [67]     _pad3
 # [68..80] panic_loc       12 bytes, null-terminated
 # [80..82] panic_line      u16 LE
-# [82..120] _reserved
+# [82..84]  stack_headroom u16 LE  (overflow depth or remaining headroom)
+# [84..120] _reserved
 # [120..124] crc32         u32 LE
 # [124..128] _pad4
 
@@ -129,9 +131,10 @@ _RECORD_FMT = (
     "x"    # _pad3
     "12s"  # panic_loc
     "H"    # panic_line
-    "38x"  # _reserved + _pad4
-    "I"    # crc32
-    "4x"   # _pad4
+    "H"    # stack_headroom
+    "36x"  # _reserved [84..120]
+    "I"    # crc32     [120..124]
+    "4x"   # _pad4     [124..128]
 )
 assert struct.calcsize(_RECORD_FMT) == RECORD_SIZE, (
     f"Record struct size mismatch: {struct.calcsize(_RECORD_FMT)} != {RECORD_SIZE}"
@@ -191,6 +194,7 @@ class CrashRecord:
             self.ppu_stat,
             self.panic_loc_raw,
             self.panic_line,
+            self.stack_headroom,
             self.crc32_stored,
         ) = fields
 
@@ -223,6 +227,11 @@ class CrashRecord:
     @property
     def has_panic_loc(self) -> bool:
         return bool(self.flags & FLAG_HAS_PANIC_LOC)
+
+    @property
+    def has_stack_overflow(self) -> bool:
+        """MSP was below `_stack_end` at crash time — stack overflow detected."""
+        return bool(self.flags & FLAG_HAS_STACK_OVERFLOW)
 
     @property
     def rom_id_hex(self) -> str:
@@ -272,6 +281,10 @@ class CrashRecord:
                 "file": self.panic_loc,
                 "line": self.panic_line,
             } if self.has_panic_loc else None,
+            "stack": {
+                "headroom_bytes": self.stack_headroom,
+                "overflowed": self.has_stack_overflow,
+            } if self.stack_headroom > 0 or self.has_stack_overflow else None,
         }
 
 
@@ -535,7 +548,22 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
         )
         console.print(Panel(header_line, expand=False, box=box.SIMPLE_HEAVY))
 
+        # Stack overflow / headroom
+        if rec.has_stack_overflow:
+            console.print(
+                f"  [bold red]⚠ STACK OVERFLOW[/]  "
+                f"MSP was [bold red]{rec.stack_headroom}[/] bytes [bold red]below[/] "
+                f"_stack_end at crash time"
+            )
+        elif rec.stack_headroom > 0:
+            warn = " [bold yellow]⚠ LOW[/]" if rec.stack_headroom < 4096 else ""
+            console.print(
+                f"  [bold]Stk hdm[/]  {rec.stack_headroom} bytes remaining"
+                f"{warn}"
+            )
+
         # ARM state
+        is_unaligned = bool(rec.arm_cfsr & (1 << 24))
         if rec.has_arm_regs:
             pc_sym = syms.get("pc", "")
             lr_sym = syms.get("lr", "")
@@ -548,7 +576,26 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
             if rec.arm_hfsr:
                 console.print(f"  [bold]HFSR   [/]  0x{rec.arm_hfsr:08x}  "
                               + _hfsr_description(rec.arm_hfsr))
-            if rec.arm_fault_addr:
+            if is_unaligned:
+                # For UNALIGNED faults, arm_fault_addr = stacked R0 at fault time.
+                # BFAR/MMFAR are not updated by hardware for UFSR.UNALIGNED.
+                console.print(
+                    f"  [bold]Stk R0 [/]  [red]0x{rec.arm_fault_addr:08x}[/]"
+                    f"  [dim](stacked R0 — likely faulting address)[/]"
+                )
+                # panic_line field repurposed as stacked R1 lo16 for UNALIGNED HardFaults.
+                if not rec.has_panic_loc:
+                    r1_lo = rec.panic_line
+                    align_note = ""
+                    if r1_lo & 3:
+                        align_note = f"  [bold red]MISALIGNED (+{r1_lo & 3})[/]"
+                    elif r1_lo == 0:
+                        align_note = "  [dim](zero — may not be faulting addr)[/]"
+                    console.print(
+                        f"  [bold]Stk R1 [/]  [red]0x{r1_lo:04x}[/]"
+                        f"  [dim](stacked R1 lo16)[/]{align_note}"
+                    )
+            elif rec.arm_fault_addr:
                 console.print(f"  [bold]Fault@ [/]  [red]0x{rec.arm_fault_addr:08x}[/]")
 
         # Panic location

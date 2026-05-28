@@ -91,6 +91,10 @@ pub mod flags {
     pub const HAS_ROM_INFO: u8 = 0x04;
     /// Panic file / line is valid.
     pub const HAS_PANIC_LOC: u8 = 0x08;
+    /// The ARM MSP was below `_stack_end` at crash time — stack overflow.
+    /// When set, `stack_headroom` holds the overflow depth in bytes.
+    /// When clear, `stack_headroom` holds the remaining headroom in bytes.
+    pub const HAS_STACK_OVERFLOW: u8 = 0x10;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +138,10 @@ pub mod flags {
 //   [67]      _pad3
 //   [68..80]  panic_loc          null-terminated filename (last segment, ≤11 chars)
 //   [80..82]  panic_line         source line number
-//   [82..120] _reserved          zero-filled
+//   [82..84]  stack_headroom     bytes between MSP-at-fault and _stack_end:
+//                                if HAS_STACK_OVERFLOW set → overflow depth,
+//                                else → remaining stack headroom
+//   [84..120] _reserved          zero-filled
 //   [120..124] crc32             CRC32 of bytes [0..120]
 //   [124..128] _pad4
 //
@@ -173,6 +180,11 @@ pub struct CrashRecord {
     /// Last path segment of the panic source file, null-terminated, ≤ 11 chars.
     pub panic_loc: [u8; 12],
     pub panic_line: u16,
+    /// Bytes between MSP-at-fault and `_stack_end`.
+    /// Meaning depends on `flags::HAS_STACK_OVERFLOW`:
+    ///   set   → overflow depth (MSP was this many bytes below `_stack_end`)
+    ///   clear → remaining headroom (MSP was this many bytes above `_stack_end`)
+    pub stack_headroom: u16,
 }
 
 /// Opaque 128-byte wire representation.
@@ -217,7 +229,8 @@ impl CrashRecord {
         // buf[67] = 0 (pad)
         buf[68..80].copy_from_slice(&self.panic_loc);
         buf[80..82].copy_from_slice(&self.panic_line.to_le_bytes());
-        // buf[82..120] = 0 (reserved)
+        buf[82..84].copy_from_slice(&self.stack_headroom.to_le_bytes());
+        // buf[84..120] = 0 (reserved)
         // buf[124..128] = 0 (pad)
 
         let checksum = crc32(&buf[..120]);
@@ -271,6 +284,7 @@ impl CrashRecord {
             ppu_stat: buf[66],
             panic_loc: buf[68..80].try_into().unwrap(),
             panic_line: u16::from_le_bytes(buf[80..82].try_into().unwrap()),
+            stack_headroom: u16::from_le_bytes(buf[82..84].try_into().unwrap()),
         })
     }
 
@@ -306,14 +320,26 @@ pub const SECTOR_FULL: u8 = 0xFF;
 // Slot discovery (pure, testable without hardware)
 // ---------------------------------------------------------------------------
 
-/// Return the index of the first slot whose 4-byte magic does not equal
-/// `RECORD_MAGIC`, or `None` if every slot is occupied.
+/// Return the index of the first slot that is completely erased (all bytes
+/// 0xFF), or `None` if no such slot exists (sector is full or entirely corrupt).
+///
+/// **Why 0xFF instead of "not RCRP"?**
+/// NOR flash can only transition bits from 1 → 0, never 0 → 1 without an
+/// erase.  A slot that contains any non-0xFF byte is considered occupied —
+/// whether it holds a valid RCRP record, a corrupt/partially-written record,
+/// or garbage from a failed previous write.  Selecting such a slot as the
+/// write target would AND the new data with the residual bits, silently
+/// corrupting the magic and CRC without returning any error.
+///
+/// When all 31 slots are occupied (by either valid records or non-erased
+/// corruption), this returns `None`, triggering a sector erase in the caller
+/// before a fresh record is written.
 ///
 /// The caller reads the leading 4 bytes of each record slot from flash and
 /// passes them here.  Keeping this logic pure (no I/O) lets it be unit-tested
 /// on the host without any embedded hardware or flash driver.
 pub fn find_next_empty_slot(slot_magics: &[[u8; 4]; MAX_RECORDS_PER_SECTOR]) -> Option<usize> {
-    slot_magics.iter().position(|m| m != &RECORD_MAGIC)
+    slot_magics.iter().position(|m| m == &[0xFF, 0xFF, 0xFF, 0xFF])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,7 +602,7 @@ impl ScratchRegs {
         //   [10] = [gb_d:8 | gb_e:8 | gb_h:8 | gb_l:8]
         //   [11] = [gb_sp:16 | ppu_ly:8 | ppu_stat:8]
         //   [12] = gb_cycle_lo
-        //   [13] = panic_line (u32, stored as u32)
+        //   [13] = [stack_headroom:16 | panic_line_or_r1:16]
         //   [14] = panic_file[0..4]
         //   [15] = panic_file[4..8]
         let rom_id_prefix = wd[8].to_le_bytes();
@@ -585,6 +611,7 @@ impl ScratchRegs {
         let sp_ly = wd[11];
         let gb_cycle_lo = wd[12];
         let panic_line = (wd[13] & 0xFFFF) as u16;
+        let stack_headroom = (wd[13] >> 16) as u16;
 
         let mut panic_loc = [0u8; 12];
         panic_loc[0..4].copy_from_slice(&wd[14].to_le_bytes());
@@ -621,6 +648,7 @@ impl ScratchRegs {
             ppu_stat: ((sp_ly >> 24) & 0xFF) as u8,
             panic_loc,
             panic_line,
+            stack_headroom,
         }
     }
 }
@@ -665,6 +693,7 @@ mod tests {
             ppu_stat: 0x83,
             panic_loc: *b"storage.r\0\0\0",
             panic_line: 0,
+            stack_headroom: 0,
         }
     }
 
@@ -892,6 +921,27 @@ mod tests {
         magics[0] = RECORD_MAGIC;
         magics[1] = RECORD_MAGIC;
         assert_eq!(find_next_empty_slot(&magics), Some(2));
+    }
+
+    #[test]
+    fn find_next_empty_slot_corrupt_treated_as_occupied() {
+        // A slot with non-RCRP, non-0xFF bytes (e.g. from a failed flash write)
+        // must be treated as occupied — not as an available write target.
+        // Writing over a non-erased slot silently corrupts data on NOR flash.
+        let mut magics = [RECORD_MAGIC; MAX_RECORDS_PER_SECTOR];
+        // Replace the last slot with the "BCB@" pattern seen in real corrupt flash.
+        magics[MAX_RECORDS_PER_SECTOR - 1] = [0x42, 0x43, 0x42, 0x40]; // BCB@
+        // All 31 slots are either RCRP or corrupt — no erased slot available.
+        assert_eq!(find_next_empty_slot(&magics), None);
+    }
+
+    #[test]
+    fn find_next_empty_slot_ef_treated_as_occupied() {
+        // 0xEF bytes are a partially-programmed state (NOR flash bit 4 = 0 instead
+        // of the erased 1).  These must not be selected as a write target.
+        let mut magics = [RECORD_MAGIC; MAX_RECORDS_PER_SECTOR];
+        magics[MAX_RECORDS_PER_SECTOR - 1] = [0xEF, 0xEF, 0xEF, 0xEF];
+        assert_eq!(find_next_empty_slot(&magics), None);
     }
 
     #[test]

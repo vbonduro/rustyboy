@@ -60,13 +60,11 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
     // want to loop on crash commits.
     clear_crash_magic();
 
-    if let Err(e) = write_record_to_flash(flash, |slot| snap.to_crash_record(slot)) {
-        defmt::error!("crash: flash commit failed: {:?}", e);
-        return false;
+    match write_record_to_flash(flash, |slot| snap.to_crash_record(slot)) {
+        Ok(true)  => { defmt::info!("crash: committed crash record to flash"); true }
+        Ok(false) => false, // skipped — sector full or duplicate
+        Err(e)    => { defmt::error!("crash: flash commit failed: {:?}", e); false }
     }
-
-    defmt::info!("crash: committed crash record to flash");
-    true
 }
 
 /// Check whether the last reset was a hardware watchdog timeout and, if so,
@@ -97,13 +95,11 @@ pub fn check_watchdog_reset(flash: &mut OnboardFlash<'_>) -> bool {
     // next boot (the register persists across watchdog resets).
     clear_watchdog_reason();
 
-    if let Err(e) = write_record_to_flash(flash, |slot| build_watchdog_record(slot)) {
-        defmt::error!("crash: watchdog flash commit failed: {:?}", e);
-        return false;
+    match write_record_to_flash(flash, |slot| build_watchdog_record(slot)) {
+        Ok(true)  => { defmt::info!("crash: watchdog timeout — committed record to flash"); true }
+        Ok(false) => false,
+        Err(e)    => { defmt::error!("crash: watchdog flash commit failed: {:?}", e); false }
     }
-
-    defmt::info!("crash: watchdog timeout — committed record to flash");
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +229,30 @@ fn build_watchdog_record(slot_seq: u8) -> super::CrashRecord {
 }
 
 /// Find the next available flash slot and write `record` to it, then update
-/// the sector header.  Erases the sector first if all 31 slots are full.
+/// the sector header.
+///
+/// Returns `Ok(true)` if a record was written, `Ok(false)` if the write was
+/// skipped (sector full or duplicate of the previous record), `Err` on a
+/// hardware flash fault.
+///
+/// # Flash-wear protection
+///
+/// Two policies combine to prevent a crash boot-loop from wearing the crash
+/// sector:
+///
+/// **A — No auto-erase when full.**  When all 31 slots hold records *and* the
+/// sector header is valid (`RCLG` magic intact), the sector is treated as
+/// "pending user acknowledgement".  The write is skipped without erasing.
+/// To resume capture, run `crash_decoder.py --mark-read`; that tool writes
+/// zeros over the `RCLG` magic, which signals this function to erase and
+/// restart on the next boot.
+///
+/// **B — Consecutive-crash deduplication.**  Before writing, the previous
+/// committed record is read and compared against the pending crash by
+/// fingerprint (crash kind, fault-status registers, panic location).  If they
+/// match the write is skipped.  For a repeating boot-loop crash this means
+/// only the first occurrence is stored — the sector never fills from a single
+/// repeating fault.
 ///
 /// `record_builder` receives the resolved slot index and returns the
 /// [`CrashRecord`] to write; this keeps slot assignment inside the storage
@@ -242,13 +261,13 @@ fn build_watchdog_record(slot_seq: u8) -> super::CrashRecord {
 fn write_record_to_flash(
     flash: &mut OnboardFlash<'_>,
     record_builder: impl FnOnce(u8) -> super::CrashRecord,
-) -> Result<(), FlashError> {
+) -> Result<bool, FlashError> {
     // Read existing header for erase_count.  If missing, treat as a fresh sector.
     let existing_header = read_sector_header(flash).ok();
     let erase_count = existing_header.map(|h| h.erase_count).unwrap_or(0);
 
     // Read the leading 4 bytes of each slot from flash, then find the first
-    // empty one via the pure `find_next_empty_slot` helper (testable on host).
+    // truly-erased (all-0xFF) slot via the pure helper (testable on host).
     let mut slot_magics = [[0u8; 4]; MAX_RECORDS_PER_SECTOR];
     for (i, magic) in slot_magics.iter_mut().enumerate() {
         let offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + i * RECORD_SIZE;
@@ -258,19 +277,50 @@ fn write_record_to_flash(
 
     let (slot, erase_count) = match next_slot {
         Some(s) => (s as u8, erase_count),
-        None => {
-            // All 31 slots full — erase the sector and restart.
-            let new_erase = erase_count.wrapping_add(1);
-            flash.blocking_erase(
-                CRASH_LOG_OFFSET as u32,
-                (CRASH_LOG_OFFSET + ERASE_SIZE) as u32,
-            )?;
-            (0u8, new_erase)
-        }
+
+        // No erased slot found — sector is full or entirely corrupt.
+        None => match existing_header {
+            // Header is valid: sector is full and the user has not yet
+            // acknowledged the existing records.  Refuse to erase —
+            // run `crash_decoder.py --mark-read` to drain and resume.
+            Some(_) => {
+                defmt::warn!(
+                    "crash: log sector full — run crash_decoder.py --mark-read to resume capture"
+                );
+                return Ok(false);
+            }
+
+            // Header is absent / invalid: the user ran `--mark-read` (which
+            // zeros the RCLG magic) or the sector is completely fresh.
+            // Safe to erase and start a new cycle.
+            None => {
+                let new_erase = erase_count.wrapping_add(1);
+                flash.blocking_erase(
+                    CRASH_LOG_OFFSET as u32,
+                    (CRASH_LOG_OFFSET + ERASE_SIZE) as u32,
+                )?;
+                (0u8, new_erase)
+            }
+        },
     };
 
-    // Build and write the crash record.
+    // Build the record now so we can fingerprint it before the write.
     let record = record_builder(slot);
+
+    // Deduplication (Option B): if the most recently committed record has the
+    // same crash fingerprint as this one, skip the write.  This prevents a
+    // repeating boot-loop crash from consuming all 31 slots and triggering
+    // repeated sector erases.
+    if slot > 0 {
+        if let Ok(prev) = read_record_at_slot(flash, (slot - 1) as usize) {
+            if is_duplicate_crash(&record, &prev) {
+                defmt::warn!("crash: duplicate — same crash site as previous record, skipping");
+                return Ok(false);
+            }
+        }
+    }
+
+    // Write the crash record.
     let record_bytes = record.to_bytes();
     let record_offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + (slot as usize) * RECORD_SIZE;
     flash.blocking_write(record_offset as u32, &record_bytes)?;
@@ -283,7 +333,24 @@ fn write_record_to_flash(
     let header = SectorHeader { erase_count, next_slot: 0 };
     flash.blocking_write(CRASH_LOG_OFFSET as u32, &header.to_bytes())?;
 
-    Ok(())
+    Ok(true)
+}
+
+/// Returns `true` if `new` and `prev` share the same crash fingerprint.
+///
+/// Compared fields: crash kind, flags, ARM PC and CFSR (for HardFaults), and
+/// panic file + line (for panics).  GB register state and cycle counter are
+/// deliberately excluded — the emulator can be at a different point each time
+/// even when the same code path crashes.
+#[cfg(target_arch = "arm")]
+#[inline]
+fn is_duplicate_crash(new: &super::CrashRecord, prev: &super::CrashRecord) -> bool {
+    new.crash_kind == prev.crash_kind
+        && new.flags    == prev.flags
+        && new.arm_pc   == prev.arm_pc
+        && new.arm_cfsr == prev.arm_cfsr
+        && new.panic_loc  == prev.panic_loc
+        && new.panic_line == prev.panic_line
 }
 
 #[cfg(target_arch = "arm")]
