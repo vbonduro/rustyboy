@@ -29,9 +29,9 @@ impl RunningState {
     ) {
         // Scope the DMA futures so `game_disp` is free after the block.
         let open_menu = {
-            let frame_buf = gameboy.published_scaled_frame();
+            let frame_buf = gameboy.published_native_frame();
             // Dirty-row bitmap produced by Core 1 at native GB resolution.
-            // Must be read after published_scaled_frame() (Acquire ordering).
+            // Must be read after published_native_frame() (Acquire ordering).
             let dirty_rows = gameboy.published_dirty_rows();
 
             // send_frame handles hash check, dirty-range narrowing, blocking
@@ -73,7 +73,7 @@ impl RunningState {
             if !disp_ready {
                 disp_future.as_mut().await;
             }
-            gameboy.release_scaled_frame();
+            gameboy.release_native_frame();
             if !audio_ready {
                 audio_future.as_mut().await;
             }

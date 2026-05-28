@@ -19,9 +19,51 @@ use mipidsi::Builder;
 
 use super::{
     loading_bar_window, menu_item_text_window, menu_item_window, render_loading_row,
-    render_menu_row, Display, LoadingFrame, LoadingProgress, RenderWindow, ScaledFrame,
+    render_menu_row, scale_native_to_rgb565_range, Display, LoadingFrame, LoadingProgress,
+    NativeFrame, RenderWindow, ScaledFrame,
 };
 use crate::menu::MenuFrame;
+
+// ---------------------------------------------------------------------------
+// Core 0 pre-scale buffer
+//
+// `send_frame` scales the dirty row range from the native GB framebuffer (23 KB)
+// into this 101 KB static, then issues a single DMA burst.  Keeping the buffer
+// as a plain static (rather than inside GameDisplay) avoids placing 101 KB on
+// the stack or heap and lets the linker pack it into BSS.
+//
+// # Safety invariant
+// CORE0_SCALE_BUF is written and read exclusively inside `send_frame` /
+// `send_frame_raw`, which are always called from Core 0's single async
+// executor task.  No other task or core ever touches this buffer, so there is
+// no aliasing — the UnsafeCell here is used only to satisfy the Rust
+// requirement that `static` items implement `Sync`.
+// ---------------------------------------------------------------------------
+
+struct Core0ScaleBuf(core::cell::UnsafeCell<ScaledFrame>);
+impl Core0ScaleBuf {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new([0u16; super::SCALED_FRAME_PIXELS]))
+    }
+    /// Obtain a mutable reference to the buffer.
+    ///
+    /// # Safety
+    /// Caller must guarantee no concurrent access (upheld by the single-core,
+    /// single-task invariant described above).
+    unsafe fn as_mut(&self) -> &mut ScaledFrame {
+        &mut *self.0.get()
+    }
+    /// Obtain a shared reference to the buffer.
+    ///
+    /// # Safety
+    /// Same aliasing requirement as [`as_mut`].
+    unsafe fn as_ref(&self) -> &ScaledFrame {
+        &*self.0.get()
+    }
+}
+// Safety: only accessed from a single Core-0 task; no concurrent access.
+unsafe impl Sync for Core0ScaleBuf {}
+static CORE0_SCALE_BUF: Core0ScaleBuf = Core0ScaleBuf::new();
 
 // Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
 // the requested frequency. 62.5 MHz is exact at 250 MHz sysclk, but at 280 MHz
@@ -234,8 +276,9 @@ impl<'d> GameDisplay<'d> {
         info!("display: letterbox bars done");
     }
 
-    /// Transfer a pre-scaled 240×216 frame to the display, handling dirty-row
-    /// detection, hash-based skip, and the DMA / emulation overlap pattern.
+    /// Transfer a native Game Boy frame (160×144 palette indices) to the
+    /// display, handling dirty-row detection, hash-based skip, pre-scaling,
+    /// and the DMA / emulation overlap pattern.
     ///
     /// # How to use in the game loop
     ///
@@ -249,38 +292,68 @@ impl<'d> GameDisplay<'d> {
     /// # How it works
     ///
     /// On the **first poll** (via `poll_once`):
-    /// - Computes the frame hash.  If identical to the previous frame, returns
+    /// - Hashes the 23 KB native frame (~76 µs at 300 MHz, vs ~345 µs for a
+    ///   pre-scaled 101 KB frame).  If identical to the previous frame, returns
     ///   `Poll::Ready` immediately — no DMA, no tearing.
-    /// - Otherwise computes the dirty display-row range, programs CASET/RASET/
-    ///   RAMWR **synchronously** (blocking TX-FIFO writes, ~2 µs for 15 bytes at
-    ///   75 MHz), then arms the pixel DMA and returns `Poll::Pending`.
+    /// - Otherwise computes the dirty display-row range from the dirty bitmap,
+    ///   **pre-scales only those rows** from the native frame into the 101 KB
+    ///   static `CORE0_SCALE_BUF`, programs CASET/RASET/RAMWR **synchronously**
+    ///   (blocking TX-FIFO writes, ~2 µs for 15 bytes at 75 MHz), then arms the
+    ///   pixel DMA from `CORE0_SCALE_BUF` and returns `Poll::Pending`.
     ///
     /// On the **second poll** (the `.await` after emulation):
     /// - The DMA has been running concurrently with ~16 ms of emulation.
     ///   Raises CS HIGH and returns `Poll::Ready`.
-    pub async fn send_frame(&mut self, buf: &ScaledFrame, dirty: &[u32; 5]) {
-        let hash = Self::hash_frame(buf);
+    ///
+    /// # Memory note
+    ///
+    /// Triple-buffered shared slots now hold raw native frames (3 × 23 KB =
+    /// 69 KB) rather than pre-scaled frames (3 × 101 KB = 303 KB).  The single
+    /// `CORE0_SCALE_BUF` (101 KB) replaces the ~133 KB that was being spent on
+    /// the two redundant scaled slots, for a net saving of 133 KB.
+    pub async fn send_frame(&mut self, native: &NativeFrame, dirty: &[u32; 5]) {
+        let hash = Self::hash_frame(native);
         if !self.frame_changed(hash) {
             return; // identical frame — display GRAM already shows this content
         }
         let (sy_start, sy_end) = Self::dirty_display_range(dirty).unwrap_or((0, 216));
         self.commit_frame_hash(hash);
+        // Pre-scale only the dirty row range into the static Core 0 output buffer.
+        // Safety: CORE0_SCALE_BUF is only accessed from this function, which runs
+        // on Core 0's single async executor task — no concurrent access possible.
+        unsafe {
+            scale_native_to_rgb565_range(native, CORE0_SCALE_BUF.as_mut(), sy_start, sy_end);
+        }
         // Blocking setup: CASET + RASET + RAMWR (~2 µs).  Completing synchronously
         // here ensures that the pixel-DMA future below is reached and armed within
         // the same `poll_once` call, so the DMA runs during the emulation step.
         self.setup_frame_range(sy_start, sy_end);
-        // Async pixel DMA: returns Poll::Pending after arming DMA hardware.
-        self.send_frame_range_pixels(buf, sy_start, sy_end).await;
+        // Async pixel DMA from CORE0_SCALE_BUF: returns Poll::Pending after arming.
+        // Safety: same single-task invariant; no other code reads CORE0_SCALE_BUF
+        // while the DMA is in flight.
+        unsafe {
+            self.send_frame_range_pixels(CORE0_SCALE_BUF.as_ref(), sy_start, sy_end)
+                .await;
+        }
     }
 
-    /// Transfer a pre-scaled 240×216 frame to the display via async DMA.
+    /// Transfer a native Game Boy frame (160×144 palette indices) to the
+    /// display via async DMA.
     ///
     /// Convenience wrapper that does a full-frame write without dirty-row
-    /// narrowing.  Uses blocking setup + async pixel DMA; compatible with the
-    /// `poll_once` / emulation-overlap pattern.
-    pub async fn send_frame_raw(&mut self, buf: &ScaledFrame) {
+    /// narrowing.  Pre-scales the entire 240×216 region into `CORE0_SCALE_BUF`
+    /// then streams via async pixel DMA; compatible with the `poll_once` /
+    /// emulation-overlap pattern.
+    pub async fn send_frame_raw(&mut self, native: &NativeFrame) {
+        // Safety: single Core-0 task invariant; see CORE0_SCALE_BUF docs.
+        unsafe {
+            scale_native_to_rgb565_range(native, CORE0_SCALE_BUF.as_mut(), 0, 216);
+        }
         self.setup_frame_range(0, 216);
-        self.send_frame_range_pixels(buf, 0, 216).await;
+        unsafe {
+            self.send_frame_range_pixels(CORE0_SCALE_BUF.as_ref(), 0, 216)
+                .await;
+        }
     }
 
     /// Paint the full 240×320 screen with a ROM loading progress screen.
@@ -442,19 +515,23 @@ impl<'d> GameDisplay<'d> {
         h
     }
 
-    /// Compute a fast hash of a scaled frame.
+    /// Compute a fast hash of a native Game Boy frame (160×144 palette indices).
     ///
-    /// Delegates to [`knuth_hash`] over the frame's raw bytes (~104 KB).
-    /// At 300 MHz on Cortex-M33 this takes ~345 µs (2 % of a 16.7 ms frame
-    /// budget).
+    /// Delegates to [`knuth_hash`] over the frame's raw 23 KB byte slice.
+    /// At 300 MHz on Cortex-M33 this takes ~76 µs — 4.5× faster than hashing
+    /// the 101 KB pre-scaled frame (~345 µs).
+    ///
+    /// Hashing the native frame is equivalent for change-detection purposes:
+    /// the scale is a pure function of the native content, so a different native
+    /// frame always produces a different scaled frame.
     ///
     /// Used to detect identical consecutive frames so the pixel DMA can
     /// be skipped entirely when the display content hasn't changed.
     ///
     /// Collision probability: ~1 in 4 × 10⁹ per frame — negligible in
     /// practice; a false skip shows a stale frame for one 16 ms period.
-    fn hash_frame(buf: &ScaledFrame) -> u32 {
-        Self::knuth_hash(bytemuck::cast_slice(buf))
+    fn hash_frame(buf: &NativeFrame) -> u32 {
+        Self::knuth_hash(buf.as_slice())
     }
 
     #[inline]
