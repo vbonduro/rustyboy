@@ -69,6 +69,7 @@ static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 static CORE1_WORKER: StaticStorage<GameBoyWorker> = StaticStorage::new();
 
+
 #[derive(Clone, Copy)]
 enum Core1Command {
     Worker(WorkerCommand),
