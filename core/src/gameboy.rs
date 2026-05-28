@@ -101,7 +101,26 @@ impl GameBoy<LocalTransport> {
 
 impl<W: WorkerTransport> GameBoy<W> {
     /// Construct with a custom transport. Used by platform-specific code (e.g. Pico multicore).
+    ///
+    /// Allocates the front framebuffer on the heap. Prefer
+    /// [`with_transport_and_buffer`] on memory-constrained targets to avoid
+    /// the 22 KiB heap cost of the front buffer.
     pub fn with_transport(memory: Box<GameBoyMemory>, transport: W) -> Self {
+        Self::with_transport_and_buffer(memory, transport, Box::new([0u8; FRAMEBUFFER_SIZE]))
+    }
+
+    /// Construct with a custom transport and a caller-supplied front buffer.
+    ///
+    /// Pass a `Box<[u8; FRAMEBUFFER_SIZE]>` backed by static memory to avoid
+    /// heap-allocating the 22 KiB front buffer.  On the Pico the caller holds
+    /// a `static mut [u8; FRAMEBUFFER_SIZE]` and wraps it in a `Box` via
+    /// `Box::from_raw`; the lifetime is valid for the life of the program so
+    /// this is sound.
+    pub fn with_transport_and_buffer(
+        memory: Box<GameBoyMemory>,
+        transport: W,
+        front_buffer: Box<[u8; FRAMEBUFFER_SIZE]>,
+    ) -> Self {
         let cpu = Sm83::new_pure();
         let joypad = JoypadPeripheral::new();
         let apu = ApuPeripheral::new();
@@ -118,7 +137,7 @@ impl<W: WorkerTransport> GameBoy<W> {
             joypad,
             serial: SerialPort::new(),
             dma: None,
-            front_buffer: Box::new([0u8; FRAMEBUFFER_SIZE]),
+            front_buffer,
             bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             transport,
