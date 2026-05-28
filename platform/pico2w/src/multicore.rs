@@ -24,7 +24,7 @@ use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
 use crate::crash::CRASH_CONTEXT;
-use crate::display::{scale_to_rgb565, ScaledFrame, SCALED_FRAME_PIXELS};
+use crate::display::NativeFrame;
 use crate::stack_probe;
 
 const CORE1_STACK_SIZE: usize = 8192;
@@ -32,7 +32,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 512;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
 const LCD_TIMING_BATCH_CYCLES: u16 = 80;
-const SCALED_FRAME_SLOT_COUNT: usize = 3;
+const NATIVE_FRAME_SLOT_COUNT: usize = 3;
 /// Number of u32 words needed to hold one dirty bit per GB scanline (144 rows).
 /// ⌈144 / 32⌉ = 5  (160 bits, 16 spare).
 pub const DIRTY_BITMAP_WORDS: usize = (VISIBLE_SCANLINES as usize + 31) / 32;
@@ -109,18 +109,26 @@ impl PpuSnapshot {
     }
 }
 
-struct SharedScaledFrameSlot(UnsafeCell<ScaledFrame>);
+/// Triple-buffered raw native frame slot (160×144 palette indices, 23 KB each).
+///
+/// Core 1 copies the PPU framebuffer into an unpublished slot and then flips
+/// `published_frame`.  Core 0 reads the published slot to pre-scale and DMA to
+/// the display.  With native slots (3 × 23 KB = 69 KB) instead of pre-scaled
+/// slots (3 × 101 KB = 303 KB) we save 234 KB in `SHARED_WORKER_STATE`, of
+/// which 101 KB is re-spent on the static `CORE0_SCALE_BUF` in `hw.rs`,
+/// for a net saving of 133 KB.
+struct SharedNativeFrameSlot(UnsafeCell<NativeFrame>);
 
-impl SharedScaledFrameSlot {
+impl SharedNativeFrameSlot {
     const fn new() -> Self {
-        Self(UnsafeCell::new([0; SCALED_FRAME_PIXELS]))
+        Self(UnsafeCell::new([0u8; FRAMEBUFFER_SIZE]))
     }
 
-    fn as_ptr(&self) -> *const ScaledFrame {
-        self.0.get() as *const ScaledFrame
+    fn as_ptr(&self) -> *const NativeFrame {
+        self.0.get() as *const NativeFrame
     }
 
-    fn as_mut_ptr(&self) -> *mut ScaledFrame {
+    fn as_mut_ptr(&self) -> *mut NativeFrame {
         self.0.get()
     }
 }
@@ -128,7 +136,7 @@ impl SharedScaledFrameSlot {
 // Safety: access is synchronized by the published-frame atomics; core 1 only
 // writes the next unpublished slot and only flips the published slot after the
 // writes complete.
-unsafe impl Sync for SharedScaledFrameSlot {}
+unsafe impl Sync for SharedNativeFrameSlot {}
 
 /// Per-scanline hashes from the previous published raw framebuffer.
 ///
@@ -197,8 +205,8 @@ unsafe impl<T> Sync for StaticStorage<T> {}
 struct SharedWorkerState {
     sync_snapshot: Mutex<RefCell<PpuSnapshot>>,
     live_ppu_snapshot: Mutex<RefCell<PpuSnapshot>>,
-    scaled_frame_slots: [SharedScaledFrameSlot; SCALED_FRAME_SLOT_COUNT],
-    scaled_frame_busy: [AtomicBool; SCALED_FRAME_SLOT_COUNT],
+    native_frame_slots: [SharedNativeFrameSlot; NATIVE_FRAME_SLOT_COUNT],
+    native_frame_busy: [AtomicBool; NATIVE_FRAME_SLOT_COUNT],
     published_frame: AtomicU8,
     published_frame_seq: AtomicU32,
     sync_complete: AtomicU32,
@@ -221,12 +229,12 @@ impl SharedWorkerState {
         Self {
             sync_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
             live_ppu_snapshot: Mutex::new(RefCell::new(PpuSnapshot::new())),
-            scaled_frame_slots: [
-                SharedScaledFrameSlot::new(),
-                SharedScaledFrameSlot::new(),
-                SharedScaledFrameSlot::new(),
+            native_frame_slots: [
+                SharedNativeFrameSlot::new(),
+                SharedNativeFrameSlot::new(),
+                SharedNativeFrameSlot::new(),
             ],
-            scaled_frame_busy: [
+            native_frame_busy: [
                 AtomicBool::new(false),
                 AtomicBool::new(false),
                 AtomicBool::new(false),
@@ -248,8 +256,8 @@ impl SharedWorkerState {
         let current_slot = self.published_frame.load(Ordering::Acquire) as usize;
         // Scan all slots for a free one that isn't currently being consumed.
         // All initial values are zero so SharedWorkerState stays in .bss.
-        let Some(target_slot) = (0..SCALED_FRAME_SLOT_COUNT).find(|&slot| {
-            slot != current_slot && !self.scaled_frame_busy[slot].load(Ordering::Acquire)
+        let Some(target_slot) = (0..NATIVE_FRAME_SLOT_COUNT).find(|&slot| {
+            slot != current_slot && !self.native_frame_busy[slot].load(Ordering::Acquire)
         }) else {
             return;
         };
@@ -272,7 +280,7 @@ impl SharedWorkerState {
         // called from Core 1's `run_core1_worker` loop, and Core 0 never reads
         // `prev_row_hashes`.  Core 0 does read `dirty_rows`, but only after
         // the `published_frame.store(Release)` below; the Acquire load on Core 0
-        // side (in `published_scaled_frame`) establishes a happens-before edge
+        // side (in `published_native_frame`) establishes a happens-before edge
         // that makes the writes here visible before they are read.  No two
         // threads can hold a mutable reference to the same data simultaneously.
         unsafe {
@@ -289,16 +297,18 @@ impl SharedWorkerState {
             }
         }
 
-        // Safety: called only from core 1; target_slot is neither the currently
-        // published slot nor marked busy, so core 0 cannot be reading it.
+        // Copy the raw native framebuffer into the target slot.  Scaling to
+        // Rgb565 now happens on Core 0 (in GameDisplay::send_frame via
+        // CORE0_SCALE_BUF), which preserves the DMA/emulation overlap.
+        //
+        // Safety: called only from Core 1; target_slot is neither the currently
+        // published slot nor marked busy, so Core 0 cannot be reading it.
         unsafe {
-            scale_to_rgb565(
-                framebuffer,
-                &mut *self.scaled_frame_slots[target_slot].as_mut_ptr(),
-            );
+            (*self.native_frame_slots[target_slot].as_mut_ptr())
+                .copy_from_slice(framebuffer);
         }
         // dirty_rows is fully written above; the Release store below pairs with
-        // the Acquire load in published_scaled_frame() on Core 0, ensuring the
+        // the Acquire load in published_native_frame() on Core 0, ensuring the
         // dirty bitmap is visible before Core 0 reads it.
         self.published_frame
             .store(target_slot as u8, Ordering::Release);
@@ -306,14 +316,14 @@ impl SharedWorkerState {
     }
 
     fn clear_published_frames(&self) {
-        for slot in &self.scaled_frame_slots {
+        for slot in &self.native_frame_slots {
             // Safety: called during reset before core 1 is re-spawned, so no
             // concurrent access to any slot is possible.
             unsafe {
                 (*slot.as_mut_ptr()).fill(0);
             }
         }
-        for busy in &self.scaled_frame_busy {
+        for busy in &self.native_frame_busy {
             busy.store(false, Ordering::Release);
         }
         // Reset per-row hashes so the first publish after reset marks every
@@ -794,38 +804,38 @@ impl Core1Transport {
         }
     }
 
-    fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
+    fn published_native_frame(&mut self) -> &'static NativeFrame {
         if self.held_frame_slot != u8::MAX {
-            self.release_scaled_frame();
+            self.release_native_frame();
         }
         let slot = self.shared.published_frame.load(Ordering::Acquire) as usize;
-        self.shared.scaled_frame_busy[slot].store(true, Ordering::Release);
+        self.shared.native_frame_busy[slot].store(true, Ordering::Release);
         self.held_frame_slot = slot as u8;
         // Safety: slot was loaded with Acquire from published_frame and then
         // marked busy with Release; core 1 only writes to slots that are
         // neither published nor busy, so exclusive read access is guaranteed
-        // until release_scaled_frame clears the busy flag.
-        unsafe { &*self.shared.scaled_frame_slots[slot].as_ptr() }
+        // until release_native_frame clears the busy flag.
+        unsafe { &*self.shared.native_frame_slots[slot].as_ptr() }
     }
 
-    fn release_scaled_frame(&mut self) {
+    fn release_native_frame(&mut self) {
         if self.held_frame_slot == u8::MAX {
             return;
         }
-        self.shared.scaled_frame_busy[self.held_frame_slot as usize]
+        self.shared.native_frame_busy[self.held_frame_slot as usize]
             .store(false, Ordering::Release);
         self.held_frame_slot = u8::MAX;
     }
 
     /// Read the dirty-row bitmap for the most recently published frame.
     ///
-    /// Must be called **after** [`published_scaled_frame`], which performs the
+    /// Must be called **after** [`published_native_frame`], which performs the
     /// Acquire load on `published_frame`.  That Acquire pairs with the Release
     /// store Core 1 did after writing the bitmap, so the bitmap is fully
     /// visible by the time this returns.
     fn published_dirty_rows(&self) -> [u32; DIRTY_BITMAP_WORDS] {
         // Safety: dirty_rows was written by Core 1 before the Release store to
-        // published_frame; published_scaled_frame() loaded published_frame with
+        // published_frame; published_native_frame() loaded published_frame with
         // Acquire, establishing the happens-before edge.
         unsafe { *self.shared.dirty_rows.as_ptr() }
     }
@@ -1058,19 +1068,19 @@ impl PicoGameBoy {
     }
 
     #[inline(always)]
-    pub fn published_scaled_frame(&mut self) -> &'static ScaledFrame {
-        self.gb.transport_mut().published_scaled_frame()
+    pub fn published_native_frame(&mut self) -> &'static NativeFrame {
+        self.gb.transport_mut().published_native_frame()
     }
 
     #[inline(always)]
-    pub fn release_scaled_frame(&mut self) {
-        self.gb.transport_mut().release_scaled_frame();
+    pub fn release_native_frame(&mut self) {
+        self.gb.transport_mut().release_native_frame();
     }
 
     /// Return the dirty-row bitmap for the currently held published frame.
     ///
     /// Each bit k indicates that GB scanline k changed relative to the previous
-    /// published frame.  Call this **after** [`published_scaled_frame`] so the
+    /// published frame.  Call this **after** [`published_native_frame`] so the
     /// Acquire ordering is already in place.
     #[inline(always)]
     pub fn published_dirty_rows(&mut self) -> [u32; DIRTY_BITMAP_WORDS] {

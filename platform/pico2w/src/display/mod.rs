@@ -30,6 +30,7 @@ use embedded_graphics::geometry::{Dimensions, Point, Size};
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::{IntoStorage, RgbColor};
 use embedded_graphics::primitives::Rectangle;
+use rustyboy_core::cpu::peripheral::ppu::FRAMEBUFFER_SIZE;
 
 // ---------------------------------------------------------------------------
 // DMG colour palette — matches the web platform exactly.
@@ -57,6 +58,8 @@ pub const SCREEN_H: i32 = 320;
 const Y_OFFSET: i32 = (SCREEN_H - SCALED_H) / 2; // 52
 pub const SCALED_FRAME_PIXELS: usize = (SCALED_W as usize) * (SCALED_H as usize);
 pub type ScaledFrame = [u16; SCALED_FRAME_PIXELS];
+/// Raw Game Boy framebuffer: 160×144 palette indices (one byte per pixel).
+pub type NativeFrame = [u8; FRAMEBUFFER_SIZE];
 
 /// A display update rectangle using inclusive starts and exclusive ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,15 +122,33 @@ pub struct Display<D> {
 /// Pre-scale a Game Boy framebuffer (160×144, palette indices) to 240×216 Rgb565.
 ///
 /// Stores raw `u16` Rgb565 storage values. Pass the result to
-/// [`Display::render_game_only_scaled`] or, in Phase C, directly to DMA.
+/// [`Display::render_game_only_scaled`] or directly to DMA.
 pub fn scale_to_rgb565(src: &[u8; 23040], dst: &mut ScaledFrame) {
-    for sy in 0..216usize {
+    scale_native_to_rgb565_range(src, dst, 0, 216);
+}
+
+/// Pre-scale a range of rows from a Game Boy framebuffer (160×144, palette
+/// indices) into the corresponding rows of a 240×216 Rgb565 output buffer.
+///
+/// Only scaled output rows `sy_start..sy_end` (game-area-relative, 0-indexed)
+/// are written; the rest of `dst` is left unchanged.  This is used by the
+/// Core 0 game-loop to pre-scale only the dirty row range before DMA.
+///
+/// Stores raw big-endian `u16` Rgb565 values so that
+/// `bytemuck::cast_slice(&dst[..])` gives the correct SPI byte order.
+pub fn scale_native_to_rgb565_range(
+    src: &NativeFrame,
+    dst: &mut ScaledFrame,
+    sy_start: usize,
+    sy_end: usize,
+) {
+    for sy in sy_start..sy_end {
         let gy = sy * 2 / 3;
         let src_row = &src[gy * 160..(gy + 1) * 160];
         let dst_row = &mut dst[sy * 240..(sy + 1) * 240];
         for sx in 0..240usize {
-            // Store big-endian so bytemuck::cast_slice in send_frame_raw gives
-            // the correct SPI byte order without an extra copy.
+            // Store big-endian so bytemuck::cast_slice in send_frame_range_pixels
+            // gives the correct SPI byte order without an extra copy.
             dst_row[sx] = dmg_color(src_row[sx * 2 / 3]).into_storage().swap_bytes();
         }
     }
