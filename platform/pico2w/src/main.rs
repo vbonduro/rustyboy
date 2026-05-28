@@ -181,7 +181,14 @@ pub(crate) enum AppState {
 async fn main(_spawner: Spawner) {
     {
         use core::mem::MaybeUninit;
-        const HEAP_SIZE: usize = 128 * 1024;
+        // 120 KiB: peak allocation during save-state load is ~113 KiB:
+        //   40 KiB  Box<GameBoyMemory>  (includes 22 KiB PPU framebuffer inline)
+        //   22 KiB  GameBoy::front_buffer Box<[u8; 23040]>
+        //   48 KiB  save_state_blob Vec (decompressed ROM state)
+        //    4 KiB  audio/misc headroom
+        // Stack drops from ~40 KiB to ~16 KiB — safe; crash data shows only
+        // ~6 KiB stack usage at fault time, and original overflow was at 8.4 KiB.
+        const HEAP_SIZE: usize = 120 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
@@ -202,6 +209,18 @@ async fn main(_spawner: Spawner) {
         FIRMWARE_VERSION,
         TARGET_SYS_HZ / 1_000_000
     );
+
+    // Commit any pending crash record as the VERY FIRST thing after clocks are
+    // up.  Flash only needs the system clock — no display, SD, or other
+    // peripherals required.  Moving this before HwDisplay::new() ensures the
+    // record is written even if the crash happens during the splash screen.
+    let mut onboard_flash = new_onboard_flash(p.FLASH);
+    if crash::storage::check_and_commit(&mut onboard_flash) {
+        defmt::warn!("crash: committed crash record from previous boot");
+    }
+    if crash::storage::check_watchdog_reset(&mut onboard_flash) {
+        defmt::warn!("crash: committed watchdog-timeout record from previous boot");
+    }
 
     // Pull GP20 low before display init so the SD module powers off while the
     // ILI9341 initialises (~265 ms). HwDisplay::new is synchronous, so by the
@@ -236,19 +255,8 @@ async fn main(_spawner: Spawner) {
     let sdcard = SdCard::new(spi_dev, Delay);
     let mut sd_mgr = PicoSdMgr::new(sdcard, DummyClock);
 
-    let mut onboard_flash = new_onboard_flash(p.FLASH);
-
-    // Commit any pending crash record before doing anything else with flash.
-    // Core 1 is not yet running, so single-core flash writes are safe here.
-    if crash::storage::check_and_commit(&mut onboard_flash) {
-        defmt::warn!("crash record from previous session was committed to flash");
-    }
-    // Also check for a bare watchdog timeout (no HardFault handler ran).
-    if crash::storage::check_watchdog_reset(&mut onboard_flash) {
-        defmt::warn!("watchdog timeout from previous session was committed to flash");
-    }
-
     // Check for unread crash records so menus can show the crash-report badge.
+    // (check_and_commit already ran earlier — before the splash.)
     let crash_pending = crash::storage::has_records(&mut onboard_flash);
     if crash_pending {
         defmt::info!("crash: unread records found in flash — showing badge");
