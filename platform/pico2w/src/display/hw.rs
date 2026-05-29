@@ -252,10 +252,17 @@ impl<'d> GameDisplay<'d> {
     /// game loop. The bars are never repainted — `send_frame` only touches the
     /// 240×216 game area.
     ///
-    /// Also resets the menu frame hash so the next `draw_menu` call (if any)
-    /// performs a full repaint rather than comparing against stale content.
+    /// Also resets both frame-hash caches:
+    /// - `prev_menu_frame_hash` → 0: next `draw_menu` always does a full repaint.
+    /// - `prev_frame_hash` → 0: next `send_frame` always DMA-s the game area,
+    ///   even if the native frame content is unchanged.  This is required because
+    ///   `draw_menu` paints the entire 240×320 display (including the game area),
+    ///   so the game area contains stale menu pixels after the menu closes; without
+    ///   this reset, `send_frame` would see a matching hash and skip the DMA,
+    ///   leaving menu remnants visible in the game region.
     pub async fn draw_letterbox_bars(&mut self) {
         self.prev_menu_frame_hash = 0;
+        self.prev_frame_hash = 0; // force game-area DMA on first send_frame after menu
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3

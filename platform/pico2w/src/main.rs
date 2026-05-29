@@ -185,10 +185,19 @@ async fn main(_spawner: Spawner) {
         //   40 KiB  Box<GameBoyMemory>  (includes 22 KiB PPU framebuffer inline)
         //   22 KiB  GameBoy::front_buffer Box<[u8; 23040]>
         //   48 KiB  save_state_blob Vec (decompressed ROM state)
-        //    4 KiB  audio/misc headroom
-        // Stack drops from ~40 KiB to ~16 KiB — safe; crash data shows only
-        // ~6 KiB stack usage at fault time, and original overflow was at 8.4 KiB.
-        const HEAP_SIZE: usize = 120 * 1024;
+        // Option A (pre-scale on Core 0) freed 135 KiB from SHARED_WORKER_STATE,
+        // growing Core 0 stack from 16.4 KiB to 151.5 KiB.  We can now afford a
+        // much larger heap without risking stack overflow.
+        //
+        // Budget (measured on release ELF after Option A + this change):
+        //   160 KiB  heap   (GameBoy ~76 KiB + 48.5 KiB save-state blob + headroom)
+        //   ~111 KiB Core 0 stack  (7× the pre-Option-A budget; crash peak was 6 KiB)
+        //
+        // Raising from 120→160 KiB restores the save-state load path: a 32 KiB
+        // cart-RAM game serialises to ~48.5 KiB; with only 44 KiB free at load
+        // time (120 KiB heap − ~76 KiB live GB state) the read_save_state Vec
+        // allocation was failing with OutOfMemory.
+        const HEAP_SIZE: usize = 160 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
     }
