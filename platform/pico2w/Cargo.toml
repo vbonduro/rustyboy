@@ -81,3 +81,4 @@ mipidsi = "0.8"
 display-interface-spi = "0.5"
 embedded-hal-bus = "0.1"
 bytemuck = { version = "1", default-features = false }
+static_cell = "2.1"

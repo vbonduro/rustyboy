@@ -17,10 +17,12 @@ use mipidsi::models::ILI9341Rgb565;
 use mipidsi::options::{ColorOrder, Orientation};
 use mipidsi::Builder;
 
+use static_cell::ConstStaticCell;
+
 use super::{
     loading_bar_window, menu_item_text_window, menu_item_window, render_loading_row,
     render_menu_row, scale_native_to_rgb565_range, Display, LoadingFrame, LoadingProgress,
-    NativeFrame, RenderWindow, ScaledFrame,
+    NativeFrame, RenderWindow, ScaledFrame, SCALED_FRAME_PIXELS,
 };
 use crate::menu::MenuFrame;
 
@@ -29,41 +31,18 @@ use crate::menu::MenuFrame;
 //
 // `send_frame` scales the dirty row range from the native GB framebuffer (23 KB)
 // into this 101 KB static, then issues a single DMA burst.  Keeping the buffer
-// as a plain static (rather than inside GameDisplay) avoids placing 101 KB on
-// the stack or heap and lets the linker pack it into BSS.
+// as a `ConstStaticCell`-backed `&'static mut` field on `GameDisplay` avoids
+// placing 101 KB on the stack or heap and lets the linker pack it into BSS.
 //
-// # Safety invariant
-// CORE0_SCALE_BUF is written and read exclusively inside `send_frame` /
-// `send_frame_raw`, which are always called from Core 0's single async
-// executor task.  No other task or core ever touches this buffer, so there is
-// no aliasing — the UnsafeCell here is used only to satisfy the Rust
-// requirement that `static` items implement `Sync`.
+// `ConstStaticCell` is const-initialized to all-zeros, so the buffer lands in
+// `.bss` with no flash overhead.  `GameDisplay::new_after_splash` calls
+// `.take()` once to claim the exclusive `&'static mut ScaledFrame`; after that
+// `&mut self.scale_buf` in `send_frame` / `send_frame_raw` provides safe,
+// uniquely-owned mutable access — no unsafe required.
 // ---------------------------------------------------------------------------
 
-struct Core0ScaleBuf(core::cell::UnsafeCell<ScaledFrame>);
-impl Core0ScaleBuf {
-    const fn new() -> Self {
-        Self(core::cell::UnsafeCell::new([0u16; super::SCALED_FRAME_PIXELS]))
-    }
-    /// Obtain a mutable reference to the buffer.
-    ///
-    /// # Safety
-    /// Caller must guarantee no concurrent access (upheld by the single-core,
-    /// single-task invariant described above).
-    unsafe fn as_mut(&self) -> &mut ScaledFrame {
-        &mut *self.0.get()
-    }
-    /// Obtain a shared reference to the buffer.
-    ///
-    /// # Safety
-    /// Same aliasing requirement as [`as_mut`].
-    unsafe fn as_ref(&self) -> &ScaledFrame {
-        &*self.0.get()
-    }
-}
-// Safety: only accessed from a single Core-0 task; no concurrent access.
-unsafe impl Sync for Core0ScaleBuf {}
-static CORE0_SCALE_BUF: Core0ScaleBuf = Core0ScaleBuf::new();
+static CORE0_SCALE_BUF: ConstStaticCell<ScaledFrame> =
+    ConstStaticCell::new([0u16; SCALED_FRAME_PIXELS]);
 
 // Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
 // the requested frequency. 62.5 MHz is exact at 250 MHz sysclk, but at 280 MHz
@@ -170,6 +149,10 @@ pub struct GameDisplay<'d> {
     dc: Output<'d>,
     _rst: Output<'d>,
     _bl: Output<'d>,
+    /// Exclusively-owned 101 KB scale buffer, backed by the `CORE0_SCALE_BUF`
+    /// BSS static.  Claimed once in `new_after_splash`; accessed via `&mut
+    /// self.scale_buf` in `send_frame` / `send_frame_raw`.
+    scale_buf: &'static mut ScaledFrame,
     /// Multiplicative hash of the last frame successfully sent to the display.
     ///
     /// Compared against each new frame's hash before deciding whether to
@@ -243,6 +226,7 @@ impl<'d> GameDisplay<'d> {
             dc,
             _rst: rst,
             _bl: bl,
+            scale_buf: CORE0_SCALE_BUF.take(),
             prev_frame_hash: 0,
             prev_menu_frame_hash: 0,
         }
@@ -304,9 +288,9 @@ impl<'d> GameDisplay<'d> {
     ///   `Poll::Ready` immediately — no DMA, no tearing.
     /// - Otherwise computes the dirty display-row range from the dirty bitmap,
     ///   **pre-scales only those rows** from the native frame into the 101 KB
-    ///   static `CORE0_SCALE_BUF`, programs CASET/RASET/RAMWR **synchronously**
+    ///   `scale_buf` field, programs CASET/RASET/RAMWR **synchronously**
     ///   (blocking TX-FIFO writes, ~2 µs for 15 bytes at 75 MHz), then arms the
-    ///   pixel DMA from `CORE0_SCALE_BUF` and returns `Poll::Pending`.
+    ///   pixel DMA from `scale_buf` and returns `Poll::Pending`.
     ///
     /// On the **second poll** (the `.await` after emulation):
     /// - The DMA has been running concurrently with ~16 ms of emulation.
@@ -316,8 +300,9 @@ impl<'d> GameDisplay<'d> {
     ///
     /// Triple-buffered shared slots now hold raw native frames (3 × 23 KB =
     /// 69 KB) rather than pre-scaled frames (3 × 101 KB = 303 KB).  The single
-    /// `CORE0_SCALE_BUF` (101 KB) replaces the ~133 KB that was being spent on
-    /// the two redundant scaled slots, for a net saving of 133 KB.
+    /// `scale_buf` (101 KB, backed by a BSS static) replaces the ~133 KB that
+    /// was being spent on the two redundant scaled slots, for a net saving of
+    /// 133 KB.
     pub async fn send_frame(&mut self, native: &NativeFrame, dirty: &[u32; 5]) {
         let hash = Self::hash_frame(native);
         if !self.frame_changed(hash) {
@@ -325,42 +310,39 @@ impl<'d> GameDisplay<'d> {
         }
         let (sy_start, sy_end) = Self::dirty_display_range(dirty).unwrap_or((0, 216));
         self.commit_frame_hash(hash);
-        // Pre-scale only the dirty row range into the static Core 0 output buffer.
-        // Safety: CORE0_SCALE_BUF is only accessed from this function, which runs
-        // on Core 0's single async executor task — no concurrent access possible.
-        unsafe {
-            scale_native_to_rgb565_range(native, CORE0_SCALE_BUF.as_mut(), sy_start, sy_end);
-        }
+        // Pre-scale only the dirty row range into the exclusively-owned scale buffer.
+        scale_native_to_rgb565_range(native, self.scale_buf, sy_start, sy_end);
         // Blocking setup: CASET + RASET + RAMWR (~2 µs).  Completing synchronously
         // here ensures that the pixel-DMA future below is reached and armed within
         // the same `poll_once` call, so the DMA runs during the emulation step.
         self.setup_frame_range(sy_start, sy_end);
-        // Async pixel DMA from CORE0_SCALE_BUF: returns Poll::Pending after arming.
-        // Safety: same single-task invariant; no other code reads CORE0_SCALE_BUF
-        // while the DMA is in flight.
-        unsafe {
-            self.send_frame_range_pixels(CORE0_SCALE_BUF.as_ref(), sy_start, sy_end)
-                .await;
-        }
+        // Access `self.spi` and `self.cs` directly (not through a `&mut self`
+        // method) so that Rust's field-level borrow splitting allows the shared
+        // borrow of `self.scale_buf` (via `bytes`) and the mutable borrows of
+        // `self.spi` / `self.cs` to coexist.
+        let pix_start = sy_start * 240;
+        let pix_end = sy_end * 240;
+        let bytes: &[u8] = bytemuck::cast_slice(&self.scale_buf[pix_start..pix_end]);
+        self.spi.write(bytes).await.ok();
+        self.cs.set_high();
     }
 
     /// Transfer a native Game Boy frame (160×144 palette indices) to the
     /// display via async DMA.
     ///
     /// Convenience wrapper that does a full-frame write without dirty-row
-    /// narrowing.  Pre-scales the entire 240×216 region into `CORE0_SCALE_BUF`
+    /// narrowing.  Pre-scales the entire 240×216 region into `scale_buf`
     /// then streams via async pixel DMA; compatible with the `poll_once` /
     /// emulation-overlap pattern.
     pub async fn send_frame_raw(&mut self, native: &NativeFrame) {
-        // Safety: single Core-0 task invariant; see CORE0_SCALE_BUF docs.
-        unsafe {
-            scale_native_to_rgb565_range(native, CORE0_SCALE_BUF.as_mut(), 0, 216);
-        }
+        scale_native_to_rgb565_range(native, self.scale_buf, 0, 216);
         self.setup_frame_range(0, 216);
-        unsafe {
-            self.send_frame_range_pixels(CORE0_SCALE_BUF.as_ref(), 0, 216)
-                .await;
-        }
+        // Access fields directly (not via a `&mut self` method) so that the
+        // shared borrow of `self.scale_buf` and the mutable borrows of
+        // `self.spi` / `self.cs` coexist via field-level borrow splitting.
+        let bytes: &[u8] = bytemuck::cast_slice(self.scale_buf.as_ref());
+        self.spi.write(bytes).await.ok();
+        self.cs.set_high();
     }
 
     /// Paint the full 240×320 screen with a ROM loading progress screen.
@@ -432,23 +414,6 @@ impl<'d> GameDisplay<'d> {
             render_menu_row(frame, y, row);
         })
         .await;
-    }
-
-    // --- low-level pixel DMA (used by send_frame / send_frame_raw) ---
-
-    /// Send display rows `sy_start..sy_end` via async DMA and raise CS HIGH.
-    ///
-    /// **Precondition:** [`setup_frame_range`] must have been called this frame
-    /// so CS is LOW and DC is HIGH.
-    async fn send_frame_range_pixels(&mut self, buf: &ScaledFrame, sy_start: usize, sy_end: usize) {
-        let pix_start = sy_start * 240;
-        let pix_end = sy_end * 240;
-        // buf stores big-endian u16s; cast_slice gives the correct SPI byte order.
-        self.spi
-            .write(bytemuck::cast_slice(&buf[pix_start..pix_end]))
-            .await
-            .ok();
-        self.cs.set_high();
     }
 
     // --- differential DMA helpers ---
