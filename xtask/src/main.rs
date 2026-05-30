@@ -56,7 +56,7 @@ enum Cmd {
 #[derive(Subcommand)]
 enum BuildTarget {
     /// Build the rustyboy-web Docker image
-    Web,
+    Web(WebArgs),
     /// Cross-compile the pico2w firmware (release, ARM Cortex-M33)
     Pico,
 }
@@ -64,9 +64,27 @@ enum BuildTarget {
 #[derive(Subcommand)]
 enum DeployTarget {
     /// Build image, (re)start container, and print the URL
-    Web,
+    Web(WebArgs),
     /// Build firmware and flash over USB BOOTSEL — no SWD probe needed
     Pico,
+}
+
+/// Options shared by `build web` and `deploy web`.
+#[derive(clap::Args)]
+struct WebArgs {
+    /// Production mode (deploy only): use real Google OAuth. By default `deploy
+    /// web` runs in dev mode (DEV_MODE=1 auth bypass + RUST_LOG=info); pass
+    /// `--prod` to disable that and require real sign-in.
+    #[arg(long)]
+    prod: bool,
+    /// Build the WASM client with the on-screen debug overlay
+    /// (DEBUG_OVERLAY=1 → `--features debug-overlay`; adds the "DBG" toggle).
+    #[arg(long)]
+    debug_overlay: bool,
+    /// Host directory to mount as the ROM library (deploy only).
+    /// Defaults to `<workspace>/roms`. A leading `~` is expanded.
+    #[arg(long, value_name = "DIR")]
+    roms: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -97,11 +115,11 @@ fn main() -> Result<()> {
 
     match cli.command {
         Cmd::Build { target } => match target {
-            BuildTarget::Web => build_web(&root),
+            BuildTarget::Web(args) => build_web(&root, args.debug_overlay),
             BuildTarget::Pico => build_pico(&root),
         },
         Cmd::Deploy { target } => match target {
-            DeployTarget::Web => deploy_web(&root),
+            DeployTarget::Web(args) => deploy_web(&root, !args.prod, args.debug_overlay, args.roms),
             DeployTarget::Pico => deploy_pico(&root),
         },
         Cmd::Run { target } => match target {
@@ -119,14 +137,19 @@ fn main() -> Result<()> {
 
 // ── build ─────────────────────────────────────────────────────────────────────
 
-fn build_web(root: &Path) -> Result<()> {
+fn build_web(root: &Path, debug_overlay: bool) -> Result<()> {
     require_tool("docker", "Run `cargo xtask setup web` to install Docker.")?;
-    println!("🔨 Building rustyboy-web Docker image…");
-    cmd(
-        "docker",
-        &["build", "-f", "platform/web/Dockerfile", "-t", "rustyboy-web", "."],
-        root,
-    )
+    if debug_overlay {
+        println!("🔨 Building rustyboy-web Docker image (debug overlay ON)…");
+    } else {
+        println!("🔨 Building rustyboy-web Docker image…");
+    }
+    let mut args = vec!["build", "-f", "platform/web/Dockerfile", "-t", "rustyboy-web"];
+    if debug_overlay {
+        args.extend_from_slice(&["--build-arg", "DEBUG_OVERLAY=1"]);
+    }
+    args.push(".");
+    cmd("docker", &args, root)
 }
 
 fn build_pico(root: &Path) -> Result<()> {
@@ -143,8 +166,8 @@ fn build_pico(root: &Path) -> Result<()> {
 
 // ── deploy ────────────────────────────────────────────────────────────────────
 
-fn deploy_web(root: &Path) -> Result<()> {
-    build_web(root)?;
+fn deploy_web(root: &Path, dev: bool, debug_overlay: bool, roms: Option<PathBuf>) -> Result<()> {
+    build_web(root, debug_overlay)?;
 
     println!("🧹 Removing existing rustyboy-web container (if any)…");
     cmd_best_effort("docker", &["rm", "-f", "rustyboy-web"], root);
@@ -153,27 +176,49 @@ fn deploy_web(root: &Path) -> Result<()> {
     std::fs::create_dir_all(&appdata)
         .with_context(|| format!("failed to create appdata dir: {}", appdata.display()))?;
 
-    let roms_mount = format!("{}:/roms:ro", root.join("roms").display());
+    // ROM library: explicit --roms <DIR> (with `~` expansion) or the default
+    // <workspace>/roms. Resolve to an absolute path and confirm it exists so
+    // Docker doesn't silently create an empty bind-mount source.
+    let roms_dir = match roms {
+        Some(p) => expand_tilde(&p),
+        None => root.join("roms"),
+    };
+    if !roms_dir.is_dir() {
+        bail!("ROM directory not found: {}", roms_dir.display());
+    }
+    println!("📁 Mounting ROM library: {}", roms_dir.display());
+    let roms_mount = format!("{}:/roms:ro", roms_dir.display());
     let data_mount = format!("{}:/appdata", appdata.display());
 
     println!("🚀 Starting rustyboy-web container…");
-    cmd(
-        "docker",
-        &[
-            "run",
-            "-d",
-            "--name",
-            "rustyboy-web",
-            "-p",
-            "8080:8080",
-            "-v",
-            &roms_mount,
-            "-v",
-            &data_mount,
-            "rustyboy-web",
-        ],
-        root,
-    )?;
+    let mut run_args = vec![
+        "run",
+        "-d",
+        "--name",
+        "rustyboy-web",
+        "-p",
+        "8080:8080",
+        "-v",
+        &roms_mount,
+        "-v",
+        &data_mount,
+    ];
+    if dev {
+        // Runtime auth bypass: the server reads DEV_MODE and skips Google OAuth,
+        // logging in a local dev user instead. (The debug overlay is a separate,
+        // build-time concern enabled by `--debug-overlay`.)
+        //
+        // RUST_LOG=info so the server's tracing subscriber (fmt::init, which
+        // otherwise defaults to ERROR-only) prints the startup banner and the
+        // `[client]` breadcrumbs POSTed to /dev/log — invaluable for debugging
+        // the browser client via `docker logs`.
+        println!("🔓 DEV_MODE on (default) — Google auth bypassed (local dev user). Pass --prod for real auth.");
+        run_args.extend_from_slice(&["-e", "DEV_MODE=1", "-e", "RUST_LOG=info"]);
+    } else {
+        println!("🔒 Production mode — real Google OAuth required.");
+    }
+    run_args.push("rustyboy-web");
+    cmd("docker", &run_args, root)?;
 
     let ip = local_ip();
     println!("\n🎮  rustyboy is running → \x1b[1;32mhttp://{ip}:8080\x1b[0m");
@@ -461,6 +506,17 @@ fn cmd(prog: &str, args: &[&str], cwd: &Path) -> Result<()> {
 /// Like `cmd` but silently ignores failures (for best-effort cleanup steps).
 fn cmd_best_effort(prog: &str, args: &[&str], cwd: &Path) {
     let _ = Command::new(prog).args(args).current_dir(cwd).status();
+}
+
+/// Expand a leading `~` / `~/…` to `$HOME`. Other paths are returned as-is.
+/// (The shell normally expands `~` for us, but handle the quoted case too.)
+fn expand_tilde(p: &Path) -> PathBuf {
+    if let Ok(rest) = p.strip_prefix("~") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Path::new(&home).join(rest);
+        }
+    }
+    p.to_path_buf()
 }
 
 /// Returns true if `name` is on PATH and can be spawned.

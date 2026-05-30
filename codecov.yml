@@ -8,3 +8,4 @@ coverage:
         target: 90%
 ignore:
     - src/cpu/opcodes/operand.rs
+    - "xtask/**"            # build & deploy tooling, not part of the emulator

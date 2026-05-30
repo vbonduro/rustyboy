@@ -1,0 +1,21 @@
+# The Dockerfile builds everything from source inside the image, so none of
+# these host-side artifacts belong in the build context. Excluding them keeps
+# the context tiny (the host target/ alone is ~16 GB) and avoids shipping
+# stray/non-UTF-8 files that break BuildKit context serialization.
+
+# Rust / build output
+target/
+**/pkg/
+
+# VCS and tooling
+.git/
+.github/
+.claude/
+.beads/
+
+# Editor / OS cruft
+**/*.swp
+.DS_Store
+
+# Local maps / logs
+*.map
