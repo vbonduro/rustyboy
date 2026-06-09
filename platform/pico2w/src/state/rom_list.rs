@@ -101,7 +101,11 @@ impl RomListState {
         }
     }
 
-    fn menu_frame<'a>(&self, frame_data: &'a RomMenuFrame<'a>, crash_pending: bool) -> MenuFrame<'a> {
+    fn menu_frame<'a>(
+        &self,
+        frame_data: &'a RomMenuFrame<'a>,
+        crash_pending: bool,
+    ) -> MenuFrame<'a> {
         MenuFrame {
             title: "ROMS",
             items: frame_data.items.as_slice(),

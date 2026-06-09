@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::{vec, vec::Vec};
 use core::fmt;
 
@@ -15,6 +14,65 @@ use crate::cpu::save_state::{write_cart_ram_section, write_mbc_section, SaveStat
 pub struct BusEvent {
     pub address: u16,
     pub value: u8,
+}
+
+pub const BUS_EVENT_QUEUE_CAP: usize = 64;
+
+const EMPTY_BUS_EVENT: BusEvent = BusEvent {
+    address: 0,
+    value: 0,
+};
+
+#[derive(Debug)]
+struct BusEventQueue {
+    entries: [BusEvent; BUS_EVENT_QUEUE_CAP],
+    len: usize,
+}
+
+impl BusEventQueue {
+    fn new() -> Self {
+        Self {
+            entries: [EMPTY_BUS_EVENT; BUS_EVENT_QUEUE_CAP],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn push_back(&mut self, event: BusEvent) {
+        if self.len >= self.entries.len() {
+            panic!("bus event queue overflow");
+        }
+        self.entries[self.len] = event;
+        self.len += 1;
+    }
+
+    fn drain_into_slice(&mut self, out: &mut [BusEvent]) -> usize {
+        let n = self.len.min(out.len());
+        out[..n].copy_from_slice(&self.entries[..n]);
+        self.len = 0;
+        n
+    }
+
+    fn drain_into_vec(&mut self, out: &mut Vec<BusEvent>) {
+        out.extend_from_slice(&self.entries[..self.len]);
+        self.len = 0;
+    }
+}
+
+#[cfg(target_arch = "arm")]
+unsafe extern "C" {
+    fn rustyboy_dma_oam_guard(
+        site: u32,
+        packed_dma: u32,
+        actual_src: u32,
+        dst: u32,
+        count: u32,
+    ) -> !;
 }
 
 #[derive(Debug)]
@@ -103,7 +161,56 @@ pub struct GameBoyMemory {
     io: [u8; 0x80],
     hram: [u8; 0x7F],
     ie: u8,
-    events: VecDeque<BusEvent>,
+    events: BusEventQueue,
+}
+
+#[cfg(target_arch = "arm")]
+#[derive(Clone, Copy)]
+pub struct BusEventQueueHeader {
+    pub cap: usize,
+    pub ptr: usize,
+    pub head: usize,
+    pub len: usize,
+}
+
+#[cfg(target_arch = "arm")]
+impl BusEventQueueHeader {
+    #[inline(always)]
+    pub fn first_bad_word(self) -> Option<usize> {
+        const MAX_REASONABLE_CAP: usize = 0x1000;
+        const HEAP_POOL_START: usize = 0x2002_0000;
+        const HEAP_POOL_END: usize = 0x2006_0000;
+
+        if self.cap > MAX_REASONABLE_CAP {
+            return Some(0);
+        }
+
+        if self.cap == 0 {
+            if self.ptr >= 0x1000
+                && !(HEAP_POOL_START..HEAP_POOL_END).contains(&self.ptr)
+            {
+                return Some(1);
+            }
+            if self.head != 0 {
+                return Some(2);
+            }
+            if self.len != 0 {
+                return Some(3);
+            }
+            return None;
+        }
+
+        if !(HEAP_POOL_START..HEAP_POOL_END).contains(&self.ptr) {
+            return Some(1);
+        }
+        if self.head >= self.cap {
+            return Some(2);
+        }
+        if self.len > self.cap {
+            return Some(3);
+        }
+        None
+    }
 }
 
 impl GameBoyMemory {
@@ -127,7 +234,7 @@ impl GameBoyMemory {
             io: [0; 0x80],
             hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::with_capacity(8),
+            events: BusEventQueue::new(),
         }
     }
 
@@ -152,7 +259,7 @@ impl GameBoyMemory {
             io: [0; 0x80],
             hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::with_capacity(8),
+            events: BusEventQueue::new(),
         }
     }
 
@@ -206,7 +313,7 @@ impl GameBoyMemory {
             core::ptr::write(core::ptr::addr_of_mut!((*p).ie), 0u8);
             core::ptr::write(
                 core::ptr::addr_of_mut!((*p).events),
-                VecDeque::with_capacity(8),
+                BusEventQueue::new(),
             );
             b.assume_init()
         }
@@ -234,7 +341,7 @@ impl GameBoyMemory {
             io: [0; 0x80],
             hram: [0; 0x7F],
             ie: 0,
-            events: VecDeque::with_capacity(8),
+            events: BusEventQueue::new(),
         }
     }
 
@@ -392,11 +499,29 @@ impl GameBoyMemory {
     /// Uses a zero-copy slice path for regions with direct backing storage
     /// (VRAM, WRAM, cached ROM); falls back to byte-by-byte for cart RAM.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[track_caller]
     pub fn copy_dma_step(&mut self, source: u16, progress: u8, count: u8) {
         // actual_src is the real memory address to read from: base + bytes already transferred.
         let actual_src = source as usize + progress as usize;
         let n = count as usize;
         let dst = progress as usize;
+        if dst > self.oam.len() || n > self.oam.len() - dst {
+            let packed_dma = ((source as u32) << 16) | ((progress as u32) << 8) | count as u32;
+            #[cfg(target_arch = "arm")]
+            unsafe {
+                rustyboy_dma_oam_guard(
+                    core::panic::Location::caller().line(),
+                    packed_dma,
+                    actual_src as u32,
+                    dst as u32,
+                    n as u32,
+                );
+            }
+            #[cfg(not(target_arch = "arm"))]
+            panic!(
+                "oam dma out of range: packed={packed_dma:#010x} actual_src={actual_src:#06x} dst={dst} count={n}"
+            );
+        }
 
         let copied = if (VRAM_BASE as usize..=VRAM_END as usize).contains(&actual_src) {
             let off = actual_src - VRAM_BASE as usize;
@@ -640,9 +765,23 @@ impl GameBoyMemory {
         !self.events.is_empty()
     }
 
-    /// Drain pending bus events into an existing buffer, reusing its allocation.
-    pub fn drain_into(&mut self, buf: &mut Vec<BusEvent>) {
-        buf.extend(self.events.drain(..));
+    /// Raw `VecDeque<BusEvent>` header snapshot for the Pico memory-corruption
+    /// investigation. This intentionally relies on the current optimized ARM
+    /// layout: cap, ptr, head, len.
+    #[cfg(target_arch = "arm")]
+    #[inline(always)]
+    pub fn bus_event_queue_header(&self) -> BusEventQueueHeader {
+        BusEventQueueHeader {
+            cap: BUS_EVENT_QUEUE_CAP,
+            ptr: core::ptr::addr_of!(self.events.entries) as usize,
+            head: 0,
+            len: self.events.len,
+        }
+    }
+
+    /// Drain pending bus events into a caller-owned fixed buffer.
+    pub fn drain_into_slice(&mut self, buf: &mut [BusEvent]) -> usize {
+        self.events.drain_into_slice(buf)
     }
 }
 
@@ -708,7 +847,9 @@ impl Memory for GameBoyMemory {
     }
 
     fn drain_events(&mut self) -> Vec<BusEvent> {
-        self.events.drain(..).collect()
+        let mut out = Vec::with_capacity(self.events.len);
+        self.events.drain_into_vec(&mut out);
+        out
     }
 }
 

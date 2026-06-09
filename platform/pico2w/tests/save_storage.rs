@@ -22,4 +22,3 @@ fn save_slot_rejects_out_of_range_slots() {
     assert_eq!(SaveSlot::new(2).unwrap().index(), 2);
     assert!(SaveSlot::new(3).is_err());
 }
-

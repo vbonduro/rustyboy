@@ -508,7 +508,10 @@ mod tests {
         let y = CRASH_ICON_TOP + CRASH_ICON_SCALE as u16;
         let row_no = render_row(&no_crash, y);
         let row_yes = render_row(&with_crash, y);
-        assert_ne!(row_no, row_yes, "header should differ when crash is pending");
+        assert_ne!(
+            row_no, row_yes,
+            "header should differ when crash is pending"
+        );
     }
 
     #[test]

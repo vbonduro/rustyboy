@@ -3,7 +3,7 @@ use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{MainMenu, MenuEffect, MenuInput, MenuLogic};
 
-use super::{RomListState, RunningState};
+use super::{RomListState, RunningState, SettingsState};
 use crate::{App, AppState, PicoSdMgr};
 
 pub struct MainMenuState {
@@ -50,6 +50,10 @@ impl MainMenuState {
             MenuEffect::ShowRoms => {
                 let next = RomListState::new(app, game_disp, sd_mgr).await;
                 app.transition_to(AppState::RomList(alloc::boxed::Box::new(next)));
+            }
+            MenuEffect::ShowSettings => {
+                let next = SettingsState::new(game_disp, app).await;
+                app.transition_to(AppState::Settings(next));
             }
             _ => {}
         }

@@ -67,6 +67,10 @@ pub enum CrashKind {
     /// No ARM exception frame is available — the CPU was reset by hardware,
     /// not by the fault handler.
     WatchdogTimeout = 2,
+    /// Boot-time reset cause captured from reset-status registers.
+    ResetReason = 3,
+    /// Core-0 multicore transport pointer triplet was overwritten.
+    TransportSmash = 4,
     Unknown = 0xFF,
 }
 
@@ -76,6 +80,8 @@ impl CrashKind {
             0 => Self::HardFault,
             1 => Self::Panic,
             2 => Self::WatchdogTimeout,
+            3 => Self::ResetReason,
+            4 => Self::TransportSmash,
             _ => Self::Unknown,
         }
     }
@@ -91,10 +97,21 @@ pub mod flags {
     pub const HAS_ROM_INFO: u8 = 0x04;
     /// Panic file / line is valid.
     pub const HAS_PANIC_LOC: u8 = 0x08;
-    /// The ARM MSP was below `_stack_end` at crash time — stack overflow.
+    /// The faulting SP was below its stack limit at crash time — stack overflow.
     /// When set, `stack_headroom` holds the overflow depth in bytes.
     /// When clear, `stack_headroom` holds the remaining headroom in bytes.
+    /// The relevant stack (and limit) is core 0's unless [`FAULT_ON_CORE1`] is set.
     pub const HAS_STACK_OVERFLOW: u8 = 0x10;
+    /// The crash occurred on core 1 (the emulator worker). When set, the stack
+    /// measurement (`stack_headroom` / [`HAS_STACK_OVERFLOW`]) is relative to
+    /// core 1's dedicated stack limit rather than core 0's `_stack_end`.
+    pub const FAULT_ON_CORE1: u8 = 0x20;
+    /// HardFault/DebugMonitor diagnostic tail is present in `panic_loc`:
+    /// `[68..72] = pre-handler r4`, `[72..76] = stacked r12`.
+    pub const HAS_HARDFAULT_EXTENDED_REGS: u8 = 0x40;
+    /// Stack-protector panic: `arm_lr` contains the return address captured by
+    /// `__stack_chk_fail`, identifying the guarded function whose canary failed.
+    pub const HAS_STACK_CHK_FAIL_LR: u8 = 0x80;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +130,8 @@ pub mod flags {
 //   [12..16]  git_hash           first 4 bytes of git SHA as u32 LE
 //   [16..20]  arm_pc             program counter at fault
 //   [20..24]  arm_lr             link register at fault
+//                                or stack-canary failure LR when
+//                                HAS_STACK_CHK_FAIL_LR is set
 //   [24..28]  arm_cfsr           Configurable Fault Status Register
 //   [28..32]  arm_hfsr           HardFault Status Register
 //   [32..36]  arm_fault_addr     MMFAR or BFAR (whichever is valid)
@@ -137,6 +156,9 @@ pub mod flags {
 //   [66]      ppu_stat           LCD status register
 //   [67]      _pad3
 //   [68..80]  panic_loc          null-terminated filename (last segment, ≤11 chars)
+//                                or HardFault/DebugMonitor diagnostic words when
+//                                HAS_HARDFAULT_EXTENDED_REGS is set:
+//                                [68..72] pre-handler r4, [72..76] stacked r12
 //   [80..82]  panic_line         source line number
 //   [82..84]  stack_headroom     bytes between MSP-at-fault and _stack_end:
 //                                if HAS_STACK_OVERFLOW set → overflow depth,
@@ -294,6 +316,8 @@ impl CrashRecord {
             CrashKind::HardFault => "HardFault",
             CrashKind::Panic => "Panic",
             CrashKind::WatchdogTimeout => "WatchdogTimeout",
+            CrashKind::ResetReason => "ResetReason",
+            CrashKind::TransportSmash => "TransportSmash",
             CrashKind::Unknown => "Unknown",
         }
     }
@@ -339,7 +363,9 @@ pub const SECTOR_FULL: u8 = 0xFF;
 /// passes them here.  Keeping this logic pure (no I/O) lets it be unit-tested
 /// on the host without any embedded hardware or flash driver.
 pub fn find_next_empty_slot(slot_magics: &[[u8; 4]; MAX_RECORDS_PER_SECTOR]) -> Option<usize> {
-    slot_magics.iter().position(|m| m == &[0xFF, 0xFF, 0xFF, 0xFF])
+    slot_magics
+        .iter()
+        .position(|m| m == &[0xFF, 0xFF, 0xFF, 0xFF])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +378,10 @@ pub struct SectorHeader {
 impl SectorHeader {
     /// Fresh header for a newly erased sector.
     pub fn fresh(erase_count: u32) -> Self {
-        Self { erase_count, next_slot: 0 }
+        Self {
+            erase_count,
+            next_slot: 0,
+        }
     }
 
     pub fn to_bytes(&self) -> RecordBytes {
@@ -392,7 +421,6 @@ pub enum SectorDecodeError {
 // Relaxed.  If `valid == 0` the fault handler leaves GB fields zeroed.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_arch = "arm")]
 use core::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(target_arch = "arm")]
@@ -455,27 +483,25 @@ impl CrashContext {
 
         self.rom_id_prefix
             .store(u32::from_le_bytes(rom_id_prefix), Ordering::Relaxed);
-        self.rom_bank_info
-            .store((rom_bank as u32) | ((ram_bank as u32) << 16), Ordering::Relaxed);
+        self.rom_bank_info.store(
+            (rom_bank as u32) | ((ram_bank as u32) << 16),
+            Ordering::Relaxed,
+        );
         self.gb_af_bc.store(
-            (gb_a as u32)
-                | ((gb_f as u32) << 8)
-                | ((gb_b as u32) << 16)
-                | ((gb_c as u32) << 24),
+            (gb_a as u32) | ((gb_f as u32) << 8) | ((gb_b as u32) << 16) | ((gb_c as u32) << 24),
             Ordering::Relaxed,
         );
         self.gb_de_hl.store(
-            (gb_d as u32)
-                | ((gb_e as u32) << 8)
-                | ((gb_h as u32) << 16)
-                | ((gb_l as u32) << 24),
+            (gb_d as u32) | ((gb_e as u32) << 8) | ((gb_h as u32) << 16) | ((gb_l as u32) << 24),
             Ordering::Relaxed,
         );
         self.gb_sp_pc
             .store((gb_sp as u32) | ((gb_pc as u32) << 16), Ordering::Relaxed);
         self.gb_cycle_lo.store(gb_cycle_lo, Ordering::Relaxed);
-        self.ppu_ly_stat
-            .store((ppu_ly as u32) | ((ppu_stat as u32) << 8), Ordering::Relaxed);
+        self.ppu_ly_stat.store(
+            (ppu_ly as u32) | ((ppu_stat as u32) << 8),
+            Ordering::Relaxed,
+        );
 
         // Publish: Release fence ensures all stores above are visible to any
         // subsequent Acquire load of `valid`.
@@ -544,6 +570,73 @@ pub struct CrashContextSnapshot {
 /// The single global crash context, updated by the emulator loop.
 #[cfg(target_arch = "arm")]
 pub static CRASH_CONTEXT: CrashContext = CrashContext::new();
+
+/// Durable diagnostic captured immediately before `report_transport_smash`
+/// panics. The panic handler consumes this and stores the values in the ARM
+/// fields of a `TransportSmash` record:
+/// - `arm_pc` = `Core1Transport` base
+/// - `arm_lr` = corrupted `command_tx` pointer
+/// - `arm_cfsr` = corrupted `audio_rx` pointer
+/// - `arm_hfsr` = corrupted `shared` pointer
+/// - `arm_fault_addr` = first duplicate triplet found in SRAM, or 0
+pub struct TransportSmashDiag {
+    active: AtomicU32,
+    base: AtomicU32,
+    cmd: AtomicU32,
+    aud: AtomicU32,
+    shr: AtomicU32,
+    source_triplet: AtomicU32,
+}
+
+impl TransportSmashDiag {
+    pub const fn new() -> Self {
+        Self {
+            active: AtomicU32::new(0),
+            base: AtomicU32::new(0),
+            cmd: AtomicU32::new(0),
+            aud: AtomicU32::new(0),
+            shr: AtomicU32::new(0),
+            source_triplet: AtomicU32::new(0),
+        }
+    }
+
+    pub fn record(&self, base: usize, cmd: usize, aud: usize, shr: usize, source_triplet: usize) {
+        self.active.store(0, Ordering::Release);
+        self.base.store(base as u32, Ordering::Relaxed);
+        self.cmd.store(cmd as u32, Ordering::Relaxed);
+        self.aud.store(aud as u32, Ordering::Relaxed);
+        self.shr.store(shr as u32, Ordering::Relaxed);
+        self.source_triplet
+            .store(source_triplet as u32, Ordering::Relaxed);
+        self.active.store(1, Ordering::Release);
+    }
+
+    pub fn take(&self) -> Option<TransportSmashSnapshot> {
+        if self.active.swap(0, Ordering::AcqRel) == 0 {
+            return None;
+        }
+        Some(TransportSmashSnapshot {
+            base: self.base.load(Ordering::Relaxed),
+            cmd: self.cmd.load(Ordering::Relaxed),
+            aud: self.aud.load(Ordering::Relaxed),
+            shr: self.shr.load(Ordering::Relaxed),
+            source_triplet: self.source_triplet.load(Ordering::Relaxed),
+        })
+    }
+}
+
+unsafe impl Sync for TransportSmashDiag {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportSmashSnapshot {
+    pub base: u32,
+    pub cmd: u32,
+    pub aud: u32,
+    pub shr: u32,
+    pub source_triplet: u32,
+}
+
+pub static TRANSPORT_SMASH_DIAG: TransportSmashDiag = TransportSmashDiag::new();
 
 // ---------------------------------------------------------------------------
 // CRC32 (IEEE 802.3 polynomial, table-free).
@@ -745,7 +838,10 @@ mod tests {
         // Bytes [120..124] hold the CRC32 of bytes [0..120].
         let stored = u32::from_le_bytes(bytes[120..124].try_into().unwrap());
         let computed = crc32(&bytes[..120]);
-        assert_eq!(stored, computed, "CRC32 in serialised record does not match");
+        assert_eq!(
+            stored, computed,
+            "CRC32 in serialised record does not match"
+        );
     }
 
     #[test]
@@ -767,7 +863,10 @@ mod tests {
         let r = sample_record(0);
         let mut bytes = r.to_bytes();
         bytes[0] = 0xDE; // corrupt magic
-        assert_eq!(CrashRecord::from_bytes(&bytes), Err(CrashDecodeError::BadMagic));
+        assert_eq!(
+            CrashRecord::from_bytes(&bytes),
+            Err(CrashDecodeError::BadMagic)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -776,7 +875,10 @@ mod tests {
 
     #[test]
     fn sector_header_roundtrip() {
-        let h = SectorHeader { erase_count: 42, next_slot: 5 };
+        let h = SectorHeader {
+            erase_count: 42,
+            next_slot: 5,
+        };
         let bytes = h.to_bytes();
         let decoded = SectorHeader::from_bytes(&bytes).expect("header decode");
         assert_eq!(h, decoded);
@@ -784,10 +886,26 @@ mod tests {
 
     #[test]
     fn sector_header_full_detection() {
-        assert!(!SectorHeader { erase_count: 0, next_slot: 0 }.is_full());
-        assert!(!SectorHeader { erase_count: 0, next_slot: 30 }.is_full());
-        assert!(SectorHeader { erase_count: 0, next_slot: 31 }.is_full());
-        assert!(SectorHeader { erase_count: 0, next_slot: SECTOR_FULL }.is_full());
+        assert!(!SectorHeader {
+            erase_count: 0,
+            next_slot: 0
+        }
+        .is_full());
+        assert!(!SectorHeader {
+            erase_count: 0,
+            next_slot: 30
+        }
+        .is_full());
+        assert!(SectorHeader {
+            erase_count: 0,
+            next_slot: 31
+        }
+        .is_full());
+        assert!(SectorHeader {
+            erase_count: 0,
+            next_slot: SECTOR_FULL
+        }
+        .is_full());
     }
 
     // -----------------------------------------------------------------------
@@ -811,7 +929,7 @@ mod tests {
         regs[10] = 0x00 | (0xD8 << 8) | (0x01 << 16) | (0x4D << 24); // d,e,h,l
         regs[11] = (0xCFE0u32) | (88u32 << 16) | (0x83u32 << 24); // sp, ly, stat
         regs[12] = 12_345_678; // cycle_lo
-        // regs[13-15] = 0 (no panic)
+                               // regs[13-15] = 0 (no panic)
 
         let snap = ScratchRegs(regs);
         assert!(snap.is_crash());
@@ -865,13 +983,16 @@ mod tests {
     #[test]
     fn write_test_fixture() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let fixture_path = std::path::PathBuf::from(manifest)
-            .join("../../tools/fixtures/test_crash.bin");
+        let fixture_path =
+            std::path::PathBuf::from(manifest).join("../../tools/fixtures/test_crash.bin");
 
         let mut sector = vec![0xFFu8; 4096];
 
         // Sector header
-        let header = SectorHeader { erase_count: 1, next_slot: 2 };
+        let header = SectorHeader {
+            erase_count: 1,
+            next_slot: 2,
+        };
         sector[..SECTOR_HEADER_SIZE].copy_from_slice(&header.to_bytes());
 
         // Record 0: HardFault
@@ -931,7 +1052,7 @@ mod tests {
         let mut magics = [RECORD_MAGIC; MAX_RECORDS_PER_SECTOR];
         // Replace the last slot with the "BCB@" pattern seen in real corrupt flash.
         magics[MAX_RECORDS_PER_SECTOR - 1] = [0x42, 0x43, 0x42, 0x40]; // BCB@
-        // All 31 slots are either RCRP or corrupt — no erased slot available.
+                                                                       // All 31 slots are either RCRP or corrupt — no erased slot available.
         assert_eq!(find_next_empty_slot(&magics), None);
     }
 
@@ -960,7 +1081,8 @@ mod tests {
         assert_eq!(CrashKind::from_u8(0), CrashKind::HardFault);
         assert_eq!(CrashKind::from_u8(1), CrashKind::Panic);
         assert_eq!(CrashKind::from_u8(2), CrashKind::WatchdogTimeout);
-        assert_eq!(CrashKind::from_u8(3), CrashKind::Unknown);
+        assert_eq!(CrashKind::from_u8(3), CrashKind::ResetReason);
+        assert_eq!(CrashKind::from_u8(4), CrashKind::TransportSmash);
         assert_eq!(CrashKind::from_u8(0xFF), CrashKind::Unknown);
     }
 
@@ -973,6 +1095,10 @@ mod tests {
         assert_eq!(rec.crash_kind_name(), "Panic");
         rec.crash_kind = 2;
         assert_eq!(rec.crash_kind_name(), "WatchdogTimeout");
+        rec.crash_kind = 3;
+        assert_eq!(rec.crash_kind_name(), "ResetReason");
+        rec.crash_kind = 4;
+        assert_eq!(rec.crash_kind_name(), "TransportSmash");
         rec.crash_kind = 0xFF;
         assert_eq!(rec.crash_kind_name(), "Unknown");
     }

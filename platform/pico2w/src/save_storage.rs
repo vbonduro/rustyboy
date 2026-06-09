@@ -51,7 +51,10 @@ pub fn save_state_filename(slot: SaveSlot) -> String {
 pub enum BootSaves {
     BatterySave(Vec<u8>),
     SaveState(SaveState),
-    Both { battery: Vec<u8>, save_state: SaveState },
+    Both {
+        battery: Vec<u8>,
+        save_state: SaveState,
+    },
 }
 
 /// Determine the boot start state from raw SD data.

@@ -53,13 +53,22 @@ RECORD_MAGIC = b"RCRP"
 SECTOR_MAGIC = b"RCLG"
 CRASH_MAGIC = 0xCF_4A_53_11
 
-CRASH_KIND_NAMES = {0: "HardFault", 1: "Panic", 2: "WatchdogTimeout"}
+CRASH_KIND_NAMES = {
+    0: "HardFault",
+    1: "Panic",
+    2: "WatchdogTimeout",
+    3: "ResetReason",
+    4: "TransportSmash",
+}
 
 FLAG_HAS_ARM_REGS = 0x01
 FLAG_HAS_GB_STATE = 0x02
 FLAG_HAS_ROM_INFO = 0x04
 FLAG_HAS_PANIC_LOC = 0x08
-FLAG_HAS_STACK_OVERFLOW = 0x10  # MSP was below _stack_end at crash time
+FLAG_HAS_STACK_OVERFLOW = 0x10  # SP was below its stack limit at crash time
+FLAG_FAULT_ON_CORE1 = 0x20      # crash occurred on core 1; stack measured vs core 1 limit
+FLAG_HAS_HARDFAULT_EXTENDED_REGS = 0x40  # UNALIGNED HardFault: panic_loc[0:4]=pre-handler r4, [4:8]=stacked r12
+FLAG_HAS_STACK_CHK_FAIL_LR = 0x80        # arm_lr holds the -Z stack-protector __stack_chk_fail LR
 
 # Flash offset of the crash log sector inside the 4 MiB address space.
 CRASH_LOG_FLASH_OFFSET = 0x3FF000  # relative to flash base 0x10000000
@@ -230,8 +239,41 @@ class CrashRecord:
 
     @property
     def has_stack_overflow(self) -> bool:
-        """MSP was below `_stack_end` at crash time — stack overflow detected."""
+        """SP was below its stack limit at crash time — stack overflow detected."""
         return bool(self.flags & FLAG_HAS_STACK_OVERFLOW)
+
+    @property
+    def fault_on_core1(self) -> bool:
+        """Crash occurred on core 1 (emulator worker); stack measured vs core 1 limit."""
+        return bool(self.flags & FLAG_FAULT_ON_CORE1)
+
+    @property
+    def has_hardfault_ext_regs(self) -> bool:
+        """UNALIGNED HardFault: panic_loc holds pre-handler r4 + stacked r12."""
+        return bool(self.flags & FLAG_HAS_HARDFAULT_EXTENDED_REGS)
+
+    @property
+    def has_stack_chk_fail_lr(self) -> bool:
+        """arm_lr holds the -Z stack-protector __stack_chk_fail return address."""
+        return bool(self.flags & FLAG_HAS_STACK_CHK_FAIL_LR)
+
+    @property
+    def ext_r4(self) -> Optional[int]:
+        """Pre-handler r4 (the multiword-store/deref base register at fault)."""
+        if not self.has_hardfault_ext_regs:
+            return None
+        return struct.unpack_from("<I", self.panic_loc_raw, 0)[0]
+
+    @property
+    def ext_r12(self) -> Optional[int]:
+        """Stacked r12 at fault (often the object/GameBoy base in the current build)."""
+        if not self.has_hardfault_ext_regs:
+            return None
+        return struct.unpack_from("<I", self.panic_loc_raw, 4)[0]
+
+    @property
+    def core_name(self) -> str:
+        return "core 1" if self.fault_on_core1 else "core 0"
 
     @property
     def rom_id_hex(self) -> str:
@@ -241,6 +283,14 @@ class CrashRecord:
     def fw_version_str(self) -> str:
         return ".".join(str(v) for v in self.fw_version)
 
+    @property
+    def has_reset_reason_fields(self) -> bool:
+        return self.has_arm_regs and self.crash_kind in (2, 3)
+
+    @property
+    def has_transport_smash_fields(self) -> bool:
+        return self.has_arm_regs and self.crash_kind == 4
+
     def to_dict(self) -> dict:
         return {
             "slot_index": self.slot_index,
@@ -249,6 +299,7 @@ class CrashRecord:
             "schema_ver": self.schema_ver,
             "crash_kind": self.crash_kind_name,
             "flags": self.flags,
+            "core": self.core_name,
             "fw_version": self.fw_version_str,
             "git_hash": f"{self.git_hash:08x}",
             "arm": {
@@ -281,10 +332,37 @@ class CrashRecord:
                 "file": self.panic_loc,
                 "line": self.panic_line,
             } if self.has_panic_loc else None,
+            "ext_regs": {
+                "r4": f"0x{self.ext_r4:08x}",
+                "r12": f"0x{self.ext_r12:08x}",
+            } if self.has_hardfault_ext_regs else None,
             "stack": {
                 "headroom_bytes": self.stack_headroom,
                 "overflowed": self.has_stack_overflow,
+                "core": self.core_name,
             } if self.stack_headroom > 0 or self.has_stack_overflow else None,
+            "reset": {
+                "watchdog_reason": f"0x{self.arm_pc:08x}",
+                "watchdog_reason_desc": _watchdog_reason_description(self.arm_pc),
+                "powman_chip_reset": f"0x{self.arm_lr:08x}",
+                "powman_chip_reset_desc": _powman_chip_reset_description(self.arm_lr),
+                "powman_current_pwrup": f"0x{self.arm_cfsr:08x}",
+                "powman_current_pwrup_desc": _powman_pwrup_description(self.arm_cfsr),
+                "powman_last_swcore_pwrup": f"0x{self.arm_hfsr:08x}",
+                "powman_last_swcore_pwrup_desc": _powman_pwrup_description(self.arm_hfsr),
+                "powman_intr": f"0x{self.arm_fault_addr:08x}",
+                "powman_intr_desc": _powman_intr_description(self.arm_fault_addr),
+            } if self.has_reset_reason_fields else None,
+            "transport_smash": {
+                "base": f"0x{self.arm_pc:08x}",
+                "command_tx": f"0x{self.arm_lr:08x}",
+                "audio_rx": f"0x{self.arm_cfsr:08x}",
+                "shared": f"0x{self.arm_hfsr:08x}",
+                "source_triplet": f"0x{self.arm_fault_addr:08x}",
+                "source_triplet_class": _transport_smash_class(
+                    self.arm_fault_addr, self.arm_pc
+                ),
+            } if self.has_transport_smash_fields else None,
         }
 
 
@@ -357,11 +435,20 @@ def _symbolize(addr: int, elf_path: str) -> str:
 def symbolize_record(record: CrashRecord, elf_path: Optional[str]) -> dict[str, str]:
     if not elf_path:
         return {}
+    if record.has_reset_reason_fields:
+        return {}
+    if record.has_transport_smash_fields:
+        return {}
     syms: dict[str, str] = {}
     if record.has_arm_regs and record.arm_pc:
         syms["pc"] = _symbolize(record.arm_pc, elf_path)
     if record.has_arm_regs and record.arm_lr:
         syms["lr"] = _symbolize(record.arm_lr, elf_path)
+    if record.has_hardfault_ext_regs:
+        if record.ext_r4:
+            syms["r4"] = _symbolize(record.ext_r4, elf_path)
+        if record.ext_r12:
+            syms["r12"] = _symbolize(record.ext_r12, elf_path)
     return syms
 
 
@@ -434,6 +521,12 @@ def mark_read_via_probe() -> None:
             [
                 "probe-rs", "download",
                 "--chip", "RP235x",
+                # Single-buffered + verify: RP2350 flash programming corrupts
+                # silently at the default probe settings on this board (see
+                # platform/pico2w/.cargo/config.toml runner). Match that here so
+                # the crash-sector write-back is actually verified.
+                "--disable-double-buffering",
+                "--verify",
                 "--binary-format", "bin",
                 "--base-address", f"0x{addr:08x}",
                 sector_path,
@@ -548,23 +641,60 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
         )
         console.print(Panel(header_line, expand=False, box=box.SIMPLE_HEAVY))
 
-        # Stack overflow / headroom
+        # Stack overflow / headroom — measured against the faulting core's stack.
+        limit_name = "__core1_stack_limit" if rec.fault_on_core1 else "_stack_end"
         if rec.has_stack_overflow:
             console.print(
-                f"  [bold red]⚠ STACK OVERFLOW[/]  "
-                f"MSP was [bold red]{rec.stack_headroom}[/] bytes [bold red]below[/] "
-                f"_stack_end at crash time"
+                f"  [bold red]⚠ {rec.core_name.upper()} STACK OVERFLOW[/]  "
+                f"SP was [bold red]{rec.stack_headroom}[/] bytes [bold red]below[/] "
+                f"{limit_name} at crash time"
             )
         elif rec.stack_headroom > 0:
             warn = " [bold yellow]⚠ LOW[/]" if rec.stack_headroom < 4096 else ""
             console.print(
-                f"  [bold]Stk hdm[/]  {rec.stack_headroom} bytes remaining"
+                f"  [bold]Stk hdm[/]  [dim]({rec.core_name})[/] "
+                f"{rec.stack_headroom} bytes remaining"
                 f"{warn}"
             )
 
-        # ARM state
+        # ARM/reset state
         is_unaligned = bool(rec.arm_cfsr & (1 << 24))
-        if rec.has_arm_regs:
+        if rec.has_reset_reason_fields:
+            console.print(
+                f"  [bold]WD reason[/]  [cyan]0x{rec.arm_pc:08x}[/]"
+                + (f"  {_watchdog_reason_description(rec.arm_pc)}" if rec.arm_pc else "")
+            )
+            console.print(
+                f"  [bold]POWMAN reset[/]  [cyan]0x{rec.arm_lr:08x}[/]"
+                + (f"  {_powman_chip_reset_description(rec.arm_lr)}" if rec.arm_lr else "")
+            )
+            console.print(
+                f"  [bold]Current pwrup[/]  [cyan]0x{rec.arm_cfsr:08x}[/]"
+                + (f"  {_powman_pwrup_description(rec.arm_cfsr)}" if rec.arm_cfsr else "")
+            )
+            console.print(
+                f"  [bold]Last swcore[/]  [cyan]0x{rec.arm_hfsr:08x}[/]"
+                + (f"  {_powman_pwrup_description(rec.arm_hfsr)}" if rec.arm_hfsr else "")
+            )
+            if rec.arm_fault_addr:
+                console.print(
+                    f"  [bold]POWMAN intr[/]  [cyan]0x{rec.arm_fault_addr:08x}[/]"
+                    + f"  {_powman_intr_description(rec.arm_fault_addr)}"
+                )
+        elif rec.has_transport_smash_fields:
+            console.print(f"  [bold]Transport[/]  base=[cyan]0x{rec.arm_pc:08x}[/]")
+            console.print(
+                f"  [bold]Ptr triplet[/]  "
+                f"cmd=[red]0x{rec.arm_lr:08x}[/]  "
+                f"aud=[red]0x{rec.arm_cfsr:08x}[/]  "
+                f"shr=[red]0x{rec.arm_hfsr:08x}[/]"
+            )
+            if rec.arm_fault_addr:
+                console.print(
+                    f"  [bold]Dup src[/]  [yellow]0x{rec.arm_fault_addr:08x}[/]"
+                    f"  {_transport_smash_class(rec.arm_fault_addr, rec.arm_pc)}"
+                )
+        elif rec.has_arm_regs:
             pc_sym = syms.get("pc", "")
             lr_sym = syms.get("lr", "")
             console.print(f"  [bold]ARM PC [/]  [cyan]0x{rec.arm_pc:08x}[/]"
@@ -597,6 +727,27 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
                     )
             elif rec.arm_fault_addr:
                 console.print(f"  [bold]Fault@ [/]  [red]0x{rec.arm_fault_addr:08x}[/]")
+
+            # Extended HardFault registers (UNALIGNED trampoline capture): the
+            # multiword-store/deref base register r4 and stacked r12. If r4 is a
+            # small/non-SRAM value it was wholesale-smashed (wild pointer write);
+            # if r4 is a sane base, suspect a corrupted offset/index instead.
+            if rec.has_hardfault_ext_regs:
+                r4 = rec.ext_r4 or 0
+                r12 = rec.ext_r12 or 0
+                r4_sym = syms.get("r4", "")
+                r12_sym = syms.get("r12", "")
+                in_sram = 0x2000_0000 <= r4 < 0x2008_2000
+                note = "" if in_sram else "  [bold red](not SRAM — base wholesale-smashed)[/]"
+                console.print(
+                    f"  [bold]Pre r4 [/]  [red]0x{r4:08x}[/]"
+                    f"  [dim](deref/store base reg)[/]{note}"
+                    + (f"  → {r4_sym}" if r4_sym and r4_sym not in ('??  (??:0)', '(addr2line not available)') else "")
+                )
+                console.print(
+                    f"  [bold]Stk r12[/]  [cyan]0x{r12:08x}[/]"
+                    + (f"  → {r12_sym}" if r12_sym and r12_sym not in ('??  (??:0)', '(addr2line not available)') else "")
+                )
 
         # Panic location
         if rec.has_panic_loc and rec.panic_loc:
@@ -668,6 +819,95 @@ def _hfsr_description(hfsr: int) -> str:
     if hfsr & (1 << 30): parts.append("FORCED")
     if hfsr & (1 <<  1): parts.append("VECTTBL")
     return "  ".join(parts) if parts else ""
+
+
+def _watchdog_reason_description(reason: int) -> str:
+    parts = []
+    if reason & 0x1: parts.append("timer")
+    if reason & 0x2: parts.append("force")
+    return "  ".join(parts) if parts else "none"
+
+
+def _powman_chip_reset_description(chip_reset: int) -> str:
+    names = [
+        (0, "double_tap"),
+        (4, "rescue_flag"),
+        (16, "had_por"),
+        (17, "had_bor"),
+        (18, "had_run_low"),
+        (19, "had_dp_reset_req"),
+        (21, "had_rescue"),
+        (22, "had_watchdog_reset_powman_async"),
+        (23, "had_watchdog_reset_powman"),
+        (24, "had_watchdog_reset_swcore"),
+        (25, "had_swcore_pd"),
+        (26, "had_glitch_detect"),
+        (27, "had_hzd_sys_reset_req"),
+        (28, "had_watchdog_reset_rsm"),
+    ]
+    parts = [name for bit, name in names if chip_reset & (1 << bit)]
+    unknown = chip_reset & ~sum(1 << bit for bit, _ in names)
+    if unknown:
+        parts.append(f"unknown=0x{unknown:08x}")
+    return "  ".join(parts) if parts else "none"
+
+
+def _powman_pwrup_description(value: int) -> str:
+    source = value & 0x7F
+    source_names = {
+        0: "chip_reset",
+        1: "pwrup0",
+        2: "pwrup1",
+        3: "pwrup2",
+        4: "pwrup3",
+        5: "coresight_pwrup",
+        6: "alarm_pwrup",
+    }
+    if source in source_names:
+        return source_names[source]
+
+    # CURRENT_PWRUP_REQ is documented as a source field, but in practice can
+    # report request-line bits after a debugger/probe attaches. Decode those
+    # bits too so values like 0x20 are not opaque during reset-cause triage.
+    bit_names = [
+        (0, "pwrup0"),
+        (1, "pwrup1"),
+        (2, "pwrup2"),
+        (3, "pwrup3"),
+        (5, "coresight_pwrup"),
+        (6, "alarm_pwrup"),
+    ]
+    parts = [name for bit, name in bit_names if source & (1 << bit)]
+    unknown = source & ~sum(1 << bit for bit, _ in bit_names)
+    if unknown:
+        parts.append(f"unknown_bits=0x{unknown:02x}")
+    return "  ".join(parts) if parts else f"unknown_source_{source}"
+
+
+def _powman_intr_description(intr: int) -> str:
+    names = [
+        (0, "vreg_output_low"),
+        (1, "timer"),
+        (2, "state_req_ignored"),
+        (3, "pwrup_while_waiting"),
+    ]
+    parts = [name for bit, name in names if intr & (1 << bit)]
+    unknown = intr & ~sum(1 << bit for bit, _ in names)
+    if unknown:
+        parts.append(f"unknown=0x{unknown:08x}")
+    return "  ".join(parts) if parts else "none"
+
+
+def _transport_smash_class(addr: int, base: int) -> str:
+    if addr == 0:
+        return "none"
+    if base + 4 <= addr < base + 16:
+        return "transport_ptr_triplet"
+    if base >= 12 and base - 12 <= addr < base:
+        return "bus_event_buf_header"
+    if 0x2000_0000 <= addr < 0x2008_0000:
+        return "sram"
+    return "not_sram"
 
 
 # ---------------------------------------------------------------------------

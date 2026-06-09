@@ -23,13 +23,44 @@ use rustyboy_core::ipc::{GameBoyWorker, WorkerCommand, WorkerOutput, WorkerTrans
 use rustyboy_core::memory::cartridge::Cartridge;
 use rustyboy_core::memory::memory::{Error as MemoryError, GameBoyMemory};
 
-use crate::crash::CRASH_CONTEXT;
+use crate::crash::{CRASH_CONTEXT, TRANSPORT_SMASH_DIAG};
 use crate::display::NativeFrame;
 use crate::stack_probe;
 
+unsafe extern "C" {
+    fn rustyboy_core1_pointer_guard(
+        site: u32,
+        shared: u32,
+        worker: u32,
+        want_shared: u32,
+        want_worker: u32,
+    ) -> !;
+
+    fn rustyboy_live_ppu_borrow_guard(
+        site: u32,
+        borrow_word: u32,
+        render_version: u32,
+        shared: u32,
+        worker: u32,
+    ) -> !;
+
+    fn rustyboy_gameboy_memory_pointer_guard(
+        site: u32,
+        gameboy: u32,
+        memory: u32,
+        want_memory: u32,
+        field_addr: u32,
+    ) -> !;
+}
+
 const CORE1_STACK_SIZE: usize = 8192;
-const COMMAND_QUEUE_CAPACITY: usize = 512;
+// heapless 0.8 `MpMcQueue` still narrows sequence deltas to i8 under
+// `mpmc_large`; keep this queue small enough that wrapped generations stay
+// unambiguous. Audio needs deeper buffering, so it uses `AudioQueue` below.
+const COMMAND_QUEUE_CAPACITY: usize = 64;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
+const _: () = assert!(COMMAND_QUEUE_CAPACITY <= 64);
+const _: () = assert!(AUDIO_QUEUE_CAPACITY.is_power_of_two());
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
 const LCD_TIMING_BATCH_CYCLES: u16 = 80;
 const NATIVE_FRAME_SLOT_COUNT: usize = 3;
@@ -63,12 +94,30 @@ const TOTAL_SCANLINES: u8 = 154;
 const SCREEN_HEIGHT: u8 = 144;
 
 static SHARED_WORKER_STATE: SharedWorkerState = SharedWorkerState::new();
+// Cross-core channels.
+//
+// COMMAND_QUEUE (core 0 → core 1): `MpMcQueue` is lock-free via LDREX/STREX CAS,
+// but the RP2350's two M33 cores have per-core exclusive monitors with no global
+// arbitration for SRAM, so concurrent enqueue/dequeue can corrupt the queue
+// indices. Every access is therefore serialized with the SIO hardware spinlock
+// (via `critical_section`). That spinlock's acquire/release barriers ALSO drain
+// each core's write buffer, which is what makes the `sync_complete` ticket
+// handshake below visible across cores — do not "optimize" the spinlock away
+// without replacing those barriers (a lock-free SPSC queue removes them and the
+// handshake deadlocks: core 1's ack store sits in its write buffer while it
+// sleeps, and core 0 spins forever on the stale value).
+//
+// AUDIO_QUEUE (core 1 → core 0): the ticket handshake serializes producer and
+// consumer (core 1 fills it inside DrainAudio, then core 0 drains it only after
+// the ticket lands), so there is never concurrent access — no spinlock needed.
 static COMMAND_QUEUE: MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY> = MpMcQueue::new();
-static AUDIO_QUEUE: MpMcQueue<i16, AUDIO_QUEUE_CAPACITY> = MpMcQueue::new();
+static AUDIO_QUEUE: AudioQueue = AudioQueue::new();
 #[unsafe(link_section = ".core1_stack")]
 static mut CORE1_STACK: Stack<CORE1_STACK_SIZE> = Stack::new();
 static CORE1_WORKER: StaticStorage<GameBoyWorker> = StaticStorage::new();
-
+static EXPECTED_WORKER_PPU_STATE_PTR: AtomicU32 = AtomicU32::new(0);
+static EXPECTED_GAMEBOY_MEMORY_PTR: AtomicU32 = AtomicU32::new(0);
+static DWT_WATCH_ADDRS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 enum Core1Command {
@@ -202,6 +251,54 @@ impl<T> StaticStorage<T> {
 
 unsafe impl<T> Sync for StaticStorage<T> {}
 
+struct AudioQueue {
+    inner: UnsafeCell<AudioQueueInner>,
+}
+
+struct AudioQueueInner {
+    samples: [i16; AUDIO_QUEUE_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+unsafe impl Sync for AudioQueue {}
+
+impl AudioQueue {
+    const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(AudioQueueInner {
+                samples: [0; AUDIO_QUEUE_CAPACITY],
+                head: 0,
+                len: 0,
+            }),
+        }
+    }
+
+    #[inline(always)]
+    fn enqueue(&self, sample: i16) -> Result<(), i16> {
+        let inner = unsafe { &mut *self.inner.get() };
+        if inner.len == AUDIO_QUEUE_CAPACITY {
+            return Err(sample);
+        }
+        let tail = (inner.head + inner.len) & (AUDIO_QUEUE_CAPACITY - 1);
+        inner.samples[tail] = sample;
+        inner.len += 1;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn dequeue(&self) -> Option<i16> {
+        let inner = unsafe { &mut *self.inner.get() };
+        if inner.len == 0 {
+            return None;
+        }
+        let sample = inner.samples[inner.head];
+        inner.head = (inner.head + 1) & (AUDIO_QUEUE_CAPACITY - 1);
+        inner.len -= 1;
+        Some(sample)
+    }
+}
+
 struct SharedWorkerState {
     sync_snapshot: Mutex<RefCell<PpuSnapshot>>,
     live_ppu_snapshot: Mutex<RefCell<PpuSnapshot>>,
@@ -253,6 +350,16 @@ impl SharedWorkerState {
     }
 
     fn publish_frame(&self, worker: &GameBoyWorker) {
+        // Mutual exclusion with `clear_published_frames` (core 0, save-state /
+        // reset path). Both write `native_frame_slots`, `prev_row_hashes`, and
+        // the published-frame atomics; the SIO spinlock is the only thing that
+        // actually prevents the cross-core race. The old "only accessed from
+        // core 1" comment was a breakable contract — `load_ppu_state` violated
+        // it while core 1 was live. Held ~once per frame (gated by frame_ready).
+        critical_section::with(|_| self.publish_frame_locked(worker));
+    }
+
+    fn publish_frame_locked(&self, worker: &GameBoyWorker) {
         let current_slot = self.published_frame.load(Ordering::Acquire) as usize;
         // Scan all slots for a free one that isn't currently being consumed.
         // All initial values are zero so SharedWorkerState stays in .bss.
@@ -304,8 +411,7 @@ impl SharedWorkerState {
         // Safety: called only from Core 1; target_slot is neither the currently
         // published slot nor marked busy, so Core 0 cannot be reading it.
         unsafe {
-            (*self.native_frame_slots[target_slot].as_mut_ptr())
-                .copy_from_slice(framebuffer);
+            (*self.native_frame_slots[target_slot].as_mut_ptr()).copy_from_slice(framebuffer);
         }
         // dirty_rows is fully written above; the Release store below pairs with
         // the Acquire load in published_native_frame() on Core 0, ensuring the
@@ -316,6 +422,15 @@ impl SharedWorkerState {
     }
 
     fn clear_published_frames(&self) {
+        // Serialize against core 1's `publish_frame` via the SIO spinlock. This
+        // runs on core 0 from `sync_ppu_state` / `load_ppu_state` *while core 1
+        // is live*, so the prior "called during reset before core 1 is
+        // re-spawned" assumption does not hold — real mutual exclusion is
+        // required, not a contract.
+        critical_section::with(|_| self.clear_published_frames_locked());
+    }
+
+    fn clear_published_frames_locked(&self) {
         for slot in &self.native_frame_slots {
             // Safety: called during reset before core 1 is re-spawned, so no
             // concurrent access to any slot is possible.
@@ -341,8 +456,14 @@ impl SharedWorkerState {
         self.ppu_ly.store(state.ppu_ly, Ordering::Release);
         self.ppu_stat.store(state.ppu_stat, Ordering::Release);
         if state.if_bits != 0 {
-            self.pending_if_bits
-                .fetch_or(state.if_bits, Ordering::AcqRel);
+            // Both cores RMW pending_if_bits (core 1 fetch_or here, core 0 swap in
+            // poll_output). The RP2350's per-core exclusive monitors make cross-core
+            // LDREX/STREX RMW unreliable, so serialize with the SIO spinlock — same
+            // hazard class as the command queue.
+            critical_section::with(|_| {
+                self.pending_if_bits
+                    .fetch_or(state.if_bits, Ordering::AcqRel)
+            });
         }
     }
 
@@ -572,7 +693,7 @@ struct PendingPpuAdvance {
 
 struct Core1Transport {
     command_tx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
-    audio_rx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
+    audio_rx: &'static AudioQueue,
     shared: &'static SharedWorkerState,
     lcd_timing: LcdTiming,
     lcd_timing_io: [u8; 0x80],
@@ -597,11 +718,20 @@ impl Core1Transport {
         // Safety: CORE1_WORKER is MaybeUninit; init_in_place writes it exactly
         // once here before core 1 starts, so there is no concurrent access.
         let worker = unsafe { GameBoyWorker::init_in_place(CORE1_WORKER.as_mut_ptr()) };
+        EXPECTED_WORKER_PPU_STATE_PTR.store(
+            worker.ppu_state_ptr_for_diagnostics() as u32,
+            Ordering::Release,
+        );
 
-        // Safety: writing to the bottom 256 bytes of core 1's stack before the
-        // thread starts; no concurrent access to this memory region yet.
+        // Paint the WHOLE core 1 stack with the sentinel before the thread
+        // starts (no concurrent access yet) so the worker loop can later read a
+        // true high-water mark, not just a bottom-of-stack tripwire.
+        // Safety: CORE1_STACK is exactly CORE1_STACK_SIZE bytes, owned here.
         unsafe {
-            stack_probe::paint_region(core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8, 256);
+            stack_probe::paint_region(
+                core::ptr::addr_of_mut!(CORE1_STACK) as *mut u8,
+                CORE1_STACK_SIZE,
+            );
         }
 
         let shared_for_core1 = shared;
@@ -625,19 +755,60 @@ impl Core1Transport {
         }
     }
 
+    /// #5 core-0 tripwire: `self.shared` is `&'static SharedWorkerState`, a
+    /// fixed address. The crash-loop's dominant fault is an UNALIGNED atomic
+    /// load through a *corrupted* `self.shared` (gameboy.rs:214 →
+    /// read_worker_output → poll_output). Reading the field's bits and comparing
+    /// (no deref) catches the smash at the first transport call after it, with a
+    /// label identifying which tick sub-step ran just before — so the
+    /// deterministic save-state repro bisects the writer. Cheap; keep on.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
+    fn check_shared(&self, label: &'static str) {
+        // Validate all three `&'static` pointer fields. In the optimized ARM
+        // layout, `pending_ppu` is before them, so this checked triplet starts
+        // at transport offset 4 (command_tx@4, audio_rx@8, shared@12). The #5
+        // wild write smashes this contiguous region; checking only `shared`
+        // missed the cases where it lands on command_tx/audio_rx (enqueue
+        // HardFault).
+        let cmd = self.command_tx as *const _ as usize;
+        let aud = self.audio_rx as *const _ as usize;
+        let shr = self.shared as *const SharedWorkerState as usize;
+        let want_cmd = core::ptr::addr_of!(COMMAND_QUEUE) as usize;
+        let want_aud = core::ptr::addr_of!(AUDIO_QUEUE) as usize;
+        let want_shr = core::ptr::addr_of!(SHARED_WORKER_STATE) as usize;
+        if cmd != want_cmd || aud != want_aud || shr != want_shr {
+            // Out-of-line cold handler: keeps THIS (inlined) hot path minimal so
+            // the stack layout barely changes — earlier in-situ dumping bloated
+            // the inlined path and suppressed the (layout-sensitive) overrun.
+            report_transport_smash(label, self as *const _ as usize, cmd, aud, shr);
+        }
+    }
+
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn enqueue_blocking(&mut self, command: Core1Command) {
         let mut command = command;
         loop {
-            match self.command_tx.enqueue(command) {
+            // Serialize the enqueue with the SIO spinlock (see COMMAND_QUEUE):
+            // the lock-free CAS is not cross-core safe on RP2350, and the
+            // spinlock's barriers also publish the ticket handshake.
+            match critical_section::with(|_| self.command_tx.enqueue(command)) {
                 Ok(()) => {
+                    // Wake core 1 if it's parked in WFE on an empty queue.
                     asm::sev();
                     return;
                 }
                 Err(returned) => {
+                    // Queue full — core 1 hasn't drained it yet. Sleep on WFE
+                    // instead of busy-retrying: a tight retry loop re-takes the
+                    // spinlock so fast it STARVES core 1's (also-spinlock-guarded)
+                    // dequeue, so the queue never drains and both cores livelock
+                    // until the watchdog reboots. WFE releases the core so core 1
+                    // can take the spinlock; it SEVs after every dequeue to wake
+                    // us, and any interrupt also wakes WFE, so we can't miss it.
                     command = returned;
-                    core::hint::spin_loop();
+                    asm::wfe();
                 }
             }
         }
@@ -799,12 +970,17 @@ impl Core1Transport {
     }
 
     fn wait_for_ticket(&self, ticket: u32) {
+        // #5: a smashed `self.shared` makes this spin on a garbage address that
+        // never matches `ticket` → watchdog hang (the observed standalone
+        // WatchdogTimeout). Catch it as a clean panic before the spin instead.
+        self.check_shared("wait_for_ticket");
         while self.shared.sync_complete.load(Ordering::Acquire) != ticket {
             core::hint::spin_loop();
         }
     }
 
     fn published_native_frame(&mut self) -> &'static NativeFrame {
+        self.check_shared("published_native_frame");
         if self.held_frame_slot != u8::MAX {
             self.release_native_frame();
         }
@@ -845,6 +1021,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn send(&mut self, command: WorkerCommand) {
+        self.check_shared("send");
         match command {
             WorkerCommand::AdvanceApu {
                 cycles,
@@ -875,6 +1052,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_vram_range(&mut self, start_offset: u16, data: &[u8]) {
+        self.check_shared("write_vram_range");
         if data.is_empty() {
             return;
         }
@@ -885,6 +1063,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_oam_range(&mut self, start_offset: u16, data: &[u8]) {
+        self.check_shared("write_oam_range");
         if data.is_empty() {
             return;
         }
@@ -895,6 +1074,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_ppu_register(&mut self, addr: u16, value: u8) {
+        self.check_shared("write_ppu_register");
         self.write_lcd_timing_register(addr, value);
         self.flush_pending_ppu();
         self.enqueue_blocking(Core1Command::Worker(WorkerCommand::WritePpuRegister {
@@ -906,6 +1086,7 @@ impl WorkerTransport for Core1Transport {
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(always)]
     fn write_ppu_registers(&mut self, regs: &[(u16, u8)]) {
+        self.check_shared("write_ppu_registers");
         if regs.is_empty() {
             return;
         }
@@ -1007,12 +1188,16 @@ impl WorkerTransport for Core1Transport {
 
     fn poll_output(&mut self, out: &mut [u8; FRAMEBUFFER_SIZE]) -> WorkerOutput {
         let _ = out;
+        self.check_shared("poll_output");
         let frame_seq = self.shared.published_frame_seq.load(Ordering::Acquire);
         let frame_ready = frame_seq != self.last_frame_seq;
         if frame_ready {
             self.last_frame_seq = frame_seq;
         }
-        let _worker_if_bits = self.shared.pending_if_bits.swap(0, Ordering::AcqRel);
+        // Serialize with core 1's fetch_or (see publish_worker_output): cross-core
+        // RMW via the SIO spinlock, not the unreliable per-core exclusive monitor.
+        let _worker_if_bits =
+            critical_section::with(|_| self.shared.pending_if_bits.swap(0, Ordering::AcqRel));
         let if_bits = self.lcd_timing_if_bits;
         self.lcd_timing_if_bits = 0;
         let lcd_timing_frame_ready = self.lcd_timing_frame_ready;
@@ -1055,6 +1240,27 @@ impl PicoGameBoy {
 
     #[inline(always)]
     pub fn tick(&mut self) {
+        let memory_field = self.gb.memory_box_field_addr_for_diagnostics();
+        let memory = self.gb.memory_ptr_for_diagnostics();
+        let expected = EXPECTED_GAMEBOY_MEMORY_PTR.load(Ordering::Acquire);
+        if expected == 0 {
+            EXPECTED_GAMEBOY_MEMORY_PTR.store(memory as u32, Ordering::Release);
+        } else if memory as u32 != expected {
+            unsafe {
+                rustyboy_gameboy_memory_pointer_guard(
+                    core::panic::Location::caller().line(),
+                    &self.gb as *const GameBoy<Core1Transport> as u32,
+                    memory as u32,
+                    expected,
+                    memory_field as u32,
+                );
+            }
+        }
+
+        // Core 1 publishes the active corruption-hunt watchpoints once it knows
+        // its stack slots. Core 0 still needs to arm its own DWT bank so a
+        // cross-core write into those slots/fields is caught.
+        crate::dwt_watch::arm_published_watch_words_for_current_core();
         self.gb.tick();
     }
 
@@ -1142,6 +1348,22 @@ impl PicoGameBoy {
         let ppu_ly = SHARED_WORKER_STATE.ppu_ly.load(Ordering::Relaxed);
         let ppu_stat = SHARED_WORKER_STATE.ppu_stat.load(Ordering::Relaxed);
 
+        // #5 RCA aid: the two captured pointer-corruption crashes both froze the
+        // emulator at GB PC=0x03ce (HRAM, HL=0xffaa). Log the cross-core context
+        // when we sample that PC so a capture run shows core 0's stack high-water
+        // and bank state at the reproducible trigger. Gated to trace so it costs
+        // nothing at the default log level; raise to DEFMT_LOG=trace to see it.
+        const TRIGGER_GB_PC: u16 = 0x03ce;
+        if regs.pc == TRIGGER_GB_PC {
+            #[cfg(feature = "stack-probe")]
+            defmt::trace!(
+                "RCA trigger: GB pc={=u16:#06x} bank={=u16} core0 stack high-water {=usize}B",
+                regs.pc,
+                rom_bank,
+                stack_probe::high_water_core0(),
+            );
+        }
+
         CRASH_CONTEXT.update(
             rom_id_prefix,
             rom_bank,
@@ -1195,8 +1417,142 @@ fn hash_raw_row(row: &[u8]) -> u32 {
     })
 }
 
+/// Cold, out-of-line handler for a detected transport-pointer smash (#5).
+///
+/// Logs the corrupted vs expected pointers, then **scans main SRAM for the
+/// corrupting values** to locate the SOURCE buffer (the overrun writes the same
+/// bytes there and onto the transport). Reporting the source address — other
+/// than `base` (the transport itself) — fingerprints the overrunning buffer.
+/// Kept `#[inline(never)]`+`#[cold]` so `check_shared`'s inlined hot path (and
+/// thus the stack layout) is unchanged, avoiding the heisenbug.
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
+#[inline(never)]
+#[cold]
+fn report_transport_smash(
+    label: &'static str,
+    base: usize,
+    cmd: usize,
+    aud: usize,
+    shr: usize,
+) -> ! {
+    let want_cmd = core::ptr::addr_of!(COMMAND_QUEUE) as usize;
+    let want_aud = core::ptr::addr_of!(AUDIO_QUEUE) as usize;
+    let want_shr = core::ptr::addr_of!(SHARED_WORKER_STATE) as usize;
+    defmt::error!(
+        "core0 transport smashed before {=str} @ {=usize:#010x}: cmd={=usize:#010x} aud={=usize:#010x} shr={=usize:#010x} (want {=usize:#010x} {=usize:#010x} {=usize:#010x})",
+        label,
+        base,
+        cmd,
+        aud,
+        shr,
+        want_cmd,
+        want_aud,
+        want_shr,
+    );
+    let source_triplet = first_duplicate_transport_triplet(base, cmd, aud, shr);
+    TRANSPORT_SMASH_DIAG.record(base, cmd, aud, shr, source_triplet);
+    scan_sram_for_transport_word("cmd", 0, cmd as u32, base, cmd, aud, shr);
+    scan_sram_for_transport_word("aud", 1, aud as u32, base, cmd, aud, shr);
+    scan_sram_for_transport_word("shr", 2, shr as u32, base, cmd, aud, shr);
+    panic!("core0 transport ptrs smashed");
+}
+
+#[inline(never)]
+fn first_duplicate_transport_triplet(base: usize, cmd: usize, aud: usize, shr: usize) -> usize {
+    let mut triplet = 0x2000_0000usize;
+    let end = 0x2008_0000usize.saturating_sub(12);
+    while triplet <= end {
+        let v0 = unsafe { (triplet as *const u32).read_volatile() } as usize;
+        if v0 == cmd {
+            let v1 = unsafe { (triplet as *const u32).add(1).read_volatile() } as usize;
+            let v2 = unsafe { (triplet as *const u32).add(2).read_volatile() } as usize;
+            if v1 == aud && v2 == shr && triplet != base + 4 {
+                return triplet;
+            }
+        }
+        triplet += 4;
+    }
+    0
+}
+
+#[inline(never)]
+fn scan_sram_for_transport_word(
+    name: &'static str,
+    word_index: usize,
+    target: u32,
+    base: usize,
+    cmd: usize,
+    aud: usize,
+    shr: usize,
+) {
+    let mut addr = 0x2000_0000usize;
+    let end = 0x2008_0000usize;
+    let mut hits = 0u32;
+    while addr < end && hits < 24 {
+        // Safety: reading a u32 in the SRAM window.
+        let v = unsafe { (addr as *const u32).read_volatile() };
+        if v == target {
+            let triplet = addr.saturating_sub(word_index * 4);
+            let seq = if (0x2000_0000..=0x2007_fff8).contains(&triplet) {
+                let v0 = unsafe { (triplet as *const u32).read_volatile() } as usize;
+                let v1 = unsafe { (triplet as *const u32).add(1).read_volatile() } as usize;
+                let v2 = unsafe { (triplet as *const u32).add(2).read_volatile() } as usize;
+                (v0 == cmd && v1 == aud && v2 == shr) as u8
+            } else {
+                0
+            };
+            let class = classify_sram_match(addr, base);
+            defmt::error!(
+                "  {=str}-word {=u32:#010x} @ {=usize:#010x} (triplet@{=usize:#010x} 12B-match={=u8} class={=str})",
+                name,
+                target,
+                addr,
+                triplet,
+                seq,
+                class,
+            );
+            hits += 1;
+        }
+        addr += 4;
+    }
+}
+
+#[inline(never)]
+fn classify_sram_match(addr: usize, transport_base: usize) -> &'static str {
+    let transport_triplet = transport_base + 4;
+    let bus_event_header = transport_base - 12;
+    if (transport_triplet..transport_triplet + 12).contains(&addr) {
+        return "transport_ptr_triplet";
+    }
+    if (bus_event_header..bus_event_header + 12).contains(&addr) {
+        return "bus_event_buf_header";
+    }
+    if (transport_base..transport_base + core::mem::size_of::<Core1Transport>()).contains(&addr) {
+        return "transport";
+    }
+
+    unsafe extern "C" {
+        static _stack_end: u32;
+    }
+    let core0_stack_bottom = core::ptr::addr_of!(_stack_end) as usize;
+    let core0_stack_top = core::ptr::addr_of!(CORE1_STACK) as usize;
+    if (core0_stack_bottom..core0_stack_top).contains(&addr) {
+        return "core0_stack";
+    }
+
+    let core1_stack = core::ptr::addr_of!(CORE1_STACK) as usize;
+    if (core1_stack..core1_stack + CORE1_STACK_SIZE).contains(&addr) {
+        return "core1_stack";
+    }
+
+    "sram_static_or_allocator"
+}
+
 fn publish_worker_state(shared: &'static SharedWorkerState, worker: &mut GameBoyWorker) {
+    // #5: re-check immediately before the atomic stores below. If this fires but
+    // the loop-top check did not, the pointer was smashed *within* this command
+    // (worker.send / sync_*), narrowing the culprit to the emulator core path.
+    assert_core1_pointers(shared, worker);
     let state = worker.poll_output();
     if state.frame_ready {
         shared.publish_frame(worker);
@@ -1204,25 +1560,194 @@ fn publish_worker_state(shared: &'static SharedWorkerState, worker: &mut GameBoy
     shared.publish_worker_output(state);
 }
 
+/// CRASH_DEBUG_NOTES #5 tripwire.
+///
+/// The open crash smashes core 1's `shared` base pointer toward 0 and then
+/// HardFaults on the next atomic store (fault addr ≈ a `SharedWorkerState`
+/// field offset). `shared` and `worker` are both `&'static` to module statics
+/// at fixed addresses, so any value other than those is corruption. Checking
+/// once per command converts the eventual wild store fault into a *clean panic*
+/// — the crash handler records it as a Panic with the bad pointer's value and
+/// the GB state, telling us whether `shared`, `worker`, or neither is the
+/// corrupted operand (i.e. spilled-pointer smash vs. a wild store target vs.
+/// corruption inside the worker). Two pointer compares; cheap enough to keep on.
+#[inline(always)]
+#[track_caller]
+fn assert_core1_pointers(shared: &SharedWorkerState, worker: &GameBoyWorker) {
+    let shared_ptr = shared as *const SharedWorkerState as usize;
+    let want_shared = core::ptr::addr_of!(SHARED_WORKER_STATE) as usize;
+    let worker_ptr = worker as *const GameBoyWorker as usize;
+    // Safety: comparing the address only; not dereferencing the storage.
+    let want_worker = unsafe { CORE1_WORKER.as_mut_ptr() } as usize;
+    if shared_ptr != want_shared || worker_ptr != want_worker {
+        defmt::error!(
+            "core1 ptr corruption: shared={=usize:#010x}/want {=usize:#010x} worker={=usize:#010x}/want {=usize:#010x}",
+            shared_ptr,
+            want_shared,
+            worker_ptr,
+            want_worker,
+        );
+        unsafe {
+            rustyboy_core1_pointer_guard(
+                core::panic::Location::caller().line(),
+                shared_ptr as u32,
+                worker_ptr as u32,
+                want_shared as u32,
+                want_worker as u32,
+            );
+        }
+    }
+}
+
+#[inline(always)]
+#[track_caller]
+fn assert_worker_ppu_pointer(worker: &GameBoyWorker) {
+    let worker_ptr = worker as *const GameBoyWorker as usize;
+    let ppu_ptr = worker.ppu_state_ptr_for_diagnostics();
+    let want_ppu = EXPECTED_WORKER_PPU_STATE_PTR.load(Ordering::Acquire) as usize;
+    if want_ppu != 0 && ppu_ptr != want_ppu {
+        defmt::error!(
+            "core1 worker ppu ptr corruption: worker={=usize:#010x} ppu={=usize:#010x}/want {=usize:#010x}",
+            worker_ptr,
+            ppu_ptr,
+            want_ppu,
+        );
+        unsafe {
+            rustyboy_core1_pointer_guard(
+                core::panic::Location::caller().line(),
+                worker_ptr as u32,
+                ppu_ptr as u32,
+                worker_ptr as u32,
+                want_ppu as u32,
+            );
+        }
+    }
+}
+
+#[inline(never)]
+#[cold]
+#[track_caller]
+fn report_live_ppu_snapshot_borrow_failure(
+    shared: &SharedWorkerState,
+    worker: &GameBoyWorker,
+    cell: &RefCell<PpuSnapshot>,
+) -> ! {
+    let shared_ptr = shared as *const SharedWorkerState as usize;
+    let worker_ptr = worker as *const GameBoyWorker as usize;
+    let borrow_word =
+        unsafe { (cell as *const RefCell<PpuSnapshot> as *const u32).read_volatile() };
+    let render_version = shared.ppu_render_version.load(Ordering::Relaxed);
+    defmt::error!(
+        "live_ppu_snapshot borrow failed: borrow={=u32:#010x} render_ver={=u32} shared={=usize:#010x} worker={=usize:#010x}",
+        borrow_word,
+        render_version,
+        shared_ptr,
+        worker_ptr,
+    );
+    unsafe {
+        rustyboy_live_ppu_borrow_guard(
+            core::panic::Location::caller().line(),
+            borrow_word,
+            render_version,
+            shared_ptr as u32,
+            worker_ptr as u32,
+        );
+    }
+}
+
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
 fn run_core1_worker(
     command_rx: &'static MpMcQueue<Core1Command, COMMAND_QUEUE_CAPACITY>,
-    audio_tx: &'static MpMcQueue<i16, AUDIO_QUEUE_CAPACITY>,
+    audio_tx: &'static AudioQueue,
     shared: &'static SharedWorkerState,
     mut worker: &'static mut GameBoyWorker,
 ) -> ! {
+    // Re-assert the ARMv8-M hardware stack-limit guard for core 1.  embassy-rp's
+    // spawn_core1 already arms MSPLIM in core1_startup for the stack we passed;
+    // we set it again here on core 1's own MSP so the invariant is explicit and
+    // greppable.  Any push below the limit raises a STKOF UsageFault that
+    // escalates to the HardFault handler at the offending instruction instead of
+    // growing down into core 0's stack region just below 0x20080000.  (This
+    // guard pre-existed, so the #5 crashes are not a core-1 stack overflow —
+    // their CFSR shows bus faults, not STKOF.  See CRASH_DEBUG_NOTES.md.)
+    // Safety: __core1_stack_limit is a linker symbol; we only need its address.
+    unsafe {
+        unsafe extern "C" {
+            static __core1_stack_limit: u32;
+        }
+        cortex_m::register::msplim::write(core::ptr::addr_of!(__core1_stack_limit) as u32);
+    }
+
     let mut last_ppu_render_version = 0u32;
     let core1_stack_bottom = core::ptr::addr_of!(CORE1_STACK) as *const u8;
+    let worker_ptr_slot = core::ptr::addr_of!(worker) as *const _ as usize;
+    let shared_ptr_slot = core::ptr::addr_of!(shared) as *const _ as usize;
+    let audio_tx_ptr_slot = core::ptr::addr_of!(audio_tx) as *const _ as usize;
+    let worker_ppu_field = worker.ppu_box_field_addr_for_diagnostics();
+    let worker_ppu_ptr = worker.ppu_state_ptr_for_diagnostics();
+    if !DWT_WATCH_ADDRS_LOGGED.swap(true, Ordering::AcqRel) {
+        defmt::info!(
+            "dwt watch targets: worker_slot={=usize:#010x} ppu_field={=usize:#010x} shared_slot={=usize:#010x} audio_slot={=usize:#010x} worker={=usize:#010x} ppu={=usize:#010x}",
+            worker_ptr_slot,
+            worker_ppu_field,
+            shared_ptr_slot,
+            audio_tx_ptr_slot,
+            worker as *const GameBoyWorker as usize,
+            worker_ppu_ptr,
+        );
+    }
+    crate::dwt_watch::publish_and_arm_raw_words([
+        worker_ptr_slot,
+        worker_ppu_field,
+        shared_ptr_slot,
+        audio_tx_ptr_slot,
+    ]);
+    // Throttle the (full-stack) high-water scan so it doesn't run every command.
+    #[cfg(feature = "stack-probe")]
+    let mut hw_report_countdown: u32 = 0;
 
     loop {
-        // Safety: core1_stack_bottom points to the bottom of this thread's own
-        // stack; reading the guard region to detect overflow is safe from core 1.
-        unsafe { stack_probe::check_region(core1_stack_bottom, 256, "core1") };
+        crate::dwt_watch::arm_published_watch_words_for_current_core();
 
-        let Some(command) = command_rx.dequeue() else {
+        // Backstop the MSPLIM guard with the software sentinel: panic if the
+        // bottom 256 bytes were ever disturbed (overflow that somehow slipped
+        // past the limit check), and periodically report the high-water mark.
+        unsafe { stack_probe::check_region(core1_stack_bottom, 256, "core1") };
+        #[cfg(feature = "stack-probe")]
+        if hw_report_countdown == 0 {
+            hw_report_countdown = 32_768;
+            // Safety: the whole CORE1_STACK region was painted before spawn.
+            let used =
+                unsafe { stack_probe::region_high_water(core1_stack_bottom, CORE1_STACK_SIZE) };
+            defmt::debug!(
+                "core1 stack high-water {=usize}B / {=usize}B",
+                used,
+                CORE1_STACK_SIZE
+            );
+        } else {
+            hw_report_countdown -= 1;
+        }
+
+        // Serialize the dequeue with the SIO spinlock to pair with the guarded
+        // enqueue on core 0 (the lock-free CAS is not cross-core safe on
+        // RP2350). Critically, `critical_section::with` runs even when the queue
+        // is empty, and its spinlock release barrier drains this core's write
+        // buffer — including any `sync_complete` ack a handler just wrote — out
+        // to coherent SRAM *before* we sleep. That is what makes core 0's
+        // `wait_for_ticket` spin observe the ack; without it the ack lingers in
+        // the write buffer and core 0 deadlocks on the stale value.
+        let Some(command) = critical_section::with(|_| command_rx.dequeue()) else {
             asm::wfe();
             continue;
         };
+        // We just freed a queue slot. Wake core 0 in case it's parked in
+        // `enqueue_blocking`'s WFE waiting for space.
+        asm::sev();
+
+        // #5 tripwire: catch a smashed `shared`/`worker` pointer at first use
+        // (clean panic record) instead of a later wild atomic-store HardFault.
+        assert_core1_pointers(shared, worker);
+        assert_worker_ppu_pointer(worker);
 
         match command {
             Core1Command::Worker(worker_command) => {
@@ -1234,13 +1759,17 @@ fn run_core1_worker(
                     let render_version = shared.ppu_render_version.load(Ordering::Acquire);
                     if render_version != last_ppu_render_version {
                         critical_section::with(|cs| {
-                            let snapshot = shared.live_ppu_snapshot.borrow(cs).borrow();
+                            let cell = shared.live_ppu_snapshot.borrow(cs);
+                            let Ok(snapshot) = cell.try_borrow() else {
+                                report_live_ppu_snapshot_borrow_failure(shared, worker, cell);
+                            };
                             worker.update_ppu_render_state(&snapshot.vram, &snapshot.oam);
                         });
                         last_ppu_render_version = render_version;
                     }
                 }
-                worker.send(worker_command);
+                assert_worker_ppu_pointer(worker);
+                worker.hyhy(worker_command);
                 publish_worker_state(shared, &mut worker);
             }
             Core1Command::DrainAudio { ticket } => {

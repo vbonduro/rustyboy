@@ -11,3 +11,5 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# rb-flash binary: parse the firmware ELF to patch the .data integrity CRC.
+object = "0.36"

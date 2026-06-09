@@ -259,7 +259,9 @@ fn run_pico(root: &Path) -> Result<()> {
 
     println!("🔨 Building + flashing via SWD probe — defmt RTT logs streaming below…");
     println!("   (Ctrl-C to stop)\n");
-    // The runner in platform/pico2w/.cargo/config.toml is `probe-rs run --chip RP235x`.
+    // The runner in platform/pico2w/.cargo/config.toml is
+    // `probe-rs run --chip RP235x --speed 1000 --disable-double-buffering --verify`
+    // (single-buffered + verify to avoid silent RP2350 flash corruption).
     cmd(
         "cargo",
         &["run", "--release"],

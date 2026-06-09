@@ -12,19 +12,34 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 mod perf;
 
 mod state;
-use state::{InGameMenuState, LoadingState, MainMenuState, RomListState, RunningState};
+use state::WifiMenuState;
+use state::{
+    InGameMenuState, LoadingState, MainMenuState, RomListState, RunningState, SettingsState,
+};
 
+// Global allocator: the bare `embedded_alloc::Heap`, or — under `heap-guard` —
+// the redzone wrapper that catches heap overruns (CRASH_DEBUG_NOTES #5). Both
+// expose `empty()` + `init(addr, size)`, so the init call below is unchanged.
+#[cfg(not(feature = "heap-guard"))]
 use embedded_alloc::Heap;
-
+#[cfg(not(feature = "heap-guard"))]
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
+
+#[cfg(feature = "heap-guard")]
+use rustyboy_pico2w::guarded_heap::GuardedHeap;
+#[cfg(feature = "heap-guard")]
+#[global_allocator]
+static HEAP: GuardedHeap = GuardedHeap::empty();
 
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{
-    CORE1, DMA_CH0, DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0, SPI0, SPI1,
+    CORE1, DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0,
+    SPI0, SPI1,
 };
+use embassy_rp::peripherals::{PIN_23, PIN_24, PIN_25, PIN_29, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
 use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::spi::{self, Blocking, Spi};
@@ -53,6 +68,7 @@ use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 #[cfg(feature = "oc-300")]
 const TARGET_SYS_HZ: u32 = 300_000_000;
+const WATCHDOG_WINDOW_MS: u64 = 16_000;
 #[cfg(all(not(feature = "oc-300"), feature = "oc-280"))]
 const TARGET_SYS_HZ: u32 = 280_000_000;
 #[cfg(all(not(feature = "oc-300"), not(feature = "oc-280"), feature = "oc-266"))]
@@ -76,7 +92,18 @@ pub(crate) const CYCLES_PER_FRAME: u64 = 70_224;
 
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => PioIrqHandler<PIO0>;
-    DMA_IRQ_0  => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
+    // CH0 and CH1 are always needed (display DMA, audio DMA).
+    // CH2 and CH3 are reserved for the WiFi CYW43439 PIO SPI driver; binding
+    // them unconditionally is safe — the handlers are no-ops when unused.
+    DMA_IRQ_0  => dma::InterruptHandler<DMA_CH0>,
+                  dma::InterruptHandler<DMA_CH1>,
+                  dma::InterruptHandler<DMA_CH2>,
+                  dma::InterruptHandler<DMA_CH3>;
+});
+
+// WiFi uses PIO1: bind it separately, scoped to the wifi feature.
+bind_interrupts!(struct WifiIrqs {
+    PIO1_IRQ_0 => PioIrqHandler<PIO1>;
 });
 
 #[unsafe(link_section = ".bi_entries")]
@@ -113,6 +140,28 @@ pub(crate) fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// WiFi peripheral tokens (consumed once when the portal starts)
+// ---------------------------------------------------------------------------
+
+/// All CYW43439 peripheral tokens, bundled for clean transfer from `main` into
+/// [`App`] and ultimately into `WifiPortalScreen::start_portal`.
+///
+/// Wrapped in `Option` so they can be consumed (`take`) exactly once.
+pub(crate) struct WifiPeriphs {
+    pub pwr: Peri<'static, PIN_23>,
+    pub dio: Peri<'static, PIN_24>,
+    pub cs: Peri<'static, PIN_25>,
+    pub clk: Peri<'static, PIN_29>,
+    pub pio1: Peri<'static, PIO1>,
+    pub dma_ch2: Peri<'static, DMA_CH2>,
+    pub dma_ch3: Peri<'static, DMA_CH3>,
+    /// PIO1 interrupt binding (from `WifiIrqs`).
+    pub pio_irqs: WifiIrqs,
+    /// DMA CH2/CH3 interrupt binding (from `Irqs`, which binds all DMA_IRQ_0 channels).
+    pub dma_irqs: Irqs,
+}
+
+// ---------------------------------------------------------------------------
 // App state machine
 // ---------------------------------------------------------------------------
 
@@ -128,6 +177,11 @@ pub(crate) struct App {
     /// by the host decoder tool.  Set once at boot; clears automatically on the
     /// next boot after the decoder runs `--mark-read`.
     pub(crate) crash_pending: bool,
+    /// Embassy task spawner — needed by `WifiPortalScreen` to spawn portal tasks.
+    pub(crate) spawner: Spawner,
+    /// CYW43439 peripheral tokens.  `Some` until the portal is first started,
+    /// then `None` for the rest of the session.
+    pub(crate) wifi_periphs: Option<WifiPeriphs>,
 }
 
 impl App {
@@ -171,6 +225,100 @@ pub(crate) enum AppState {
     MainMenu(MainMenuState),
     RomList(Box<RomListState>),
     Loading(Box<LoadingState>),
+    Settings(SettingsState),
+    WifiMenu(Box<WifiMenuState>),
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time .data integrity guard
+// ---------------------------------------------------------------------------
+//
+// The SM83 interpreter's hot functions are placed in `.data` so they execute
+// from RAM. cortex-m-rt copies that image from flash (LMA `__sidata`) into RAM
+// at boot. A failed flash page-write in the `.data` image — which probe-rs
+// `--verify` has been observed to miss (XIP-cache false pass) — therefore boots
+// into corrupt RAM code and crashes deep in the emulator (e.g. `dispatch_isr`).
+//
+// `EXPECTED_DATA_CRC` is patched post-link by the `rb-flash` runner with the
+// CRC32 of the `.data` load image. On boot we CRC the same bytes straight from
+// flash (immutable at runtime, so this is safe before any peripheral init and
+// free of false positives) and compare. On mismatch we exit via semihosting so
+// `probe-rs run` returns non-zero — the user re-runs `cargo run` to retry; we
+// deliberately do not auto-reflash, to avoid needless flash wear.
+mod integrity {
+    use cortex_m_semihosting::debug;
+
+    extern "C" {
+        /// Start of the flashed firmware image (set in `memory.x`).
+        static __start_block_addr: u32;
+    }
+
+    /// Sentinel left in place when the image was flashed without `rb-flash`
+    /// (e.g. via picotool). The guard is skipped so non-probe-rs flashing still
+    /// boots normally.
+    const UNPATCHED: u32 = 0xFFFF_FFFF;
+
+    /// CRC32 of the **entire** flashed firmware image (`.start_block` + `.text`
+    /// + `.rodata` + the `.data` load image), patched post-link by `rb-flash`.
+    ///
+    /// It lives at the very end of the image, in `.end_block` — so the CRC
+    /// covers every byte *before* it. On boot we re-CRC the same flash bytes in
+    /// place (immutable, so this is safe before any peripheral init and free of
+    /// false positives) and compare. This supersedes the old `.data`-only guard:
+    /// a corrupt `.text` page — which `--verify` has been seen to miss and which
+    /// boots into a garbage instruction → wild HardFault — is now caught here.
+    #[no_mangle]
+    #[used]
+    #[link_section = ".end_block"]
+    static IMAGE_CRC: u32 = UNPATCHED;
+
+    pub fn verify_image() {
+        let want = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IMAGE_CRC)) };
+        if want == UNPATCHED {
+            return;
+        }
+        let got = image_crc();
+        if got != want {
+            defmt::error!(
+                "IMAGE CORRUPT: crc {=u32:#010x} != expected {=u32:#010x} — reflash (cargo run)",
+                got,
+                want
+            );
+            // Clean exit so the run command fails without faulting (keeps the
+            // crash log free of a spurious record). probe-rs reports non-zero.
+            loop {
+                debug::exit(debug::EXIT_FAILURE);
+            }
+        }
+        defmt::info!("integrity: full image crc {=u32:#010x} OK", got);
+    }
+
+    fn image_crc() -> u32 {
+        let start = core::ptr::addr_of!(__start_block_addr) as *const u8;
+        // The image ends right before the CRC word (IMAGE_CRC sits at the start
+        // of `.end_block`, i.e. at `__end_block_addr`), so [start, &IMAGE_CRC)
+        // is exactly the CRC-covered region.
+        let end = core::ptr::addr_of!(IMAGE_CRC) as usize;
+        let len = end - (start as usize);
+        // Safety: [start, end) is the flashed image in XIP flash, produced by
+        // the linker and read-only at runtime.
+        let bytes = unsafe { core::slice::from_raw_parts(start, len) };
+        crc32(bytes)
+    }
+
+    /// CRC-32/ISO-HDLC (reflected, poly 0xEDB88320). Must stay byte-for-byte
+    /// identical to the implementation in the `rb-flash` runner.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &byte in data {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,25 +326,41 @@ pub(crate) enum AppState {
 // ---------------------------------------------------------------------------
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
+    // Verify the .data load image before it can be executed as RAM code.
+    integrity::verify_image();
+
+    // Re-assert the ARMv8-M hardware stack-limit guard for core 0 (MSPLIM).
+    // cortex-m-rt already arms this at reset to `_stack_end`; we set it again
+    // explicitly so the invariant is greppable and survives a runtime change.
+    // With it, any push below `_stack_end` (bottom of the ~79 KiB core-0 stack;
+    // the 160 KiB heap is a separate .bss array) raises a STKOF UsageFault that
+    // escalates to the HardFault handler at the exact offending instruction.
+    // NB: because this guard PRE-EXISTS, the #5 bus-fault crashes (IBUSERR /
+    // PRECISERR, not STKOF) are *not* a core-0 stack overflow — see
+    // CRASH_DEBUG_NOTES.md.  Safety: `_stack_end` is a linker symbol.
+    unsafe {
+        unsafe extern "C" {
+            static _stack_end: u32;
+        }
+        cortex_m::register::msplim::write(core::ptr::addr_of!(_stack_end) as u32);
+    }
+
     {
         use core::mem::MaybeUninit;
-        // 120 KiB: peak allocation during save-state load is ~113 KiB:
-        //   40 KiB  Box<GameBoyMemory>  (includes 22 KiB PPU framebuffer inline)
-        //   22 KiB  GameBoy::front_buffer Box<[u8; 23040]>
-        //   48 KiB  save_state_blob Vec (decompressed ROM state)
-        // Option A (pre-scale on Core 0) freed 135 KiB from SHARED_WORKER_STATE,
-        // growing Core 0 stack from 16.4 KiB to 151.5 KiB.  We can now afford a
-        // much larger heap without risking stack overflow.
+        // Save-state boot is the allocator high-water mark: by the time the
+        // boot path reads SLOT0.RBS, GameBoy and the core1 worker are live.
         //
-        // Budget (measured on release ELF after Option A + this change):
-        //   160 KiB  heap   (GameBoy ~76 KiB + 48.5 KiB save-state blob + headroom)
-        //   ~111 KiB Core 0 stack  (7× the pre-Option-A budget; crash peak was 6 KiB)
+        // Major live allocations measured from release symbols:
+        //   ~40 KiB Box<GameBoyMemory> and cartridge state
+        //   ~22 KiB GameBoy::front_buffer
+        //   ~31 KiB core1 PPU worker framebuffer/state
+        //   ~8 KiB  APU sample buffers, plus smaller CPU/opcode allocations
+        //   ~49 KiB SaveState blob for a 32 KiB cart-RAM game
         //
-        // Raising from 120→160 KiB restores the save-state load path: a 32 KiB
-        // cart-RAM game serialises to ~48.5 KiB; with only 44 KiB free at load
-        // time (120 KiB heap − ~76 KiB live GB state) the read_save_state Vec
-        // allocation was failing with OutOfMemory.
+        // 160 KiB leaves room for GameBoy state plus the transient save-state
+        // blob while preserving core0 stack headroom. Allocation failures on
+        // this path are reported through `try_reserve_exact`, not HardFaults.
         const HEAP_SIZE: usize = 160 * 1024;
         static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
         unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
@@ -211,7 +375,13 @@ async fn main(_spawner: Spawner) {
     };
 
     let mut watchdog = Watchdog::new(p.WATCHDOG);
-    watchdog.start(Duration::from_millis(10_000));
+    watchdog.start(Duration::from_millis(WATCHDOG_WINDOW_MS));
+    // Pause the watchdog while a debugger has the cores halted. embassy's
+    // `start()` clears the pause-on-debug bits, so without this the 10 s
+    // watchdog fires during a probe-rs flash or GDB halt — resetting the chip
+    // mid-operation (mid-flash page-write timeouts; GDB "core is running"
+    // fatal errors). No effect in production (no debugger => never paused).
+    watchdog.pause_on_debug(true);
 
     info!(
         "rustyboy-pico2w v{} starting @{}MHz",
@@ -227,8 +397,8 @@ async fn main(_spawner: Spawner) {
     if crash::storage::check_and_commit(&mut onboard_flash) {
         defmt::warn!("crash: committed crash record from previous boot");
     }
-    if crash::storage::check_watchdog_reset(&mut onboard_flash) {
-        defmt::warn!("crash: committed watchdog-timeout record from previous boot");
+    if crash::storage::check_reset_reason(&mut onboard_flash) {
+        defmt::warn!("crash: committed reset-reason record from previous boot");
     }
 
     // Pull GP20 low before display init so the SD module powers off while the
@@ -328,20 +498,29 @@ async fn main(_spawner: Spawner) {
                     );
                     let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
                     if let Some(rom_id) = info.rom_id {
-                        // Read save state first while heap pressure is lowest; a
-                        // successful save state read contains cart RAM already so
-                        // we skip the battery save in that case.  Reading battery
-                        // first consumes ~32 KB of the heap, leaving too little
-                        // for the ~48 KB save state blob.
+                        // A save state contains cart RAM, so prefer it and only
+                        // read the battery file if no state is available. This
+                        // avoids holding two large SD blobs at once during boot.
                         let slot = SaveSlot::new(0).expect("slot 0 is valid");
-                        let save_state_blob = sd_mgr.read_save_state(&rom_id, slot)
-                            .unwrap_or_else(|e| { defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e)); None });
+                        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
+                        let save_state_blob =
+                            sd_mgr.read_save_state(&rom_id, slot).unwrap_or_else(|e| {
+                                defmt::warn!(
+                                    "boot save state read failed: {:?}",
+                                    defmt::Debug2Format(&e)
+                                );
+                                None
+                            });
+                        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
                         let has_save_state = save_state_blob.is_some();
                         let battery_data = if has_save_state {
                             None // save state includes cart RAM; skip battery read
                         } else {
-                            sd_mgr.read_battery_save(&rom_id)
-                                .unwrap_or_else(|e| { defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e)); None })
+                            watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
+                            sd_mgr.read_battery_save(&rom_id).unwrap_or_else(|e| {
+                                defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e));
+                                None
+                            })
                         };
                         match boot_load_saves(battery_data, save_state_blob) {
                             None => {}
@@ -350,7 +529,10 @@ async fn main(_spawner: Spawner) {
                                 let _ = gb.load_state(state);
                                 info!("save state loaded on boot");
                             }
-                            Some(BootSaves::Both { battery, save_state }) => {
+                            Some(BootSaves::Both {
+                                battery,
+                                save_state,
+                            }) => {
                                 gb.set_external_ram(&battery);
                                 let _ = gb.load_state(save_state);
                                 info!("save state loaded on boot");
@@ -377,6 +559,8 @@ async fn main(_spawner: Spawner) {
                         staged_rom_id: None,
                         core1: None,
                         crash_pending,
+                        spawner,
+                        wifi_periphs: None,
                     };
                     let next = MainMenuState::new(&mut game_disp, &stub_app).await;
                     (AppState::MainMenu(next), None, None, None, Some(p.CORE1))
@@ -394,6 +578,8 @@ async fn main(_spawner: Spawner) {
                 staged_rom_id: None,
                 core1: None,
                 crash_pending,
+                spawner,
+                wifi_periphs: None,
             };
             let menu_state = MainMenuState::new(&mut game_disp, &stub_app).await;
             (
@@ -411,6 +597,18 @@ async fn main(_spawner: Spawner) {
 
     let mut gameboy: Option<PicoGameBoy> = gameboy_init;
 
+    let wifi_periphs = Some(WifiPeriphs {
+        pwr: p.PIN_23,
+        dio: p.PIN_24,
+        cs: p.PIN_25,
+        clk: p.PIN_29,
+        pio1: p.PIO1,
+        dma_ch2: p.DMA_CH2,
+        dma_ch3: p.DMA_CH3,
+        pio_irqs: WifiIrqs,
+        dma_irqs: Irqs,
+    });
+
     let mut app = App {
         state: initial_state,
         next_state: None,
@@ -420,6 +618,8 @@ async fn main(_spawner: Spawner) {
         staged_rom_id,
         core1: core1_token,
         crash_pending,
+        spawner,
+        wifi_periphs,
     };
     refresh_save_slot_available(&mut app, &sd_mgr);
 
@@ -428,7 +628,7 @@ async fn main(_spawner: Spawner) {
 
     loop {
         stack_probe::check_current_sp("main loop");
-        watchdog.feed(Duration::from_millis(5_000));
+        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
 
         // Take the current state out so we can pass &mut app into tick().
         let mut state = core::mem::replace(&mut app.state, AppState::Running(RunningState));
@@ -486,6 +686,18 @@ async fn main(_spawner: Spawner) {
                         &mut game_disp,
                         &mut watchdog,
                     )
+                    .await;
+            }
+
+            AppState::Settings(settings_state) => {
+                settings_state
+                    .tick(&mut app, &mut game_disp, &mut input, &mut onboard_flash)
+                    .await;
+            }
+
+            AppState::WifiMenu(wifi_menu_state) => {
+                wifi_menu_state
+                    .tick(&mut app, &mut game_disp, &mut input, &mut onboard_flash)
                     .await;
             }
         }

@@ -13,13 +13,17 @@ pub const ROM_METADATA_BYTES: usize = ERASE_SIZE;
 pub const ROM_SLOT_OFFSET: usize = FIRMWARE_SLOT_BYTES;
 pub const ROM_DATA_OFFSET: usize = ROM_SLOT_OFFSET + ROM_METADATA_BYTES;
 
+/// One 4 KiB sector reserved for WiFi credentials (SSID + password).
+/// Immediately before the crash log sector.
+pub const WIFI_CONFIG_OFFSET: usize = FLASH_CAPACITY_BYTES - 2 * ERASE_SIZE;
+
 /// One 4 KiB sector at the very end of flash is reserved for crash records.
 /// This is written by `crash::storage::check_and_commit` on each boot when a
 /// crash was detected.  ROM data must not be staged here.
 pub const CRASH_LOG_OFFSET: usize = FLASH_CAPACITY_BYTES - ERASE_SIZE;
 
-/// ROM data capacity is the full flash minus firmware, metadata, and crash log.
-pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSET - ERASE_SIZE;
+/// ROM data capacity is the full flash minus firmware, metadata, WiFi config, and crash log.
+pub const ROM_DATA_CAPACITY_BYTES: usize = FLASH_CAPACITY_BYTES - ROM_DATA_OFFSET - 2 * ERASE_SIZE;
 
 const ROM_BANK_BYTES: usize = 0x4000;
 const HEADER_MAGIC: [u8; 8] = *b"RBROM1\0\0";
@@ -368,3 +372,16 @@ const fn align_up(value: usize, align: usize) -> usize {
         value + (align - rem)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time flash layout invariants (Finding E)
+// ---------------------------------------------------------------------------
+
+/// WiFi config sector must be exactly one ERASE_SIZE before the crash log.
+const _: () = assert!(WIFI_CONFIG_OFFSET + ERASE_SIZE == CRASH_LOG_OFFSET);
+
+/// Crash log sector must be the last sector in flash.
+const _: () = assert!(CRASH_LOG_OFFSET + ERASE_SIZE == FLASH_CAPACITY_BYTES);
+
+/// ROM data region must not overlap the WiFi config sector.
+const _: () = assert!(ROM_DATA_OFFSET + ROM_DATA_CAPACITY_BYTES <= WIFI_CONFIG_OFFSET);

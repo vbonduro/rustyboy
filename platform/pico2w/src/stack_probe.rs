@@ -117,6 +117,32 @@ mod imp {
             }
         }
     }
+
+    /// Peak bytes ever used in a painted, downward-growing stack region.
+    ///
+    /// Scans up from `bottom` (the stack limit) counting intact sentinel bytes;
+    /// the first disturbed byte marks the deepest the stack ever reached.  Peak
+    /// usage is therefore `size - <leading sentinel bytes>`.
+    ///
+    /// # Safety
+    /// `[bottom, bottom + size)` must have been painted by [`paint_region`] (or
+    /// [`paint`]) and be readable.  Pass the *whole* region for a true peak.
+    pub unsafe fn region_high_water(bottom: *const u8, size: usize) -> usize {
+        let mut free = 0;
+        while free < size && unsafe { bottom.add(free).read_volatile() } == STACK_SENTINEL {
+            free += 1;
+        }
+        size - free
+    }
+
+    /// Peak bytes ever used by core 0's stack, measured over the region painted
+    /// by [`paint`] (bottom = `__sheap`/`_stack_end`, top = pre-paint SP).
+    pub fn high_water_core0() -> usize {
+        let (bottom, top) = bounds();
+        // Safety: paint() sentinels [bottom, sp-margin); scanning up from bottom
+        // stays inside that painted span until the deepest real frame.
+        unsafe { region_high_water(bottom as *const u8, top - bottom) }
+    }
 }
 
 #[cfg(not(feature = "stack-probe"))]
@@ -128,6 +154,16 @@ mod imp {
     pub unsafe fn paint_region(_bottom: *mut u8, _guard_bytes: usize) {}
 
     pub unsafe fn check_region(_bottom: *const u8, _guard_bytes: usize, _label: &'static str) {}
+
+    pub unsafe fn region_high_water(_bottom: *const u8, _size: usize) -> usize {
+        0
+    }
+
+    pub fn high_water_core0() -> usize {
+        0
+    }
 }
 
-pub use imp::{check_current_sp, check_region, paint, paint_region};
+pub use imp::{
+    check_current_sp, check_region, high_water_core0, paint, paint_region, region_high_water,
+};
