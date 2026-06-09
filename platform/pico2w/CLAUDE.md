@@ -53,13 +53,28 @@ if you have the target set workspace-wide.
 Connect a Raspberry Pi Debug Probe (or any CMSIS-DAP probe) to the Pico 2W
 SWD header (SWDIO, SWDCLK, GND).
 
+Build the `rb-flash` runner once (the `cargo run` runner — see below):
+
+```sh
+cargo build -p xtask --release   # produces target/release/rb-flash
+```
+
+Then, from the firmware crate:
+
 ```sh
 cd platform/pico2w
 cargo run --release
 ```
 
-`probe-rs run` flashes the binary and immediately starts streaming defmt RTT
-logs to the terminal.
+The `runner` in `.cargo/config.toml` is `rb-flash`, not bare `probe-rs run`.
+`rb-flash` stamps a CRC32 of the `.data` load image into the ELF, then flashes
+(single-buffered + verify) and streams defmt RTT. On boot the firmware
+re-checks that CRC against the `.data` image in flash (see `integrity` in
+`main.rs`); on mismatch — a corrupt page-write that `--verify` missed — it exits
+via semihosting so `cargo run` returns **non-zero**. Just re-run `cargo run` to
+retry (we intentionally do not auto-reflash, to spare flash wear). If `cargo
+run` errors that the runner is missing, you forgot the `cargo build -p xtask`
+step above.
 
 ### Via picotool (BOOTSEL) — no debug probe required
 

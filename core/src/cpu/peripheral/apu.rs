@@ -730,7 +730,12 @@ impl ApuPeripheral {
     pub fn write_wave_ram(&mut self, offset: u8, value: u8) {
         if self.channel3.enabled {
             if self.channel3.just_read {
-                let byte_index = (self.channel3.position / 2) as usize;
+                // `position` is a 5-bit counter (0..=31), so `position / 2` is
+                // always a valid 0..=15 index into the 16-byte wave RAM — but
+                // mask defensively (matching the read path's `& 0x0F`) so a
+                // stray out-of-range `position` can never index out of bounds
+                // and panic, crashing the emulator on some games' ch3 access.
+                let byte_index = (self.channel3.position / 2) as usize & 0x0F;
                 self.channel3.wave_ram[byte_index] = value;
             }
             // else: write ignored on DMG when ch3 is active outside read window

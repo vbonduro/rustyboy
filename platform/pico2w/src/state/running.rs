@@ -8,10 +8,7 @@ use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::multicore::PicoGameBoy;
 
 use super::InGameMenuState;
-use crate::{
-    poll_once, refresh_save_slot_available, App, AppState, PicoSdMgr,
-    CYCLES_PER_FRAME,
-};
+use crate::{poll_once, refresh_save_slot_available, App, AppState, PicoSdMgr, CYCLES_PER_FRAME};
 
 pub struct RunningState;
 
@@ -40,8 +37,7 @@ impl RunningState {
             // First poll (poll_once): if frame unchanged → Ready immediately.
             // If changed: blocking setup completes, DMA armed → Pending.
             // The pixel DMA then runs concurrently with the ~16 ms emulation below.
-            let mut disp_future =
-                core::pin::pin!(game_disp.send_frame(frame_buf, &dirty_rows));
+            let mut disp_future = core::pin::pin!(game_disp.send_frame(frame_buf, &dirty_rows));
             // Capture the Ready/Pending result.  Polling a future after it has
             // already returned Poll::Ready is undefined behaviour (the async state
             // machine panics with "polled after completion").  We must skip the

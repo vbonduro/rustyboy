@@ -18,7 +18,20 @@ use crate::cpu::sm83::Sm83;
 use crate::ipc::{LocalTransport, WorkerCommand, WorkerTransport};
 use crate::memory::cartridge::Cartridge;
 use crate::memory::map::{OAM_BASE, OAM_END, VRAM_BASE, VRAM_END};
-use crate::memory::memory::{BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait};
+use crate::memory::memory::{
+    BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait, BUS_EVENT_QUEUE_CAP,
+};
+
+#[cfg(target_arch = "arm")]
+unsafe extern "C" {
+    fn rustyboy_route_drain_guard(
+        cap: u32,
+        ptr: u32,
+        head: u32,
+        len: u32,
+        bad_index: u32,
+    ) -> !;
+}
 
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
@@ -28,6 +41,7 @@ const APU_UNUSED_START: u16 = 0xFF27;
 const OAM_DMA_BYTES: u8 = 160;
 const PPU_REG_BATCH_CAP: usize = 16;
 
+#[repr(C, align(4))]
 pub(crate) struct DmaState {
     pub source: u16,
     pub progress: u8,
@@ -44,7 +58,6 @@ pub struct GameBoy<W: WorkerTransport = LocalTransport> {
     serial: SerialPort,
     dma: Option<DmaState>,
     front_buffer: Box<[u8; FRAMEBUFFER_SIZE]>,
-    bus_event_buf: Vec<BusEvent>,
     cycle_counter: u64,
     transport: W,
 }
@@ -138,7 +151,6 @@ impl<W: WorkerTransport> GameBoy<W> {
             serial: SerialPort::new(),
             dma: None,
             front_buffer,
-            bus_event_buf: Vec::with_capacity(4),
             cycle_counter: 0,
             transport,
         }
@@ -237,6 +249,27 @@ impl<W: WorkerTransport> GameBoy<W> {
     #[inline(always)]
     pub fn front_buffer(&self) -> &[u8; FRAMEBUFFER_SIZE] {
         &self.front_buffer
+    }
+
+    #[cfg(target_arch = "arm")]
+    #[inline(always)]
+    pub fn memory_box_field_addr_for_diagnostics(&self) -> usize {
+        core::ptr::addr_of!(self.memory) as usize
+    }
+
+    #[cfg(target_arch = "arm")]
+    #[inline(always)]
+    pub fn memory_ptr_for_diagnostics(&self) -> usize {
+        let field = core::ptr::addr_of!(self.memory) as *const usize;
+        unsafe { field.read_volatile() }
+    }
+
+    #[cfg(target_arch = "arm")]
+    #[inline(always)]
+    pub fn dma_field_watch_words_for_diagnostics(&self) -> [usize; 2] {
+        let field = core::ptr::addr_of!(self.dma) as usize;
+        let word0 = field & !3;
+        [word0, word0 + 4]
     }
 
     pub fn set_button(&mut self, btn: Button, pressed: bool) {
@@ -408,8 +441,20 @@ impl<W: WorkerTransport> GameBoy<W> {
         let Some(DmaState { source, progress }) = self.dma else {
             return;
         };
+        // #5 hardening: `progress` should never exceed OAM_DMA_BYTES, but crash
+        // #5 corrupts GameBoy control state so we have seen `progress > 160`.
+        // A bare `OAM_DMA_BYTES - progress` then underflows (release u8 wraps to
+        // ~0xNN), yielding a huge `to_copy` and an OOB `copy_dma_step` dst slice
+        // (the `memory.rs:410` panic that keeps consuming crash slots). Treat an
+        // already-complete/over-run DMA as finished so the corrupting *writer*
+        // can be caught by the r4/r12 + stack-canary diagnostics instead.
+        let remaining = OAM_DMA_BYTES.saturating_sub(progress);
+        if remaining == 0 {
+            self.dma = None;
+            return;
+        }
         let steps = (cycles / 4) as u8;
-        let to_copy = steps.min(OAM_DMA_BYTES - progress);
+        let to_copy = steps.min(remaining);
         self.memory.copy_dma_step(source, progress, to_copy);
         let next = progress + to_copy;
         if next >= OAM_DMA_BYTES {
@@ -429,14 +474,20 @@ impl<W: WorkerTransport> GameBoy<W> {
         if !self.memory.has_events() {
             return 0;
         }
-        let mut buf = core::mem::take(&mut self.bus_event_buf);
-        self.memory.drain_into(&mut buf);
-        let event_count = buf.len();
+        #[cfg(target_arch = "arm")]
+        self.guard_bus_event_queue_header();
+        let mut events = [BusEvent {
+            address: 0,
+            value: 0,
+        }; BUS_EVENT_QUEUE_CAP];
+        let event_count = self.memory.drain_into_slice(&mut events);
+        let events = &events[..event_count];
         let mut ppu_reg_buf = [(0u16, 0u8); PPU_REG_BATCH_CAP];
         let mut ppu_reg_count = 0usize;
         let mut i = 0usize;
-        while i < buf.len() {
-            if let Some((start_offset, len)) = contiguous_region_len(&buf, i, VRAM_BASE, VRAM_END) {
+        while i < events.len() {
+            if let Some((start_offset, len)) = contiguous_region_len(events, i, VRAM_BASE, VRAM_END)
+            {
                 let start = start_offset as usize;
                 let end = start + len;
                 self.transport
@@ -444,7 +495,7 @@ impl<W: WorkerTransport> GameBoy<W> {
                 i += len;
                 continue;
             }
-            if let Some((start_offset, len)) = contiguous_region_len(&buf, i, OAM_BASE, OAM_END) {
+            if let Some((start_offset, len)) = contiguous_region_len(events, i, OAM_BASE, OAM_END) {
                 let start = start_offset as usize;
                 let end = start + len;
                 self.transport
@@ -452,7 +503,7 @@ impl<W: WorkerTransport> GameBoy<W> {
                 i += len;
                 continue;
             }
-            if let Some(reg) = self.handle_bus_event(buf[i].address, buf[i].value) {
+            if let Some(reg) = self.handle_bus_event(events[i].address, events[i].value) {
                 if ppu_reg_count < ppu_reg_buf.len() {
                     ppu_reg_buf[ppu_reg_count] = reg;
                     ppu_reg_count += 1;
@@ -464,9 +515,24 @@ impl<W: WorkerTransport> GameBoy<W> {
             self.transport
                 .write_ppu_registers(&ppu_reg_buf[..ppu_reg_count]);
         }
-        buf.clear();
-        self.bus_event_buf = buf;
         event_count
+    }
+
+    #[cfg(target_arch = "arm")]
+    #[inline(always)]
+    fn guard_bus_event_queue_header(&self) {
+        let header = self.memory.bus_event_queue_header();
+        if let Some(bad_index) = header.first_bad_word() {
+            unsafe {
+                rustyboy_route_drain_guard(
+                    header.cap as u32,
+                    header.ptr as u32,
+                    header.head as u32,
+                    header.len as u32,
+                    bad_index as u32,
+                );
+            }
+        }
     }
 
     /// Handle a single bus event. Returns `Some((addr, value))` if the event

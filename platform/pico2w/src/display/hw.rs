@@ -250,9 +250,15 @@ impl<'d> GameDisplay<'d> {
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
-        self.set_window(RenderWindow::new(0, DISPLAY_X_END + 1, 0, TOP_BAR_Y_END + 1));
+        self.set_window(RenderWindow::new(
+            0,
+            DISPLAY_X_END + 1,
+            0,
+            TOP_BAR_Y_END + 1,
+        ));
         self.write_command(0x2C, &[]);
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &C3_BE)
+            .await;
         info!("display: top bar done");
 
         // Bottom bar: rows 268..319, colour black
@@ -263,7 +269,8 @@ impl<'d> GameDisplay<'d> {
             DISPLAY_Y_END + 1,
         ));
         self.write_command(0x2C, &[]);
-        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE).await;
+        self.fill_rect_raw(LETTERBOX_ROWS * DISPLAY_ROW_PIXELS, &BLACK_BE)
+            .await;
         info!("display: letterbox bars done");
     }
 

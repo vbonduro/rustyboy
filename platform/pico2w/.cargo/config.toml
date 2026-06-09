@@ -1,7 +1,15 @@
 [target.thumbv8m.main-none-eabihf]
 # probe-rs flash + run via SWD/JTAG debug probe.
 # For picotool (BOOTSEL / drag-and-drop), see CLAUDE.md.
-runner = "probe-rs run --chip RP235x"
+# RP2350 flash programming has been flaky at the default probe settings on this
+# board; failed page writes in the firmware .data load image leave corrupted RAM
+# code after boot — and probe-rs --verify has been seen to false-pass it (XIP
+# cache). `rb-flash` patches a CRC of the .data image into the ELF, then flashes
+# (single-buffered + verify); the firmware self-checks it on boot and exits
+# non-zero on mismatch so `cargo run` fails and you can re-run to retry.
+#
+# Build the runner once:  cargo build -p xtask --release
+runner = "../../target/release/rb-flash"
 
 rustflags = [
     # Link against the memory layout defined in memory.x.

@@ -34,6 +34,84 @@ use super::registers::{Flags, Registers};
 use crate::memory::map::{IO_REG_BASE, IO_REG_END, OAM_BASE, OAM_END, VRAM_BASE, VRAM_END};
 use crate::memory::memory::GameBoyMemory;
 
+#[cfg(target_arch = "arm")]
+unsafe extern "C" {
+    fn rustyboy_find_stack_canary(caller_sp: u32, site: u32) -> u32;
+    fn rustyboy_stack_canary_change_guard(
+        site: u32,
+        canary_addr: u32,
+        before: u32,
+        after: u32,
+        bus_addr: u32,
+        memory: u32,
+    ) -> !;
+}
+
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_INC8_HL_FIND: u32 = 0x1C80_0000;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_INC8_HL_AFTER_READ: u32 = 0x1C80_0001;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_INC8_HL_AFTER_INC: u32 = 0x1C80_0002;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_INC8_HL_AFTER_WRITE: u32 = 0x1C80_0003;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_DEC8_HL_FIND: u32 = 0x1D80_0000;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_DEC8_HL_AFTER_READ: u32 = 0x1D80_0001;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_DEC8_HL_AFTER_DEC: u32 = 0x1D80_0002;
+#[cfg(target_arch = "arm")]
+const CANARY_SITE_DEC8_HL_AFTER_WRITE: u32 = 0x1D80_0003;
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn find_current_stack_canary(site: u32) -> u32 {
+    let caller_sp: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, sp",
+            out(reg) caller_sp,
+            options(nomem, nostack, preserves_flags),
+        );
+        rustyboy_find_stack_canary(caller_sp, site)
+    }
+}
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn read_stack_canary_word(canary_addr: u32) -> u32 {
+    unsafe { (canary_addr as *const u32).read_volatile() }
+}
+
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn guard_stack_canary_word(
+    site: u32,
+    canary_addr: u32,
+    before: u32,
+    addr: u16,
+    memory: &mut GameBoyMemory,
+) {
+    if canary_addr == 0 {
+        return;
+    }
+
+    let after = read_stack_canary_word(canary_addr);
+    if after != before {
+        unsafe {
+            rustyboy_stack_canary_change_guard(
+                site,
+                canary_addr,
+                before,
+                after,
+                addr as u32,
+                memory as *mut GameBoyMemory as u32,
+            );
+        }
+    }
+}
+
 /// Interrupt Master Enable state. EI has a 1-instruction delay before IME becomes active.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ImeState {
@@ -728,9 +806,45 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
+                #[cfg(target_arch = "arm")]
+                let stack_canary_addr = if addr == 0xFFFF {
+                    find_current_stack_canary(CANARY_SITE_INC8_HL_FIND)
+                } else {
+                    0
+                };
+                #[cfg(target_arch = "arm")]
+                let stack_canary_before = if stack_canary_addr != 0 {
+                    read_stack_canary_word(stack_canary_addr)
+                } else {
+                    0
+                };
                 let old = memory.read_fast(addr);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_INC8_HL_AFTER_READ,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 let (v, f) = inc_u8(old, self.registers.f);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_INC8_HL_AFTER_INC,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 self.bus_write(memory, addr, v);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_INC8_HL_AFTER_WRITE,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 self.registers.f = f;
             }
             _ => {
@@ -752,9 +866,45 @@ impl Instructions for Sm83 {
             }
             Operand::Memory(Memory::HL) => {
                 let addr = self.registers.hl();
+                #[cfg(target_arch = "arm")]
+                let stack_canary_addr = if addr == 0xFFFF {
+                    find_current_stack_canary(CANARY_SITE_DEC8_HL_FIND)
+                } else {
+                    0
+                };
+                #[cfg(target_arch = "arm")]
+                let stack_canary_before = if stack_canary_addr != 0 {
+                    read_stack_canary_word(stack_canary_addr)
+                } else {
+                    0
+                };
                 let old = memory.read_fast(addr);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_DEC8_HL_AFTER_READ,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 let (v, f) = dec_u8(old, self.registers.f);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_DEC8_HL_AFTER_DEC,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 self.bus_write(memory, addr, v);
+                #[cfg(target_arch = "arm")]
+                guard_stack_canary_word(
+                    CANARY_SITE_DEC8_HL_AFTER_WRITE,
+                    stack_canary_addr,
+                    stack_canary_before,
+                    addr,
+                    memory,
+                );
                 self.registers.f = f;
             }
             _ => {

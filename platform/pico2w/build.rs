@@ -26,7 +26,11 @@ fn main() {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
     let sha8 = git_sha.trim();
-    let sha8 = if sha8.len() >= 8 { &sha8[..8] } else { "00000000" };
+    let sha8 = if sha8.len() >= 8 {
+        &sha8[..8]
+    } else {
+        "00000000"
+    };
     let git_hash_u32 = u32::from_str_radix(sha8, 16).unwrap_or(0);
 
     // Firmware version from Cargo.toml.

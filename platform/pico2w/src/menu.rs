@@ -42,6 +42,9 @@ pub enum MenuEffect {
     Quit,
     Continue,
     ShowRoms,
+    ShowSettings,
+    ShowWifiMenu,
+    Back,
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +188,8 @@ impl MenuLogic for InGameMenu {
 // Main menu
 // ---------------------------------------------------------------------------
 
-const MAIN_ITEMS_FULL: &[&str] = &["CONTINUE", "ROMS"];
-const MAIN_ITEMS_ROMS: &[&str] = &["ROMS"];
+const MAIN_ITEMS_FULL: &[&str] = &["CONTINUE", "ROMS", "SETTINGS"];
+const MAIN_ITEMS_ROMS: &[&str] = &["ROMS", "SETTINGS"];
 
 pub struct MainMenu {
     selected: usize,
@@ -201,8 +204,22 @@ impl MainMenu {
     /// CONTINUE is available. B is always a no-op in the main menu.
     pub fn handle_main(&mut self, input: MenuInput, game_available: bool) -> MenuEffect {
         if !game_available {
+            // No game: items are ["ROMS", "SETTINGS"]
+            let items = MAIN_ITEMS_ROMS;
+            if input.up && self.selected > 0 {
+                self.selected -= 1;
+                return MenuEffect::None;
+            }
+            if input.down && self.selected < items.len() - 1 {
+                self.selected += 1;
+                return MenuEffect::None;
+            }
             if input.confirm {
-                return MenuEffect::ShowRoms;
+                return match self.selected {
+                    0 => MenuEffect::ShowRoms,
+                    1 => MenuEffect::ShowSettings,
+                    _ => MenuEffect::None,
+                };
             }
             return MenuEffect::None;
         }
@@ -218,6 +235,7 @@ impl MainMenu {
             return match self.selected {
                 0 => MenuEffect::Continue,
                 1 => MenuEffect::ShowRoms,
+                2 => MenuEffect::ShowSettings,
                 _ => MenuEffect::None,
             };
         }
@@ -229,8 +247,8 @@ impl MenuLogic for MainMenu {
     /// `context_flag` = a ROM is staged and the game can be resumed.
     /// When false, CONTINUE is omitted entirely so no blank slot appears.
     fn frame(&self, game_available: bool) -> MenuFrame<'_> {
-        static FULL_ENABLED: [bool; 2] = [true, true];
-        static ROMS_ENABLED: [bool; 1] = [true];
+        static FULL_ENABLED: [bool; 3] = [true, true, true];
+        static ROMS_ENABLED: [bool; 2] = [true, true];
         if game_available {
             MenuFrame {
                 title: "MAIN MENU",
@@ -245,7 +263,7 @@ impl MenuLogic for MainMenu {
             MenuFrame {
                 title: "MAIN MENU",
                 items: MAIN_ITEMS_ROMS,
-                selected: 0,
+                selected: self.selected,
                 marquee_frame: 0,
                 enabled: &ROMS_ENABLED,
                 marked: None,
@@ -256,6 +274,59 @@ impl MenuLogic for MainMenu {
 
     fn handle(&mut self, input: MenuInput) -> MenuEffect {
         self.handle_main(input, true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings menu
+// ---------------------------------------------------------------------------
+
+const SETTINGS_ITEMS: &[&str] = &["WIFI"];
+static SETTINGS_ENABLED: [bool; 1] = [true];
+
+pub struct SettingsMenu {
+    selected: usize,
+}
+
+impl SettingsMenu {
+    pub fn new() -> Self {
+        Self { selected: 0 }
+    }
+}
+
+impl MenuLogic for SettingsMenu {
+    /// `context_flag` unused (no context-dependent items).
+    fn frame(&self, _context_flag: bool) -> MenuFrame<'_> {
+        MenuFrame {
+            title: "SETTINGS",
+            items: SETTINGS_ITEMS,
+            selected: self.selected,
+            marquee_frame: 0,
+            enabled: &SETTINGS_ENABLED,
+            marked: None,
+            crash_pending: false,
+        }
+    }
+
+    fn handle(&mut self, input: MenuInput) -> MenuEffect {
+        if input.back {
+            return MenuEffect::Back;
+        }
+        if input.up && self.selected > 0 {
+            self.selected -= 1;
+            return MenuEffect::None;
+        }
+        if input.down && self.selected < SETTINGS_ITEMS.len() - 1 {
+            self.selected += 1;
+            return MenuEffect::None;
+        }
+        if input.confirm {
+            return match self.selected {
+                0 => MenuEffect::ShowWifiMenu,
+                _ => MenuEffect::None,
+            };
+        }
+        MenuEffect::None
     }
 }
 
@@ -517,7 +588,10 @@ mod tests {
         let menu = InGameMenu::new();
         let frame = menu.frame(false);
         let load_idx = INGAME_ITEMS.iter().position(|&s| s == "LOAD").unwrap();
-        assert!(!frame.enabled[load_idx], "LOAD should be disabled with no save slot");
+        assert!(
+            !frame.enabled[load_idx],
+            "LOAD should be disabled with no save slot"
+        );
     }
 
     #[test]
@@ -525,7 +599,10 @@ mod tests {
         let menu = InGameMenu::new();
         let frame = menu.frame(true);
         let load_idx = INGAME_ITEMS.iter().position(|&s| s == "LOAD").unwrap();
-        assert!(frame.enabled[load_idx], "LOAD should be enabled with a save slot");
+        assert!(
+            frame.enabled[load_idx],
+            "LOAD should be enabled with a save slot"
+        );
     }
 
     // --- MainMenu navigation ---
@@ -544,10 +621,17 @@ mod tests {
     }
 
     #[test]
-    fn main_without_game_goes_to_roms_even_after_navigation_input() {
+    fn main_without_game_goes_to_roms_on_first_item() {
         let mut menu = MainMenu::new();
-        assert_eq!(menu.handle_main(press_down(), false), MenuEffect::None);
+        // selected = 0 = ROMS (no game: items are ["ROMS", "SETTINGS"])
         assert_eq!(menu.handle_main(press_a(), false), MenuEffect::ShowRoms);
+    }
+
+    #[test]
+    fn main_without_game_goes_to_settings_on_second_item() {
+        let mut menu = MainMenu::new();
+        menu.handle_main(press_down(), false); // -> SETTINGS
+        assert_eq!(menu.handle_main(press_a(), false), MenuEffect::ShowSettings);
     }
 
     #[test]
@@ -567,14 +651,26 @@ mod tests {
     }
 
     #[test]
+    fn main_down_to_settings_returns_show_settings() {
+        let mut menu = MainMenu::new();
+        menu.handle(press_down()); // -> ROMS
+        menu.handle(press_down()); // -> SETTINGS
+        assert_eq!(menu.handle(press_a()), MenuEffect::ShowSettings);
+    }
+
+    #[test]
     fn main_frame_disables_continue_without_game() {
         let menu = MainMenu::new();
         let frame = menu.frame(false);
-        // When no game is available, CONTINUE is omitted entirely; only ROMS appears.
-        assert_eq!(frame.items, &["ROMS"]);
+        // When no game is available, CONTINUE is omitted entirely; ROMS + SETTINGS appear.
+        assert_eq!(frame.items, &["ROMS", "SETTINGS"]);
         assert!(
             frame.enabled[0],
             "ROMS should be enabled with no game running"
+        );
+        assert!(
+            frame.enabled[1],
+            "SETTINGS should be enabled with no game running"
         );
     }
 
@@ -731,5 +827,49 @@ mod tests {
         );
         assert_eq!(page(0, 0, 12, true).request(RomListEffect::NextPage), None);
         assert_eq!(page(0, 7, 0, false).request(RomListEffect::PrevPage), None);
+    }
+
+    // --- SettingsMenu navigation ---
+
+    #[test]
+    fn settings_confirm_on_wifi_returns_show_wifi_menu() {
+        let mut menu = SettingsMenu::new(); // selected = 0 = WIFI
+        assert_eq!(menu.handle(press_a()), MenuEffect::ShowWifiMenu);
+    }
+
+    #[test]
+    fn settings_back_returns_back() {
+        let mut menu = SettingsMenu::new();
+        assert_eq!(menu.handle(press_b()), MenuEffect::Back);
+    }
+
+    #[test]
+    fn settings_up_does_not_wrap_below_zero() {
+        let mut menu = SettingsMenu::new();
+        menu.handle(press_up());
+        assert_eq!(menu.selected, 0);
+    }
+
+    #[test]
+    fn settings_down_does_not_exceed_last_item() {
+        let mut menu = SettingsMenu::new();
+        for _ in 0..10 {
+            menu.handle(press_down());
+        }
+        assert_eq!(menu.selected, SETTINGS_ITEMS.len() - 1);
+    }
+
+    #[test]
+    fn settings_no_input_returns_none() {
+        let mut menu = SettingsMenu::new();
+        assert_eq!(menu.handle(no_input()), MenuEffect::None);
+    }
+
+    #[test]
+    fn settings_frame_shows_wifi_item() {
+        let menu = SettingsMenu::new();
+        let frame = menu.frame(false);
+        assert_eq!(frame.title, "SETTINGS");
+        assert!(frame.items.contains(&"WIFI"));
     }
 }

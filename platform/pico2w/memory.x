@@ -62,7 +62,12 @@ SECTIONS {
      */
     .core1_stack (NOLOAD) : ALIGN(32)
     {
+        /* Lowest valid address of core 1's stack (it grows down from the top).
+         * The crash handler compares the faulting SP against this to detect a
+         * core 1 stack overflow, mirroring `_stack_end` for core 0. */
+        __core1_stack_limit = .;
         KEEP(*(.core1_stack));
+        __core1_stack_top = .;
     } > CORE1_STACK
 
 } INSERT AFTER .uninit;

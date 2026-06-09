@@ -28,8 +28,8 @@ use crate::flash_rom::OnboardFlash;
 
 #[cfg(target_arch = "arm")]
 use super::{
-    find_next_empty_slot, CrashRecord, SectorDecodeError, SectorHeader, ScratchRegs,
-    RECORD_SIZE, SECTOR_HEADER_SIZE, MAX_RECORDS_PER_SECTOR,
+    find_next_empty_slot, CrashRecord, ScratchRegs, SectorDecodeError, SectorHeader,
+    MAX_RECORDS_PER_SECTOR, RECORD_SIZE, SECTOR_HEADER_SIZE,
 };
 
 /// Byte offset from the start of flash to the crash log sector.
@@ -61,9 +61,15 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
     clear_crash_magic();
 
     match write_record_to_flash(flash, |slot| snap.to_crash_record(slot)) {
-        Ok(true)  => { defmt::info!("crash: committed crash record to flash"); true }
+        Ok(true) => {
+            defmt::info!("crash: committed crash record to flash");
+            true
+        }
         Ok(false) => false, // skipped — sector full or duplicate
-        Err(e)    => { defmt::error!("crash: flash commit failed: {:?}", e); false }
+        Err(e) => {
+            defmt::error!("crash: flash commit failed: {:?}", e);
+            false
+        }
     }
 }
 
@@ -86,6 +92,140 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
 /// Returns `true` if a watchdog-timeout record was committed this boot.
 #[cfg(target_arch = "arm")]
 pub fn check_watchdog_reset(flash: &mut OnboardFlash<'_>) -> bool {
+    check_reset_reason(flash)
+}
+
+/// Capture reset causes that do not flow through the panic/HardFault scratch
+/// sentinel.
+///
+/// This records watchdog timer/force resets plus POWMAN causes that are useful
+/// for the silent-reboot crash hunt. POR/debugger resets are logged but not
+/// written to flash, so normal flashing and power cycling do not consume crash
+/// slots. RUN-low resets are recorded during the hunt because repeated
+/// user-observed splash/save-state reboots latched exactly that cause.
+#[cfg(target_arch = "arm")]
+pub fn check_reset_reason(flash: &mut OnboardFlash<'_>) -> bool {
+    let snapshot = ResetReasonSnapshot::read();
+    snapshot.log();
+    clear_watchdog_reason();
+
+    if !snapshot.should_record() {
+        return false;
+    }
+
+    match write_record_to_flash(flash, |slot| snapshot.to_crash_record(slot)) {
+        Ok(true) => {
+            defmt::info!("crash: reset reason - committed record to flash");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            defmt::error!("crash: reset-reason flash commit failed: {:?}", e);
+            false
+        }
+    }
+}
+
+#[cfg(target_arch = "arm")]
+#[derive(Clone, Copy)]
+struct ResetReasonSnapshot {
+    watchdog_reason: u32,
+    powman_chip_reset: u32,
+    powman_current_pwrup: u32,
+    powman_last_swcore_pwrup: u32,
+    powman_intr: u32,
+}
+
+#[cfg(target_arch = "arm")]
+impl ResetReasonSnapshot {
+    const CHIP_HAD_BOR: u32 = 1 << 17;
+    const CHIP_HAD_RUN_LOW: u32 = 1 << 18;
+    const CHIP_HAD_WATCHDOG_RESET_POWMAN_ASYNC: u32 = 1 << 22;
+    const CHIP_HAD_WATCHDOG_RESET_POWMAN: u32 = 1 << 23;
+    const CHIP_HAD_WATCHDOG_RESET_SWCORE: u32 = 1 << 24;
+    const CHIP_HAD_SWCORE_PD: u32 = 1 << 25;
+    const CHIP_HAD_GLITCH_DETECT: u32 = 1 << 26;
+    const CHIP_HAD_HZD_SYS_RESET_REQ: u32 = 1 << 27;
+    const CHIP_HAD_WATCHDOG_RESET_RSM: u32 = 1 << 28;
+
+    const RECORDABLE_CHIP_RESET_MASK: u32 = Self::CHIP_HAD_BOR
+        | Self::CHIP_HAD_RUN_LOW
+        | Self::CHIP_HAD_WATCHDOG_RESET_POWMAN_ASYNC
+        | Self::CHIP_HAD_WATCHDOG_RESET_POWMAN
+        | Self::CHIP_HAD_WATCHDOG_RESET_SWCORE
+        | Self::CHIP_HAD_SWCORE_PD
+        | Self::CHIP_HAD_GLITCH_DETECT
+        | Self::CHIP_HAD_HZD_SYS_RESET_REQ
+        | Self::CHIP_HAD_WATCHDOG_RESET_RSM;
+
+    fn read() -> Self {
+        let watchdog_reason = WATCHDOG.reason().read().0;
+        let powman = POWMAN;
+        Self {
+            watchdog_reason,
+            powman_chip_reset: powman.chip_reset().read().0,
+            powman_current_pwrup: powman.current_pwrup_req().read().0,
+            powman_last_swcore_pwrup: powman.last_swcore_pwrup().read().0,
+            powman_intr: powman.intr().read().0,
+        }
+    }
+
+    fn log(&self) {
+        defmt::info!(
+            "reset: watchdog_reason={=u32:#010x} powman_chip_reset={=u32:#010x} current_pwrup={=u32:#010x} last_swcore_pwrup={=u32:#010x} powman_intr={=u32:#010x}",
+            self.watchdog_reason,
+            self.powman_chip_reset,
+            self.powman_current_pwrup,
+            self.powman_last_swcore_pwrup,
+            self.powman_intr,
+        );
+    }
+
+    fn watchdog_timer(self) -> bool {
+        self.watchdog_reason & 0x1 != 0
+    }
+
+    fn watchdog_force(self) -> bool {
+        self.watchdog_reason & 0x2 != 0
+    }
+
+    fn has_recordable_chip_reset(self) -> bool {
+        self.powman_chip_reset & Self::RECORDABLE_CHIP_RESET_MASK != 0
+    }
+
+    fn should_record(self) -> bool {
+        self.watchdog_timer() || self.watchdog_force() || self.has_recordable_chip_reset()
+    }
+
+    fn to_crash_record(self, slot_seq: u8) -> CrashRecord {
+        let mut record = CrashRecord {
+            schema_ver: 1,
+            crash_kind: if self.watchdog_timer() {
+                super::CrashKind::WatchdogTimeout as u8
+            } else {
+                super::CrashKind::ResetReason as u8
+            },
+            flags: super::flags::HAS_ARM_REGS,
+            slot_seq,
+            fw_version: super::FW_VERSION,
+            git_hash: super::GIT_HASH_U32,
+            arm_pc: self.watchdog_reason,
+            arm_lr: self.powman_chip_reset,
+            arm_cfsr: self.powman_current_pwrup,
+            arm_hfsr: self.powman_last_swcore_pwrup,
+            arm_fault_addr: self.powman_intr,
+            ..Default::default()
+        };
+        if self.watchdog_force() {
+            record.crash_kind = super::CrashKind::ResetReason as u8;
+        }
+        record
+    }
+}
+
+#[cfg(target_arch = "arm")]
+#[allow(dead_code)]
+fn check_legacy_watchdog_reset(flash: &mut OnboardFlash<'_>) -> bool {
     let reason = WATCHDOG.reason().read();
     if !reason.timer() {
         return false;
@@ -96,9 +236,15 @@ pub fn check_watchdog_reset(flash: &mut OnboardFlash<'_>) -> bool {
     clear_watchdog_reason();
 
     match write_record_to_flash(flash, |slot| build_watchdog_record(slot)) {
-        Ok(true)  => { defmt::info!("crash: watchdog timeout — committed record to flash"); true }
+        Ok(true) => {
+            defmt::info!("crash: watchdog timeout — committed record to flash");
+            true
+        }
         Ok(false) => false,
-        Err(e)    => { defmt::error!("crash: watchdog flash commit failed: {:?}", e); false }
+        Err(e) => {
+            defmt::error!("crash: watchdog flash commit failed: {:?}", e);
+            false
+        }
     }
 }
 
@@ -112,10 +258,7 @@ pub fn check_watchdog_reset(flash: &mut OnboardFlash<'_>) -> bool {
 /// Scans all 31 slots by RCRP magic — does not rely on `SectorHeader::next_slot`
 /// which is unreliable after two or more writes (NOR flash AND-corruption).
 #[cfg(target_arch = "arm")]
-pub fn read_records(
-    flash: &mut OnboardFlash<'_>,
-    buf: &mut [CrashRecord],
-) -> usize {
+pub fn read_records(flash: &mut OnboardFlash<'_>, buf: &mut [CrashRecord]) -> usize {
     // Require a valid sector header before reading anything.
     if read_sector_header(flash).is_err() {
         return 0;
@@ -139,7 +282,10 @@ pub fn read_records(
 /// Call after all records have been offloaded to SD / uploaded.
 #[cfg(target_arch = "arm")]
 pub fn erase_log(flash: &mut OnboardFlash<'_>) -> Result<(), FlashError> {
-    flash.blocking_erase(CRASH_LOG_OFFSET as u32, (CRASH_LOG_OFFSET + ERASE_SIZE) as u32)
+    flash.blocking_erase(
+        CRASH_LOG_OFFSET as u32,
+        (CRASH_LOG_OFFSET + ERASE_SIZE) as u32,
+    )
 }
 
 /// Returns `true` if the crash log sector contains at least one valid record.
@@ -262,46 +408,40 @@ fn write_record_to_flash(
     flash: &mut OnboardFlash<'_>,
     record_builder: impl FnOnce(u8) -> super::CrashRecord,
 ) -> Result<bool, FlashError> {
-    // Read existing header for erase_count.  If missing, treat as a fresh sector.
+    // Read existing header for erase_count. If missing, the sector is fresh,
+    // marked-read, or partially/corruptly written; erase before writing so old
+    // hidden records cannot participate in dedupe or reappear under a new header.
     let existing_header = read_sector_header(flash).ok();
-    let erase_count = existing_header.map(|h| h.erase_count).unwrap_or(0);
+    let mut erase_count = existing_header.map(|h| h.erase_count).unwrap_or(0);
 
-    // Read the leading 4 bytes of each slot from flash, then find the first
-    // truly-erased (all-0xFF) slot via the pure helper (testable on host).
-    let mut slot_magics = [[0u8; 4]; MAX_RECORDS_PER_SECTOR];
-    for (i, magic) in slot_magics.iter_mut().enumerate() {
-        let offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + i * RECORD_SIZE;
-        let _ = flash.blocking_read(offset as u32, magic);
-    }
-    let next_slot = find_next_empty_slot(&slot_magics);
+    let slot = if existing_header.is_none() {
+        erase_count = erase_count.wrapping_add(1);
+        flash.blocking_erase(
+            CRASH_LOG_OFFSET as u32,
+            (CRASH_LOG_OFFSET + ERASE_SIZE) as u32,
+        )?;
+        0u8
+    } else {
+        // Read the leading 4 bytes of each slot from flash, then find the first
+        // truly-erased (all-0xFF) slot via the pure helper (testable on host).
+        let mut slot_magics = [[0u8; 4]; MAX_RECORDS_PER_SECTOR];
+        for (i, magic) in slot_magics.iter_mut().enumerate() {
+            let offset = CRASH_LOG_OFFSET + SECTOR_HEADER_SIZE + i * RECORD_SIZE;
+            let _ = flash.blocking_read(offset as u32, magic);
+        }
+        match find_next_empty_slot(&slot_magics) {
+            Some(s) => s as u8,
 
-    let (slot, erase_count) = match next_slot {
-        Some(s) => (s as u8, erase_count),
-
-        // No erased slot found — sector is full or entirely corrupt.
-        None => match existing_header {
-            // Header is valid: sector is full and the user has not yet
-            // acknowledged the existing records.  Refuse to erase —
-            // run `crash_decoder.py --mark-read` to drain and resume.
-            Some(_) => {
+            // Header is valid and no erased slot was found: sector is full and
+            // the user has not yet acknowledged the existing records. Refuse to
+            // erase; run `crash_decoder.py --mark-read` to drain and resume.
+            None => {
                 defmt::warn!(
                     "crash: log sector full — run crash_decoder.py --mark-read to resume capture"
                 );
                 return Ok(false);
             }
-
-            // Header is absent / invalid: the user ran `--mark-read` (which
-            // zeros the RCLG magic) or the sector is completely fresh.
-            // Safe to erase and start a new cycle.
-            None => {
-                let new_erase = erase_count.wrapping_add(1);
-                flash.blocking_erase(
-                    CRASH_LOG_OFFSET as u32,
-                    (CRASH_LOG_OFFSET + ERASE_SIZE) as u32,
-                )?;
-                (0u8, new_erase)
-            }
-        },
+        }
     };
 
     // Build the record now so we can fingerprint it before the write.
@@ -330,7 +470,10 @@ fn write_record_to_flash(
     // this field.  Writing the same fixed value on every commit is safe: the
     // RCLG magic and erase_count are identical bytes, so no bits need to go
     // from 0→1 (that would require an erase that already happened above).
-    let header = SectorHeader { erase_count, next_slot: 0 };
+    let header = SectorHeader {
+        erase_count,
+        next_slot: 0,
+    };
     flash.blocking_write(CRASH_LOG_OFFSET as u32, &header.to_bytes())?;
 
     Ok(true)
@@ -346,10 +489,10 @@ fn write_record_to_flash(
 #[inline]
 fn is_duplicate_crash(new: &super::CrashRecord, prev: &super::CrashRecord) -> bool {
     new.crash_kind == prev.crash_kind
-        && new.flags    == prev.flags
-        && new.arm_pc   == prev.arm_pc
+        && new.flags == prev.flags
+        && new.arm_pc == prev.arm_pc
         && new.arm_cfsr == prev.arm_cfsr
-        && new.panic_loc  == prev.panic_loc
+        && new.panic_loc == prev.panic_loc
         && new.panic_line == prev.panic_line
 }
 
