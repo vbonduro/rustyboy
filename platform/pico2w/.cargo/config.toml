@@ -18,6 +18,14 @@ rustflags = [
     "-C", "link-arg=-Tdefmt.x",
     # Disable the default linker relaxation pass — required for RP235x.
     "-C", "link-arg=--nmagic",
+    # BUG #5 FIX: use LLVM's `basic` register allocator instead of `greedy`.
+    # The ~15.27B deterministic wild-store crash is a greedy-regalloc stack-slot
+    # collision (stale-LiveRegMatrix class, LLVM PR #197773/#197776). The `basic`
+    # allocator does not use that incremental-update path; a §G20 soak ran clean
+    # past the crash window (16.5B) where greedy crashes every time. Perf-neutral
+    # (the emulator's ~realtime frame rate is unchanged). See
+    # docs/investigations/oam-dma-bisection.md §G20.
+    "-C", "llvm-args=-regalloc=basic",
 ]
 
 [build]
