@@ -22,17 +22,6 @@ use crate::memory::memory::{
     BusEvent, Error as MemoryError, GameBoyMemory, Memory as MemoryTrait, BUS_EVENT_QUEUE_CAP,
 };
 
-#[cfg(target_arch = "arm")]
-unsafe extern "C" {
-    fn rustyboy_route_drain_guard(
-        cap: u32,
-        ptr: u32,
-        head: u32,
-        len: u32,
-        bad_index: u32,
-    ) -> !;
-}
-
 const IF_ADDR: u16 = 0xFF0F;
 const DMA_ADDR: u16 = 0xFF46;
 const SB_ADDR: u16 = 0xFF01;
@@ -251,27 +240,6 @@ impl<W: WorkerTransport> GameBoy<W> {
         &self.front_buffer
     }
 
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn memory_box_field_addr_for_diagnostics(&self) -> usize {
-        core::ptr::addr_of!(self.memory) as usize
-    }
-
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn memory_ptr_for_diagnostics(&self) -> usize {
-        let field = core::ptr::addr_of!(self.memory) as *const usize;
-        unsafe { field.read_volatile() }
-    }
-
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn dma_field_watch_words_for_diagnostics(&self) -> [usize; 2] {
-        let field = core::ptr::addr_of!(self.dma) as usize;
-        let word0 = field & !3;
-        [word0, word0 + 4]
-    }
-
     pub fn set_button(&mut self, btn: Button, pressed: bool) {
         let interrupt = self.joypad.set_button(btn, pressed);
         self.memory.write_io(JOYP_ADDR, self.joypad.read());
@@ -441,13 +409,9 @@ impl<W: WorkerTransport> GameBoy<W> {
         let Some(DmaState { source, progress }) = self.dma else {
             return;
         };
-        // #5 hardening: `progress` should never exceed OAM_DMA_BYTES, but crash
-        // #5 corrupts GameBoy control state so we have seen `progress > 160`.
-        // A bare `OAM_DMA_BYTES - progress` then underflows (release u8 wraps to
-        // ~0xNN), yielding a huge `to_copy` and an OOB `copy_dma_step` dst slice
-        // (the `memory.rs:410` panic that keeps consuming crash slots). Treat an
-        // already-complete/over-run DMA as finished so the corrupting *writer*
-        // can be caught by the r4/r12 + stack-canary diagnostics instead.
+        // `progress` should never exceed OAM_DMA_BYTES; treat an already-complete
+        // or over-run DMA as finished so a bare `OAM_DMA_BYTES - progress` can't
+        // underflow into a huge `to_copy` and an OOB `copy_dma_step` dst slice.
         let remaining = OAM_DMA_BYTES.saturating_sub(progress);
         if remaining == 0 {
             self.dma = None;
@@ -470,23 +434,43 @@ impl<W: WorkerTransport> GameBoy<W> {
     }
 
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(always)]
     fn route_bus_events(&mut self) -> usize {
+        // Hot path: this runs every CPU step. Keep the no-events fast path inlined
+        // (just a load + branch); only hand off to the out-of-line body when there
+        // is actually work, so event-less ticks pay no call overhead.
         if !self.memory.has_events() {
             return 0;
         }
-        #[cfg(target_arch = "arm")]
-        self.guard_bus_event_queue_header();
+        self.drain_bus_events()
+    }
+
+    /// Bug #5 ROOT FIX — this MUST stay `#[inline(never)]`. Do not inline it back,
+    /// and do not move the framing to the OAM-DMA side (per §E2 that only masks).
+    ///
+    /// When this body was inlined into the single giant `.data` `embassy_main_task`
+    /// stack frame, the register allocator coalesced its spill of `&self.memory`
+    /// (preserved across the `write_vram_range`/`write_oam_range` flush calls) onto
+    /// the same stack word `[sp,#0xf0]` that `copy_dma_step` uses to hold its live
+    /// `&oam` base. A code-motion pass then dropped that store into
+    /// `copy_dma_step`'s spill→reload window, overwriting `&oam` (0x20043ab0) with
+    /// `&GameBoyMemory` (0x2003fa30) and sending the OAM-DMA copy 4 bytes below
+    /// OAM. Giving this body its own stack frame makes that slot collision
+    /// impossible. Full capture: docs/investigations/oam-dma-bisection.md §G1.
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(never)]
+    fn drain_bus_events(&mut self) -> usize {
         let mut events = [BusEvent {
             address: 0,
             value: 0,
         }; BUS_EVENT_QUEUE_CAP];
         let event_count = self.memory.drain_into_slice(&mut events);
-        let events = &events[..event_count];
         let mut ppu_reg_buf = [(0u16, 0u8); PPU_REG_BATCH_CAP];
         let mut ppu_reg_count = 0usize;
         let mut i = 0usize;
-        while i < events.len() {
-            if let Some((start_offset, len)) = contiguous_region_len(events, i, VRAM_BASE, VRAM_END)
+        while i < event_count {
+            if let Some((start_offset, len)) =
+                contiguous_region_len(&events[..event_count], i, VRAM_BASE, VRAM_END)
             {
                 let start = start_offset as usize;
                 let end = start + len;
@@ -495,7 +479,9 @@ impl<W: WorkerTransport> GameBoy<W> {
                 i += len;
                 continue;
             }
-            if let Some((start_offset, len)) = contiguous_region_len(events, i, OAM_BASE, OAM_END) {
+            if let Some((start_offset, len)) =
+                contiguous_region_len(&events[..event_count], i, OAM_BASE, OAM_END)
+            {
                 let start = start_offset as usize;
                 let end = start + len;
                 self.transport
@@ -503,7 +489,8 @@ impl<W: WorkerTransport> GameBoy<W> {
                 i += len;
                 continue;
             }
-            if let Some(reg) = self.handle_bus_event(events[i].address, events[i].value) {
+            let (address, value) = (events[i].address, events[i].value);
+            if let Some(reg) = self.handle_bus_event(address, value) {
                 if ppu_reg_count < ppu_reg_buf.len() {
                     ppu_reg_buf[ppu_reg_count] = reg;
                     ppu_reg_count += 1;
@@ -516,23 +503,6 @@ impl<W: WorkerTransport> GameBoy<W> {
                 .write_ppu_registers(&ppu_reg_buf[..ppu_reg_count]);
         }
         event_count
-    }
-
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    fn guard_bus_event_queue_header(&self) {
-        let header = self.memory.bus_event_queue_header();
-        if let Some(bad_index) = header.first_bad_word() {
-            unsafe {
-                rustyboy_route_drain_guard(
-                    header.cap as u32,
-                    header.ptr as u32,
-                    header.head as u32,
-                    header.len as u32,
-                    bad_index as u32,
-                );
-            }
-        }
     }
 
     /// Handle a single bus event. Returns `Some((addr, value))` if the event

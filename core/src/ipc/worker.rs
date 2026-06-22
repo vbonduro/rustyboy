@@ -156,19 +156,6 @@ impl GameBoyWorker {
         self.ppu.framebuffer()
     }
 
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn ppu_box_field_addr_for_diagnostics(&self) -> usize {
-        core::ptr::addr_of!(self.ppu) as usize
-    }
-
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn ppu_state_ptr_for_diagnostics(&self) -> usize {
-        let field = core::ptr::addr_of!(self.ppu) as *const usize;
-        unsafe { field.read_volatile() }
-    }
-
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     pub fn poll_output(&mut self) -> WorkerOutput {
         let output = self.output;

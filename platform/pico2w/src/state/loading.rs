@@ -24,13 +24,13 @@ impl LoadingState {
     pub async fn tick(
         &mut self,
         app: &mut App,
-        gameboy: &mut Option<PicoGameBoy>,
+        gameboy: &mut Option<Box<PicoGameBoy>>,
         flash: &mut OnboardFlash<'_>,
         sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
         watchdog: &mut Watchdog,
     ) {
-        if let Some(existing_gb) = gameboy.as_ref() {
+        if let Some(existing_gb) = gameboy.as_deref() {
             flush_battery_save(app, sd_mgr, existing_gb);
         }
         let had_game = halt_running_game(gameboy);
@@ -79,7 +79,7 @@ impl LoadingState {
     async fn enter_staged_rom(
         &self,
         app: &mut App,
-        gameboy: &mut Option<PicoGameBoy>,
+        gameboy: &mut Option<Box<PicoGameBoy>>,
         sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
         watchdog: &mut Watchdog,
@@ -96,7 +96,7 @@ impl LoadingState {
     }
 }
 
-fn halt_running_game(gameboy: &mut Option<PicoGameBoy>) -> bool {
+fn halt_running_game(gameboy: &mut Option<Box<PicoGameBoy>>) -> bool {
     // Halt core1 if a game is running — must stop before writing flash.
     // Then drop the GameBoy to free its heap (~70 KB: front_buffer, GameBoyMemory,
     // OpCodeTable arcs, APU buffer) before RomStager::begin allocates its 16 KB
@@ -120,7 +120,7 @@ fn rom_matches_staged(app: &App, filename: &str) -> bool {
 
 async fn start_first_rom(
     app: &mut App,
-    gameboy: &mut Option<PicoGameBoy>,
+    gameboy: &mut Option<Box<PicoGameBoy>>,
     sd_mgr: &mut PicoSdMgr,
     game_disp: &mut GameDisplay<'static>,
     info: FlashRomInfo,
@@ -131,7 +131,7 @@ async fn start_first_rom(
         .expect("CORE1 consumed without a running game");
     match XipCartridge::from_staged_flash(info) {
         Ok(cart) => {
-            let mut gb = PicoGameBoy::with_cartridge(core1, Box::new(cart));
+            let mut gb = Box::new(PicoGameBoy::with_cartridge(core1, Box::new(cart)));
             load_battery_save(app, sd_mgr, &mut gb);
             *gameboy = Some(gb);
             refresh_save_slot_available(app, sd_mgr);

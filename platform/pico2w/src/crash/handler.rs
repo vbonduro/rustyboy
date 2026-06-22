@@ -52,16 +52,11 @@
 use cortex_m_rt::ExceptionFrame;
 use rp_pac::{POWMAN, SIO, WATCHDOG};
 
-use super::{flags, CrashKind, CRASH_CONTEXT, CRASH_MAGIC, TRANSPORT_SMASH_DIAG};
-use crate::dwt_watch;
+use super::{flags, CrashKind, CRASH_CONTEXT, CRASH_MAGIC};
 
 #[cfg(target_arch = "arm")]
 #[unsafe(no_mangle)]
 static mut HARDFAULT_EXTRA_REGS: [u32; 8] = [0; 8];
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-static mut DEBUG_MONITOR_EXTRA_REGS: [u32; 8] = [0; 8];
 
 // cortex-m-rt's normal HardFault trampoline only exposes the hardware-stacked
 // registers. Crash #5 needs the multiword-store base register, which is callee
@@ -97,56 +92,12 @@ HardFault:
     adds r1, #4
     mov r2, r11
     str r2, [r1]
+    mov r1, lr
     b.w {handler}
     .size HardFault, . - HardFault
     "#,
     extra = sym HARDFAULT_EXTRA_REGS,
     handler = sym hard_fault_rust,
-);
-
-// DWT data watchpoints enter through DebugMonitor, not HardFault. Capture the
-// callee-saved registers the same way as the HardFault trampoline: for the
-// route_bus_events `stm r4!, {...}` path, pre-handler r4 is the store
-// destination.
-#[cfg(target_arch = "arm")]
-core::arch::global_asm!(
-    r#"
-    .section .DebugMonitorTrampoline,"ax",%progbits
-    .global DebugMonitor
-    .type DebugMonitor,%function
-    .thumb_func
-DebugMonitor:
-    mov r12, lr
-    mov r0, lr
-    movs r1, #4
-    tst r0, r1
-    bne 1f
-    mrs r0, msp
-    b 2f
-1:
-    mrs r0, psp
-2:
-    ldr r1, ={extra}
-    stmia r1!, {{r4, r5, r6, r7}}
-    mov r2, r8
-    str r2, [r1]
-    adds r1, #4
-    mov r2, r9
-    str r2, [r1]
-    adds r1, #4
-    mov r2, r10
-    str r2, [r1]
-    adds r1, #4
-    mov r2, r11
-    str r2, [r1]
-    push {{r12, lr}}
-    bl {handler}
-    pop {{r12, lr}}
-    bx r12
-    .size DebugMonitor, . - DebugMonitor
-    "#,
-    extra = sym DEBUG_MONITOR_EXTRA_REGS,
-    handler = sym debug_monitor_rust,
 );
 
 // ---------------------------------------------------------------------------
@@ -178,30 +129,6 @@ const CFSR_UNDEFINSTR: u32 = 1 << 16;
 /// we repurpose `arm_fault_addr` to hold the stacked R0 from the exception
 /// frame so the decoder can display the actual misaligned address.
 const CFSR_UNALIGNED: u32 = 1 << 24;
-/// Sentinel stored in `arm_cfsr` for firmware DWT/DebugMonitor watchpoint hits.
-/// It is intentionally outside the architectural CFSR bit pattern space.
-const CFSR_DWT_WATCHPOINT: u32 = 0xD717_0001;
-/// Sentinel stored in `arm_cfsr` when `route_bus_events` sees an impossible
-/// `GameBoyMemory.events` VecDeque header before calling `drain_into`.
-const CFSR_ROUTE_DRAIN_GUARD: u32 = 0xD917_0001;
-/// Sentinel stored in `arm_cfsr` for a core-1 `shared`/`worker` pointer
-/// tripwire. `arm_hfsr`/`arm_fault_addr` hold the observed pointers.
-const CFSR_CORE1_POINTER_GUARD: u32 = 0xC011_0001;
-/// Sentinel stored in `arm_cfsr` for a failed `live_ppu_snapshot` RefCell borrow
-/// on core 1. `arm_hfsr` is the raw borrow word; `arm_fault_addr` is render ver.
-const CFSR_LIVE_PPU_BORROW_GUARD: u32 = 0xC011_0002;
-/// Sentinel stored in `arm_cfsr` when OAM DMA is about to form an impossible
-/// destination slice. `arm_hfsr` packs source/progress/count.
-const CFSR_DMA_OAM_GUARD: u32 = 0xD6A0_0001;
-/// Sentinel stored in `arm_cfsr` when the main `GameBoy.memory` Box pointer
-/// differs from the pointer captured at initialization.
-const CFSR_GAMEBOY_MEMORY_POINTER_GUARD: u32 = 0xC011_0003;
-/// Sentinel stored in `arm_cfsr` when an explicit stack-canary checkpoint sees
-/// that the protected function's canary word changed.
-const CFSR_STACK_CANARY_CHANGE_GUARD: u32 = 0xC011_0004;
-/// Sentinel stored in `arm_cfsr` by the guarded global allocator when an
-/// allocation fails or returns an impossible pointer.
-const CFSR_HEAP_ALLOC_GUARD: u32 = 0xC011_0005;
 
 // ---------------------------------------------------------------------------
 // HardFault handler
@@ -209,7 +136,7 @@ const CFSR_HEAP_ALLOC_GUARD: u32 = 0xC011_0005;
 
 #[cfg(target_arch = "arm")]
 #[inline(never)]
-unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame) -> ! {
+unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame, exc_return: u32) -> ! {
     let ef = unsafe { &*ef };
 
     // Disable interrupts so nothing else interferes while we write scratch.
@@ -244,9 +171,10 @@ unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame) -> ! {
     let core = current_core();
 
     // Compute stack headroom / overflow depth from the pre-exception SP.
-    // The hardware pushes 8 words (32 bytes) before entering the exception handler,
-    // so the pre-fault SP = exception frame pointer + 32.
-    let sp_before = ef as *const ExceptionFrame as usize + 32;
+    // NOTE: `ef + 32` is only correct for the basic 8-word frame with no
+    // alignment pad. On this hard-float target the frame can be 104 bytes
+    // (FP extended frame) plus a 4-byte aligner — see `sp_before_exception`.
+    let sp_before = sp_before_exception(ef, exc_return);
     let (stack_headroom, overflowed) = compute_stack_info(sp_before, core);
 
     let f = flags::HAS_ARM_REGS
@@ -262,11 +190,11 @@ unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame) -> ! {
         }
         | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
 
-    let hardfault_tail = {
-        let r4 =
-            unsafe { (core::ptr::addr_of!(HARDFAULT_EXTRA_REGS) as *const u32).read_volatile() };
-        Some([r4, ef.r12()])
-    };
+    // Store sp_before (the faulted thread's SP) rather than pre-handler r4.
+    // For INVSTATE from trigger's `pop {r7,pc}`, sp_before - 4 is the exact
+    // address of the corrupted saved-LR slot, giving us the DWT watchpoint
+    // address for the next crash hunt iteration.
+    let hardfault_tail = Some([sp_before as u32, ef.r12()]);
 
     let f = f | if hardfault_tail.is_some() {
         flags::HAS_HARDFAULT_EXTENDED_REGS
@@ -297,519 +225,6 @@ unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame) -> ! {
         None,
         hardfault_tail,
         arm_r1_for_unaligned,
-        stack_headroom,
-    );
-
-    cortex_m::peripheral::SCB::sys_reset()
-}
-
-#[cfg(target_arch = "arm")]
-/// A watched `VecDeque<BusEvent>` header write is legitimate only while its
-/// header invariants hold: small cap, heap/POOL buffer pointer, `head < cap`,
-/// and `len <= cap`. The #5 corruptor can leave individually small words that
-/// still make the deque impossible, so checking each word independently misses
-/// the `drain_into` variant.
-#[inline(always)]
-fn is_plausible_queue_ptr(v: u32) -> bool {
-    (0x2002_0000..0x2006_0000).contains(&v)
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-unsafe fn read_watched_header_words(base: u32) -> [u32; 4] {
-    [
-        unsafe { (base as *const u32).read_volatile() },
-        unsafe { (base.wrapping_add(4) as *const u32).read_volatile() },
-        unsafe { (base.wrapping_add(8) as *const u32).read_volatile() },
-        unsafe { (base.wrapping_add(12) as *const u32).read_volatile() },
-    ]
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(always)]
-fn first_bad_queue_header_word(words: &[u32; 4]) -> Option<usize> {
-    const MAX_REASONABLE_CAP: u32 = 0x1000;
-
-    let cap = words[0];
-    let ptr = words[1];
-    let head = words[2];
-    let len = words[3];
-
-    if cap > MAX_REASONABLE_CAP {
-        return Some(0);
-    }
-
-    if cap == 0 {
-        if ptr >= 0x1000 && !is_plausible_queue_ptr(ptr) {
-            return Some(1);
-        }
-        if head != 0 {
-            return Some(2);
-        }
-        if len != 0 {
-            return Some(3);
-        }
-        return None;
-    }
-
-    if !is_plausible_queue_ptr(ptr) {
-        return Some(1);
-    }
-    if head >= cap {
-        return Some(2);
-    }
-    if len > cap {
-        return Some(3);
-    }
-    None
-}
-
-#[cfg(target_arch = "arm")]
-unsafe extern "C" fn debug_monitor_rust(ef: *const ExceptionFrame) {
-    let ef = unsafe { &*ef };
-
-    let hit = dwt_watch::watch_hit();
-    // Multiword header stores can trip the comparator on a small cap/head/len
-    // word. Snapshot the whole VecDeque header and record if the combined
-    // invariants are impossible.
-    let base = dwt_watch::current_watch_base();
-    if base == 0 {
-        dwt_watch::clear_debug_status();
-        return;
-    }
-    if dwt_watch::current_watch_is_raw_word() {
-        let bad_address = hit.address;
-        if dwt_watch::current_watch_uses_dma_filter()
-            && should_ignore_valid_dma_watch_hit(bad_address)
-        {
-            dwt_watch::clear_debug_status();
-            return;
-        }
-
-        cortex_m::interrupt::disable();
-        dwt_watch::clear_debug_status();
-
-        let ctx = CRASH_CONTEXT.snapshot();
-        let core = current_core();
-        let sp_before = ef as *const ExceptionFrame as usize + 32;
-        let (stack_headroom, overflowed) = compute_stack_info(sp_before, core);
-
-        let diagnostic_tail = {
-            let r4 = unsafe {
-                (core::ptr::addr_of!(DEBUG_MONITOR_EXTRA_REGS) as *const u32).read_volatile()
-            };
-            Some([r4, ef.r12()])
-        };
-
-        let f = flags::HAS_ARM_REGS
-            | flags::HAS_HARDFAULT_EXTENDED_REGS
-            | if ctx.is_some() {
-                flags::HAS_GB_STATE | flags::HAS_ROM_INFO
-            } else {
-                0
-            }
-            | if overflowed {
-                flags::HAS_STACK_OVERFLOW
-            } else {
-                0
-            }
-            | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
-
-        let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-        let packed6 = (CrashKind::HardFault as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
-
-        let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
-        let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
-        let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
-
-        write_watchdog_scratch(
-            ef.pc(),
-            ef.lr(),
-            CFSR_DWT_WATCHPOINT,
-            hit.function,
-            bad_address,
-            packed6,
-            packed7,
-        );
-        write_powman_scratch_from_context(
-            ctx.as_ref(),
-            None,
-            diagnostic_tail,
-            ef.r1(),
-            stack_headroom,
-        );
-
-        cortex_m::peripheral::SCB::sys_reset()
-    }
-    let header_words = unsafe { read_watched_header_words(base) };
-    let bad_index = if let Some(index) = first_bad_queue_header_word(&header_words) {
-        index
-    } else {
-        dwt_watch::clear_debug_status();
-        return;
-    };
-    let bad_address = base.wrapping_add((bad_index as u32) * 4);
-
-    cortex_m::interrupt::disable();
-    dwt_watch::clear_debug_status();
-
-    let ctx = CRASH_CONTEXT.snapshot();
-    let core = current_core();
-    let sp_before = ef as *const ExceptionFrame as usize + 32;
-    let (stack_headroom, overflowed) = compute_stack_info(sp_before, core);
-
-    let diagnostic_tail = {
-        let r4 = unsafe {
-            (core::ptr::addr_of!(DEBUG_MONITOR_EXTRA_REGS) as *const u32).read_volatile()
-        };
-        Some([r4, ef.r12()])
-    };
-
-    let f = flags::HAS_ARM_REGS
-        | flags::HAS_HARDFAULT_EXTENDED_REGS
-        | if ctx.is_some() {
-            flags::HAS_GB_STATE | flags::HAS_ROM_INFO
-        } else {
-            0
-        }
-        | if overflowed {
-            flags::HAS_STACK_OVERFLOW
-        } else {
-            0
-        }
-        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
-
-    let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-    let packed6 = (CrashKind::HardFault as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
-
-    let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
-    let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
-    let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
-
-    write_watchdog_scratch(
-        ef.pc(),
-        ef.lr(),
-        CFSR_DWT_WATCHPOINT,
-        hit.function,
-        bad_address,
-        packed6,
-        packed7,
-    );
-    write_powman_scratch_from_context(ctx.as_ref(), None, diagnostic_tail, ef.r1(), stack_headroom);
-
-    cortex_m::peripheral::SCB::sys_reset()
-}
-
-#[cfg(target_arch = "arm")]
-fn should_ignore_valid_dma_watch_hit(hit_address: u32) -> bool {
-    let addresses = dwt_watch::current_watch_addresses();
-    let dma_tag_word = addresses[0];
-    let dma_payload_word = addresses[1];
-    if dma_tag_word == 0
-        || dma_payload_word == 0
-        || (hit_address != dma_tag_word && hit_address != dma_payload_word)
-    {
-        return false;
-    }
-
-    let tag = unsafe { (dma_tag_word as *const u32).read_volatile() };
-    let payload = unsafe { (dma_payload_word as *const u32).read_volatile() };
-    dma_words_are_valid_for_diagnostics(tag, payload)
-}
-
-#[cfg(target_arch = "arm")]
-fn dma_words_are_valid_for_diagnostics(tag: u32, payload: u32) -> bool {
-    if tag == 0 {
-        return true;
-    }
-    if tag != 1 {
-        return false;
-    }
-
-    let source = payload & 0xFFFF;
-    let progress = (payload >> 16) & 0xFF;
-    source & 0x00FF == 0 && progress <= 160
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_route_drain_guard(
-    cap: u32,
-    ptr: u32,
-    head: u32,
-    len: u32,
-    bad_index: u32,
-) -> ! {
-    let route_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) route_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        route_lr,
-        bad_index,
-        CFSR_ROUTE_DRAIN_GUARD,
-        cap,
-        ptr,
-        Some([head, len]),
-        bad_index,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_core1_pointer_guard(
-    site: u32,
-    shared: u32,
-    worker: u32,
-    want_shared: u32,
-    want_worker: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_CORE1_POINTER_GUARD,
-        shared,
-        worker,
-        Some([want_shared, want_worker]),
-        site,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_live_ppu_borrow_guard(
-    site: u32,
-    borrow_word: u32,
-    render_version: u32,
-    shared: u32,
-    worker: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_LIVE_PPU_BORROW_GUARD,
-        borrow_word,
-        render_version,
-        Some([shared, worker]),
-        site,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_dma_oam_guard(
-    site: u32,
-    packed_dma: u32,
-    actual_src: u32,
-    dst: u32,
-    count: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_DMA_OAM_GUARD,
-        packed_dma,
-        actual_src,
-        Some([dst, count]),
-        site,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_gameboy_memory_pointer_guard(
-    site: u32,
-    gameboy: u32,
-    memory: u32,
-    want_memory: u32,
-    field_addr: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_GAMEBOY_MEMORY_POINTER_GUARD,
-        gameboy,
-        memory,
-        Some([want_memory, field_addr]),
-        site,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub extern "C" fn rustyboy_find_stack_canary(caller_sp: u32, _site: u32) -> u32 {
-    let guard = crate::stack_chk::__stack_chk_guard as u32;
-    let mut addr = caller_sp;
-    let end = caller_sp.saturating_add(128);
-    while addr < end {
-        let value = unsafe { (addr as *const u32).read_volatile() };
-        if value == guard {
-            return addr;
-        }
-        addr = addr.wrapping_add(core::mem::size_of::<u32>() as u32);
-    }
-    0
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rustyboy_stack_canary_change_guard(
-    site: u32,
-    canary_addr: u32,
-    before: u32,
-    after: u32,
-    bus_addr: u32,
-    memory: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_STACK_CANARY_CHANGE_GUARD,
-        canary_addr,
-        after,
-        Some([before, memory]),
-        bus_addr,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[unsafe(no_mangle)]
-pub extern "C" fn rustyboy_heap_alloc_guard(
-    site: u32,
-    ptr: u32,
-    size: u32,
-    align: u32,
-    heap_start: u32,
-    heap_end: u32,
-) -> ! {
-    let guard_lr: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {}, lr",
-            out(reg) guard_lr,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-
-    record_synthetic_hardfault(
-        guard_lr,
-        site,
-        CFSR_HEAP_ALLOC_GUARD,
-        size,
-        align,
-        Some([ptr, heap_start]),
-        heap_end,
-    )
-}
-
-#[cfg(target_arch = "arm")]
-#[inline(never)]
-fn record_synthetic_hardfault(
-    arm_pc: u32,
-    arm_lr: u32,
-    arm_cfsr: u32,
-    arm_hfsr: u32,
-    arm_fault_addr: u32,
-    diagnostic_words: Option<[u32; 2]>,
-    panic_line_or_r1: u32,
-) -> ! {
-    cortex_m::interrupt::disable();
-    dwt_watch::clear_debug_status();
-
-    let ctx = CRASH_CONTEXT.snapshot();
-    let core = current_core();
-    let sp = cortex_m::register::msp::read() as usize;
-    let (stack_headroom, overflowed) = compute_stack_info(sp, core);
-
-    let f = flags::HAS_ARM_REGS
-        | if diagnostic_words.is_some() {
-            flags::HAS_HARDFAULT_EXTENDED_REGS
-        } else {
-            0
-        }
-        | if ctx.is_some() {
-            flags::HAS_GB_STATE | flags::HAS_ROM_INFO
-        } else {
-            0
-        }
-        | if overflowed {
-            flags::HAS_STACK_OVERFLOW
-        } else {
-            0
-        }
-        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
-
-    let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-    let packed6 = (CrashKind::HardFault as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
-
-    let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
-    let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
-    let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
-
-    write_watchdog_scratch(
-        arm_pc,
-        arm_lr,
-        arm_cfsr,
-        arm_hfsr,
-        arm_fault_addr,
-        packed6,
-        packed7,
-    );
-    write_powman_scratch_from_context(
-        ctx.as_ref(),
-        None,
-        diagnostic_words,
-        panic_line_or_r1,
         stack_headroom,
     );
 
@@ -849,9 +264,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let sp = cortex_m::register::msp::read() as usize;
     let (stack_headroom, overflowed) = compute_stack_info(sp, core);
 
-    let stack_chk_lr = crate::stack_chk::last_fail_lr() as u32;
-    let transport_smash = TRANSPORT_SMASH_DIAG.take();
-
     let f = flags::HAS_PANIC_LOC
         | if ctx.is_some() {
             flags::HAS_GB_STATE | flags::HAS_ROM_INFO
@@ -863,42 +275,19 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         } else {
             0
         }
-        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 }
-        | if transport_smash.is_some() {
-            flags::HAS_ARM_REGS
-        } else if stack_chk_lr != 0 {
-            flags::HAS_ARM_REGS | flags::HAS_STACK_CHK_FAIL_LR
-        } else {
-            0
-        };
+        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
 
     let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-    let crash_kind = if transport_smash.is_some() {
-        CrashKind::TransportSmash
-    } else {
-        CrashKind::Panic
-    };
+    let crash_kind = CrashKind::Panic;
     let packed6 = (crash_kind as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
 
     let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
     let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
     let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
 
-    let (arm_pc, arm_lr, arm_cfsr, arm_hfsr, arm_fault_addr) = if let Some(smash) = transport_smash
-    {
-        (
-            smash.base,
-            smash.cmd,
-            smash.aud,
-            smash.shr,
-            smash.source_triplet,
-        )
-    } else {
-        // Software panics do not have an exception frame. Stack-protector
-        // panics are the exception: `__stack_chk_fail` captured LR before
-        // calling into defmt.
-        (0, stack_chk_lr, 0, 0, 0)
-    };
+    // Software panics do not have an exception frame, so there are no ARM
+    // register values to record.
+    let (arm_pc, arm_lr, arm_cfsr, arm_hfsr, arm_fault_addr) = (0, 0, 0, 0, 0);
     write_watchdog_scratch(
         arm_pc,
         arm_lr,
@@ -966,6 +355,31 @@ fn stack_limit_for_core(core: u32) -> usize {
     }
 }
 
+/// Reconstruct the pre-exception stack pointer from the exception frame.
+///
+/// `ef + 32` is correct ONLY for the basic 8-word frame with no alignment pad.
+/// On this hard-float (`thumbv8m.main-none-eabihf`) target two things enlarge
+/// the frame and must be added back, or every absolute spill-slot address
+/// derived from this SP is wrong (this exact error mis-named a watchpoint slot
+/// during the G4 hunt — see docs/investigations/compiler-codegen-investigation.md):
+///   * FP context: if EXC_RETURN.FType (bit 4) is 0, the hardware reserved an
+///     extended frame (26 words = 104 bytes) instead of the basic 32 bytes.
+///   * 8-byte realignment: if stacked xPSR bit 9 is set, the hardware inserted
+///     a 4-byte pad word below the frame to keep it 8-byte aligned.
+///
+/// `exc_return` is the handler-entry LR (EXC_RETURN), forwarded by the
+/// HardFault trampoline.
+#[cfg(target_arch = "arm")]
+#[inline(always)]
+fn sp_before_exception(ef: &ExceptionFrame, exc_return: u32) -> usize {
+    let ef_addr = ef as *const ExceptionFrame as usize;
+    // EXC_RETURN bit 4 (FType): 1 = basic frame, 0 = extended (FP) frame.
+    let frame_size = if exc_return & (1 << 4) == 0 { 104 } else { 32 };
+    // Stacked xPSR bit 9: a 4-byte aligner pad was inserted below the frame.
+    let pad = if ef.xpsr() & (1 << 9) != 0 { 4 } else { 0 };
+    ef_addr + frame_size + pad
+}
+
 /// Compute `(headroom_or_depth: u16, overflowed: bool)` for a pre-fault stack
 /// pointer, measured against the faulting `core`'s stack limit:
 /// - If `sp_before >= limit`: `headroom = sp_before - limit`, not overflowed.
@@ -995,6 +409,11 @@ fn write_watchdog_scratch(
     packed6: u32,
     packed7: u32,
 ) {
+    // Capture DMA channel write-addresses before the reset wipes them.
+    // Stored in a .uninit static so the bytes survive the soft reset and can
+    // be read back in check_and_commit on the next boot.
+    capture_dma_snapshot();
+
     let wd = WATCHDOG;
     wd.scratch0().write_value(CRASH_MAGIC);
     wd.scratch1().write_value(arm_pc);
@@ -1005,6 +424,60 @@ fn write_watchdog_scratch(
     wd.scratch6().write_value(packed6);
     wd.scratch7().write_value(packed7);
 }
+
+/// Snapshot DMA channels 0-7 WRITE_ADDR + a busy-channel bitmask into the
+/// `.uninit` static below.  Called once per crash, before `sys_reset`, so the
+/// data survives into the next boot's `check_and_commit`.
+fn capture_dma_snapshot() {
+    // RP2350 DMA register layout (channels 0-15):
+    //   Base: 0x5000_0000
+    //   Per channel: stride 0x40
+    //   +0x00 = READ_ADDR, +0x04 = WRITE_ADDR, +0x08 = TRANS_COUNT,
+    //   +0x0C = CTRL_TRIG  (bit 24 = BUSY)
+    const DMA_BASE: usize = 0x5000_0000;
+    const WRITE_ADDR_OFF: usize = 0x04;
+    const CTRL_TRIG_OFF: usize = 0x0C;
+    const CHANNEL_STRIDE: usize = 0x40;
+    const BUSY_BIT: u32 = 1 << 24;
+
+    let mut busy_mask: u32 = 0;
+    let mut write_addrs = [0u32; 16];
+    for i in 0usize..16 {
+        let base = DMA_BASE + i * CHANNEL_STRIDE;
+        let ctrl = unsafe { ((base + CTRL_TRIG_OFF) as *const u32).read_volatile() };
+        if ctrl & BUSY_BIT != 0 {
+            busy_mask |= 1 << i;
+        }
+        write_addrs[i] = unsafe { ((base + WRITE_ADDR_OFF) as *const u32).read_volatile() };
+    }
+    unsafe {
+        DMA_CRASH_SNAPSHOT[0] = DMA_SNAPSHOT_SENTINEL;
+        DMA_CRASH_SNAPSHOT[1] = busy_mask;
+        // ch0-ch6 go into the crash record (slots 2-8)
+        for i in 0..7usize {
+            DMA_CRASH_SNAPSHOT[2 + i] = write_addrs[i];
+        }
+        // ch7-ch15 (9 channels) stored in slots 9-17 for boot-time defmt logging
+        for i in 7..16usize {
+            DMA_CRASH_SNAPSHOT[2 + i] = write_addrs[i];
+        }
+    }
+}
+
+/// Sentinel value in DMA_CRASH_SNAPSHOT[0] that distinguishes a populated
+/// snapshot from uninitialised memory left over from a previous boot.
+pub const DMA_SNAPSHOT_SENTINEL: u32 = 0xD4A0_C12A;
+
+/// DMA channel write-address snapshot, populated at crash time and consumed
+/// at boot by `check_and_commit`.  Lives in `.uninit` so it is not zeroed by
+/// the cortex-m-rt reset handler and survives the `sys_reset()` soft reboot.
+///
+/// Layout: [0] = sentinel, [1] = busy_mask, [2..18] = WRITE_ADDR ch0-15.
+/// Slots 2-8 (ch0-6) are also committed to the flash crash record.
+/// Slots 9-17 (ch7-15) are logged via defmt only — see check_and_commit.
+#[unsafe(no_mangle)]
+#[link_section = ".uninit"]
+pub static mut DMA_CRASH_SNAPSHOT: [u32; 18] = [0; 18];
 
 /// Write the 8 POWMAN scratch registers with emulator and panic context.
 ///

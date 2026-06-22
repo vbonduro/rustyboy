@@ -135,6 +135,37 @@ bad_index. DWT arming is disabled for this guard build so legitimate
   The next diagnostic image should therefore stop watching DMA and DWT-watch the
   worker-reference stack slot plus the static `GameBoyWorker.ppu` Box field.
 
+**Attempted follow-up (2026-06-14):**
+- Implemented the narrow MPU bracketing design for the cartridge vtable block:
+  `core::memory::GameBoyMemory::refresh_rom_windows()` now routes through a
+  tiny optional callback seam (`install_rom_window_cache_refresh_bracket_for_diagnostics`)
+  so the Pico layer can unlock only MPU region 2 around the legitimate
+  `rom_*` cache-field writes, then immediately relock it. The callback checks
+  the vtable word immediately before unlock and immediately after relock and
+  fires the existing synthetic `rustyboy_cartridge_vtable_guard` if the word
+  changed inside the writable window. Follow-up review made the whole Core 0
+  writable interval locally interrupt-atomic, including boot save restoration.
+  Core 1 polls the published runtime address and permanently marks the same
+  block privileged-read-only in MPU region 1; only Core 0's tightly bracketed
+  cache refresh can make its own region writable.
+- Local validation only: `cargo check --release` passed and `cargo test-host`
+  passed (191/191) after the bracketing change.
+- Hardware validation did **not** run because reflashing the board became
+  blocked before the new image could be programmed. Every `probe-rs download`
+  / `rb-flash` attempt failed inside the target flash algorithm's `init`
+  routine with the same report: `init failed with code 288`. A captured
+  `probe-rs` debug log shows the flash algorithm call returning `r0 = 0x120`
+  (`Routine returned 120.`) during `Call to flash algorithm init`.
+- Recovery attempts that did **not** clear the blocker: probe USB reset, target
+  watchdog clear (`WATCHDOG.CTRL = 0`), SWD reset, lower SWD speed, explicit
+  `MPU_CTRL = 0`, and clearing all four DWT comparator function registers
+  before the flash attempt. `probe-rs info --chip RP235x` still attached and
+  read the CoreSight ROM successfully, so the failure was specific to flash
+  programming, not SWD attach in general.
+- No positive-control run, no normal-boot verification, and no standalone bug
+  #5 trials were completed on 2026-06-14. No new crash-sector captures were
+  produced.
+
 ---
 
 ## Diagnostic techniques that worked (use these, not probe-rs unwind)
@@ -1948,3 +1979,1929 @@ Final filter added for this round:
   `Core1Transport` pointer triplet starts at transport offset 4, not 0.
 
 Nothing has been committed; all changes are in the working tree.
+
+### #5-investigation session (2026-06-10) — heapless MpMcQueue i8 overflow deep-dive
+
+#### The bug (heapless 0.8.0)
+
+`MpMcQueue` uses Dmitry Vyukov's bounded MPMC algorithm. The readiness check
+computes a *signed* difference between the cell's sequence number and the current
+position, to distinguish three states: ready (dif==0), full/empty (dif<0),
+contention (dif>0).
+
+In heapless 0.8.0 the comparison is **hardcoded to `i8`** regardless of the
+`mpmc_large` feature:
+
+```rust
+// enqueue
+let dif = (seq as i8).wrapping_sub(pos as i8);
+// dequeue
+let dif = (seq as i8).wrapping_sub((pos.wrapping_add(1)) as i8);
+```
+
+With `mpmc_large` enabled, `AtomicTargetSize = AtomicUsize` and `IntSize =
+usize` — the atomic is 64-bit on RP2350 — but the comparison still casts both
+operands to `i8` before subtracting. The sequence numbers and position counters
+can exceed 255 for large N, so the bottom-8-bit truncation produces wrong
+`dif` values.
+
+**Safe capacity limit for this comparison: N ≤ 127.** The Vyukov algorithm
+requires that the signed difference fits in the comparison type. For `i8` that
+is [-128, 127]; cell sequence numbers advance by N each full cycle, so the
+observable difference is up to ±N. At N=128 it barely fits; at N=256 it
+overflows.
+
+The const assert in 0.8.0 is:
+```rust
+Self::ASSERT[!(N < (IntSize::MAX as usize)) as usize];
+// With mpmc_large: IntSize = usize → MAX = usize::MAX → passes for any N
+```
+It checks against `usize::MAX`, not `i8::MAX`. No compile-time guard prevents
+N=256 from compiling.
+
+#### Why the original algorithm used a larger signed type
+
+Vyukov's reference implementation used `int` (32-bit on x86), wide enough for
+any practical queue. heapless chose `u8`/`i8` to minimize per-cell overhead on
+embedded targets (1 byte vs 4). That trade-off is fine for N ≤ 127. When
+`mpmc_large` was added for larger queues, the atomic/storage type aliases were
+updated but the comparison casts were not — a copy-paste miss.
+
+#### The consequence for our queues
+
+| Queue | N | Bug triggered? |
+|---|---|---|
+| `COMMAND_QUEUE` | 512 | Yes — far exceeds i8 range |
+| `AUDIO_QUEUE` | 2048 | Yes |
+
+A consumer can observe a cell as "ready" (dif==0) when the producer has not yet
+written a valid payload. For `Core1Command` (a Rust enum) this is **enum UB**:
+reading an uninitialized or stale discriminant can produce any variant and any
+field bytes. The resulting garbage command dispatched on Core 1 can write to
+arbitrary memory — including the `.data` thunk table.
+
+#### Fix in heapless 0.9.0
+
+The changelog entry is explicit:
+
+> **Fixed `MpMcQueue` with `mpmc_large` feature.**
+
+In 0.9.x the type aliases become:
+```rust
+#[cfg(feature = "mpmc_large")]
+type IntSize = isize;   // was: hardcoded i8 in comparison
+#[cfg(not(feature = "mpmc_large"))]
+type IntSize = i8;
+```
+And the comparison uses `IntSize` throughout:
+```rust
+let dif = (seq as IntSize).wrapping_sub(pos as IntSize);
+```
+With `mpmc_large` this is `isize` (64-bit on RP2350), so any practical queue
+capacity is safe. heapless 0.9.2 is already present in `Cargo.lock` (pulled in
+by another dependency); the platform crate pins `"0.8"`.
+
+heapless 0.9.2 also **deprecates** the entire `mpmc` module (issue #583),
+signalling that the design is considered flawed and users should migrate to
+other primitives.
+
+#### Is this a known / documented issue?
+
+Yes — it was fixed as a named bug in the 0.9.0 release. The GitHub issue #583
+discusses deprecating the module. Before the fix landed, it was not documented
+in any warning or doc comment in 0.8.x, so it was a silent bug.
+
+#### Recommended action
+
+Upgrade `heapless` to `"0.9"` in `platform/pico2w/Cargo.toml`. The 0.9.x
+breaking changes affecting us:
+- `Q2`/`Q4`/…/`Q64` type aliases removed → use `MpMcQueue<T, N>` directly
+  (already done).
+- `Drop` impl added for `MpMcQueue` → static queues unaffected.
+- `mpmc` marked deprecated → will produce a warning; acceptable for now.
+
+Alternatively, cap `COMMAND_QUEUE_CAPACITY` to ≤ 127 as a short-term
+mitigation (proved to stop the crash for ≥ 6-minute runs in the 2026-06-04
+session), then upgrade heapless in a follow-up.
+
+==================================================================
+**CORRUPTOR IDENTIFIED (2026-06-11) — BusEvent scratch buffer on hot stack.**
+==================================================================
+
+### DWT standalone-run methodology
+
+All prior DWT runs were under `probe-rs run` which holds C_DEBUGEN set. With
+C_DEBUGEN set, DWT watchpoint hits cause the CPU to HALT (caught by probe-rs)
+instead of firing the DebugMonitor exception. To get DebugMonitor to fire (and
+write a crash record) the firmware must run WITHOUT the debugger attached.
+
+Workflow used:
+1. `STAMP_ONLY=1 cargo run --release` — CRC-stamps the ELF but skips flashing.
+2. `probe-rs download --chip RP235x --speed 1000 <elf>.rbcrc` — flashes silently
+   and exits, clearing C_DEBUGEN on session Drop.
+3. `probe-rs reset --chip RP235x` — resets target and exits, C_DEBUGEN stays 0.
+4. Firmware runs standalone; DebugMonitor fires on DWT hit and writes a crash record.
+5. `crash_decoder.py --probe --elf <elf>` reads the record.
+
+`STAMP_ONLY` support was added to `xtask/src/bin/rb-flash.rs`.
+
+### Watch configuration
+
+`multicore.rs` armed DWT in `WATCH_MODE_STACK_LR` mode watching `0x2007EACC × 4`
+comparators. The DebugMonitor handler skips records for Thumb (odd) values and
+values ≤ 0xFFFF (legitimate LR pushes are odd; the corrupt write is even and
+≥ 0x10000). The victim address `0x2007EACC` was derived from crash #31's sp_before.
+
+### DWT hit — crash record (crash #2 of the cleared log)
+
+```
+ARM PC = 0x1002e396 = __aeabi_memcpy
+ARM LR = 0x1000316b = core::ptr::copy_nonoverlapping
+Stk R0 = 0x2007eacc          ← memcpy DESTINATION = the watchpoint address
+```
+
+The DWT fired on a WRITE to `0x2007EACC`, with memcpy as the writer.
+
+### Full call chain (llvm-addr2line on 0x1000316b)
+
+```
+embassy_main_task (main.rs:649)
+  → RunningState::tick (running.rs:53)
+    → PicoGameBoy::tick (multicore.rs:1225)
+      → GameBoy::tick (gameboy.rs:222)
+        → GameBoy::route_bus_events (gameboy.rs:483)
+          → GameBoyMemory::drain_into_slice (memory.rs:784)
+            → BusEventQueue::drain_into_slice (memory.rs:56)
+              → [u8]::copy_from_slice → copy_nonoverlapping → __aeabi_memcpy
+```
+
+The **entire chain is inlined** into `embassy_main_task_inner_function` at
+`0x100002d4`. Its prologue: `push {r4-r7,lr}` + `push.w {r8-r11}` +
+`sub.w sp, sp, #5312` = **5348-byte stack frame**.
+
+At `0x10002ec8`: `add.w r11, sp, #2000`
+→ r11 = SP + 2000 = the base of the `events` array from:
+```rust
+let mut events = [BusEvent { address: 0, value: 0 }; BUS_EVENT_QUEUE_CAP]; // 256 bytes
+```
+
+At runtime: SP + 2000 = **0x2007EACC** = the watchpoint address.
+
+The `events` array (`let mut events` in `route_bus_events`) therefore occupied
+`[0x2007EACC, 0x2007FACC)` on the stack. The address `0x2007EACC` is also the
+**saved LR slot** of some other function at a shallower stack depth. When the
+embassy main task polls, the frame is allocated fresh (SP decremented by 5348);
+when it yields, the frame is freed. Code running at shallower depth (embassy
+executor callbacks, timer tasks, etc.) can use `0x2007EACC` as a saved LR.
+If the main task's next poll fills `0x2007EACC` with BusEvent bytes from
+`drain_into_slice`, those bytes are later loaded as a PC → INVSTATE / IBUSERR.
+
+BusEvent #0 at [0x2007EACC]:
+- bytes = (addr_lo, addr_hi, value, padding) = (addr[0], addr[1], value, ?)
+- e.g. address=0xFE9E, value=0x00, padding=0x00 → word = **0x0000_FE9E** (≤ 0xFFFF,
+  DWT filter skips → firmware continues → IBUSERR crash later, recorded as crash #31)
+- or address=0x8000, value=0x02, padding=0x20 → word = **0x2002_6E8C** (even >0xFFFF,
+  DWT filter triggers → DebugMonitor records it as crash #2)
+
+### Fix applied (2026-06-11)
+
+`core/src/gameboy.rs`: added `bus_event_scratch: [BusEvent; BUS_EVENT_QUEUE_CAP]`
+as a field of `GameBoy<W>`. `GameBoy` is `Box`-allocated (heap) in the pico2w
+platform → heap address ~0x2003xxxx, never overlapping the MSP stack.
+
+`route_bus_events` changed from:
+```rust
+let mut events = [BusEvent { address: 0, value: 0 }; BUS_EVENT_QUEUE_CAP]; // stack!
+let event_count = self.memory.drain_into_slice(&mut events);
+```
+to:
+```rust
+let event_count = self.memory.drain_into_slice(&mut self.bus_event_scratch); // heap!
+```
+
+This eliminates the 256-byte stack allocation from the hot frame. Confirmed by
+disassembly of the new build: `add.w rN, sp, #2000` pattern is completely absent;
+all events-array accesses are `[r10, #offset]` (r10 = GameBoy self pointer, heap).
+
+All 14 core crate tests pass. Firmware cross-compiles clean for thumbv8m.main-none-eabihf.
+
+**Status: fix built and confirmed in disassembly. Pending hardware flash + runtime
+verification per [[feedback-flash-before-claiming-fix]].**
+
+### Critical gap: the `bus_event_scratch` fix is a layout shift, not an RCA (2026-06-11)
+
+The DWT catch (crash #2) recorded `ARM PC = __aeabi_memcpy`, `LR = copy_nonoverlapping`,
+destination = `0x2007EACC`. The other agent concluded that BusEvent bytes left on the
+dead stack after a poll yield were later loaded as a PC by a shallower function. That
+mechanism is **physically impossible** in cooperative single-threaded execution: any
+function saving an LR at `0x2007EACC` does so with a prologue `push {…,lr}`, which
+**overwrites** whatever stale bytes were there before the LR is ever loaded. The stale
+BusEvent bytes cannot survive to be popped as PC.
+
+The DWT crash #2 record is a **false positive**: the STACK_LR filter read the *written
+value* (BusEvent bytes at `events[0]`, e.g. `address=0x8000` → word with bit 0 = 0 and
+value > 0xFFFF) and recorded it as the corruptor. This `sys_reset` fired before the
+actual corruptor could produce its own record. Every prior DWT iteration that
+"never caught the corruptor" was suffering from this: the filter fires on the legit
+drain, resets, and the real writer never gets a turn.
+
+**What the fix actually does:** moving `events` from the hot frame to a `GameBoy` field
+removes the source of the false positive by making the drain write to the POOL region
+instead of the MSP stack, so the DWT at `0x2007EACC` can no longer false-positive.
+It is good hygiene regardless; the POOL address also avoids the stack-layout-sensitive
+bug class entirely for this buffer. But it is a layout shift — the real corruptor
+(which writes GB-address values into host pointer/return-address slots across POOL,
+CORE1_WORKER, and the MSP stack) has not been identified.
+
+**Evidence:** every confirmed victim spans distant regions simultaneously — POOL
+transport triplet, CORE1_WORKER `apu.sample_buffer` Vec header, `live_ppu_snapshot`
+RefCell borrow flag, core-0/1 stack return addresses. A simple stack BusEvent-bytes
+overflow hits only one victim at one address; the corruptor hits many addresses. The
+writer is something that scatters GB-address-valued bytes using a wild pointer, on
+either core.
+
+### DWT filter corrected to geometry-based (2026-06-11)
+
+Root cause of every prior false-positive DWT record: the STACK_LR filter read the
+*written value* and skipped on `written & 1 == 1` (Thumb) or `written <= 0xFFFF`
+(GB constant). This allowed any BusEvent write where the address word happened to be
+even and > `0xFFFF` to trigger a record and reset.
+
+**Fix (handler.rs):** replaced the value filter with a geometry check on `sp_before`:
+
+- **Skip** if: core 0 AND `watched_address >= sp_before` — the write is into the
+  writer's own live frame or a caller's frame (normal prologue push, struct store,
+  or the legit drain). Stack grows downward; `sp_before` is the bottom of the live
+  frame, so `addr >= sp_before` means "inside the frame."
+- **Record** if: core 1 (cross-core write — core 1's SP is in `CORE1_STACK`
+  at `0x2008xxxx`, always above any core-0 victim, so `addr < sp_before` on core 1),
+  OR if the write is to an address below the writer's own SP (write outside the live
+  frame from core 0 — suspicious).
+
+This filter is value-independent and layout-independent. It correctly ignores the
+drain memcpy (writes into its own live frame) and correctly catches a cross-core store
+from core 1 that scatters GB bytes into core-0's stack or POOL.
+
+### Watch target changed to `worker.ppu` Box pointer field (2026-06-11)
+
+Previous target: hardcoded `0x2007EACC` (stack LR slot from crash #31). That address
+is layout-specific and shifts with every image rebuild; the `bus_event_scratch` fix
+reduces the frame by 256 bytes, putting `0x2007EACC` at a different relative position.
+
+**New target (multicore.rs):** `worker.ppu_box_field_addr_for_diagnostics()` — the
+address of the `Box<PpuWorkerState>` pointer field inside `CORE1_WORKER` static. This
+field is:
+- Written **exactly once** at construction (`GameBoyWorker::init_in_place`), before
+  `run_core1_worker` is entered and before the DWT is armed.
+- Never written by any normal code path afterward.
+- A confirmed previous victim (crash records showed `worker.ppu ≈ 0xf5006042`).
+
+Watching it in **raw word mode** (no filter): any write after we arm = the corruptor.
+The DebugMonitor geometry filter in raw mode skips all non-STACK_LR modes anyway, so
+this comparator fires on every write and records the writer PC unconditionally.
+
+### Remaining open investigation items (2026-06-11)
+
+1. **Flash and soak.** Build and flash the new image. Play to reproduce. The first
+   DWT record should now be the real corruptor rather than the drain false positive.
+
+2. **DMA channel dump.** The cyw43 WiFi PIO/SPI RX DMA writes RAM and is invisible
+   to all CPU-side watchpoints. A DMA channel with a corrupted `WRITE_ADDR` register
+   could scatter GB-valued words across RAM without triggering any CPU DWT. Add a
+   quick dump of all active DMA channel `WRITE_ADDR`/`CTRL_TRIG` registers to the
+   crash record (read from `0x50000000 + n*0x40`). This closes the only remaining
+   blind spot. Cheap: 12 DMA channels × 2 registers = 24 word reads, can fit in an
+   existing diagnostic tail.
+
+3. **Identify the corruptor class.** Once the writer PC is recorded, determine:
+   - Flash address → `addr2line` → which function owns the store instruction.
+   - If it's core-0 application code: audit the store's base register source (r4/r12
+     from the extended regs) to find how a GB address ended up there.
+   - If it's core 1: the base register was a `shared`/`worker` pointer corrupted
+     earlier; trace how *that* pointer got the GB value (the `shared` pointer smash
+     records showing base ≈ `0x407E` GB ROM address are the clearest prior evidence).
+   - If `arm_pc` is inside `__aeabi_memcpy`/`RawVec`/embassy internals: the base
+     register contains the corrupt destination address; determine what provided it.
+
+4. **ACCESSCTRL SRAM firewall + MPU read-only.** Structural backstop that converts
+   any code-execution from a corrupted PC in `.data`-resident RAM code into a precise
+   MemFault with a writer PC, rather than unpredictable behaviour. Not needed to find
+   the root cause, but provides a safety net once identified.
+
+---
+
+## #5 investigation continued (2026-06-12) — Core 1 MPU experiment + DMA ruled out
+
+### Context
+
+After the 2026-06-11 session (see "CORRUPTOR IDENTIFIED" and retraction above),
+the DWT was re-armed in RAW mode on `worker.ppu_box_field_addr_for_diagnostics()`
+(`0x20004598`) — a field that is written exactly once at construction and should
+never change. The hypothesis entering this session: the corruptor is Core 1's CPU
+executing wild code and writing to Core 0's stack LR slots.
+
+### Experiment: Core 1 PMSAv8-M MPU protecting Core 0's stack
+
+Added `setup_core1_mpu()` called from `run_core1_worker` (immediately after the
+MSPLIM assertion). Configured Core 1's MPU region 0:
+
+```
+RBAR = 0x20066B7B  (BASE=0x20066B60, XN=1, AP=10=priv-RO, SH=11=inner-shareable)
+RLAR = 0x2007FFE1  (LIMIT=0x2007FFFF, AttrIndx=0, EN=1)
+MPU_MAIR0 = 0xFF   (Normal, write-back, read/write-allocate)
+MPU_CTRL = 0x05    (ENABLE | PRIVDEFENA — background full-access for all other addresses)
+HFNMIENA = 0       (MPU off in HardFault so crash handler can read/write freely)
+```
+
+Rationale: any write by Core 1's CPU to Core 0's stack range (`0x20066B60–0x2007FFFF`)
+fires MemManage → escalates to HardFault (MEMFAULTENA=0) → existing handler records
+stacked PC = exact corrupt store instruction. CFSR.DACCVIOL would be set.
+
+Flashed using STAMP_ONLY methodology (no probe attached during soak).
+
+### Result: 7 crashes, zero DACCVIOL — Core 1 CPU is definitively NOT the corruptor
+
+After a multi-hour soak, `crash_decoder.py --probe` read 7 new records (fresh flash
+page, erase_count=1 — the crash page was erased during the firmware flash). Every
+crash showed the same LR-slot corruption pattern as before; **not one record had
+CFSR.DACCVIOL**. The crash badge never appeared on screen — the firmware was
+crashing during boot before the badge display sequence could run.
+
+**This definitively rules out Core 1's CPU as the corruptor.** If Core 1 were writing
+to any address in `0x20066B60–0x2007FFFF`, Core 1's MPU would fire. It did not.
+
+### DMA analysis: channels 2–6 have WRITE_ADDR=0 (unused)
+
+The crash decoder skips DMA channels with WRITE_ADDR=0 (`if addr == 0: continue` in
+`crash_decoder.py:800`). In all 7 new crashes the DMA section shows only:
+
+```
+DMA ch0  WRITE_ADDR=0x50200010   (PIO0 SM0 TX FIFO — audio/WiFi)
+DMA ch1  WRITE_ADDR=0x40088008   (I2S peripheral)
+```
+
+Channels 2–6 = 0x00000000. Both active channels write to peripheral registers,
+not SRAM. DMA is an increasingly unlikely suspect, though it cannot be fully ruled
+out: a DMA transfer that briefly writes to SRAM and completes before the downstream
+fault fires would leave WRITE_ADDR at the post-transfer peripheral address.
+
+### Crash #2 notable: stacked R0 = victim LR slot address
+
+Crash #2 had an unusually corrupted state:
+```
+CFSR     0xd7170001  (reserved bits set — CFSR value itself is corrupted)
+Stk R0   0x2007eacc  (stacked R0 — this is one of the victim LR slot addresses)
+SP_bef   0x2002b0ac  (Core 0's SP was in the heap region, not the stack)
+```
+
+Stk R0 = `0x2007eacc` means some code was running with R0 holding a Core 0 stack
+address at the moment of exception. This is consistent with a pattern like
+`STR Rx, [R0]` where R0 was loaded with a stack slot address. The CFSR with reserved
+bits set suggests the CFSR register itself was corrupted by the same writer.
+
+### LR slot victim addresses (consistent across all firmware versions)
+
+The corruption consistently hits Core 0's stack in a specific region:
+- `0x2007e9fc` — seen in crash #4 (LR zeroed, Fault@=0xFFFFFFFE)
+- `0x2007ead4` — seen in crash #3 (written with `0x2007eb10`, INVSTATE — executing from stack)
+- `0x2007ea54` — seen in crash #6 (LR zeroed, Fault@=0x4f21d8b9)
+- `0x2007eacc` — seen in crash #7 (written with `0x0000FE9E`, IBUSERR)
+
+The value `0x0000FE9E` in LR slots is **extremely consistent** across firmware versions
+(13 of 22 crashes in the older firmware set, and crash #7 in the new set). See the
+2026-06-04 analysis: `0xfe9e` ∈ GB OAM address space (`0xFE00–0xFE9F`). This is a
+GB-address-valued word written over a host return address — consistent with the
+"GB-derived value used as host pointer" pattern identified earlier. The corruptor
+is still writing GB-address-space values into host return address slots.
+
+### Current state
+
+All three hardware corruptor hypotheses have now been tested:
+- **Core 0 CPU**: Core 0 MPU tested earlier — no violations.
+- **Core 1 CPU**: Core 1 MPU tested this session — no DACCVIOL in 7 crashes.
+- **DMA ch0/ch1**: both write to peripheral FIFOs, not SRAM; ch2–6 unused.
+
+The corruptor bypasses all of these. Remaining possibilities:
+1. Core 0 is the writer but Core 0's MPU couldn't catch it writing to its own stack.
+2. DMA channel with brief SRAM write that completes before crash snapshot.
+3. Some other AHB bus master (CYW43 WiFi PIO-based SPI RX?).
+
+### Updated next steps
+
+1. **Search firmware ELF for the constant `0x0000FE9E`** — this value is too consistent
+   to be random. If it appears as a literal in the program data or ROM tables it
+   identifies the code path producing the corrupt value.
+
+2. **Audit Core 0's own code paths** for a dangling pointer or stack-address escape.
+   The stacked R0 = victim address in crash #2 suggests some code computes a stack
+   address into R0 and then stores through it. A use-after-return of a `&local` passed
+   to an async closure or callback is the classic pattern. Focus on Embassy timer
+   callbacks, SPI completion handlers, and any closure capturing a reference to a
+   stack variable.
+
+3. **Arm Core 0's DWT on the victim address** to determine if Core 0 is the writer.
+   In raw mode on `0x2007eacc`, it fires on every write — which will include normal
+   function prologue pushes. The STACK_LR geometry filter (skip if writer==core0 and
+   addr >= sp_before) handles this. If Core 0 IS the writer, the DWT will catch it.
+   If DWT on Core 0 also never fires, then only DMA or another bus master remains.
+
+4. DMA snapshot now extended to capture all 16 channels (ch0–ch15). The crash record
+   format still only stores ch0–ch6 (unchanged), but ch7–ch15 are logged via defmt
+   at the next boot. If CYW43 WiFi SPI RX (suspected to use ch8–ch11) was writing
+   to Core 0 stack, it will appear as a `crash: DMA chN: WRITE_ADDR=0x2007...` warning
+   at boot after the next crash.
+
+---
+
+## #5 investigation continued (2026-06-12) — crash pattern analysis + DMA ch7-15
+
+### Crash log analysis
+
+Decoded 24 crash records from crash_log.txt (firmware git=71713c6b, old firmware).
+**14 of 24 crashes** show the **identical** pattern:
+
+```
+ARM PC   0x0000FE9E  → not in firmware (IBUSERR: fetch from GB OAM address space)
+ARM LR   0x2000048F  → maps to set_r8_enum in current ELF (may differ in old fw)
+CFSR     0x00000100  IBUSERR
+GB CPU   PC=0x03CE  SP=0xDFFF  AF=0x0080  BC=0x00FF  DE=0x5800  HL=0xFFAA
+```
+
+The GB CPU state is **byte-for-byte identical** across all 14 crashes (same cycle count phase,
+same game state at frame start), consistent with a deterministic race that fires at the same
+point in the emulation loop.
+
+Other crash types seen in the same log: BSS execution (PC in BSS region, LR=0x00000001), cyw43
+init/UNALIGNED faults (crash #9, #11, #21), sio.rs panic (#19), WiFi driver drop_in_place (#22).
+
+### Key observation: 0x0000FE9E is a BusEvent value
+
+`BusEvent { address: u16, value: u8 }` with no repr annotation has size=4 on ARM (u16 at offset 0,
+u8 at offset 2, 1-byte padding). For address=0xFE9E, value=0x00, padding=0x00:
+
+    bytes = [0x9E, 0xFE, 0x00, 0x00]  →  u32 LE = 0x0000FE9E
+
+`0xFE9E` is GB OAM address 0xFE9E = sprite 39's tile number slot. The game writes byte value
+0x00 to that OAM slot (clearing/hiding sprite 39). The BusEvent for this write, if it landed
+at a Core 0 stack return-address slot, would corrupt that return address to 0x0000FE9E.
+
+### LR=0x2000048F is NOT a valid set_r8_enum call site
+
+All BL calls to set_r8_enum in the current ELF produce return addresses:
+0x200001B1, 0x200001D5, 0x200001E7, 0x200009A1, 0x20000ED3, 0x200010B7
+
+None is 0x2000048F. The crash decoder maps 0x2000048F to set_r8_enum only because it falls
+within the function's address range in the **current** ELF. The old firmware (git=71713c6b)
+likely has different .data layout. The consistent LR value is likely either:
+- The actual CPU LR at crash time, set by a BL in the old firmware at a different address
+- Or: a value restored from a corrupted stack slot via pop/ldmia
+
+### DMA ch7-ch15 extension (2026-06-12)
+
+Extended `DMA_CRASH_SNAPSHOT` from 9 to 18 words and `capture_dma_snapshot` loop from 8
+to 16 channels. Changes in `check_and_commit` now log ch7–ch15 via defmt at boot (not stored
+in flash record). Newly flashed — waiting for first crash to see high-channel data.
+
+---
+
+## #5 investigation continued (2026-06-12) — DMA fully ruled out + bus_write layout
+
+### DMA ch4–ch15 are never allocated
+
+`bind_interrupts!` in `driver.rs` only registers handlers for ch0–ch3. No code ever
+calls `Channel::new(DMA_CH4..DMA_CH15, …)`. Channels 4–15 are never allocated and
+cannot have a valid WRITE_ADDR. **All 16 DMA channels are definitively ruled out as
+the corruptor.**
+
+### WiFi DMA channels (ch2/ch3) do not reach victim addresses
+
+Confirmed from the actual cyw43-pio source (git revision c722d94, the compiled version):
+
+- ch2 = WiFi TX → writes to PIO1 TX FIFO (peripheral address, not SRAM)
+- ch3 = WiFi RX → writes into `cyw43_task` POOL at `0x20003e08`
+
+The `cyw43_task` POOL is ~270 KB below the victim addresses (`0x2007e???`). DMA
+physically cannot reach the victim. The DMA snapshot at the next crash will show
+ch7–ch15, but this is now mostly academic — DMA is not the corruptor.
+
+### bus_write disassembly: GameBoyMemory struct layout
+
+Traced the full `bus_write` function (compiled into `.data` at `0x20000310`). The
+compiler-optimized `GameBoyMemory` layout, reverse-engineered from the IO write path
+(`strb [r0 + 0x4100]` where r0 = GameBoyMemory + sign_extend_16(addr)):
+
+| Offset | Field | Size |
+|--------|-------|------|
+| 0x0000 | vram [u8; 0x2000] | 8192 |
+| 0x2000 | wram [u8; 0x2000] | 8192 |
+| 0x3F00 | io [u8; 0x80] | 128 |
+| 0x3F80 | (other fields) | ... |
+| 0x4000 | oam [u8; 0xA0] | 160 |
+| 0x40A0 | hram / other | ... |
+| **0x4120** | **cartridge: Box<dyn Cartridge>** (data_ptr) | 4 |
+| **0x4124** | **cartridge: Box<dyn Cartridge>** (vtable_ptr) | 4 |
+| 0x4128 | rom window cache fields | ... |
+
+The `io` array does NOT end right at 0x4120 — the compiler reordered fields. The
+`cartridge` fat pointer is at 0x4120 with the vtable at 0x4124.
+
+### Dominant crash mechanism (14 of 24 in old firmware log)
+
+In `bus_write`, the MBC dispatch path at `0x200003b6`:
+```
+ldrd r9, r6, [r4]    ; r9 = cartridge.data_ptr, r6 = cartridge.vtable_ptr
+ldr r3, [r6, #0x14]  ; r3 = vtable.write method
+blx r3               ; if vtable_ptr is wrong SRAM addr → PC = garbage
+```
+
+If `GameBoyMemory + 0x4124` (vtable_ptr) is corrupted to a SRAM address X where
+`[X + 0x14]` = `0x0000FE9E`, the branch to r3 causes IBUSERR. The bus_write stores
+after MBC return write to offsets +8 through +20 (NOT +4), so bus_write itself
+cannot corrupt the vtable_ptr.
+
+### LR=0x2000048F is probably a valid return address in old firmware
+
+The crash decoder uses the *current* firmware's symbol table to decode crashes from
+old firmware (git=71713c6b). In the old firmware, `0x2000048F` was likely a valid
+return address from a `bl bus_write` in the SM83 dispatch — it only falls inside
+`set_r8_enum` in the *current* .data layout. LR is probably not corrupted; only the
+vtable pointer at `GameBoyMemory + 0x4124` is the corruption target.
+
+### Status
+
+- **All DMA channels**: ruled out
+- **Core 1 CPU**: ruled out (MPU, 7 crashes, zero DACCVIOL)
+- **Core 0 CPU**: cannot catch Core 0 writing to its own stack via MPU; not ruled out
+- **Corruption target**: `GameBoyMemory + 0x4124` (cartridge vtable pointer)
+- **Mechanism**: some code writes a SRAM address to that word; `bus_write` then
+  dereferences it as a vtable, reads `0x0000FE9E` at vtable+0x14, branches → IBUSERR
+
+### Next steps
+
+1. **Software vtable guard in `PicoGameBoy::tick()`**: check each tick that
+   `GameBoyMemory.cartridge`'s vtable pointer is ≥ `0x10000000` (valid flash). Log the
+   corrupted value via defmt the moment it goes wrong. No DWT needed, no timing shift.
+   The existing `EXPECTED_GAMEBOY_MEMORY_PTR` guard checks the Box pointer, not the
+   contents — this would guard the *contents*.
+
+2. **DWT on `GameBoyMemory + 0x4124`** at runtime: arm after construction, geometry
+   filter to skip self-writes. First write that is not the initial construction =
+   the corruptor. This is layout-dependent (address shifts with each build) so needs
+   runtime derivation.
+
+3. **Investigate Core 0 for GB-address-to-host-pointer paths**: the corruptor writes
+   a value that causes `[X+0x14]` = `0x0000FE9E`. X is some SRAM address. Something
+   on Core 0 computes that SRAM address as a function of GB data (BusEvent, DmaState,
+   etc.) and stores it into the cartridge fat pointer.
+
+---
+
+## #5 investigation continued (2026-06-12) — boot-window clustering + WiFi ruled out
+
+### Crash timing: boot-clustered, not gameplay-triggered
+
+User observation: the most recent crashes happened soon after boot. An 8-hour soak
+after the agents' recent changes (bus_event_scratch heap move etc.) produced no crash.
+
+This is consistent with the notes: the poisoned save state resumes at ~2.39 B cycles and
+all captured records show `cycle_lo=2,395,577,292` — only a few million cycles past the
+save point. The "deterministic trigger" at `PC=0x03CE` is simply the state the save
+resumes into, firing within a second or two of boot, not after minutes of gameplay.
+
+**The 8-hour soak is not a valid test for a boot-clustered crash.** One soak = one boot
+= one trial. If the corruption probability is concentrated in the first ~60 seconds, a
+single clean soak proves nothing. The earlier 6-minute clean soaks on image `0x017e9080`
+showed the same pattern before later reproducing. Do not treat the soak as a fix
+confirmation.
+
+**Implication for test methodology.** Replace open-ended soaks with a **reboot-loop
+harness**: `probe-rs reset` (standalone, no debugger), wait ~90 s, run
+`crash_decoder.py --probe --json`, log, repeat. This gives ~30–40 trials per hour instead
+of one per soak. An A/B across old/new images with N≥20 trials each is the minimum
+meaningful test.
+
+### WiFi as a corruptor: likely ruled out
+
+User confirmed going back to an old PR (pre-WiFi) produced the same crashes. The
+`crash_log.txt` records all carry `git=71713c6b` = "Add crash reporting and save state
+format documentation", which predates commit `fd1bb00` (WiFi captive portal work) in
+the repo history.
+
+**Caveat:** `build.rs` stamps `git rev-parse HEAD` with no dirty-tree flag. Some of the
+22 records in that log carry crashes symbolizing coherently to `cyw43::runner::init` and
+`wifi::driver::configure`, which cannot appear in a clean `71713c6b` build — they came
+from dirty-tree builds with WiFi present in the working tree. The git stamp alone cannot
+distinguish "clean old-PR build" from "dirty-tree session build at the same HEAD."
+
+**To make the WiFi-out ruling airtight (one-time verification, low cost):** clean
+checkout of `71713c6b`, confirm the ELF contains no `cyw43` symbol (`nm | grep cyw43`),
+flash, run the reboot-loop, and observe a `0x0000FE9E` record. One such record from a
+provably WiFi-free image closes this permanently. Without it, WiFi remains "likely out"
+rather than "definitively out."
+
+**Assuming WiFi is out**, the suspects list is:
+- **All DMA channels**: ruled out
+- **Core 1 CPU**: ruled out (MPU experiment, 7 crashes, zero DACCVIOL)
+- **Core 0 CPU**: not yet ruled out; cannot catch Core 0 writing to its own stack via MPU
+- **WiFi/cyw43**: likely ruled out by old-PR repro (see caveat above)
+- **Corruption target**: `GameBoyMemory + 0x4124` (cartridge vtable pointer)
+
+### RAM-resident hot code as an additional hypothesis
+
+`bus_write` lives at `0x20000310` in `.data` (RAM-resident code). The CRC guard
+verifies flash at boot but does **not** verify the SRAM copy of the code after it is
+copied from flash. If the `.data` region itself is corrupted at runtime, audited store
+instructions can silently go wrong — which would explain why every source-level audit
+comes back clean.
+
+Supporting evidence: crash #2 from the MPU-soak session had `CFSR` with reserved bits
+set (the CFSR register itself was corrupted) and `SP_before=0x2002b0ac` (Core 0's SP
+was in the heap region, not the stack). Both are signatures of the CPU having gone wild
+before the fault frame was committed — consistent with executing corrupted code, not
+clean code with a bad operand.
+
+### Updated priority next steps (revised from above)
+
+These supersede the three steps at the end of the previous section:
+
+1. **Tick-time vtable guard + RAM-code CRC** — two cheap per-tick checks, no DWT,
+   no layout sensitivity:
+   - Check `GameBoyMemory.cartridge` vtable ptr ≥ `0x10000000` (valid flash range). Log
+     and record the moment it goes wrong. This is the front-door check for the dominant
+     crash signature.
+   - Snapshot a CRC (or a few sentinel words) of the `.data` code region at boot and
+     recheck each tick. A mismatch means RAM code was corrupted, not application data —
+     the two hypotheses produce different failures here, so one capture discriminates them.
+
+2. **MPU read-only on the `.data` / RAM-code region** — arm Core 0's MPU region to
+   make `0x20000000..end_of_.data` non-writable after the copy-from-flash startup.
+   Any write to that region from Core 0 fires DACCVIOL with the exact writer PC. Unlike
+   the stack-range MPU experiment, Core 0 never legitimately writes its own code, so
+   there are no false positives and no filter needed. This is the single most decisive
+   trap if the RAM-code hypothesis is correct.
+
+3. **Reboot-loop harness as the standard test** — script: `probe-rs reset`, wait 90 s,
+   `crash_decoder.py --probe --json`, repeat. Use N≥20 trials for any A/B comparison.
+   Do not use open-ended soaks to confirm fixes for a boot-clustered bug.
+
+4. **DWT on `GameBoyMemory + 0x4124`** (runtime-derived, geometry filter) — confirmatory
+   once the vtable guard names the corruption window. If the vtable guard says the word
+   changed but the DWT never fires, the write didn't come from a CPU store — which points
+   back at corrupted code executing a store through a bad operand.
+
+5. **Clean old-PR WiFi-out verification** — one reboot-loop run on a provably WiFi-free
+   `71713c6b` build. Low cost, closes the last exotic-bus-master question permanently.
+
+---
+
+## #5 investigation continued (2026-06-13) — valid current-image fault capture
+
+### Crash-record review and symbol-mapping correction
+
+The flash crash sector contains 31 records, all stamped `git=fd1bb003`. They are
+not records from the current dirty-tree image, and current-ELF symbolization of
+their addresses is invalid. The sector is full, so current faults cannot append
+new flash records. A raw backup was saved as
+`/tmp/rustyboy-crash-sector.bin`.
+
+The first current-image fault instead survived in watchdog scratch:
+
+```
+PC=0x200024bc LR=0x1001a6e5 CFSR=0x00000001 HFSR=0x40000000
+```
+
+Disassembly showed `0x200024bc` was the first instruction of
+`GameBoy::read_worker_output`. This was not application corruption: Core 0's
+MPU RBAR had been encoded as `0x2000000b`, which sets XN on PMSAv8-M. Executing
+RAM code in the protected `.data` region therefore caused IACCVIOL.
+
+The same RBAR field misunderstanding affected Core 1:
+
+```
+old Core 0 RBAR = 0x2000000b  (wrong: XN=1)
+new Core 0 RBAR = 0x2000001c  (SH=11, AP=10 privileged-RO, XN=0)
+
+old Core 1 RBAR = 0x20066b7b  (wrong AP/SH/XN combination)
+new Core 1 RBAR = 0x20066b7d  (SH=11, AP=10 privileged-RO, XN=1)
+```
+
+Therefore the earlier conclusion "Core 1 CPU ruled out by seven MPU-protected
+crashes" is invalid. Those runs did not have the intended MPU permissions.
+
+### DWT instrumentation removed
+
+After fixing the MPU encodings, an attached run halted after tick 0 with
+`CFSR=0`, `HFSR=0`. DWT comparator 0 was still armed on the worker PPU field and
+had matched a legitimate write. This was another instrumentation-induced stop.
+
+The runtime no longer publishes or rearms DWT watches. Both cores call
+`dwt_watch::disarm_for_current_core()` during startup to clear comparator state
+that can survive a warm reset. The same worker PPU field remains available as
+ordinary software-checkpoint metadata, so load-state and tick-0 logs still
+verify its value without a hardware watchpoint.
+
+### Definitive current-image HardFault
+
+Image CRC `0xba7f05b0` repeatedly reached every load-state checkpoint and both
+tick-0 checkpoints with stable values:
+
+```
+GameBoy memory = 0x20026184
+cartridge vtable = 0x100322ac
+worker.ppu field @ 0x200038d0 = 0x2002b444
+```
+
+Using an in-session breakpoint at the current image's HardFault vector captured
+the exception before the handler or a second debugger connection could resume
+the target:
+
+```
+HardFault LR       = 0xfffffff9
+exception SP       = 0x2007eab0
+stacked R0         = 0x00000004
+stacked R1         = 0xffffff80
+stacked R2         = 0x00000000
+stacked R3         = 0x20000045
+stacked R12        = 0x1001443f
+stacked LR         = 0x20000087
+stacked PC         = 0x0000fe9e
+stacked xPSR       = 0x29000000
+CFSR               = 0x00000100 (IBUSERR)
+HFSR               = 0x40000000 (FORCED)
+```
+
+`0x20000087` is a valid Thumb return address in RAM-resident
+`Instructions::rotate_accumulator`. It follows:
+
+```
+0x20000082: bl  rr_u8
+0x20000086: b   0x20000090
+```
+
+`rr_u8` is a leaf:
+
+```
+0x1001443e: push {r7,lr}
+...
+0x1001445e: pop  {r7,pc}
+```
+
+At this stack depth its saved LR slot is `0x2007eacc`. The function contains no
+calls and no stores between push and pop, yet its return loaded
+`0x0000fe9e`. This is direct evidence that another execution context overwrote
+the live Core 0 LR slot while `rr_u8` was active. It is not stale data from a
+previous stack frame.
+
+### Hardware-source checks at the exact fault
+
+Core 1's corrected MPU was read live after the fault:
+
+```
+MPU_CTRL = 0x00000005
+RBAR     = 0x20066b7d
+RLAR     = 0x2007ffe1
+MAIR0    = 0x000000ff
+```
+
+Thus a Core 1 CPU store to `0x2007eacc` would have raised DACCVIOL on Core 1
+before Core 0 returned. No such Core 1 fault occurred. This corrected capture,
+not the malformed earlier experiment, excludes Core 1 as writer for this event.
+
+All DMA registers were also read while the HardFault was stopped:
+
+```
+ch0 WRITE_ADDR=0x50200010  (PIO FIFO)
+ch1 WRITE_ADDR=0x40088008  (peripheral FIFO)
+ch2-ch15 all zero/unconfigured
+```
+
+No DMA channel was configured to write SRAM at the fault instant.
+
+### Current hypothesis and next experiment
+
+The remaining execution context capable of changing a live Core 0 MSP slot
+during a leaf function is a Core 0 interrupt handler. Enabled handlers include
+`TIMER0_IRQ_0`, `DMA_IRQ_0`, `PIO0_IRQ_0`, `PIO1_IRQ_0`, and
+`SIO_IRQ_FIFO`.
+
+First isolation iteration: preserve PRIMASK, disable Core 0 interrupts only
+around `self.gb.tick()`, then restore PRIMASK immediately afterward.
+
+Expected outcomes:
+
+- If repeated boot faults disappear, an interrupt handler is the writer. Next,
+  mask individual IRQ classes to identify which handler.
+- If the same `0x0000fe9e` LR-slot fault persists, interrupt preemption is not
+  required and investigation returns to Core 0 thread execution or another bus
+  master.
+
+### Interrupt-masked iteration 1 — partial result
+
+Built and flashed image CRC `0xe959be1e`. The generated code confirms the
+intended local interrupt window:
+
+```
+0x1000301e: mrs   r0, primask
+0x10003024: cpsid i
+              ... inlined GameBoy::tick() ...
+0x10003e0a: bl    GameBoy::read_worker_output
+0x10003e1e: ldr   r0, [sp, #saved_primask]
+0x10003e24: cpsie i     (only when interrupts were enabled on entry)
+```
+
+This masks Core 0 interrupts only while the emulator tick is active and restores
+the caller's prior PRIMASK state afterward.
+
+Two boot trials completed every load-state checkpoint, both tick-0 checkpoints,
+and remained alive beyond the immediate crash window. Stable values were:
+
+```
+GameBoy memory = 0x20026184
+cartridge vtable = 0x100322dc
+worker.ppu field @ 0x200038d0 = 0x2002b444
+```
+
+For comparison, the immediately preceding unmasked image reproduced the
+post-tick HardFault in two attached boots. A separate unmasked GDB-controlled
+run had also survived 90 seconds, so two clean masked trials are suggestive but
+not sufficient to conclude that an ISR is the corruptor.
+
+### Interrupt-masked iteration 2 — IBUSERR eliminated, new SPSC panic (2026-06-13)
+
+Continued the same image (`0xe959be1e`) with 3 more trials (trials 3–5, 90 s each).
+
+**All 3 trials produced an IDENTICAL set of 3 records — the `0x0000fe9e` IBUSERR crash
+pattern is completely absent:**
+
+```
+Crash #1  WatchdogTimeout (prior session's watchdog, committed at boot)
+Crash #2  Panic  core 1  spsc.rs:185  ROM bank=2  GB PC=0x63e6  Cycles=2,403,934,428
+Crash #3  WatchdogTimeout  (watchdog after the spsc panic reset)
+```
+
+The same 3 records appeared in all 3 read-backs; the sector fills during the first
+boot after mark-read (the spsc panic fires at ~8 s, then the board crash-loops).
+
+**Significance:**
+
+- The dominant `0x0000fe9e IBUSERR` / LR-slot corruption crash (14 of 24 records in
+  the prior log) is **gone**. `PRIMASK` during `gb.tick()` definitively eliminates it.
+  A Core 0 ISR was writing `0x0000fe9e` to the LR slot at `0x2007EACC` while `rr_u8`
+  had that address as its saved return address on the stack.
+
+- A new crash appears: `spsc.rs:185` = `(val + 1) % self.n()` in heapless 0.9.3's
+  SPSC queue `increment` helper. Division by zero if `self.n()` (= AUDIO_QUEUE's
+  buffer length through its fat pointer) is 0. This is a **corruption of the
+  AUDIO_QUEUE's fat pointer** (buffer-length word smashed to 0), not a queue-overflow.
+  It fires on Core 1.
+
+- **Interpretation:** the same wild writer is still active, but the PRIMASK shifted
+  the stack layout during tick so the wild write lands on the AUDIO_QUEUE static's
+  fat pointer instead of the `rr_u8` LR slot. This is consistent with the
+  layout-sensitivity documented throughout this session. The root corruptor is an ISR
+  that writes GB-derived bytes to memory — the victim changes when the ISR can no
+  longer fire during tick().
+
+- `spsc.rs:185` is still the corruption pattern (GB bytes landing on a host pointer),
+  not a new independent bug.
+
+**Next step: identify which IRQ.**
+
+Mask individual interrupt classes during `gb.tick()` to find which handler is the writer.
+Candidates (per `bind_interrupts!`):
+
+| IRQ | Handler | Suspicion |
+|-----|---------|-----------|
+| `TIMER0_IRQ_0` | embassy_time timer | Fires on GB-cycle-aligned ticks; could re-enter poll machinery |
+| `DMA_IRQ_0` | CH0-CH3 completion | Fires on display/audio DMA done |
+| `PIO0_IRQ_0` | I2S audio | Fires per I2S word |
+| `PIO1_IRQ_0` | WiFi | Fires on WiFi PIO events |
+| `SIO_IRQ_FIFO` | inter-core FIFO | Not in bind_interrupts!, may be implicit |
+
+The `TIMER0_IRQ_0` / embassy timer is the primary suspect: it runs on Core 0, fires
+frequently (every embassy timer tick), and the timer machinery can execute async waker
+code with a non-trivial stack frame that could be positioned to overwrite `0x2007EACC`
+with whatever happens to be 4 bytes into its frame. Mask it first via
+`NVIC::mask(embassy_rp::pac::Interrupt::TIMER0_IRQ_0)` around `gb.tick()`.
+
+### Core-0 ISR hypothesis ruled out; Core 1 is the remaining CPU writer (2026-06-13)
+
+The linked DWT experiment did not capture the `0x0000FE9E` write. Image CRC
+`0x0cdb5906` reproduced repeated current-image faults, including the exact
+`PC=0x0000FE9E`, `SP_before=0x2007EAD0` pattern, but committed no DWT record.
+Clearing `C_DEBUGEN` from firmware was therefore not sufficient; the linked
+comparator encoding and/or halting-debug state remained a capture problem.
+
+A raw DWT watch on the hot Core 0 LR slot suppressed the crash for three reboot
+trials, confirming that DebugMonitor traffic on a frequently-written stack word
+perturbs this race too heavily to be useful.
+
+The investigation then returned to the reproducible interrupt-masked image:
+
+- `cortex_m::interrupt::free` masks Core 0 interrupts only around `gb.tick()`.
+- `run_core1_worker` keeps its original 0x100-byte frame.
+- Disassembly places the `audio_tx: spsc::Producer<i16>` QueueView metadata word
+  at `0x20081F44`; its healthy value is `0x00000801` (2049).
+- Core 0 MPU region 1 marked `0x20081F40..=0x20081F5F` privileged-read-only,
+  while region 0 continued protecting `.data` RAM code.
+
+MPU-only image CRC `0x306dd4dd` immediately restored the failure, producing five
+records in one 30-second trial. The records included the same Core 1
+`heapless::spsc.rs:185` panic and **no Core 0 DACCVIOL** for the protected
+`audio_tx` block. Therefore Core 0, including all Core 0 IRQ handlers, did not
+write the queue-length word. This supersedes the earlier interpretation that
+PRIMASK proved a Core 0 ISR was the corruptor.
+
+The remaining CPU writer is Core 1. (The existing DMA register/allocation audit
+still rules out DMA as the practical writer.) The next capture image arms Core
+1's own raw DWT comparator on `0x20081F44` without taking `audio_tx`'s address,
+preserving the failing frame layout:
+
+```
+image CRC:       0x46672172
+watch address:   0x20081F44
+healthy value:   0x00000801
+run_core1_worker frame: 0x100 bytes
+```
+
+The comparator is programmed after the initial metadata store. If halting debug
+remains enabled, Core 1 should stop at the corrupting instruction and can be
+read through `probe-rs gdb` / GDB thread 2. If DebugMonitor is active instead,
+the firmware will commit `CFSR_DWT_WATCHPOINT`.
+
+The image was flashed and reset standalone, then allowed to run for 30 seconds.
+Reading the result was blocked only by the external-tool approval quota. Resume
+by attaching without another reset, inspect GDB thread 2 first, and read:
+
+```
+0x20081F44   audio_tx QueueView length metadata
+0xE0001020   Core 1 DWT_COMP0
+0xE0001028   Core 1 DWT_FUNCTION0 (MATCHED bit 24)
+```
+
+## #5 investigation continued (2026-06-13) — REVIEW: "Core 1 is the writer" is not sound
+
+A review of the elimination chain that led to the "remaining CPU writer is Core 1"
+conclusion. Summary: that conclusion is the weakest link and contradicts
+better-supported evidence in the same session. The original core-1 ruling was
+likely sound; the experiment that re-opened it was invalidated by an MPU encoding
+bug, and the experiment that re-closed it onto core 1 is shaky for the same reason.
+
+### The unreconciled contradiction
+
+Two MPU experiments, run separately, exclude OPPOSITE cores for what the latest
+agent treats as the SAME bug (one writer, victim moved by layout shift):
+
+- Victim A — LR slot `0x2007EACC` (the dominant `0x0000FE9E` IBUSERR crash):
+  at the exact fault, Core 1's MPU (`RBAR=0x20066b7d`, `RLAR=0x2007ffe1`) covered
+  that address and NO Core 1 DACCVIOL fired. Conclusion drawn: "excludes Core 1."
+- Victim B — `audio_tx` queue length word `0x20081F44` (the `spsc.rs:185`
+  div-by-zero panic): Core 0 MPU marked `0x20081F40..5F` privileged-RO and NO
+  Core 0 DACCVIOL fired. Conclusion drawn: "remaining CPU writer is Core 1."
+
+If A and B are one writer (the agent's own assumption — "PRIMASK shifted the
+layout, victim moved A->B"), then by this logic NEITHER core wrote it. That is
+impossible for a single CPU writer. At least one "no DACCVIOL" result is a FALSE
+NEGATIVE.
+
+This investigation has already been burned by exactly that failure mode: the
+earlier "Core 1 ruled out by 7 MPU-protected crashes" was retracted because the
+RBAR was encoded with XN wrong. That is two documented MPU mis-encodings already.
+A region that is not actually armed / not actually covering the address produces a
+silent "no DACCVIOL" that is indistinguishable from "this core didn't write it."
+The core-1 conclusion rests on a SINGLE 30-second trial whose region encoding is
+not even recorded in the notes.
+
+### The cleanest evidence points at Core 0, not Core 1
+
+The PRIMASK experiment is the strongest single result in the log because it is
+pure software with no MPU encoding to get wrong. Masking CORE 0 interrupts during
+`gb.tick()` made the dominant `0x0000FE9E` crash vanish across 3 trials. If the
+writer were Core 1, masking Core 0's interrupts would have no reason to affect it
+— core 1 runs independently. The crash being COUPLED to Core 0 interrupt state is
+direct evidence the writer is a Core 0 ISR (or a Core-0 path whose preemption
+timing the mask changed). The agent originally read it this way, then walked it
+back on the strength of the much weaker audio_tx MPU trial.
+
+The value clue reinforces core 0: `0x0000FE9E` is exactly
+`BusEvent { address: 0xFE9E, value: 0 }` byte-for-byte. BusEvents are generated by
+the CPU bus-write path, which runs on core 0. A BusEvent-shaped value landing on a
+host return-address slot is a core-0-side wild store.
+
+### Meta-lesson
+
+The investigation keeps concluding by ELIMINATION ("DMA out, core 0 out, therefore
+core 1"). The A-vs-B contradiction proves at least one elimination is false, so
+elimination is no longer safe. Switch to POSITIVE identification — catch the writer
+with a validated trap, not infer it from an absence.
+
+### Corrected next steps (supersede "arm Core 1 DWT on 0x20081F44")
+
+1. Add a POSITIVE CONTROL to every MPU experiment: after arming a region, do a
+   deliberate test store to the protected address from the core under test and
+   confirm DACCVIOL fires with the expected PC. Until that passes, no "no DACCVIOL"
+   result is trustworthy — including the one the core-1 conclusion depends on.
+2. Discriminating experiment: arm the SAME victim word RO on BOTH cores' MPUs at
+   once (queue length metadata is written once at construction, never during
+   operation, so RO is safe on both). Whichever core faults is the writer. If
+   neither faults and it still smashes -> not a CPU store, or the encoding is wrong
+   (see step 1).
+3. Lean back into the PRIMASK lead — it is the safe, high-signal path. Continue the
+   per-IRQ bisection: mask `TIMER0_IRQ_0` alone during `gb.tick()`, then
+   `DMA_IRQ_0`, etc. If masking one specific IRQ kills the crash, that core-0
+   handler is the writer, with no MPU encoding risk. `TIMER0_IRQ_0` (embassy timer
+   waker) is the first target.
+4. Methodology: stop concluding from single 30s/90s trials. The bug is
+   boot-clustered and probabilistic. Use the reboot-loop harness, N>=20, for any
+   "ruled out."
+
+## #5 investigation continued (2026-06-13) — BISECTION: Core 0 TIMER0_IRQ_0 is the writer
+
+The IRQ-mask bisection from the corrected next steps was carried out. Result:
+the writer is a **Core 0 interrupt handler**, specifically **`TIMER0_IRQ_0`**
+(the embassy time-driver ISR). This confirms the Core-0 reading and **refutes the
+earlier "Core 1 is the writer" conclusion**.
+
+### Experiment
+
+Changed the `gb.tick()` wrapper in `src/multicore.rs` (~line 1302) from masking ALL
+Core 0 interrupts (`cortex_m::interrupt::free`) to masking ONLY `TIMER0_IRQ_0`:
+
+```rust
+cortex_m::peripheral::NVIC::mask(rp_pac::Interrupt::TIMER0_IRQ_0);
+self.gb.tick();
+unsafe { cortex_m::peripheral::NVIC::unmask(rp_pac::Interrupt::TIMER0_IRQ_0) };
+```
+
+Flashed image CRC `0x5bdff527`. Ran a 10-trial standalone reboot-loop (blank crash
+sector at `0x103FF000`, `probe-rs reset`, wait ~120s, decode with
+`crash_decoder.py --probe --json`).
+
+### Result (10 trials)
+
+- **`0x0000FE9E` IBUSERR (the dominant target signature): 0 occurrences.** Gone —
+  exactly as under full PRIMASK masking.
+- **`spsc.rs:185` Core-1 panic: 2 trials** — the SAME secondary victim the full-mask
+  build produced.
+- New dominant crash: HardFault at `0x10003e4c` (`GameBoy::cycle_counter`,
+  `core/src/gameboy.rs:293`), Core 0, LR=`0x20002521` (inside `GameBoy::read_worker_output`),
+  CFSR `0x01000000` (IBUSERR) or `0x00008200`.
+- Also seen: a Core-1 `atomic_load` IBUSERR (1 trial), WatchdogTimeouts, 3 clean trials.
+
+Note: `CFSR=0x00008200` is PRECISERR + BFARVALID (a precise BUS fault from
+dereferencing a corrupted pointer), NOT a DACCVIOL/MPU hit. The `audio_tx` MPU
+region did not fire here.
+
+### Interpretation
+
+Among all Core 0 interrupts, masking ONLY `TIMER0_IRQ_0` during `tick()` reproduces
+the full-mask outcome (same elimination of `0x0000FE9E`, same `spsc.rs:185` secondary
+victim). So `TIMER0_IRQ_0` is the IRQ whose masking matters — the embassy time-driver
+ISR is in the corruption path. This vindicates the PRIMASK/Core-0 evidence and refutes
+the Core-1 elimination conclusion.
+
+**Masking it did NOT fix the bug — it relocated the victim.** TIMER0 is only masked
+*during tick*, so the ISR still fires outside the tick window and its wild write lands
+on whatever stack/static is live then (the new `cycle_counter`/`read_worker_output`
+crash, and the `spsc.rs:185` Core-1 victim). This is a diagnostic confirmation of the
+writer, not a fix. The `multicore.rs` masking change remains in the working tree as a
+diagnostic only.
+
+### Remaining gap + next step
+
+The bisection is layout-confounded: the mask wrapper shifts the frame AND stops the
+ISR firing during tick. A NEGATIVE CONTROL is needed to prove the elimination is
+TIMER0-specific and not a generic layout shift: mask a different single frequently-firing
+IRQ (`DMA_IRQ_0`) during tick, same code structure.
+
+- If `0x0000FE9E` RETURNS under DMA-mask → confirms TIMER0-specific (locked).
+- If `0x0000FE9E` STAYS GONE under DMA-mask → the effect is generic layout perturbation
+  and TIMER0 is not proven.
+
+After the control confirms TIMER0, the investigation moves to the **embassy-rp time
+driver ISR** — the alarm/waker queue handling — hunting a dangling/stale `Waker` whose
+wake performs a wild write. This is a firmware/embassy-level bug, not the GB emulator core.
+
+## #5 investigation continued (2026-06-13) — NEGATIVE CONTROL REFUTES TIMER0; masking-bisection is layout-confounded
+
+The `DMA_IRQ_0` negative control for the TIMER0 finding was run. It refutes the
+"TIMER0 is the writer" conclusion. The masking-bisection method is confounded by
+the mask wrapper's own stack-frame perturbation and cannot identify the writer.
+
+### Experiment
+
+Changed only the masked interrupt in the `gb.tick()` wrapper (`src/multicore.rs`
+~line 1302) from `TIMER0_IRQ_0` to `DMA_IRQ_0`, keeping the exact same code
+structure so the wrapper's layout perturbation is held constant and only WHICH
+firing interrupt is masked changes. `DMA_IRQ_0` (CH0-CH3: display SPI + audio I2S
+completion) does fire during gameplay. Flashed image CRC `0x92b9fff1`. Ran an
+8-trial standalone reboot-loop (the 9th/10th were lost when the board entered a
+tight crash-loop needing a physical power-cycle).
+
+### Result (8 valid trials)
+
+- **`0x0000FE9E` IBUSERR (the dominant target signature): 0 occurrences.** It did
+  NOT return under DMA-mask.
+- All 8 trials showed the SAME new victim as the TIMER0-mask build:
+  `PC=0x10003e4e` (`GameBoy::cycle_counter`, `core/src/gameboy.rs:293`), Core 0,
+  LR=`0x20002521` (`read_worker_output` / `critical_section::release`),
+  `CFSR=0x01000000` (IBUSERR), `HFSR=0x40000000` (FORCED),
+  `fault_addr=0x00000004` (null+4 fetch, consistent with a corrupted vtable/fn-ptr),
+  `ext_regs.r4=0x2007ead0`.
+
+### Interpretation — TIMER0 refuted
+
+Single-ISR logic: if TIMER0 were the writer, masking DMA (leaving TIMER0 free to
+fire) should have let `0x0000FE9E` return. It did not. Symmetrically the TIMER0
+experiment masked TIMER0 (leaving DMA free) and also eliminated it. So NEITHER IRQ
+alone is the writer.
+
+Clinching detail: both masks (TIMER0 and DMA) produce the IDENTICAL new victim
+(`cycle_counter`, `fault_addr=4`). If the masked-IRQ identity mattered, different
+masks would relocate the victim to different addresses. Same victim across both ⇒
+the only thing that differs between unmasked-vs-wrapped is the wrapper's
+stack-frame shape, not the interrupt. **The `0x0000FE9E` elimination is a LAYOUT
+artifact of adding the mask wrapper, not evidence of an IRQ writer.**
+
+This is the same extreme layout-sensitivity documented throughout #5 (boxing moved
+the victim; the in-situ dump suppressed it; per-tick checkpoints suppressed it).
+The masking-bisection approach measures its own perturbation and is therefore
+abandoned. The earlier PRIMASK result is now best read as another layout artifact,
+not as evidence of a Core-0 ISR writer.
+
+### What still holds
+
+- Unmasked baseline (no wrapper, plain `self.gb.tick()`): `0x0000FE9E` reproduces
+  at `0x2007EACC`. Any mask/perturbation wrapper relocates the victim and hides it.
+- The corruption is real and on Core 0. The writer is NOT identified.
+- Same poisoned save state as all prior captures (live boot log shows
+  `cycles=15267416632`, whose low 32 bits ≈ 2.382 B match the historical
+  `cycle_lo≈2.3955B` records).
+
+### Decisive next step — layout-immune hardware watchpoint
+
+Stop software-masking experiments; they perturb the frame. Revert the shim to plain
+`self.gb.tick()` (the only build that reproduces `0x0000FE9E`), then set an OpenOCD
+hardware WRITE-watchpoint on `0x2007EACC` on that unmasked build. The watchpoint is
+external to the firmware (no code change, no layout shift) and halts the CPU at the
+exact store instruction that writes the victim — its PC + base register names the
+writer. The recipe is documented earlier in this file (RaspberryPi OpenOCD fork,
+`set USE_CORE cm0` single-core attach, `mww 0x400d8000 0` to disable the watchdog,
+open-ended `poll`+`sleep` TCL loop). Prior attempts were blocked only by approval
+budget, not by the method.
+
+Optional cheap pre-check: a pure-layout control — a wrapper that shifts the frame
+identically but masks NO firing interrupt (mask an unused IRQ vector, or insert
+equivalent `black_box` stack churn). If `0x0000FE9E` still vanishes, layout is
+definitively the variable and the IRQ theory is closed for good.
+
+## #5 investigation continued (2026-06-14) — MPU vtable-trap capture run: BLOCKED on flash wedge (board needs power-cycle)
+
+Decisive-capture session for the cold write-once victim (the `Box<dyn Cartridge>`
+vtable pointer inside `GameBoyMemory`, at `GameBoyMemory_base + 0x4124`, healthy =
+a flash ptr ≥0x10000000; corruptor writes a GB `BusEvent` like `0x0000FE9E` over
+it, later dispatch through the smashed vtable → IBUSERR at a wild PC).
+
+### Prior census recap (for the record)
+- Standalone repro ~13/18 boots (72%), watchdog on, NO manual input.
+- Vtable word `base+0x4124` is the victim in ~50% of records.
+- `audio_tx` length word `0x20081F44` never smashed (0/18).
+- Masking-bisection (TIMER0/DMA) was abandoned as layout-confounded (see prior
+  2026-06-13 sections); the only build that reproduces `0x0000FE9E` is the
+  unmasked baseline, BUT the current trap build deliberately keeps the
+  `cortex_m::interrupt::free(|_| self.gb.tick())` mask wrapper because in that
+  build the vtable word is the dominant *cold* victim and the MPU can trap it.
+
+### Trap implementation under test (src/multicore.rs, already in tree)
+- MPU **region 2** = priv-RO (AP=10, XN=1, SH=11) over the 32-byte block holding
+  the vtable word, armed at boot in `setup_core0_vtable_mpu` once the `Box` is
+  built and healthy (`arm_cartridge_vtable_watch`). MEMFAULTENA left OFF on
+  purpose, so a write → MemManage DACCVIOL → **escalates to HardFault** (priority
+  -1, not maskable by the per-tick PRIMASK). Region temporarily unlocked RW
+  around legit rom-window-cache writes (`refresh_rom_window_cache_with_mpu_bracket`),
+  relocked after. MPU_CTRL=0x5 (ENABLE|PRIVDEFENA, HFNMIENA=0 so the MPU is off
+  inside the HardFault handler and it can read crash regs).
+- HardFault handler (`src/crash/handler.rs::hard_fault_rust`) records CFSR, HFSR,
+  MMFAR/BFAR (picks BFARVALID then MMARVALID), and the stacked PC. A
+  DACCVIOL→HardFault with MMARVALID gives MMFAR == faulting addr and stacked
+  PC == the exact corrupting store. THIS IS THE PRIZE PATH (classification A).
+- Secondary/diagnostic layers (layout-perturbation risk, candidates for stripping
+  in contingency D): per-tick software vtable guard (`rustyboy_cartridge_vtable_guard`),
+  RAM-code sentinel snapshot (`rustyboy_ram_code_guard`), core-1 stack-RO MPU
+  region 0, optional core-1 vtable MPU region 1.
+
+### STEP 0 — crash sector on arrival
+Decoded `0x103FF000` (`crash_decoder.py --probe --json --elf <abs ELF>`): sector
+`valid:false`, `crashes:[]` — BLANK. The previous agent left no committed record;
+no free capture. Full validation + capture required.
+NOTE: the decoder's `--elf` must be the ABSOLUTE workspace path
+`/.../rustyboy/target/thumbv8m.main-none-eabihf/release/rustyboy-pico2w` (build
+output lands in the workspace `target/`, not under `platform/pico2w/target/`); a
+relative path fails silently to "(addr2line not available)". Host GNU `addr2line`
+and `objdump` are present and read the ARM ELF fine; ARM-specific binutils are NOT
+installed (`rust-objdump`/`cargo-objdump` available as fallback).
+
+### STEP 1 — POSITIVE CONTROL build prepared
+Changes made for the positive control (TEMPORARY — revert after validation):
+1. `src/multicore.rs:139` `VTABLE_TRAP_POSITIVE_CONTROL` set `false → true`.
+2. Added a guaranteed one-shot test store at the END of `arm_cartridge_vtable_watch`
+   (right after `setup_core0_vtable_mpu` relocks region 2 RO), gated by the same
+   flag+PENDING latch. RATIONALE: the existing positive-control write lives inside
+   `refresh_rom_window_cache_with_mpu_bracket`, which only fires on an MBC ROM-bank
+   switch and may NEVER run for a no-MBC cart — so it cannot be relied on. The new
+   site does `write_volatile(vtable_addr, 0x0000_FE9E)` to the now-RO word; it must
+   trap → DACCVIOL → HardFault, stacked PC == this site, MMFAR == vtable word.
+   It logs a loud `defmt::error!` if the write RETURNS (trap failed to fire).
+Build: clean, ~13s. **rb-flash image CRC `0x7ff2c8f4`** (over [0x10000114,0x10075980)).
+
+### BLOCKER — flash loader `init` fails (code 288); board needs PHYSICAL POWER-CYCLE
+Could NOT flash the positive-control build. Every flash-WRITE path fails at the
+flash-algorithm `init` with **"execution of 'init' failed with code 288"**:
+- `cargo run --release` (rb-flash) — fails 288 (after its USB-reset + watchdog-disable).
+- `probe-rs erase --chip RP235x` (direct) — fails 288.
+- `probe-rs download ... --base-address 0x103FF000 ff4k.bin` (sector-blank) — fails 288.
+- Retried after `probe-rs reset` (succeeds), after a manual watchdog disable via
+  `probe-rs write b32 0x400d8000 0` (succeeds), at `--speed 1000` — all still 288.
+- `--connect-under-reset` times out (Pico 2W SWD header doesn't wire RUN/reset).
+
+Crucially the SWD link is HEALTHY: `probe-rs list` shows the Debugprobe, and
+`probe-rs info --chip RP235x` reads the full CoreSight ROM (Cortex-M33, DWT/FPB/ITM,
+both cores). `probe-rs reset` and register writes work. ONLY the QSPI flash loader's
+`init` is wedged — the classic RP2350 post-crash-loop flash-subsystem wedge that
+SWD-only recovery cannot clear. Per the task's own contingency ("If the board
+wedges unrecoverably, report it needs a physical power-cycle and stop"), this run
+is halted here.
+
+probe-rs version: 0.29.1.
+
+### RESUME RECIPE (after a physical power-cycle of the Pico 2W)
+1. `pkill -9 -x probe-rs; sleep 1`. Confirm `probe-rs erase --chip RP235x` now
+   inits (no 288). If still 288, re-power again / reseat USB.
+2. Positive control is ALREADY staged in the tree (flag=true + one-shot write).
+   `cd platform/pico2w && cargo run --release` to flash (note the CRC; should be
+   `0x7ff2c8f4` unless source changed). Watch RTT for
+   "POSITIVE CONTROL one-shot test write (arm site)". Then run STANDALONE
+   (blank sector → `probe-rs reset` → `pkill -f probe-rs` → wait ~100s → decode)
+   and CONFIRM a record: MMFAR == the boot-logged vtable word, stacked PC == the
+   one-shot write site in `arm_cartridge_vtable_watch`. If it does NOT fire, the
+   trap is broken (check SHCSR.MEMFAULTENA expectation / region encoding / handler).
+3. On pass: set `VTABLE_TRAP_POSITIVE_CONTROL` back to `false`, REMOVE the
+   temporary one-shot block in `arm_cartridge_vtable_watch`, rebuild, reflash, and
+   run the 15–20-trial standalone reboot-loop (STEP 2). Track repro rate vs the 72%
+   census; classify each record A/B/C/D per the plan.
+
+## #5 investigation continued (2026-06-14, RESUMED after power-cycle) — POSITIVE CONTROL PASSED
+
+### Flash wedge: CLEARED by the physical power-cycle
+- `probe-rs reset --chip RP235x` OK; `cargo run --release` (rb-flash) flashed clean,
+  NO code-288. Image CRC `0x7ff2c8f4` (matches staged expectation). Boot integrity
+  `full image crc 0x7ff2c8f4 OK`. Flash program took ~30s (single-buffered+verify).
+
+### Boot-logged vtable target (this build/heap layout)
+- `bug#5 trap: arm core0 MPU @ vtable_word=0x2002a2d8 value=0x1003255c block=0x2002a2c0`
+- region 2 = [0x2002a2c0, 0x2002a2df] priv-RO.
+- Core 1 also arms its own vtable MPU (region 1, same block) at top of run_core1_worker
+  loop — so BOTH cores trap writes to 0x2002a2d8 in this build (contingency B partly
+  pre-covered; the committed record's `core` field tells us which core stored).
+
+### Positive control — under cargo run (vector-catch)
+RTT showed, in order:
+- `POSITIVE CONTROL one-shot test write (arm site) to 0x2002a2d8` (multicore.rs:1874 WARN)
+- then `Firmware exited unexpectedly: Exception` (the store TRAPPED — vector-catch
+  caught the escalated HardFault). The `trap did NOT fire` error did NOT print. Good.
+
+### Positive control — STANDALONE (the real validation)
+Procedure: blank crash sector (download 4 KiB 0xFF @ 0x103FF000) → `probe-rs reset`
+→ `pkill -9 probe-rs` (detach) → wait 65s → decode.
+Committed record (slot 10, newest):
+- crash_kind HardFault, **core 0**
+- CFSR `0x00000082` = MMARVALID(b7) | DACCVIOL(b1) → MemManage data-access violation, MMFAR valid
+- HFSR `0x40000000` = FORCED → DACCVIOL escalated to HardFault (as designed; MEMFAULTENA off)
+- MMFAR (fault_addr) `0x2002a2d8` == the boot-logged vtable word ✓
+- PC `0x1001aec2` → `core::ptr::write_volatile` inlined into
+  `rustyboy_pico2w::multicore::arm_cartridge_vtable_watch` at **multicore.rs:1879**
+  (the one-shot test store `write_volatile(vtable_addr, 0x0000_FE9E)`) ✓
+- LR `0x1001aebf` → multicore.rs:1874 (the WARN just above the store) ✓
+- ext_regs r4=0x2007e740, r12=0x20065bc0. stack not overflowed (headroom sentinel).
+
+**VERDICT: POSITIVE CONTROL PASSES.** MPU region 2 traps core-0 writes to the
+vtable word, the DACCVIOL escalates to a forced HardFault, and the handler records
+MMFAR == faulting addr and stacked PC == the exact corrupting store. The capture
+path (classification A) is proven sound. Proceeding to STEP 2 (revert + real loop).
+
+## #5 investigation continued (2026-06-14) — *** THE CAPTURE: corruptor is a memcpy overrun into GameBoyMemory ***
+
+### Real-capture build (positive control reverted)
+- `VTABLE_TRAP_POSITIVE_CONTROL` set back to `false`; one-shot test-store block
+  REMOVED from `arm_cartridge_vtable_watch`. (The pre-existing rom-window-bracket
+  positive-control `if` at multicore.rs ~1830 is left in place but is dead with the
+  flag false.) Rebuilt clean. **rb-flash image CRC `0x41817bf7`** over
+  [0x10000114,0x10075920). Boot integrity OK.
+- Boot-logged target: `vtable_word=0x2002a2d8 value=0x100324f4 block=0x2002a2c0`,
+  region 2 = [0x2002a2c0, 0x2002a2df] priv-RO. (Core 1 also arms its mirror region 1.)
+
+### Classification A captured on trial 01 AND trial 02 (reproducible)
+Standalone reboot loop (blank sector -> reset -> detach -> wait 100s -> decode).
+Both trials committed an IDENTICAL record:
+- crash_kind HardFault, **core 0**
+- CFSR `0x00000082` = MMARVALID(b7) | DACCVIOL(b1) -> MemManage data-access violation
+- HFSR `0x40000000` = FORCED (DACCVIOL escalated to HardFault; MEMFAULTENA off)
+- **MMFAR (fault_addr) = `0x2002a2c0`** (the MPU block base; first protected word the store reached)
+- **stacked PC = `0x1002eaaa`**
+- LR `0x000000a0` (garbage — leaf memcpy clobbered LR; no useful caller frame)
+- ext_regs: **r4=0x2007ea00, r12=0x2002a2d4**
+- stack NOT overflowed; DMA busy_mask 0x00 (no DMA in flight)
+
+### RESOLVED writer — it is `memcpy`
+`addr2line 0x1002eaaa` -> `compiler_builtins::mem::impls::copy_forward::copy_forward_aligned_words`
+(memcpy.rs:130), inlined into `compiler_builtins::mem::memcpy`.
+Disassembly (the aligned-words unrolled copy loop, function @ 0x1002e9e8):
+```
+1002eaa6: 68cd        ldr   r5, [r1, #0xc]     ; load source word
+1002eaa8: 3110        adds  r1, #0x10          ; src += 16
+1002eaaa: f843 5b04   str   r5, [r3], #4       ; <-- FAULTING STORE: *r3 = r5; r3 += 4
+1002eaae: 4563        cmp   r3, r12            ; r3 == dest-end?
+1002eab0: d3ea        blo   0x1002ea88         ; loop while r3 < r12
+```
+Register meaning at fault:
+- **r3 = destination write pointer** = 0x2002a2c0 (== MMFAR) — the wild dest.
+- **r5 = the word being written** (loaded from source [r1, #0xc]).
+- **r12 = destination END pointer = 0x2002a2d4**.
+- **r1 = source pointer** (value at fault not stacked; it's mid-loop).
+
+### Geometry — the destination END is EXACTLY the GameBoyMemory struct base
+`GameBoyMemory::cartridge_vtable_word_addr_for_diagnostics() = addr_of!(self.cartridge)+4`.
+Boot log vtable word = 0x2002a2d8 => **GameBoyMemory base = addr_of!(self.cartridge) = 0x2002a2d4**
+(the Box<dyn Cartridge> fat-ptr: data_ptr @0x2002a2d4, vtable_ptr @0x2002a2d8).
+- memcpy dest-END r12 = **0x2002a2d4 == the GameBoyMemory struct base.**
+- The MPU block [0x2002a2c0,0x2002a2df] starts 0x14 below the struct base, so the
+  copy hits the RO region (at 0x2002a2c0) BEFORE finishing at 0x2002a2d4 and traps.
+- WITHOUT the MPU this copy ends at the struct base; a copy a hair longer (or this
+  same copy on a build where the box sits a few bytes lower) overruns the data_ptr
+  and the vtable_ptr at +4 — i.e. the classic `0x0000FE9E`-over-vtable smash.
+
+### CONCLUSION
+Bug #5 is **NOT a stray wild-pointer store** and **NOT a cross-core RMW** and **NOT
+DMA** (DMA idle). It is a **`memcpy` whose destination region runs up to / over the
+base of the `GameBoyMemory` heap allocation** — a heap buffer-overrun / adjacent
+allocation written by a memcpy whose destination (r3 base) + length reaches into the
+GameBoyMemory struct's first words (the cartridge fat pointer). The object being
+copied lives in the heap pool immediately below GameBoyMemory; its copy length or
+its destination pointer is wrong, so the tail of the copy lands on the cartridge
+data_ptr/vtable_ptr.
+
+NEXT (for parent / next session): identify the memcpy CALL SITE. The leaf memcpy
+clobbered LR (0x000000a0), so the crash record can't name the caller. To get it:
+either (a) widen the MPU block / move trap so the handler also walks the stack for a
+flash-range return address, or (b) set an additional capture that records r1 (source)
+— the source buffer identity will name the structure. Candidate callers are any
+copy_from_slice/clone/to_vec near a heap object adjacent to GameBoyMemory (e.g. the
+512KiB staged-ROM XipCartridge build, save-state restore, or the rom_window cache).
+The decisive fact is locked in: **the corrupting instruction is memcpy @0x1002eaaa,
+dest pointer r3, dest-end r12=struct-base 0x2002a2d4, written value r5 from src r1.**
+
+### Reproduction rate (real-capture loop, 100s/trial standalone)
+Every decoded trial committed the SAME single record (memcpy @0x1002eaaa, MMFAR
+0x2002a2c0, CFSR 0x82, r12=0x2002a2d4). First 3 decoded trials: 3/3 = 100% — far
+above the 72% census, because the MPU trap is precise and the boot save-state restore
+is a DETERMINISTIC trigger (no manual input needed, no race window). No B/C/D records
+observed; no contingency needed. The store is ALWAYS a core-0 CPU store inside memcpy
+(rules out core-1 and DMA definitively for this trigger path).
+
+## #5 investigation (2026-06-14, NEW AGENT) — PRECISE DWT switch + positive control PASS
+
+### CORRECTION to the prior "memcpy IS the bug" section above
+The prior agent's MPU build captured a memcpy @0x1002eaaa whose dest-END r12 =
+0x2002a2d4 == the GameBoyMemory struct base. That copy is the BOUNDED load_state
+restore of the GB-memory array that abuts `cartridge`; its last word lands at
+0x2002a2d0 (< struct base) and it tripped only the MPU block LOW end (0x2002a2c0),
+**never the cold vtable word 0x2002a2d8**. That is a FALSE POSITIVE of the coarse
+32-byte MPU region — it fires on EVERY boot during load_state, resets before
+gameplay, and MASKS the real corruptor that writes 0x0000FE9E over the vtable
+during emulation ticks. (Do NOT treat the prior section's "CONCLUSION: heap
+buffer-overrun memcpy" as the resolved #5 writer — it is the abutting-array
+restore, not a store to the vtable word.) Switched to a PRECISE 4-byte DWT watch
+on EXACTLY 0x2002a2d8 so the array's writes (all <= 0x2002a2d3) cannot trip it.
+
+### Code changes (src/multicore.rs)
+- MPU region 2 (vtable block) DISARMED: removed `setup_core0_vtable_mpu` and
+  `setup_core1_vtable_mpu`; `arm_cartridge_vtable_watch` now arms a DWT raw-word
+  write-watch (`dwt_watch::publish_and_arm_raw_words([vtable_addr,0,0,0])`, fixed
+  0x815 encoding) on core 0, and `run_core1_worker` arms the same on core 1.
+- `refresh_rom_window_cache_with_mpu_bracket` no longer unlocks/relocks an MPU
+  region (region 2 gone); keeps only the value asserts around the cache refresh.
+- Per-tick software vtable guard (`rustyboy_cartridge_vtable_guard`) and RAM-code
+  sentinel KEPT as independent cross-checks.
+- Core 0 .data MPU (region 0) and audio_tx MPU (region 1) in main.rs left as-is;
+  core 1's "core-0 stack RO" MPU (setup_core1_mpu) left as-is. None touch 0x..d8.
+
+### POSITIVE CONTROL — PASS (both vector-catch and standalone)
+Build w/ VTABLE_TRAP_POSITIVE_CONTROL=true + one-shot write_volatile(vtable,0xFE9E)
+at end of arm_cartridge_vtable_watch. rb-flash image CRC **0xc9db77d5**, integrity OK.
+Boot log: `arm core0 DWT write-watch @ vtable_word=0x2002a2d8 value=0x1003285c`.
+- Under cargo run: vector-catch reported "Firmware exited: Watchpoint @
+  arm_cartridge_vtable_watch"; the "write RETURNED — trap did NOT fire" error did
+  NOT print. The DWT caught the store.
+- STANDALONE (blank sector -> reset -> detach -> wait 70s -> decode), slot 0:
+  HardFault core 0; CFSR 0xd7170001 (DWT-watchpoint sentinel); HFSR 0x59000815
+  (low bits carry the 0x815 DWT FUNCTION); **fault_addr/watched = 0x2002a2d8** ==
+  vtable word; **stacked PC = 0x1001af54** -> arm_cartridge_vtable_watch
+  multicore.rs:1838 (the test store); **ext_regs r4 = 0x0000fe9e** == the written
+  value; DMA idle. VERDICT: DWT comparator + DebugMon handler fire with NO external
+  debugger and record watched addr + written value + store PC. Classification-A
+  path proven. Proceeding to remove the test write and run the real capture loop.
+
+### REAL-CAPTURE LOOP (precise DWT, positive control removed) — DWT fires ZERO times
+Real-capture build: VTABLE_TRAP_POSITIVE_CONTROL=false, one-shot write removed.
+rb-flash image CRC **0x0df3fb08** over [0x10000114,0x10075c60). Integrity OK.
+Boot: `arm core0 DWT write-watch @ vtable_word=0x2002a2d8 value=0x1003282c`; core 1
+also armed its DWT @ 0x2002a2d8. NOTABLE: the full load_state sequence
+(cpu/timer/memory/.../worker-output phases) completed with NO DWT hit — the
+abutting GB-memory array restore does NOT trip the precise watch (the coarse MPU
+would have false-positived here). tick-0 pre-gb.tick shows vtable=0x1003282c healthy.
+
+18-trial standalone reboot loop (blank sector -> reset -> detach -> 22-30s -> decode):
+- Repro rate: ~10 records / 17 conclusive trials ≈ **59%** (trial 5 was a transient
+  probe-rs init glitch, re-verified board healthy immediately after; excluded).
+  Below the 72% census but NOT a collapse — the passive DWT is not suppressing the bug.
+- Signature tally:
+  - (A) DWT watchpoint hit on 0x2002a2d8: **0 trials.**  THE VTABLE WORD IS NOT THE VICTIM.
+  - (B) rustyboy_cartridge_vtable_guard panic: **0 trials.**
+  - DOMINANT (8 trials: 1,2,6,8,11,14,15,16) = classification **C**:
+    HardFault **core 0**, CFSR **0x00008200** (BFARVALID|PRECISERR), HFSR 0x40000000
+    (forced), **fault_addr 0x4f220158**, **PC 0x1000329a** = BusEventQueue::is_empty
+    (memory.rs:60), r4=0x2007ead8, r12=0x20001bdf. Identical every time.
+  - SECONDARY (2 trials: 10,18) = classification **C**: HardFault **core 1**, CFSR
+    **0x00000001** (IBUSERR), PC **0xfffffffe** (wild), r4=0x20081e80, r12=0x20065b77;
+    trial 18 also committed a downstream WatchdogTimeout.
+
+### RESOLVED downstream fault — it is a CORRUPT GameBoyMemory POINTER, not the vtable
+Disasm at the dominant fault PC 0x1000329a (BusEventQueue::is_empty inlined into the
+embassy_main tick loop):
+```
+10003292: ldr  r0, [sp, #0xd4]   ; r0 = a pointer spilled on the core-0 stack
+10003294: movw r1, #0x4238       ; r1 = 0x4238 = byte offset of events.len in GameBoyMemory
+10003298: ldr  r0, [r0]          ; r0 = *r0  (the GameBoyMemory pointer)
+1000329a: ldr  r1, [r0, r1]      ; <-- FAULT: load events.len at [r0 + 0x4238]
+1000329c: cmp  r1, #0x0          ; is_empty()
+```
+fault_addr 0x4f220158 => r0 = 0x4f220158 - 0x4238 = **0x4f21bf20**, a WILD pointer
+(not in 0x2000_0000 SRAM). r0 came from `ldr r0,[r0]` after `ldr r0,[sp,#0xd4]`, i.e.
+a smashed pointer-to-GameBoyMemory living on the core-0 stack (or the object it points
+to). `events` is the LAST field of GameBoyMemory (offset 0x4238); `cartridge`/vtable is
+the FIRST (offset 0/4). So in THIS build/heap layout the corruptor's victim is a
+**stack-resident pointer to GameBoyMemory**, ~0x4238 BELOW and structurally unrelated
+to the cold vtable word at 0x2002a2d8 — which is why the precise DWT (and the value
+guard) never fire. The MPU "memcpy capture" earlier was a load_state false positive AND
+the vtable word is simply not where this build's smash lands.
+
+CONCLUSION: classification **C** across the board (downstream faults, DWT/guard silent,
+rate not collapsed). The cold vtable word is NOT the #5 victim in this build. The smash
+is a corrupt pointer-to-GameBoyMemory on the core-0 stack (dominant) plus occasional
+core-1 wild-PC. Next per STEP 4: strip the per-tick software guard (layout-perturbation
+suspect) and re-run DWT-only; if the victim relocates, that confirms layout sensitivity.
+
+### STEP-4 FALLBACK — DWT-ONLY (per-tick software guard + RAM-code sentinel STRIPPED)
+Stripped the per-tick `rustyboy_cartridge_vtable_guard` value-check and the `__sdata`
+RAM-code sentinel from `PicoGameBoy::tick` (kept only the passive DWT comparator, the
+least-perturbing on-device trap). rb-flash image CRC **0x82055da4**. Boot: DWT armed
+@ 0x2002a2d8 value=0x10032714 (heap shifted vs 0x1003282c — removing the guards moved
+the layout, as expected). load_state again completed with NO DWT hit.
+
+10-trial DWT-only loop: repro **4/10 ≈ 40%** (down from 59% with the guard). Still
+**0 DWT hits** on the vtable word. The victim RELOCATED:
+- New dominant (trials 2,6,7,8): HardFault **core 1**, CFSR 0x00008200 (BFARVALID|
+  PRECISERR), **fault_addr 0xc0000000**, **PC 0x1001b1c6** inside
+  `multicore::run_core1_worker` — `core::ptr::read` / slice `get_unchecked`
+  (`ldr.w r10,[r2,r0,lsl #2]`), r2=slice base, r0=index; r4=0x20081ec8, r12=0.
+  The few preceding instrs (`ldr r1,[r12]; add r0,r12,#4; lda r0,[r0]; cmp r1,r0`)
+  are an spsc queue head/tail compare — i.e. the core-1 dequeue path indexing through
+  a CORRUPT queue/slice pointer. Downstream symptom, not the corrupting store.
+
+### VERDICT for the parent
+1. The precise DWT comparator + DebugMonitor handler are PROVEN GOOD (positive control:
+   standalone record with watched addr 0x2002a2d8, written value 0x0000FE9E, store PC).
+2. Across 28 real-capture trials (18 with guard + 10 DWT-only), the DWT fired on the
+   cold vtable word **ZERO** times, and the software value-guard panicked ZERO times,
+   yet the bug reproduced at 40-59%. **The cold vtable word 0x2002a2d8 is NOT the #5
+   victim.** The earlier MPU "memcpy capture" was a load_state false positive; the real
+   smash lands on a DIFFERENT, LAYOUT-DEPENDENT victim:
+     - guard build: corrupt pointer-to-GameBoyMemory spilled on the core-0 stack,
+       faulting in BusEventQueue::is_empty (`[r0+0x4238]`, r0 wild=0x4f21bf20).
+     - DWT-only build: corrupt queue/slice pointer in core-1 run_core1_worker,
+       faulting in a get_unchecked (`[0xc0000000]`).
+   The victim MOVING when per-tick code is added/removed CONFIRMS layout sensitivity.
+3. Classification: **C** throughout (downstream faults; DWT + value-guard silent;
+   rate not collapsed → the passive DWT is not what suppresses, the victim simply
+   isn't the watched word). No classification-A (real) capture is achievable by
+   watching the vtable word.
+
+### RECOMMENDED NEXT (do NOT thrash; for parent/next session)
+The corruptor is a wild/overrun STORE whose victim address is layout-dependent and is
+NOT the vtable word. To catch the WRITER we must watch the victim that the CURRENT
+build actually smashes, or bisect by time:
+  (a) Point a DWT WRITE watch at the build's ACTUAL victim — for the guard build that
+      is the core-0 stack slot [sp,#0xd4]'s pointer, or better the GameBoyMemory base
+      pointer copy; for the DWT-only build the core-1 queue/slice pointer. These move
+      per build, so capture the boot-logged victim each flash.
+  (b) Re-introduce ONE software guard that records the cycle counter + GB state at the
+      first tick the corruption is detectable (value-guard on the GameBoyMemory base
+      pointer, not the vtable), to bisect WHEN the store lands (a non-DWT path).
+  (c) The two downstream faults both implicate POINTER/REFERENCE smashes near the
+      cross-core queue + GameBoyMemory — re-examine the spsc Producer/Consumer handles
+      and the GameBoyMemory `&`/Box on the stack as the overrun target, not the vtable.
+Stopping here per the task's "report and stop for parent guidance" instruction.
+
+### Files changed this session (for parent review/revert)
+- platform/pico2w/src/multicore.rs:
+  * VTABLE_TRAP_POSITIVE_CONTROL back to false; one-shot test write removed;
+    PENDING static kept under #[allow(dead_code)].
+  * arm_cartridge_vtable_watch: MPU region 2 arming REMOVED, replaced with
+    dwt_watch::publish_and_arm_raw_words([vtable_addr,0,0,0]) (precise 4-byte 0x815).
+  * run_core1_worker: setup_core1_vtable_mpu arming REPLACED with the same DWT arm.
+  * setup_core0_vtable_mpu, setup_core1_vtable_mpu, write_region2_rbar_rlar,
+    relock/unlock_core0_vtable_region_* REMOVED (now unused with the MPU gone).
+  * refresh_rom_window_cache_with_mpu_bracket: MPU unlock/relock removed; keeps the
+    vtable value asserts around the cache refresh only.
+  * PicoGameBoy::tick: STEP-4 FALLBACK strips the per-tick vtable value-guard and the
+    RAM-code sentinel (keeps the TICK_COUNTER increment and the GameBoyMemory-pointer
+    guard). RAM_CODE_SENTINELS kept under #[allow(dead_code)]; rustyboy_ram_code_guard
+    extern now unused (one harmless warning).
+- platform/pico2w/CRASH_DEBUG_NOTES.md: appended this session's dated subsections.
+Current flashed build: DWT-only fallback, CRC 0x82055da4. Board healthy (no 288 wedge).
+
+## #5 investigation (2026-06-14, CODEX) - OAM DMA phase brackets
+
+### Goal and instrumentation
+
+This pass followed the handoff's OAM-DMA hypothesis directly. It added four
+software checkpoints around the emulated Game Boy OAM DMA path:
+
+1. before `copy_dma_step`
+2. after `copy_dma_step`
+3. before publishing the completed OAM image to core 1
+4. after publishing
+
+Each checkpoint validates the outer `GameBoy.memory` Box pointer, cartridge
+vtable, bus-event queue header, core-1 transport handles, and (in the final
+build) cached ROM-window flag/pointers/lengths. The copy interval also snapshots
+the words immediately before and after the embedded OAM array. A failure records
+sentinel `CFSR=0xD6A00002`, phase, reason, DMA source/progress/count, observed,
+and expected values.
+
+The previous layout-confounding `interrupt::free(|_| gb.tick())`, fixed-address
+audio-tx MPU range, and stale vtable DWT arming were removed. The core-0 RAM-code
+MPU upper limit now follows the actual `_SEGGER_RTT` address.
+
+### Positive control - PASS
+
+A one-shot synthetic checkpoint was flashed and captured standalone:
+
+- phase: `after-copy`
+- reason: `word after OAM changed`
+- DMA: source `0xC000`, progress `4`, count `4`
+- observed `0xDEADBEEF`, expected `0xFEEDFACE`
+- record sentinel: `0xD6A00002`
+
+This proves the checkpoint guard, scratch persistence, flash commit, and decoder.
+The synthetic trigger was then removed.
+
+### Hardware results
+
+Artifacts:
+
+- `/tmp/pre_oam_dma_checkpoints_20260614.bin` - crash sector before this pass
+- `/tmp/oam_dma_trial_01.json`
+- `/tmp/oam_dma_trials_20260614/trial_02.json` through `trial_41.json`
+
+#### Build A - initial phase brackets
+
+ELF SHA-256: `83e5f6fb0a20128b33a8fec5cfe490a8f2016be4289ae1cfb77259f61626b9fa`
+
+20 trials, 2 failing trials, 3 HardFault records, zero real OAM checkpoint
+sentinels.
+
+The important capture is trial 8:
+
+- first fault: core 0, `PC=0x10003C74`, `CFSR=0x00008200`,
+  `BFAR=0x2A112127`
+- symbolization: the post-copy `oam_boundary_words_for_diagnostics` read,
+  immediately after `copy_dma_step` returned
+- the before-copy pointer/invariant checkpoint and pre-copy boundary read had
+  both succeeded
+
+Thus corruption first became observable across the `copy_dma_step` call
+interval in this layout. The diagnostic dereferenced the now-bad memory pointer
+before the after-copy invariant check could convert it into a sentinel.
+
+Trial 18 reproduced the known downstream core-1 queue read:
+`PC=0x1001B0E2`, `BFAR=0xC0000000`.
+
+#### Build B - raw Box-pointer check moved before post-copy boundary read
+
+ELF SHA-256: `6bed31ed580007ae52a236cbd44e29ce37bc0b97578e041c1eeb8e72d24bae49`
+
+Trials 21-23 all produced the same core-0 panic:
+
+- panic location `gameboy.rs:607`
+- this is the tracked caller line for `copy_dma_step`
+- zero OAM checkpoint sentinels
+
+This strongly associates the active failure with the OAM-copy call in this
+layout, but the panic record does not contain the internal panic message or DMA
+source state.
+
+#### Build C - cached ROM-window raw guards
+
+ELF SHA-256: `1f973909150a4a771a412720f68a77a9ddd003c32eaf7b99b5fc72fa7c274f07`
+
+Added non-dereferencing checks for the cached ROM-window flag, pointers, and
+lengths before any OAM-DMA raw ROM slice can be formed.
+
+Trials 24-41:
+
+- 17 readable trials; trial 28 had a transient SWD read failure
+- 10 failing trials
+- 2 panic records (`spsc.rs:185`)
+- 11 HardFault records plus 2 downstream watchdog records
+- zero OAM phase sentinels
+- zero ROM-window cache sentinels
+
+The deterministic `gameboy.rs:607` panic disappeared when these guards changed
+the layout. The original signatures remained frequent: `PC=0x0000FE9E`, wild
+SRAM/invalid PCs, `spsc.rs:185`, and cross-core queue faults.
+
+### Verdict
+
+OAM DMA **does track as a narrow timing hotspot**:
+
+- one layout first observed the bad `GameBoy.memory` pointer on the first load
+  immediately after `copy_dma_step`
+- the next layout panicked at the `copy_dma_step` call on 3/3 boots
+
+However, this pass does **not** prove that the bounded OAM copy is the corrupting
+writer:
+
+- no real `0xD6A00002` checkpoint fired across 40 readable real trials
+- DMA source/progress bounds and OAM-adjacent words did not report a violation
+- ROM-window cache guards did not report a bad raw source pointer/length
+- small instrumentation changes moved the victim/signature again
+
+The best current interpretation is still a layout-sensitive wild store or stack
+smash whose first visible use can land inside the OAM-DMA interval. OAM DMA is a
+good temporal bracket, not yet a convicted writer.
+
+Recommended next capture: keep the minimal before/after raw Box-pointer check,
+record the active packed OAM DMA state in a single global word so panic/HardFault
+records always include source/progress/count, and watch the current build's
+actual `GameBoy.memory` pointer slot rather than adding broader layout-changing
+guards.
+
+Current flashed build: Build C above, synthetic control removed.
+
+Validation:
+
+- `cargo check --release` passed
+- `cargo build --release` passed
+- `cargo test-host`: 191/191 passed
+- decoder AST parse and `git diff --check` passed
+
+## #5 investigation continued (2026-06-14) — HOST REPLAY EXONERATES CORE EMULATION; bug is cross-core/platform
+
+After ~12 on-device capture attempts kept moving the victim per build, we took
+the fight off-device. A host replay harness reproduces the device's exact
+trajectory under sanitizers, immune to the on-device layout-sensitivity.
+
+### Harness + fidelity
+
+New host test `core/tests/replay_poisoned_save.rs` loads the device's exact
+poison ROM + save state and replays `GameBoy::<LocalTransport>::tick()` on the
+host, where ASan/Miri can see an illegal access directly.
+
+- Fixtures: ROM dumped from XIP flash — rom_id `21f712e2`, MBC1+RAM+BATTERY
+  (`[0x0147]=0x03`), 512 KiB, "ZELDA" / Link's Awakening.
+- The poison save state is NOT in flash. It lives on the microSD at
+  `SAVES/21F712E2/SLOT0.RBS` and was read directly off the card: 25060 B,
+  `RBSS` v2 blob, exactly what `SaveState::from_blob` expects.
+- Same generic `tick()` source as the device; the portable MBC provides
+  `rom_windows()` so the unsafe OAM-DMA `from_raw_parts` path is exercised
+  identically.
+
+### Validation gate — PASSED exactly
+
+Host post-load state matched the device boot log to the digit:
+
+| Field           | Value          |
+|-----------------|----------------|
+| `cycle_counter` | `15267416632`  |
+| `rom_bank`      | `2`            |
+| `PC`            | `0x1807`       |
+| `HL`            | `0x17bb`       |
+
+The replay is provably on the same trajectory as the device.
+
+### Result — 20M ticks, ZERO corruption
+
+ASan (`-Zsanitizer=address`), 20,000,000 ticks — ~10x past the device's
+deterministic crash point (~tick 2M / cycle_lo ≈ 2.395B). The run reached
+`PC=0x03ce` (the historical trigger) repeatedly and completed clean: no panic,
+no ASan trap, no divergence.
+
+### Conclusion — core emulation is exonerated as the root
+
+The replay is deterministic and faithful. A core-logic bug (bad DMA length, OOB
+index, stale ROM pointer in CPU/MBC/memory/bus-events) would fire at the SAME
+cycle on host — it does not. A safe-Rust OOB would have panicked even without
+ASan; an unsafe heap OOB (e.g. `copy_dma_step`'s `from_raw_parts`) would have
+tripped ASan. Neither happened. So the portable `rustyboy-core` emulation is NOT
+the corruptor.
+
+By elimination the writer is in the **platform / cross-core layer** — what the
+host lacks: `Core1Transport`, `SharedWorkerState`, the cross-core copies of
+vram/oam/bus-event/audio data, real core0/core1 concurrency, embassy/async, and
+32-bit layout. This reconciles all prior evidence:
+
+- victims were almost always transport-related
+- the GB-data payload (`0x0000FE9E`) is emulator data the transport copies
+  across cores
+- the bug is timing- and layout-sensitive (race hallmarks)
+- the notes already hit the "Release orders but does not force completion; only
+  DSB drains the write buffer" landmine
+
+**Second fingerprint:** the microSD `SAVES/` is corrupted *only* in the
+`21F712E2` directory — 220 trashed entries with GB-data-looking byte-soup
+filenames, multi-GB sizes, impossible timestamps — while every other ROM's save
+dir is clean. Consistent with a platform-layer corruptor reaching the SD/FAT
+write buffers while this ROM runs.
+
+### Caveat
+
+ASan misses intra-allocation OOB and the host is 64-bit. Miri at `i686` would
+close both gaps but cannot practically reach the ~2M-tick crash cycle
+(interpreted, too slow). That residual is itself the platform-layout/concurrency
+hypothesis, so it sharpens rather than changes the direction.
+
+### Next
+
+Hunt the cross-core transport for a data race / missing barrier:
+
+1. A ThreadSanitizer 2-thread host harness — core-0 `GameBoy` + core-1
+   `GameBoyWorker` through a `Core1Transport`-faithful transport.
+2. A targeted audit of `Core1Transport` / `SharedWorkerState` / the
+   `write_*_range` / `write_ppu_registers` delivery + audio path for
+   unsynchronized cross-core access.
+
+Note: x86 (TSO) is more strongly ordered than ARM, so pure weak-ordering bugs
+may not reproduce under TSan even though genuine data races will.
+
+---
+
+## #5 Weak-memory-ordering audit (2026-06-14) — cross-core publish/consume review
+
+Pure code review of the cross-core transport for an ARM weak-ordering /
+write-buffer-drain bug, after ASan (single-thread) and TSan (two-thread x86/TSO)
+both ran clean. Files: `platform/pico2w/src/multicore.rs`,
+`core/src/ipc/{worker,transport,local}.rs`, plus the dependency
+`embassy-rp/src/critical_section_impl.rs` and `heapless-0.9` `spsc.rs`.
+
+### KEY FINDING (load-bearing): `critical_section` on RP2350 has NO DSB
+
+`embassy-rp/src/critical_section_impl.rs` `RpSpinlockCs::acquire/release` use
+ONLY `core::sync::atomic::compiler_fence(SeqCst)` (a compile-time-only barrier,
+emits zero instructions) plus the SIO Spinlock-31 MMIO read/write. `Spinlock31`
+(`embassy-rp/src/spinlock.rs`) `try_claim` is a device read, `release` is a
+device write — and **there is no `dsb()` anywhere in acquire or release**.
+
+Consequence: a `critical_section::with` block on this silicon does NOT drain the
+store buffer for **Normal SRAM** writes made inside it. A device-ordered MMIO
+write to the spinlock register orders the MMIO access, but on Cortex-M33 it does
+not force completion/visibility of buffered Normal-memory stores. This is the
+exact landmine from #2's reverted-SPSC writeup: *"Release orders but does not
+force completion; only DSB drains the write buffer."* The whole transport was
+(re)built on the assumption that `critical_section` supplies the cross-core
+barrier for the shared **data buffers**. For the small atomics it nominally does
+(Acquire/Release pair on the SAME location), but for the raw `UnsafeCell` buffers
+published *under the lock but gated by a SEPARATE atomic*, it does not guarantee
+physical visibility before the consumer observes the gating atomic.
+
+### Ranked suspicious sites
+
+#### 1. STRONGEST — frame publish: raw buffers gated by a separate atomic, no DSB
+- Producer (core 1): `publish_frame_locked`, `multicore.rs:330-390`. Inside
+  `critical_section::with` (entered at :327): writes `dirty_rows` (:362-372) and
+  `native_frame_slots[target]` (:381-383) — both raw `UnsafeCell<[…]>` in Normal
+  SRAM — then `published_frame.store(Release)` (:387) and
+  `published_frame_seq.fetch_add(AcqRel)` (:389). **No `dsb()` after the buffer
+  writes and before the publishing atomics.**
+- Consumer (core 0): `poll_output` Acquire-loads `published_frame_seq`
+  (:1199) to set `frame_ready`; later `published_native_frame` Acquire-loads
+  `published_frame` (:967), marks the slot busy (:968), and hands out
+  `&native_frame_slots[slot]` (:974); `published_dirty_rows` (:992-997) reads the
+  raw `dirty_rows` buffer with **no atomic of its own** (:996), relying purely on
+  the earlier `published_frame` Acquire.
+- Hazard ARM permits: the `dirty_rows` / slot stores can still be sitting in core
+  1's store buffer when core 1's `published_frame.store(Release)` /
+  `published_frame_seq.fetch_add` become visible to core 0 (Release on M33 is a
+  plain `str`/`strex`, no implicit DSB; the surrounding `critical_section` adds no
+  DSB either). Core 0 then observes the new seq/slot via Acquire and reads the
+  raw slot + dirty bitmap **before core 1's buffer stores have drained** → it
+  consumes a torn/stale 23 KB frame and a stale dirty bitmap. The Acquire/Release
+  edge is correct in the C++ abstract model, but #2 already PROVED empirically on
+  this exact board that a Release store can be observed while the data it
+  "published" is still buffered (core 0 `lda` read 1413 while SRAM held 1414).
+- Why it best matches #5: this is the only large (KB-scale) cross-core buffer
+  publish, and it is gated by a *separate* atomic (the textbook fragile pattern),
+  unlike every ticket path which is hard-drained by `ack_ticket`'s DSB. It fires
+  ~once per rendered frame, i.e. at a frame-rate cadence that reaches "~2M ticks"
+  in the minutes-scale window before the crash, and it is deterministic per ROM
+  because dirty-row content is ROM/scene-determined. It is invisible to TSan-on-
+  x86 (TSO retires the store buffer in order, so the Release is never observed
+  ahead of the data; and TSan treats the Acquire/Release pair as a valid
+  happens-before, suppressing any race report) and invisible to the single-thread
+  host (no second core). The consumed data is **GB framebuffer bytes / dirty-
+  bitmap words** — exactly "GB-shaped data" — and `send_frame` then drives DMA
+  setup (CASET/RASET ranges) and a `&dirty_rows` array from that data; a stale/
+  torn dirty bitmap or slot can mis-size a copy/DMA and scribble GB-shaped bytes
+  over adjacent core-0 stack objects (the transport pointer triplet, the worker-
+  reference stack slot — precisely the observed victims).
+- Proposed minimal fix: add `cortex_m::asm::dsb()` in `publish_frame_locked`
+  immediately AFTER the slot+dirty buffer writes and BEFORE
+  `published_frame.store(Release)` (i.e. between :383 and :387). That drains core
+  1's store buffer so the buffers are physically visible before the gating atomic
+  can be observed by core 0 — the same discipline `ack_ticket` already uses.
+  (Belt-and-suspenders: a matching `asm::dsb()` on core 0 after the
+  `published_frame` Acquire in `published_native_frame`, before dereferencing the
+  slot, to defeat any speculative/early read — though the producer-side DSB is the
+  necessary one.)
+- Validation: standalone soak past the deterministic repro point with the
+  producer DSB added; if the transport-smash / worker-ptr-guard records stop, the
+  ordering gap is confirmed. Cheap (one DSB per published frame, ~60/s).
+
+#### 2. Frame "unpublish" / clear path — same missing-DSB pattern, reset cadence
+- `clear_published_frames_locked` (:401-420): inside `critical_section`, zeroes
+  all slots and `prev_row_hashes` (raw buffers), clears `native_frame_busy`, then
+  `published_frame.store(0, Release)` / `published_frame_seq.store(0, Release)`.
+  No DSB. Same class as #1 but only on save-state / sync / reset, so far rarer.
+  The bigger subtlety: this runs on **core 0** while **core 1 is still live**
+  (per the corrected comment at :392-398) — but #1's repro is in steady-state
+  gameplay, so this is secondary. Fix: DSB before the two Release stores.
+
+#### 3. PPU snapshot (`live_ppu_snapshot`) gated by `ppu_render_version`
+- Producer (core 0): `write_live_vram_range`/`write_live_oam_range`
+  (:448-466) and `copy_live_ppu_snapshot` (:438-446) write the snapshot inside
+  `critical_section`, then bump `ppu_render_version` (`fetch_add`/`store Release`)
+  **outside** the lock.
+- Consumer (core 1): loop at :1890 Acquire-loads `ppu_render_version`; if changed,
+  re-enters `critical_section` and reads the snapshot via `try_borrow()`
+  (:1892-1899).
+- Assessment: LOWER risk than #1 because the consumer re-takes the SAME
+  `critical_section` and reads the buffer THROUGH the `RefCell` inside it, and the
+  version load is Acquire vs the producer's Release on the same location. The data
+  read is itself inside a (re-acquired) lock that the producer also held, so there
+  is a lock-ordered edge on the buffer, not just a separate-atomic gate. Still,
+  there is no DSB, so a torn snapshot is theoretically possible if the version
+  Release is observed before the in-lock writes drain; but the in-lock re-read
+  narrows the window vs #1's lock-free raw-pointer read. Watch, don't fix first.
+  If fixing: DSB after the snapshot copy, before the `ppu_render_version` bump.
+
+#### 4. Command queue (spsc) — SOUND
+- `heapless-0.9` `spsc::inner_enqueue` writes the slot then `tail.store(Release)`;
+  `inner_dequeue` does `tail.load(Acquire)` then reads the slot. Producer (core 0)
+  additionally `asm::dsb()` after enqueue, before `sev()` (:784). Consumer (core
+  1) `asm::dsb()` before `wfe()` when the queue is empty (:1870). The Release/
+  Acquire on `tail` plus the producer DSB give a correct, drained edge. OK.
+
+#### 5. Audio queue (spsc, core 1 → core 0) — SOUND via ticket DSB
+- Core 1 `audio_tx.enqueue` per sample in `DrainAudio` (:1908) has NO per-enqueue
+  DSB, BUT the path is ticket-serialized: core 1 fills the queue, then
+  `ack_ticket` (:1910) does `sync_complete.store(Release)` + **`dsb()`** (:1687-
+  1688); core 0 spins in `wait_for_ticket` (Acquire, :957) and only drains AFTER
+  the ticket lands. The `ack_ticket` DSB drains the audio slot stores before the
+  ticket is observable. OK — this is the model #1 should copy.
+
+#### 6. `pending_if_bits` cross-core RMW — SOUND
+- `fetch_or` (core 1, :431-434) and `swap` (core 0, :1207) both inside
+  `critical_section` (AcqRel). Single small value, both sides serialized; no
+  separate-atomic-gated buffer. OK (matches prior 2026-06-03 audit).
+
+#### 7. `apu_nr52` / `ppu_ly` / `ppu_stat` — SOUND
+- Release stores in `publish_worker_output` (:423-425), Acquire load of
+  `apu_nr52` in `poll_output` (:1213). Independent scalar bytes, no buffer gated
+  behind them; a one-frame-stale scalar is harmless and not pointer-shaped. OK.
+  (Note `ppu_ly`/`ppu_stat` in `poll_output` are actually read from the core-0-
+  local `lcd_timing_io` mirror, not the shared atomics, so even less exposure.)
+
+### Bottom line
+The single best-fit candidate is **#1, the frame publish in
+`publish_frame_locked` (multicore.rs:330-390)**: raw KB-scale GB-data buffers
+(`native_frame_slots`, `dirty_rows`) published under a `critical_section` that —
+on RP2350 — performs no store-buffer drain, gated by a *separate* atomic
+(`published_frame` / `published_frame_seq`) that core 0 Acquire-loads before
+reading the raw buffers with no DSB on either side. This is the exact failure
+mode #2 proved real on this board, at frame cadence, deterministic per ROM,
+producing GB-shaped data that downstream `send_frame`/DMA can scatter onto
+core-0 stack/pointer objects — and structurally invisible to both the
+single-thread ASan host and the x86/TSO TSan host. Recommended first change: one
+`cortex_m::asm::dsb()` between the buffer writes (:383) and the
+`published_frame.store(Release)` (:387). If a soak still smashes after that, the
+remaining hypothesis narrows to silicon or a non-transport wild store.

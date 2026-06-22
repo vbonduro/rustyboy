@@ -107,7 +107,8 @@ pub mod flags {
     /// core 1's dedicated stack limit rather than core 0's `_stack_end`.
     pub const FAULT_ON_CORE1: u8 = 0x20;
     /// HardFault/DebugMonitor diagnostic tail is present in `panic_loc`:
-    /// `[68..72] = pre-handler r4`, `[72..76] = stacked r12`.
+    /// `[68..72] = sp_before (faulted-thread SP; corrupted LR slot = sp_before-4)`,
+    /// `[72..76] = stacked r12`.
     pub const HAS_HARDFAULT_EXTENDED_REGS: u8 = 0x40;
     /// Stack-protector panic: `arm_lr` contains the return address captured by
     /// `__stack_chk_fail`, identifying the guarded function whose canary failed.
@@ -163,7 +164,9 @@ pub mod flags {
 //   [82..84]  stack_headroom     bytes between MSP-at-fault and _stack_end:
 //                                if HAS_STACK_OVERFLOW set → overflow depth,
 //                                else → remaining stack headroom
-//   [84..120] _reserved          zero-filled
+//   [84..88]  dma_busy_mask      bitmask of DMA channels with BUSY=1 at crash time
+//   [88..116] dma_write_addrs    WRITE_ADDR for DMA channels 0-6 (7 × u32 LE)
+//   [116..120] _reserved         zero-filled (schema v2+; 0 in v1 records)
 //   [120..124] crc32             CRC32 of bytes [0..120]
 //   [124..128] _pad4
 //
@@ -207,6 +210,12 @@ pub struct CrashRecord {
     ///   set   → overflow depth (MSP was this many bytes below `_stack_end`)
     ///   clear → remaining headroom (MSP was this many bytes above `_stack_end`)
     pub stack_headroom: u16,
+    /// Bitmask of DMA channels (0-7) that had CTRL_TRIG.BUSY=1 at crash time.
+    /// Zero if DMA snapshot was not captured (schema v1 records).
+    pub dma_busy_mask: u32,
+    /// WRITE_ADDR register snapshot for DMA channels 0-6 at crash time.
+    /// Zeros for schema v1 records or channels that were not snapshotted.
+    pub dma_write_addrs: [u32; 7],
 }
 
 /// Opaque 128-byte wire representation.
@@ -252,7 +261,12 @@ impl CrashRecord {
         buf[68..80].copy_from_slice(&self.panic_loc);
         buf[80..82].copy_from_slice(&self.panic_line.to_le_bytes());
         buf[82..84].copy_from_slice(&self.stack_headroom.to_le_bytes());
-        // buf[84..120] = 0 (reserved)
+        buf[84..88].copy_from_slice(&self.dma_busy_mask.to_le_bytes());
+        for (i, &addr) in self.dma_write_addrs.iter().enumerate() {
+            let off = 88 + i * 4;
+            buf[off..off + 4].copy_from_slice(&addr.to_le_bytes());
+        }
+        // buf[116..120] = 0 (reserved)
         // buf[124..128] = 0 (pad)
 
         let checksum = crc32(&buf[..120]);
@@ -307,6 +321,15 @@ impl CrashRecord {
             panic_loc: buf[68..80].try_into().unwrap(),
             panic_line: u16::from_le_bytes(buf[80..82].try_into().unwrap()),
             stack_headroom: u16::from_le_bytes(buf[82..84].try_into().unwrap()),
+            dma_busy_mask: u32::from_le_bytes(buf[84..88].try_into().unwrap()),
+            dma_write_addrs: {
+                let mut addrs = [0u32; 7];
+                for (i, addr) in addrs.iter_mut().enumerate() {
+                    let off = 88 + i * 4;
+                    *addr = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                }
+                addrs
+            },
         })
     }
 
@@ -742,6 +765,9 @@ impl ScratchRegs {
             panic_loc,
             panic_line,
             stack_headroom,
+            // DMA fields are injected after this call in check_and_commit,
+            // once the .uninit DMA_CRASH_SNAPSHOT has been read.
+            ..Default::default()
         }
     }
 }
@@ -787,6 +813,7 @@ mod tests {
             panic_loc: *b"storage.r\0\0\0",
             panic_line: 0,
             stack_headroom: 0,
+            ..Default::default()
         }
     }
 
