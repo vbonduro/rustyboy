@@ -64,17 +64,6 @@ impl BusEventQueue {
     }
 }
 
-#[cfg(target_arch = "arm")]
-unsafe extern "C" {
-    fn rustyboy_dma_oam_guard(
-        site: u32,
-        packed_dma: u32,
-        actual_src: u32,
-        dst: u32,
-        count: u32,
-    ) -> !;
-}
-
 #[derive(Debug)]
 pub enum Error {
     OutOfRange(u16),
@@ -162,55 +151,6 @@ pub struct GameBoyMemory {
     hram: [u8; 0x7F],
     ie: u8,
     events: BusEventQueue,
-}
-
-#[cfg(target_arch = "arm")]
-#[derive(Clone, Copy)]
-pub struct BusEventQueueHeader {
-    pub cap: usize,
-    pub ptr: usize,
-    pub head: usize,
-    pub len: usize,
-}
-
-#[cfg(target_arch = "arm")]
-impl BusEventQueueHeader {
-    #[inline(always)]
-    pub fn first_bad_word(self) -> Option<usize> {
-        const MAX_REASONABLE_CAP: usize = 0x1000;
-        const HEAP_POOL_START: usize = 0x2002_0000;
-        const HEAP_POOL_END: usize = 0x2006_0000;
-
-        if self.cap > MAX_REASONABLE_CAP {
-            return Some(0);
-        }
-
-        if self.cap == 0 {
-            if self.ptr >= 0x1000
-                && !(HEAP_POOL_START..HEAP_POOL_END).contains(&self.ptr)
-            {
-                return Some(1);
-            }
-            if self.head != 0 {
-                return Some(2);
-            }
-            if self.len != 0 {
-                return Some(3);
-            }
-            return None;
-        }
-
-        if !(HEAP_POOL_START..HEAP_POOL_END).contains(&self.ptr) {
-            return Some(1);
-        }
-        if self.head >= self.cap {
-            return Some(2);
-        }
-        if self.len > self.cap {
-            return Some(3);
-        }
-        None
-    }
 }
 
 impl GameBoyMemory {
@@ -311,10 +251,7 @@ impl GameBoyMemory {
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).io) as *mut u8, 0, 0x80);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).hram) as *mut u8, 0, 0x7F);
             core::ptr::write(core::ptr::addr_of_mut!((*p).ie), 0u8);
-            core::ptr::write(
-                core::ptr::addr_of_mut!((*p).events),
-                BusEventQueue::new(),
-            );
+            core::ptr::write(core::ptr::addr_of_mut!((*p).events), BusEventQueue::new());
             b.assume_init()
         }
     }
@@ -370,6 +307,15 @@ impl GameBoyMemory {
             Some(rom_windows) => (true, rom_windows),
             None => (false, CartridgeRomWindows::EMPTY),
         };
+        self.apply_rom_window_cache_refresh(cartridge_has_rom_windows, rom_windows);
+    }
+
+    #[inline(always)]
+    pub fn apply_rom_window_cache_refresh(
+        &mut self,
+        cartridge_has_rom_windows: bool,
+        rom_windows: CartridgeRomWindows,
+    ) {
         self.cartridge_has_rom_windows = cartridge_has_rom_windows;
         self.rom_fixed_ptr = rom_windows.fixed_ptr;
         self.rom_fixed_len = rom_windows.fixed_len;
@@ -498,7 +444,18 @@ impl GameBoyMemory {
     /// Copy `count` bytes from `source + progress` into OAM at `progress`.
     /// Uses a zero-copy slice path for regions with direct backing storage
     /// (VRAM, WRAM, cached ROM); falls back to byte-by-byte for cart RAM.
+    // §G10 ROOT FIX — this MUST stay `#[inline(never)]`. The DWT victim-watch
+    // caught this function's `self.oam[dst + i]` store (memory.rs:627, PC
+    // 0x10003842) writing to three addresses up to 73 KB apart, even though the
+    // line-565 guard proves `dst + i < oam.len()`. An in-bounds index that lands
+    // 73 KB away can only mean a CORRUPT `&oam`/`self` BASE — bug #5's class, a
+    // register-allocator stack-slot collision in the giant `.data`-inlined `tick`
+    // frame (same pathology as `drain_bus_events`). `#[inline(never)]` gives the
+    // OAM-DMA copy its OWN frame so its base spill can no longer be coalesced onto
+    // a colliding sibling's slot. Do NOT re-inline.
+    // See docs/investigations/oam-dma-bisection.md §G10.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[inline(never)]
     #[track_caller]
     pub fn copy_dma_step(&mut self, source: u16, progress: u8, count: u8) {
         // actual_src is the real memory address to read from: base + bytes already transferred.
@@ -507,17 +464,6 @@ impl GameBoyMemory {
         let dst = progress as usize;
         if dst > self.oam.len() || n > self.oam.len() - dst {
             let packed_dma = ((source as u32) << 16) | ((progress as u32) << 8) | count as u32;
-            #[cfg(target_arch = "arm")]
-            unsafe {
-                rustyboy_dma_oam_guard(
-                    core::panic::Location::caller().line(),
-                    packed_dma,
-                    actual_src as u32,
-                    dst as u32,
-                    n as u32,
-                );
-            }
-            #[cfg(not(target_arch = "arm"))]
             panic!(
                 "oam dma out of range: packed={packed_dma:#010x} actual_src={actual_src:#06x} dst={dst} count={n}"
             );
@@ -763,20 +709,6 @@ impl GameBoyMemory {
     #[inline(always)]
     pub fn has_events(&self) -> bool {
         !self.events.is_empty()
-    }
-
-    /// Raw `VecDeque<BusEvent>` header snapshot for the Pico memory-corruption
-    /// investigation. This intentionally relies on the current optimized ARM
-    /// layout: cap, ptr, head, len.
-    #[cfg(target_arch = "arm")]
-    #[inline(always)]
-    pub fn bus_event_queue_header(&self) -> BusEventQueueHeader {
-        BusEventQueueHeader {
-            cap: BUS_EVENT_QUEUE_CAP,
-            ptr: core::ptr::addr_of!(self.events.entries) as usize,
-            head: 0,
-            len: self.events.len,
-        }
     }
 
     /// Drain pending bus events into a caller-owned fixed buffer.

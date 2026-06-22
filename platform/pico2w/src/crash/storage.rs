@@ -60,7 +60,37 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
     // want to loop on crash commits.
     clear_crash_magic();
 
-    match write_record_to_flash(flash, |slot| snap.to_crash_record(slot)) {
+    match write_record_to_flash(flash, |slot| {
+        let mut rec = snap.to_crash_record(slot);
+        unsafe {
+            use crate::crash::handler::{DMA_CRASH_SNAPSHOT, DMA_SNAPSHOT_SENTINEL};
+            if DMA_CRASH_SNAPSHOT[0] == DMA_SNAPSHOT_SENTINEL {
+                rec.dma_busy_mask = DMA_CRASH_SNAPSHOT[1];
+                for i in 0..7usize {
+                    rec.dma_write_addrs[i] = DMA_CRASH_SNAPSHOT[2 + i];
+                }
+                // Log high channels (ch7-ch15) via defmt — not stored in flash record.
+                // These are the channels WiFi/PIO DMA would use.
+                let busy = DMA_CRASH_SNAPSHOT[1];
+                for ch in 7u32..16u32 {
+                    let write_addr = DMA_CRASH_SNAPSHOT[2 + ch as usize];
+                    let is_busy = (busy >> ch) & 1 != 0;
+                    // Only log channels that were busy or have non-zero write addresses
+                    // (zero means unconfigured/idle).
+                    if is_busy || write_addr != 0 {
+                        defmt::warn!(
+                            "crash: DMA ch{}: WRITE_ADDR={:#010x}  BUSY={}",
+                            ch,
+                            write_addr,
+                            is_busy,
+                        );
+                    }
+                }
+                DMA_CRASH_SNAPSHOT[0] = 0; // consume — don't reuse on next boot
+            }
+        }
+        rec
+    }) {
         Ok(true) => {
             defmt::info!("crash: committed crash record to flash");
             true

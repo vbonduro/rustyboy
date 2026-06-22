@@ -390,6 +390,16 @@ impl PpuPeripheral {
         interrupt
     }
 
+    // Bug G4 ROOT FIX — this MUST stay `#[inline(never)]`. The entire PPU
+    // rendering chain (bg, window, sprite) is called from this function and
+    // when inlined into `run_core1_worker`, the compiler reuses the same spill
+    // slot (sp+0x94 relative to the dequeue-path SP) for both the Consumer
+    // fat-pointer `command_rx.rb.data_ptr` AND a local variable inside
+    // `render_sprite_scanline`. That collision corrupts the consumer pointer
+    // and triggers an UNALIGNED HardFault (R0=0x0D or 0x11) on the next LDA.
+    // Keeping this `#[inline(never)]` gives the entire scanline render its own
+    // stack frame, isolating its locals from `run_core1_worker`'s queue state.
+    #[inline(never)]
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_scanline(&mut self, io: &[u8], vram: &[u8], oam: &[u8]) {
         let lcdc = Lcdc(io[LCDC_IO]);
@@ -528,6 +538,10 @@ impl PpuPeripheral {
         self.window_line_counter += 1;
     }
 
+    // Belt-and-suspenders: also keep this non-inlined. The `sprites` array
+    // (10 × 5 bytes) and the OAM iteration locals were the actual spill-slot
+    // colliders caught by the OpenOCD DWT watchpoint (halt #16, PC=0x1001b688).
+    #[inline(never)]
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn render_sprite_scanline(
         &mut self,

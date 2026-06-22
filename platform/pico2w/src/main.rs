@@ -17,20 +17,10 @@ use state::{
     InGameMenuState, LoadingState, MainMenuState, RomListState, RunningState, SettingsState,
 };
 
-// Global allocator: the bare `embedded_alloc::Heap`, or — under `heap-guard` —
-// the redzone wrapper that catches heap overruns (CRASH_DEBUG_NOTES #5). Both
-// expose `empty()` + `init(addr, size)`, so the init call below is unchanged.
-#[cfg(not(feature = "heap-guard"))]
+// Global allocator: the bare `embedded_alloc::Heap`.
 use embedded_alloc::Heap;
-#[cfg(not(feature = "heap-guard"))]
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
-
-#[cfg(feature = "heap-guard")]
-use rustyboy_pico2w::guarded_heap::GuardedHeap;
-#[cfg(feature = "heap-guard")]
-#[global_allocator]
-static HEAP: GuardedHeap = GuardedHeap::empty();
 
 use defmt::info;
 use embassy_executor::Spawner;
@@ -63,7 +53,6 @@ use rustyboy_pico2w::input::{ButtonState, InputHandler};
 use rustyboy_pico2w::multicore::PicoGameBoy;
 use rustyboy_pico2w::save_storage::{boot_load_saves, BootSaves, SaveSlot};
 use rustyboy_pico2w::sd::{self, DummyClock};
-use rustyboy_pico2w::stack_probe;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 #[cfg(feature = "oc-300")]
@@ -338,13 +327,24 @@ async fn main(spawner: Spawner) {
     // escalates to the HardFault handler at the exact offending instruction.
     // NB: because this guard PRE-EXISTS, the #5 bus-fault crashes (IBUSERR /
     // PRECISERR, not STKOF) are *not* a core-0 stack overflow — see
-    // CRASH_DEBUG_NOTES.md.  Safety: `_stack_end` is a linker symbol.
+    // docs/investigations/crash-debug-notes.md.  Safety: `_stack_end` is a linker symbol.
     unsafe {
         unsafe extern "C" {
             static _stack_end: u32;
         }
         cortex_m::register::msplim::write(core::ptr::addr_of!(_stack_end) as u32);
     }
+
+    // Make the .data RAM-code region read-only on Core 0.
+    // If the corruptor is a Core-0 CPU write into this region, any such write
+    // fires DACCVIOL (MemManage → HardFault) with the exact writer PC stacked.
+    // Core 0 never legitimately writes its own code, so zero false positives.
+    // Region covers __sdata through the last complete 32-byte block before
+    // _SEGGER_RTT, which is written by defmt.
+    // See docs/investigations/crash-debug-notes.md — "MPU read-only on .data / RAM-code region".
+    // Protect .data / RAM-code region as priv-RO. Any write fires DACCVIOL;
+    // MMFAR records the exact write address so we can identify the corruptor.
+    unsafe { setup_core0_data_mpu() };
 
     {
         use core::mem::MaybeUninit;
@@ -413,11 +413,9 @@ async fn main(spawner: Spawner) {
         p.SPI1, p.PIN_10, p.PIN_11, p.PIN_9, p.PIN_8, p.PIN_12, p.PIN_13,
     );
     sd_pwr.set_high(); // SD module now has ≥265 ms off-time behind it; splash provides the 250 ms power-up window
-    stack_probe::paint();
     info!("starting splash");
     hw_disp.splash().await;
     drop(hw_disp);
-    stack_probe::paint();
 
     // GP21=Up  GP22=Down  GP26=Left  GP27=Right
     // GP0=A    GP1=B      GP2=Start  GP3=Select
@@ -496,7 +494,16 @@ async fn main(spawner: Spawner) {
                         "building GameBoy, clk={}",
                         embassy_rp::clocks::clk_sys_freq()
                     );
-                    let mut gb = PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart));
+                    // Box immediately so the GameBoy + Core1Transport (and its
+                    // immutable `imm` block) live on the HEAP from the very first
+                    // transport call — including the boot-time save-state restore
+                    // below, whose `load_state` drives `check_shared` and arms the
+                    // `transport-immutable-mpu` region. If `gb` were a stack local
+                    // here, the MPU would arm over the stack and exception stacking
+                    // would fault (MSTKERR false positive). See
+                    // docs/investigations/memory-barrier-investigation-plan.md.
+                    let mut gb: Box<PicoGameBoy> =
+                        Box::new(PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart)));
                     if let Some(rom_id) = info.rom_id {
                         // A save state contains cart RAM, so prefer it and only
                         // read the battery file if no state is available. This
@@ -592,10 +599,15 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    stack_probe::paint();
     info!("entering main loop");
 
-    let mut gameboy: Option<PicoGameBoy> = gameboy_init;
+    // Box the GameBoy so the `GameBoy` + `Core1Transport` (and its immutable
+    // `imm` block, used by the `transport-immutable-mpu` writer-ID trap) live on
+    // the HEAP at a stable address rather than high in the core-0 stack. A
+    // stack-resident transport defeats the priv-RO MPU region: normal exception
+    // stacking writes through the protected page and faults (MSTKERR) before the
+    // bug #5 wild store runs. See docs/investigations/memory-barrier-investigation-plan.md.
+    let mut gameboy: Option<Box<PicoGameBoy>> = gameboy_init;
 
     let wifi_periphs = Some(WifiPeriphs {
         pwr: p.PIN_23,
@@ -627,7 +639,6 @@ async fn main(spawner: Spawner) {
     let mut tracker = perf::PerfTracker::new();
 
     loop {
-        stack_probe::check_current_sp("main loop");
         watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
 
         // Take the current state out so we can pass &mut app into tick().
@@ -638,7 +649,7 @@ async fn main(spawner: Spawner) {
                 running
                     .tick(
                         &mut app,
-                        gameboy.as_mut().expect("Running without GameBoy"),
+                        gameboy.as_deref_mut().expect("Running without GameBoy"),
                         &mut game_disp,
                         &mut i2s,
                         &mut input,
@@ -656,7 +667,7 @@ async fn main(spawner: Spawner) {
                 menu_state
                     .tick(
                         &mut app,
-                        gameboy.as_mut().expect("InGameMenu without GameBoy"),
+                        gameboy.as_deref_mut().expect("InGameMenu without GameBoy"),
                         &mut game_disp,
                         &mut input,
                         &mut sd_mgr,
@@ -705,4 +716,62 @@ async fn main(spawner: Spawner) {
         // Restore state or apply a queued transition.
         app.state = app.next_state.take().unwrap_or(state);
     }
+}
+
+/// Configure Core 0's PMSAv8-M MPU with one privileged-read-only region:
+/// - region 0: .data RAM code from `__sdata` to immediately before `_SEGGER_RTT`
+///
+/// Core 0 never legitimately writes this range after startup. Any write
+/// fires DACCVIOL (MemManage → HardFault) with the exact writer PC stacked.
+///
+/// The upper bound is derived from `_SEGGER_RTT` so adding another RAM-resident
+/// function cannot silently leave the end of `.data` writable.
+#[cfg(target_arch = "arm")]
+#[inline(never)]
+unsafe fn setup_core0_data_mpu() {
+    unsafe extern "C" {
+        static _SEGGER_RTT: u8;
+    }
+
+    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
+    const MPU_CTRL: *mut u32 = 0xE000_ED94 as *mut u32;
+    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
+    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
+    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
+    const MPU_MAIR0: *mut u32 = 0xE000_EDC0 as *mut u32;
+
+    let dregion = unsafe { (MPU_TYPE.read_volatile() >> 8) & 0xFF };
+    defmt::info!("core0 MPU setup: DREGION={=u32}", dregion);
+    if dregion == 0 {
+        defmt::warn!("core0 MPU: no MPU regions available — .data protection disabled");
+        return;
+    }
+
+    let rtt_addr = core::ptr::addr_of!(_SEGGER_RTT) as usize;
+    let data_limit = (rtt_addr - 1) & !0x1F;
+
+    unsafe {
+        MPU_CTRL.write_volatile(0); // disable MPU before configuring regions
+
+        // Configure MAIR0 index 0: Normal memory, write-back, read/write-allocate.
+        MPU_MAIR0.write_volatile(0xFF);
+
+        // Region 0: __sdata through the final 32-byte block below _SEGGER_RTT,
+        // privileged-read-only, execute OK.
+        //   RBAR: BASE=0x20000000, SH=11=inner-shareable, AP=10=priv-RO,
+        //         XN=0 (execution allowed) → 0x2000_001C
+        MPU_RNR.write_volatile(0);
+        MPU_RBAR.write_volatile(0x2000_001C);
+        MPU_RLAR.write_volatile(data_limit as u32 | 1);
+
+        // ENABLE=1, PRIVDEFENA=1 (other addresses use default map), HFNMIENA=0
+        // (MPU disabled during fault handlers so the crash handler can read freely).
+        MPU_CTRL.write_volatile(0x0000_0005);
+    }
+    cortex_m::asm::dsb();
+    cortex_m::asm::isb();
+    defmt::info!(
+        "core0 MPU armed: r0=.data RO [0x20000000..={=usize:#010x}]",
+        data_limit + 0x1F
+    );
 }

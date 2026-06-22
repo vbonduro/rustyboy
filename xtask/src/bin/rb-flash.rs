@@ -91,6 +91,35 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Best-effort: reset the debug probe USB device so it recovers from a stuck
+/// CMSIS-DAP state (happens when probe-rs disconnects after a firmware crash
+/// — the debugprobe firmware locks up in its SWD loop and stops responding to
+/// bulk transfers until the USB device is reset). Uses Python3 to issue a
+/// USBDEVFS_RESET ioctl on the device matching VID 2e8a (Raspberry Pi probe).
+/// Failure is silently ignored — the caller will detect the real error later.
+fn try_reset_probe_usb() {
+    let script = r#"
+import fcntl, os, glob, time
+for f in glob.glob('/sys/bus/usb/devices/*/idVendor'):
+    try:
+        if open(f).read().strip() == '2e8a':
+            d = os.path.dirname(f)
+            bus = int(open(d+'/busnum').read().strip())
+            dev = int(open(d+'/devnum').read().strip())
+            path = f'/dev/bus/usb/{bus:03d}/{dev:03d}'
+            fd = os.open(path, os.O_WRONLY)
+            fcntl.ioctl(fd, 0x5514, 0)  # USBDEVFS_RESET
+            os.close(fd)
+            import sys; print(f'rb-flash: probe USB reset {path} (recovering stuck CMSIS-DAP)', file=sys.stderr)
+            time.sleep(3)
+    except Exception:
+        pass
+"#;
+    let _ = std::process::Command::new("python3")
+        .args(["-c", script])
+        .status();
+}
+
 fn main() -> Result<()> {
     // cargo invokes the runner as `rb-flash <path-to-elf> [extra args...]`.
     let mut args = std::env::args().skip(1).peekable();
@@ -177,11 +206,21 @@ fn main() -> Result<()> {
 
     let out_path = format!("{elf_path}.rbcrc");
     std::fs::write(&out_path, &patched).with_context(|| format!("writing {out_path}"))?;
-    eprintln!("rb-flash: image crc {crc:#010x} over [{img_start:#010x}, {crc_addr:#010x}) -> IMAGE_CRC");
+    eprintln!(
+        "rb-flash: image crc {crc:#010x} over [{img_start:#010x}, {crc_addr:#010x}) -> IMAGE_CRC"
+    );
 
     // Kill any live watchdog before programming so it can't reset the chip
     // mid-flash (see module docs). Must happen right before the flash, on
     // whatever firmware is currently running.
+    // STAMP_ONLY=1: just produce the .rbcrc file without flashing (used when
+    // the caller wants to flash via a different mechanism, e.g. probe-rs download).
+    if std::env::var("STAMP_ONLY").is_ok() {
+        eprintln!("rb-flash: stamp-only mode — skipping flash (output: {out_path})");
+        return Ok(());
+    }
+
+    try_reset_probe_usb();
     disable_target_watchdog();
 
     let status = Command::new("probe-rs")
