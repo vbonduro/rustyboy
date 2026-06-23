@@ -6,7 +6,9 @@ extern crate alloc;
 pub mod audio;
 pub mod crash;
 #[cfg(target_arch = "arm")]
-mod critical_section_impl;
+pub mod integrity;
+#[cfg(target_arch = "arm")]
+pub mod mpu;
 pub mod display;
 #[cfg(target_arch = "arm")]
 pub mod flash_rom;
@@ -22,6 +24,10 @@ pub mod xip_cartridge;
 /// Pure encode/decode helpers for WiFi credential storage and the captive
 /// portal.  No platform gate — available on host for unit tests.
 pub mod wifi_codec;
+
+/// DHCP marshalling/unmarshalling for the captive-portal server.  Pure logic,
+/// no platform gate — available on host for unit tests.
+pub mod dhcp;
 
 /// WiFi captive-portal configuration support.
 ///

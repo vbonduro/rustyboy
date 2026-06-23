@@ -11,6 +11,7 @@ trace = []
 [dependencies]
 bitflags = "2.5.0"
 bytemuck = { version = "1", default-features = false, features = ["extern_crate_alloc"] }
+heapless = { version = "0.9", default-features = false }
 sha2 = { version = "0.10.9", default-features = false }
 
 [dev-dependencies]

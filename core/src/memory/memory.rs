@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::{vec, vec::Vec};
 use core::fmt;
+use heapless;
 
 use super::cartridge::{self, Cartridge, CartridgeRomWindows, NoMbc};
 use super::map::{
@@ -18,51 +19,7 @@ pub struct BusEvent {
 
 pub const BUS_EVENT_QUEUE_CAP: usize = 64;
 
-const EMPTY_BUS_EVENT: BusEvent = BusEvent {
-    address: 0,
-    value: 0,
-};
-
-#[derive(Debug)]
-struct BusEventQueue {
-    entries: [BusEvent; BUS_EVENT_QUEUE_CAP],
-    len: usize,
-}
-
-impl BusEventQueue {
-    fn new() -> Self {
-        Self {
-            entries: [EMPTY_BUS_EVENT; BUS_EVENT_QUEUE_CAP],
-            len: 0,
-        }
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline(always)]
-    fn push_back(&mut self, event: BusEvent) {
-        if self.len >= self.entries.len() {
-            panic!("bus event queue overflow");
-        }
-        self.entries[self.len] = event;
-        self.len += 1;
-    }
-
-    fn drain_into_slice(&mut self, out: &mut [BusEvent]) -> usize {
-        let n = self.len.min(out.len());
-        out[..n].copy_from_slice(&self.entries[..n]);
-        self.len = 0;
-        n
-    }
-
-    fn drain_into_vec(&mut self, out: &mut Vec<BusEvent>) {
-        out.extend_from_slice(&self.entries[..self.len]);
-        self.len = 0;
-    }
-}
+type BusEventQueue = heapless::Vec<BusEvent, BUS_EVENT_QUEUE_CAP>;
 
 #[derive(Debug)]
 pub enum Error {
@@ -444,19 +401,12 @@ impl GameBoyMemory {
     /// Copy `count` bytes from `source + progress` into OAM at `progress`.
     /// Uses a zero-copy slice path for regions with direct backing storage
     /// (VRAM, WRAM, cached ROM); falls back to byte-by-byte for cart RAM.
-    // §G10 ROOT FIX — this MUST stay `#[inline(never)]`. The DWT victim-watch
-    // caught this function's `self.oam[dst + i]` store (memory.rs:627, PC
-    // 0x10003842) writing to three addresses up to 73 KB apart, even though the
-    // line-565 guard proves `dst + i < oam.len()`. An in-bounds index that lands
-    // 73 KB away can only mean a CORRUPT `&oam`/`self` BASE — bug #5's class, a
-    // register-allocator stack-slot collision in the giant `.data`-inlined `tick`
-    // frame (same pathology as `drain_bus_events`). `#[inline(never)]` gives the
-    // OAM-DMA copy its OWN frame so its base spill can no longer be coalesced onto
-    // a colliding sibling's slot. Do NOT re-inline.
-    // See docs/investigations/oam-dma-bisection.md §G10.
+    // Defense-in-depth for bug #5 (regalloc stack-slot collision): `#[inline(never)]`
+    // keeps this OAM-DMA copy in its own stack frame so its base spill cannot be
+    // coalesced onto a sibling's slot. Root cause fixed via `-regalloc=basic`; do NOT re-inline.
+    // See platform/pico2w/docs/investigations/oam-dma-bisection.md.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     #[inline(never)]
-    #[track_caller]
     pub fn copy_dma_step(&mut self, source: u16, progress: u8, count: u8) {
         // actual_src is the real memory address to read from: base + bytes already transferred.
         let actual_src = source as usize + progress as usize;
@@ -691,7 +641,7 @@ impl GameBoyMemory {
     /// memory through a direct fast path.
     #[inline(always)]
     pub fn enqueue_bus_event(&mut self, address: u16, value: u8) {
-        self.events.push_back(BusEvent { address, value });
+        self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
     }
 
     /// Returns a read-only view of the IO register array (0xFF00–0xFF7F).
@@ -713,7 +663,10 @@ impl GameBoyMemory {
 
     /// Drain pending bus events into a caller-owned fixed buffer.
     pub fn drain_into_slice(&mut self, buf: &mut [BusEvent]) -> usize {
-        self.events.drain_into_slice(buf)
+        let n = self.events.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.events[..n]);
+        self.events.clear();
+        n
     }
 }
 
@@ -747,7 +700,7 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::Vram(offset) => {
                 self.vram[offset as usize] = value;
-                self.events.push_back(BusEvent { address, value });
+                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Wram(offset) => {
@@ -757,12 +710,12 @@ impl Memory for GameBoyMemory {
             RegionMapping::EchoRam(_) => Err(Error::ReadOnly(address)),
             RegionMapping::Oam(offset) => {
                 self.oam[offset as usize] = value;
-                self.events.push_back(BusEvent { address, value });
+                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Io(offset) => {
                 self.io[offset as usize] = value;
-                self.events.push_back(BusEvent { address, value });
+                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Hram(offset) => {
@@ -771,7 +724,7 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::InterruptEnable => {
                 self.ie = value;
-                self.events.push_back(BusEvent { address, value });
+                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Unmapped => Ok(()),
@@ -779,8 +732,9 @@ impl Memory for GameBoyMemory {
     }
 
     fn drain_events(&mut self) -> Vec<BusEvent> {
-        let mut out = Vec::with_capacity(self.events.len);
-        self.events.drain_into_vec(&mut out);
+        let mut out = Vec::with_capacity(self.events.len());
+        out.extend_from_slice(&self.events);
+        self.events.clear();
         out
     }
 }
