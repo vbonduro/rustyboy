@@ -280,6 +280,15 @@ impl SharedWorkerState {
         // actually prevents the cross-core race. The old "only accessed from
         // core 1" comment was a breakable contract — `load_ppu_state` violated
         // it while core 1 was live. Held ~once per frame (gated by frame_ready).
+        //
+        // The whole function is held under the lock deliberately: there is no
+        // sub-region that can be safely isolated. `clear_published_frames`
+        // unconditionally rewrites every slot AND the single shared
+        // `prev_row_hashes` buffer, so the slot reservation, the hash compute/
+        // update, and the frame copy are all part of the contended region.
+        // Narrowing this would require a slot-reservation protocol that `clear`
+        // also honours plus separate protection for `prev_row_hashes` — a redesign
+        // best deferred until the residual cross-core corruption crash is closed.
         critical_section::with(|_| self.publish_frame_locked(worker));
     }
 
@@ -334,9 +343,19 @@ impl SharedWorkerState {
         unsafe {
             (*self.native_frame_slots[target_slot].as_mut_ptr()).copy_from_slice(framebuffer);
         }
-        // dirty_rows is fully written above; the Release store below pairs with
-        // the Acquire load in published_native_frame() on Core 0, ensuring the
-        // dirty bitmap is visible before Core 0 reads it.
+        // Drain Core 1's store buffer before publishing. The slot/dirty-row writes
+        // above are Normal SRAM stores; `critical_section` on RP2350 supplies only a
+        // `compiler_fence` (no `dsb` — see embassy-rp's RpSpinlockCs), so the
+        // Release store alone does not guarantee those buffered writes are globally
+        // visible before Core 0 observes the gating atomic. Without this, Core 0 can
+        // Acquire-load `published_frame`/`published_frame_seq`, then read stale/torn
+        // slot or dirty-row data and size DMA/dirty-row copies off it — a suspected
+        // source of the residual cross-core corruption. The explicit `dsb` forces
+        // completion of the buffered stores before the publishing atomics below.
+        cortex_m::asm::dsb();
+        // The Release store pairs with the Acquire load in published_native_frame()
+        // on Core 0, ensuring the (now-drained) dirty bitmap + frame are visible
+        // before Core 0 reads them.
         self.published_frame
             .store(target_slot as u8, Ordering::Release);
         self.published_frame_seq.fetch_add(1, Ordering::AcqRel);
@@ -348,6 +367,11 @@ impl SharedWorkerState {
         // is live*, so the prior "called during reset before core 1 is
         // re-spawned" assumption does not hold — real mutual exclusion is
         // required, not a contract.
+        //
+        // The full body is the contended region: it rewrites every
+        // `native_frame_slots` entry, the shared `prev_row_hashes`, all
+        // `dirty_rows`, and the publish atomics — the exact state `publish_frame`
+        // mutates. There is no isolatable sub-area to take out of the lock.
         critical_section::with(|_| self.clear_published_frames_locked());
     }
 
