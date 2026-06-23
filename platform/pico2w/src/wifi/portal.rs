@@ -26,9 +26,8 @@ use embassy_sync::signal::Signal;
 use embedded_io_async::Write as _;
 
 use super::driver::{Cyw43Runner, AP_IP_OCTETS};
-use crate::wifi_codec::{
-    build_dhcp_response, build_dns_response, find_body_start, parse_credentials, DHCP_RESPONSE_LEN,
-};
+use crate::dhcp::{build_dhcp_response, DHCP_RESPONSE_LEN};
+use crate::wifi_codec::{build_dns_response, find_body_start, parse_credentials};
 
 // ---------------------------------------------------------------------------
 // Shared result signal

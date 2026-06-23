@@ -51,6 +51,7 @@ embassy-rp = { git = "https://github.com/embassy-rs/embassy", features = [
     "rp235xa",
     "time-driver",
     "defmt",
+    "critical-section-impl",
     "binary-info",
 ] }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", features = [
@@ -69,8 +70,8 @@ cortex-m-rt = "0.7"
 # corrupt image makes `probe-rs run` (and thus `cargo run`) return non-zero
 # without going through the fault handler. See `integrity` in main.rs.
 cortex-m-semihosting = "0.5"
-critical-section = { version = "1.2", features = ["restore-state-u8"] }
-heapless = { version = "0.9", default-features = false, features = ["mpmc_large"] }
+critical-section = "1.2"
+heapless = { version = "0.9", default-features = false }
 rp-pac = { git = "https://github.com/embassy-rs/rp-pac", rev = "c2e27609b021c444f634673155318977d7f0bdf6" }
 
 defmt = "1"

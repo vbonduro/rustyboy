@@ -164,52 +164,17 @@ unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame, exc_return: u32)
         0
     };
 
-    // Attempt to read emulator state from the global context.
-    let ctx = CRASH_CONTEXT.snapshot();
-
-    // Identify the faulting core so we measure against the correct stack.
-    let core = current_core();
-
     // Compute stack headroom / overflow depth from the pre-exception SP.
     // NOTE: `ef + 32` is only correct for the basic 8-word frame with no
     // alignment pad. On this hard-float target the frame can be 104 bytes
     // (FP extended frame) plus a 4-byte aligner — see `sp_before_exception`.
     let sp_before = sp_before_exception(ef, exc_return);
-    let (stack_headroom, overflowed) = compute_stack_info(sp_before, core);
-
-    let f = flags::HAS_ARM_REGS
-        | if ctx.is_some() {
-            flags::HAS_GB_STATE | flags::HAS_ROM_INFO
-        } else {
-            0
-        }
-        | if overflowed {
-            flags::HAS_STACK_OVERFLOW
-        } else {
-            0
-        }
-        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
 
     // Store sp_before (the faulted thread's SP) rather than pre-handler r4.
     // For INVSTATE from trigger's `pop {r7,pc}`, sp_before - 4 is the exact
     // address of the corrupted saved-LR slot, giving us the DWT watchpoint
     // address for the next crash hunt iteration.
     let hardfault_tail = Some([sp_before as u32, ef.r12()]);
-
-    let f = f | if hardfault_tail.is_some() {
-        flags::HAS_HARDFAULT_EXTENDED_REGS
-    } else {
-        0
-    };
-
-    // Build the packed word for scratch[6].
-    let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-    let packed6 = (CrashKind::HardFault as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
-
-    // Build the packed word for scratch[7].
-    let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
-    let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
-    let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
 
     // For UNALIGNED faults, also capture R1 into POWMAN scratch[5] lo16.
     // Pattern B is `lda r1, [r1]` — stacked R1 = faulting address.
@@ -219,16 +184,19 @@ unsafe extern "C" fn hard_fault_rust(ef: *const ExceptionFrame, exc_return: u32)
         0
     };
 
-    write_watchdog_scratch(ef.pc(), ef.lr(), cfsr, hfsr, fault_addr, packed6, packed7);
-    write_powman_scratch_from_context(
-        ctx.as_ref(),
+    commit_crash_and_reset(
+        CrashKind::HardFault,
+        flags::HAS_ARM_REGS | flags::HAS_HARDFAULT_EXTENDED_REGS,
+        sp_before,
+        ef.pc(),
+        ef.lr(),
+        cfsr,
+        hfsr,
+        fault_addr,
         None,
         hardfault_tail,
         arm_r1_for_unaligned,
-        stack_headroom,
-    );
-
-    cortex_m::peripheral::SCB::sys_reset()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -255,49 +223,96 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         ([0u8; 8], 0)
     };
 
-    let ctx = CRASH_CONTEXT.snapshot();
-
-    // Identify the panicking core so we measure against the correct stack.
-    let core = current_core();
-
     // Read the current SP directly — in a panic handler there's no exception frame.
     let sp = cortex_m::register::msp::read() as usize;
+
+    // Software panics do not have an exception frame, so ARM register values
+    // are all zero.
+    commit_crash_and_reset(
+        CrashKind::Panic,
+        flags::HAS_PANIC_LOC,
+        sp,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Some(file_bytes),
+        None,
+        line,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Shared crash-commit helper
+// ---------------------------------------------------------------------------
+
+/// Capture the crash context, build the packed scratch words, write both sets
+/// of scratch registers, and trigger a clean `sys_reset`.
+///
+/// Both `hard_fault_rust` and the `#[panic_handler]` funnel through here;
+/// the caller supplies the kind-specific inputs and the two extra flag bits
+/// that distinguish a HardFault from a Panic:
+///
+/// - `kind_flags` — additional flags that are always set for this crash kind
+///   (e.g. `HAS_ARM_REGS | HAS_HARDFAULT_EXTENDED_REGS` for HardFault,
+///    `HAS_PANIC_LOC` for Panic).
+/// - `sp` — pre-fault stack pointer (used to compute stack headroom).
+/// - `arm_*` — ARM exception frame fields; all zero for panics.
+/// - `panic_file` — 8-byte filename buffer; `None` for HardFaults.
+/// - `diagnostic_words` — `[sp_before, r12]` for HardFaults; `None` for panics.
+/// - `panic_line_or_r1` — panic source line (panics) or stacked R1 lo16
+///   (UNALIGNED HardFaults); 0 otherwise.
+#[inline(never)]
+fn commit_crash_and_reset(
+    kind: CrashKind,
+    kind_flags: u8,
+    sp: usize,
+    arm_pc: u32,
+    arm_lr: u32,
+    arm_cfsr: u32,
+    arm_hfsr: u32,
+    arm_fault_addr: u32,
+    panic_file: Option<[u8; 8]>,
+    diagnostic_words: Option<[u32; 2]>,
+    panic_line_or_r1: u32,
+) -> ! {
+    // Attempt to read emulator state from the global context.
+    let ctx = CRASH_CONTEXT.snapshot();
+
+    // Identify the faulting core so we measure against the correct stack.
+    let core = current_core();
+
     let (stack_headroom, overflowed) = compute_stack_info(sp, core);
 
-    let f = flags::HAS_PANIC_LOC
-        | if ctx.is_some() {
+    // Common flag bits: emulator state availability, stack overflow, core ID.
+    let common_flags = if ctx.is_some() {
             flags::HAS_GB_STATE | flags::HAS_ROM_INFO
         } else {
             0
         }
-        | if overflowed {
-            flags::HAS_STACK_OVERFLOW
-        } else {
-            0
-        }
+        | if overflowed { flags::HAS_STACK_OVERFLOW } else { 0 }
         | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
 
-    let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
-    let crash_kind = CrashKind::Panic;
-    let packed6 = (crash_kind as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
+    let f = kind_flags | common_flags;
 
+    // Build scratch[6]: [crash_kind:8 | flags:8 | ram_bank:8 | _:8]
+    let ram_bank = ctx.as_ref().map(|c| c.ram_bank).unwrap_or(0);
+    let packed6 = (kind as u32) | ((f as u32) << 8) | ((ram_bank as u32) << 16);
+
+    // Build scratch[7]: [rom_bank:16 | gb_pc:16]
     let rom_bank = ctx.as_ref().map(|c| c.rom_bank).unwrap_or(0);
     let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
     let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
 
-    // Software panics do not have an exception frame, so there are no ARM
-    // register values to record.
-    let (arm_pc, arm_lr, arm_cfsr, arm_hfsr, arm_fault_addr) = (0, 0, 0, 0, 0);
-    write_watchdog_scratch(
-        arm_pc,
-        arm_lr,
-        arm_cfsr,
-        arm_hfsr,
-        arm_fault_addr,
-        packed6,
-        packed7,
+    write_watchdog_scratch(arm_pc, arm_lr, arm_cfsr, arm_hfsr, arm_fault_addr, packed6, packed7);
+    write_powman_scratch_from_context(
+        ctx.as_ref(),
+        panic_file,
+        diagnostic_words,
+        panic_line_or_r1,
+        stack_headroom,
     );
-    write_powman_scratch_from_context(ctx.as_ref(), Some(file_bytes), None, line, stack_headroom);
 
     cortex_m::peripheral::SCB::sys_reset()
 }

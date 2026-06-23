@@ -57,6 +57,8 @@ use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 #[cfg(feature = "oc-300")]
 const TARGET_SYS_HZ: u32 = 300_000_000;
+// 16 s gives worst-case frame/flash-sync stalls plenty of headroom without false-tripping;
+// the multicore livelock that caused the old 5 s freeze→reset is separately fixed by WFE backpressure.
 const WATCHDOG_WINDOW_MS: u64 = 16_000;
 #[cfg(all(not(feature = "oc-300"), feature = "oc-280"))]
 const TARGET_SYS_HZ: u32 = 280_000_000;
@@ -219,96 +221,8 @@ pub(crate) enum AppState {
 }
 
 // ---------------------------------------------------------------------------
-// Boot-time .data integrity guard
+// Boot-time .data integrity guard — see `rustyboy_pico2w::integrity`
 // ---------------------------------------------------------------------------
-//
-// The SM83 interpreter's hot functions are placed in `.data` so they execute
-// from RAM. cortex-m-rt copies that image from flash (LMA `__sidata`) into RAM
-// at boot. A failed flash page-write in the `.data` image — which probe-rs
-// `--verify` has been observed to miss (XIP-cache false pass) — therefore boots
-// into corrupt RAM code and crashes deep in the emulator (e.g. `dispatch_isr`).
-//
-// `EXPECTED_DATA_CRC` is patched post-link by the `rb-flash` runner with the
-// CRC32 of the `.data` load image. On boot we CRC the same bytes straight from
-// flash (immutable at runtime, so this is safe before any peripheral init and
-// free of false positives) and compare. On mismatch we exit via semihosting so
-// `probe-rs run` returns non-zero — the user re-runs `cargo run` to retry; we
-// deliberately do not auto-reflash, to avoid needless flash wear.
-mod integrity {
-    use cortex_m_semihosting::debug;
-
-    extern "C" {
-        /// Start of the flashed firmware image (set in `memory.x`).
-        static __start_block_addr: u32;
-    }
-
-    /// Sentinel left in place when the image was flashed without `rb-flash`
-    /// (e.g. via picotool). The guard is skipped so non-probe-rs flashing still
-    /// boots normally.
-    const UNPATCHED: u32 = 0xFFFF_FFFF;
-
-    /// CRC32 of the **entire** flashed firmware image (`.start_block` + `.text`
-    /// + `.rodata` + the `.data` load image), patched post-link by `rb-flash`.
-    ///
-    /// It lives at the very end of the image, in `.end_block` — so the CRC
-    /// covers every byte *before* it. On boot we re-CRC the same flash bytes in
-    /// place (immutable, so this is safe before any peripheral init and free of
-    /// false positives) and compare. This supersedes the old `.data`-only guard:
-    /// a corrupt `.text` page — which `--verify` has been seen to miss and which
-    /// boots into a garbage instruction → wild HardFault — is now caught here.
-    #[no_mangle]
-    #[used]
-    #[link_section = ".end_block"]
-    static IMAGE_CRC: u32 = UNPATCHED;
-
-    pub fn verify_image() {
-        let want = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IMAGE_CRC)) };
-        if want == UNPATCHED {
-            return;
-        }
-        let got = image_crc();
-        if got != want {
-            defmt::error!(
-                "IMAGE CORRUPT: crc {=u32:#010x} != expected {=u32:#010x} — reflash (cargo run)",
-                got,
-                want
-            );
-            // Clean exit so the run command fails without faulting (keeps the
-            // crash log free of a spurious record). probe-rs reports non-zero.
-            loop {
-                debug::exit(debug::EXIT_FAILURE);
-            }
-        }
-        defmt::info!("integrity: full image crc {=u32:#010x} OK", got);
-    }
-
-    fn image_crc() -> u32 {
-        let start = core::ptr::addr_of!(__start_block_addr) as *const u8;
-        // The image ends right before the CRC word (IMAGE_CRC sits at the start
-        // of `.end_block`, i.e. at `__end_block_addr`), so [start, &IMAGE_CRC)
-        // is exactly the CRC-covered region.
-        let end = core::ptr::addr_of!(IMAGE_CRC) as usize;
-        let len = end - (start as usize);
-        // Safety: [start, end) is the flashed image in XIP flash, produced by
-        // the linker and read-only at runtime.
-        let bytes = unsafe { core::slice::from_raw_parts(start, len) };
-        crc32(bytes)
-    }
-
-    /// CRC-32/ISO-HDLC (reflected, poly 0xEDB88320). Must stay byte-for-byte
-    /// identical to the implementation in the `rb-flash` runner.
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc: u32 = 0xFFFF_FFFF;
-        for &byte in data {
-            crc ^= byte as u32;
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -317,7 +231,7 @@ mod integrity {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     // Verify the .data load image before it can be executed as RAM code.
-    integrity::verify_image();
+    rustyboy_pico2w::integrity::verify_image();
 
     // Re-assert the ARMv8-M hardware stack-limit guard for core 0 (MSPLIM).
     // cortex-m-rt already arms this at reset to `_stack_end`; we set it again
@@ -344,7 +258,7 @@ async fn main(spawner: Spawner) {
     // See docs/investigations/crash-debug-notes.md — "MPU read-only on .data / RAM-code region".
     // Protect .data / RAM-code region as priv-RO. Any write fires DACCVIOL;
     // MMFAR records the exact write address so we can identify the corruptor.
-    unsafe { setup_core0_data_mpu() };
+    unsafe { rustyboy_pico2w::mpu::setup_core0_data_mpu() };
 
     {
         use core::mem::MaybeUninit;
@@ -718,60 +632,3 @@ async fn main(spawner: Spawner) {
     }
 }
 
-/// Configure Core 0's PMSAv8-M MPU with one privileged-read-only region:
-/// - region 0: .data RAM code from `__sdata` to immediately before `_SEGGER_RTT`
-///
-/// Core 0 never legitimately writes this range after startup. Any write
-/// fires DACCVIOL (MemManage → HardFault) with the exact writer PC stacked.
-///
-/// The upper bound is derived from `_SEGGER_RTT` so adding another RAM-resident
-/// function cannot silently leave the end of `.data` writable.
-#[cfg(target_arch = "arm")]
-#[inline(never)]
-unsafe fn setup_core0_data_mpu() {
-    unsafe extern "C" {
-        static _SEGGER_RTT: u8;
-    }
-
-    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
-    const MPU_CTRL: *mut u32 = 0xE000_ED94 as *mut u32;
-    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
-    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
-    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
-    const MPU_MAIR0: *mut u32 = 0xE000_EDC0 as *mut u32;
-
-    let dregion = unsafe { (MPU_TYPE.read_volatile() >> 8) & 0xFF };
-    defmt::info!("core0 MPU setup: DREGION={=u32}", dregion);
-    if dregion == 0 {
-        defmt::warn!("core0 MPU: no MPU regions available — .data protection disabled");
-        return;
-    }
-
-    let rtt_addr = core::ptr::addr_of!(_SEGGER_RTT) as usize;
-    let data_limit = (rtt_addr - 1) & !0x1F;
-
-    unsafe {
-        MPU_CTRL.write_volatile(0); // disable MPU before configuring regions
-
-        // Configure MAIR0 index 0: Normal memory, write-back, read/write-allocate.
-        MPU_MAIR0.write_volatile(0xFF);
-
-        // Region 0: __sdata through the final 32-byte block below _SEGGER_RTT,
-        // privileged-read-only, execute OK.
-        //   RBAR: BASE=0x20000000, SH=11=inner-shareable, AP=10=priv-RO,
-        //         XN=0 (execution allowed) → 0x2000_001C
-        MPU_RNR.write_volatile(0);
-        MPU_RBAR.write_volatile(0x2000_001C);
-        MPU_RLAR.write_volatile(data_limit as u32 | 1);
-
-        // ENABLE=1, PRIVDEFENA=1 (other addresses use default map), HFNMIENA=0
-        // (MPU disabled during fault handlers so the crash handler can read freely).
-        MPU_CTRL.write_volatile(0x0000_0005);
-    }
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
-    defmt::info!(
-        "core0 MPU armed: r0=.data RO [0x20000000..={=usize:#010x}]",
-        data_limit + 0x1F
-    );
-}

@@ -3078,6 +3078,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "bytemuck",
+ "heapless 0.9.3",
  "png",
  "sha2",
 ]

@@ -28,6 +28,8 @@ use crate::crash::CRASH_CONTEXT;
 use crate::display::NativeFrame;
 
 const CORE1_STACK_SIZE: usize = 8192;
+// Reduced from 512 after migration to spsc::Queue + WFE backpressure; 64 slots
+// comfortably covers per-frame command bursts and shrinks the static footprint.
 const COMMAND_QUEUE_CAPACITY: usize = 64;
 const AUDIO_QUEUE_CAPACITY: usize = 2048;
 const PPU_ADVANCE_BATCH_CYCLES: u16 = 456;
@@ -1294,72 +1296,6 @@ fn ack_ticket(shared: &SharedWorkerState, ticket: u32) {
     cortex_m::asm::dsb();
 }
 
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
-/// Configure Core 1's PMSAv8-M MPU to mark Core 0's stack as privileged-read-only.
-///
-/// Region 0: 0x20066B60–0x2007FFFF, AP=10 (priv RO), XN=1, SH=inner-shareable.
-/// PRIVDEFENA=1 leaves all other addresses with full default access.
-///
-/// When Core 1 writes anywhere in this range → MemManage fault (CFSR.DACCVIOL=1,
-/// MMFAR=faulting address) → escalates to HardFault → existing handler records
-/// stacked PC = the exact corrupt store instruction.
-unsafe fn setup_core1_mpu() {
-    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
-    const MPU_CTRL: *mut u32 = 0xE000_ED94 as *mut u32;
-    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
-    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
-    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
-    const MPU_MAIR0: *mut u32 = 0xE000_EDC0 as *mut u32;
-
-    let dregion = (MPU_TYPE.read_volatile() >> 8) & 0xFF;
-    defmt::info!("core1 MPU setup: DREGION={=u32}", dregion);
-    if dregion == 0 {
-        defmt::warn!("core1 MPU: no MPU regions present — protection disabled");
-        return;
-    }
-
-    // Disable before reconfiguring.
-    MPU_CTRL.write_volatile(0);
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
-
-    // Attr 0 = Normal memory, outer+inner write-back, read/write-allocate (0xFF).
-    MPU_MAIR0.write_volatile(0xFF);
-
-    // Region 0: Core 0 stack [_stack_end, _stack_start]. Derive the base from the
-    // linker symbol (NOT a hardcode) so the region tracks SRAM layout shifts. §G11:
-    // a stale hardcode (0x20066B60) sat ~1 KB below the real stack bottom, inside
-    // the defmt RTT buffer (0x20066b3c–0x20066f3c); after the copy_dma_step .data
-    // fix grew SRAM, legit core-1 RTT logging wrote into the covered range and
-    // crash-looped on MMFAR DACCVIOL. Aligning the base DOWN to the 32-byte MPU
-    // granule keeps it above the RTT buffer (which lives below _stack_end in
-    // .uninit) while still covering the entire core-0 stack.
-    extern "C" {
-        static _stack_end: u32;
-    }
-    let stack_bottom = core::ptr::addr_of!(_stack_end) as u32;
-    let base = stack_bottom & !0x1F; // 32-byte aligned MPU region base
-    //   RBAR: BASE | SH=11(b4:3) | AP=10(b2:1) | XN=1(b0) = base | 0x1D
-    //   RLAR: LIMIT=0x2007FFE0 | AttrIndx=0(b3:1) | EN=1(b0) = 0x2007FFE1
-    MPU_RNR.write_volatile(0);
-    MPU_RBAR.write_volatile(base | 0x1D);
-    MPU_RLAR.write_volatile(0x2007_FFE1);
-    defmt::info!("core1 MPU region 0 base (from _stack_end) = 0x{=u32:08x}", base);
-
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
-
-    // Enable: PRIVDEFENA(b2)=1 background full-access for non-covered addresses,
-    // HFNMIENA(b1)=0 MPU off in HardFault so our handler can read crash info,
-    // ENABLE(b0)=1.
-    MPU_CTRL.write_volatile(0x0000_0005);
-
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
-
-    defmt::info!("core1 MPU armed: region 0 = [0x20066B60, 0x2007FFFF] priv-RO (Core 0 stack)");
-}
-
 fn run_core1_worker(
     mut command_rx: spsc::Consumer<'static, Core1Command>,
     mut audio_tx: spsc::Producer<'static, i16>,
@@ -1386,7 +1322,7 @@ fn run_core1_worker(
     // Any write by Core 1 to 0x20066B60–0x2007FFFF fires MemManage (escalates
     // to HardFault since MEMFAULTENA=0), capturing stacked PC = exact corrupt
     // store instruction.  PRIVDEFENA=1 keeps all other memory fully accessible.
-    unsafe { setup_core1_mpu() };
+    unsafe { crate::mpu::setup_core1_mpu() };
 
     let mut last_ppu_render_version = 0u32;
 

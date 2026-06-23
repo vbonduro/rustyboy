@@ -30,7 +30,6 @@ const APU_UNUSED_START: u16 = 0xFF27;
 const OAM_DMA_BYTES: u8 = 160;
 const PPU_REG_BATCH_CAP: usize = 16;
 
-#[repr(C, align(4))]
 pub(crate) struct DmaState {
     pub source: u16,
     pub progress: u8,
