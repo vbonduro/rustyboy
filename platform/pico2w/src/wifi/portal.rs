@@ -184,25 +184,63 @@ pub async fn http_task(stack: Stack<'static>, ssids: heapless::Vec<heapless::Str
     }
 }
 
+/// Byte offset of the first body byte after the HTTP header terminator
+/// (`\r\n\r\n` or `\n\n`), or `None` while the headers are still incomplete.
+fn header_end_offset(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+}
+
+/// Parse the `Content-Length` header (case-insensitive) from the header bytes,
+/// returning 0 when absent or unparseable.
+fn parse_content_length(headers: &[u8]) -> usize {
+    let Ok(s) = core::str::from_utf8(headers) else {
+        return 0;
+    };
+    for line in s.lines() {
+        if let Some((name, val)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                return val.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
 async fn handle_http_connection(
     socket: &mut TcpSocket<'_>,
     ssids: &heapless::Vec<heapless::String<32>, 16>,
 ) {
-    // Read the first 1 KiB of the request — enough for headers + small POST body.
+    // Read the request: headers first, then the full POST body. The body
+    // typically arrives in a later TCP segment than the headers, so we must keep
+    // reading until `Content-Length` body bytes have arrived. Breaking at the
+    // `\r\n\r\n` header terminator alone (the previous behaviour) dropped the
+    // POST body → `parse_credentials("")` → 400 → credentials never saved.
     let mut req_buf = [0u8; 1024];
     let mut total = 0usize;
+    let mut body_start: Option<usize> = None;
+    let mut content_len = 0usize;
     loop {
         match socket.read(&mut req_buf[total..]).await {
             Ok(0) => break,
             Ok(n) => {
                 total += n;
-                if total >= req_buf.len() {
-                    break;
+                if body_start.is_none() {
+                    if let Some(bs) = header_end_offset(&req_buf[..total]) {
+                        body_start = Some(bs);
+                        content_len = parse_content_length(&req_buf[..bs]);
+                    }
                 }
-                let so_far = &req_buf[..total];
-                if so_far.windows(4).any(|w| w == b"\r\n\r\n")
-                    || so_far.windows(2).any(|w| w == b"\n\n")
-                {
+                // Once the headers are complete, stop only when the whole body
+                // has arrived (content_len is 0 for GET, so this breaks at once).
+                if let Some(bs) = body_start {
+                    if total - bs >= content_len {
+                        break;
+                    }
+                }
+                if total >= req_buf.len() {
                     break;
                 }
             }

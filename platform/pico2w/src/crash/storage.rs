@@ -518,7 +518,13 @@ fn write_record_to_flash(
 #[cfg(target_arch = "arm")]
 #[inline]
 fn is_duplicate_crash(new: &super::CrashRecord, prev: &super::CrashRecord) -> bool {
-    new.crash_kind == prev.crash_kind
+    // `git_hash` must be part of the fingerprint: a WatchdogTimeout carries no
+    // arm_pc/cfsr/panic info (all zero), so without this every watchdog hang
+    // looks identical and dedups against the first one ever recorded — even one
+    // from a *different firmware build*. That silently suppressed real new-build
+    // crashes (e.g. the WiFi-portal hang) behind a stale old-build record.
+    new.git_hash == prev.git_hash
+        && new.crash_kind == prev.crash_kind
         && new.flags == prev.flags
         && new.arm_pc == prev.arm_pc
         && new.arm_cfsr == prev.arm_cfsr

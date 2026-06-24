@@ -13,6 +13,14 @@ use rustyboy_pico2w::wifi::portal::PORTAL_RESULT;
 use super::settings::SettingsState;
 use crate::{App, AppState};
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Boot-scoped guard: the portal tasks own the WiFi peripherals once spawned and
+/// run until reboot, so `start_portal` must run at most once per boot. Re-entering
+/// the portal screen (or creating a fresh instance) reuses the running tasks
+/// instead of trying to consume the (already-taken) peripherals again.
+static PORTAL_STARTED: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Top-level enum
 // ---------------------------------------------------------------------------
@@ -214,9 +222,14 @@ impl WifiPortalScreen {
     ) {
         // Spawn portal tasks on the first tick so we have the spawner available
         // from App.
+        // Spawn portal tasks once per boot. A fresh portal-screen instance
+        // (re-entry after backing out) reuses the already-running tasks rather
+        // than re-consuming the WiFi peripherals, which would fail.
         if !self.tasks_started {
             self.tasks_started = true;
-            self.start_portal(app).await;
+            if !PORTAL_STARTED.swap(true, Ordering::AcqRel) {
+                self.start_portal(app).await;
+            }
         }
 
         Timer::after(Duration::from_millis(100)).await;
