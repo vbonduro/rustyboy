@@ -6,6 +6,9 @@ mod running;
 mod settings;
 mod wifi_menu;
 
+const MENU_POLL_MS: u64 = 4;
+const PORTAL_POLL_MS: u64 = 16;
+
 pub use in_game_menu::InGameMenuState;
 pub use loading::LoadingState;
 pub use main_menu::MainMenuState;

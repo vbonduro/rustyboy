@@ -19,30 +19,40 @@ use mipidsi::Builder;
 
 use static_cell::ConstStaticCell;
 
+use super::eg_target::{FbTarget, FB_PIXELS};
+use super::ui::Ui;
 use super::{
-    loading_bar_window, menu_item_text_window, menu_item_window, render_loading_row,
-    render_menu_row, scale_native_to_rgb565_range, Display, LoadingFrame, LoadingProgress,
-    NativeFrame, RenderWindow, ScaledFrame, SCALED_FRAME_PIXELS,
+    scale_native_to_rgb565_range, Display, LoadingFrame, LoadingProgress, NativeFrame,
+    RenderWindow, ScaledFrame,
 };
 use crate::menu::MenuFrame;
 
 // ---------------------------------------------------------------------------
-// Core 0 pre-scale buffer
+// Shared Core 0 pixel buffer
 //
-// `send_frame` scales the dirty row range from the native GB framebuffer (23 KB)
-// into this 101 KB static, then issues a single DMA burst.  Keeping the buffer
-// as a `ConstStaticCell`-backed `&'static mut` field on `GameDisplay` avoids
-// placing 101 KB on the stack or heap and lets the linker pack it into BSS.
+// This single static backs BOTH the game-frame pre-scale buffer (101 KiB, the
+// first SCALED_FRAME_PIXELS elements) AND the ratatui RGB565 framebuffer for
+// menus/loading (150 KiB, full FB_PIXELS elements).
 //
-// `ConstStaticCell` is const-initialized to all-zeros, so the buffer lands in
-// `.bss` with no flash overhead.  `GameDisplay::new_after_splash` calls
-// `.take()` once to claim the exclusive `&'static mut ScaledFrame`; after that
-// `&mut self.scale_buf` in `send_frame` / `send_frame_raw` provides safe,
-// uniquely-owned mutable access — no unsafe required.
+// The two uses are NEVER live simultaneously:
+//   - Game mode: `send_frame` / `send_frame_raw` use the first 101 KiB as a
+//     ScaledFrame.  The Ui object is idle.
+//   - Menu mode: `Ui::render_menu` / `render_loading` use the full 150 KiB as
+//     a native-endian RGB565 framebuffer.  The scale path is not called.
+//
+// Both views use raw `[u16]` storage, so the same backing memory is re-used
+// without relying on `Rgb565` layout.  Game mode stores pre-swapped RGB565 words
+// for zero-copy SPI; menu mode stores native-endian RGB565 words that
+// `FbTarget::read_row_be` exports as panel-order bytes.
+//
+// `ConstStaticCell` zero-initialises into BSS (no flash cost).
 // ---------------------------------------------------------------------------
 
-static CORE0_SCALE_BUF: ConstStaticCell<ScaledFrame> =
-    ConstStaticCell::new([0u16; SCALED_FRAME_PIXELS]);
+/// Total size of the shared buffer (the larger of the two uses).
+const SHARED_BUF_LEN: usize = FB_PIXELS; // 240*320 = 76800 u16s = 153 600 bytes
+
+static CORE0_SHARED_BUF: ConstStaticCell<[u16; SHARED_BUF_LEN]> =
+    ConstStaticCell::new([0u16; SHARED_BUF_LEN]);
 
 // Embassy's RP2350 SPI divider picks the nearest realizable rate at or below
 // the requested frequency. 62.5 MHz is exact at 250 MHz sysclk, but at 280 MHz
@@ -149,10 +159,25 @@ pub struct GameDisplay<'d> {
     dc: Output<'d>,
     _rst: Output<'d>,
     _bl: Output<'d>,
-    /// Exclusively-owned 101 KB scale buffer, backed by the `CORE0_SCALE_BUF`
-    /// BSS static.  Claimed once in `new_after_splash`; accessed via `&mut
-    /// self.scale_buf` in `send_frame` / `send_frame_raw`.
-    scale_buf: &'static mut ScaledFrame,
+    /// Game-frame pre-scale buffer, as a **raw pointer** into the first
+    /// SCALED_FRAME_PIXELS elements of `CORE0_SHARED_BUF`.
+    ///
+    /// Raw (not `&'static mut`) because the same backing memory is shared with
+    /// the ratatui framebuffer in `ui` — holding two overlapping `&'static mut`
+    /// would be instant UB.  `send_frame` / `send_frame_raw` deref this to a
+    /// transient `&mut` that is dropped before they return; menus are never in
+    /// flight at the same time, so only one live borrow of the region ever
+    /// exists.  Idle while menus are active.
+    scale_buf: *mut ScaledFrame,
+    /// ratatui UI layer (terminal + FbTarget framebuffer).
+    ///
+    /// The FbTarget holds a raw pointer into the same `CORE0_SHARED_BUF`
+    /// backing store (the full FB_PIXELS range).  Idle while the game loop is
+    /// running.
+    ui: Ui,
+    /// Last loading-screen filename, retained so `draw_loading_bar` can redraw
+    /// via ratatui without erasing static title/filename text.
+    loading_filename: heapless::String<64>,
     /// Multiplicative hash of the last frame successfully sent to the display.
     ///
     /// Compared against each new frame's hash before deciding whether to
@@ -160,17 +185,6 @@ pub struct GameDisplay<'d> {
     /// the display refreshes its own GRAM with no scan-line race.
     /// Cost: 4 bytes (vs 103 KB for a full shadow copy).
     prev_frame_hash: u32,
-    /// Hash of the last [`MenuFrame`] passed to [`draw_menu`].
-    ///
-    /// Hashed at the struct level (before any rendering) using the same Knuth
-    /// multiplicative step as [`knuth_hash`].  If the incoming frame hashes
-    /// identically to this cached value, `draw_menu` returns immediately
-    /// without rendering or DMA-ing anything — the display already shows the
-    /// correct content.
-    ///
-    /// Zeroed in `draw_letterbox_bars` so the first `draw_menu` call after a
-    /// game session always performs a full repaint.  Cost: 4 bytes.
-    prev_menu_frame_hash: u32,
 }
 
 impl<'d> GameDisplay<'d> {
@@ -219,6 +233,28 @@ impl<'d> GameDisplay<'d> {
         let rst = Output::new(rst_pin, Level::High);
         let bl = Output::new(bl_pin, Level::High);
 
+        // Claim the shared pixel buffer once and derive TWO overlapping raw
+        // pointers that view the same backing memory for two purposes that are
+        // never live simultaneously:
+        //   scale_buf: first SCALED_FRAME_PIXELS elements (game-frame pre-scale)
+        //   fb_buf:    full FB_PIXELS elements (ratatui RGB565 framebuffer)
+        //
+        // SAFETY:
+        //   - `CORE0_SHARED_BUF.take()` yields the sole `&'static mut` to the
+        //     region; we immediately convert it to a base raw pointer and let
+        //     that `&mut` expire on the same line, so no long-lived `&mut`
+        //     covering the region is ever stored (which would be aliasing UB).
+        //   - Both `scale_buf` and `fb_buf` are raw pointers derived from that
+        //     base; each is deref'd to a transient `&mut`/`&` only at the point
+        //     of use (see `send_frame*` and `FbTarget`), and the game-frame and
+        //     menu paths are mutually exclusive, so at most one live borrow of
+        //     the region exists at any instant.
+        let base: *mut u16 = CORE0_SHARED_BUF.take().as_mut_ptr();
+        let scale_buf: *mut ScaledFrame = base as *mut ScaledFrame;
+        let fb_buf: *mut [u16; FB_PIXELS] = base as *mut [u16; FB_PIXELS];
+        let fb_target = FbTarget::new(fb_buf);
+        let ui = Ui::new(fb_target);
+
         info!("display: async SPI re-initialised for game loop");
         Self {
             spi,
@@ -226,9 +262,10 @@ impl<'d> GameDisplay<'d> {
             dc,
             _rst: rst,
             _bl: bl,
-            scale_buf: CORE0_SCALE_BUF.take(),
+            scale_buf,
+            ui,
+            loading_filename: heapless::String::new(),
             prev_frame_hash: 0,
-            prev_menu_frame_hash: 0,
         }
     }
 
@@ -236,17 +273,19 @@ impl<'d> GameDisplay<'d> {
     /// game loop. The bars are never repainted — `send_frame` only touches the
     /// 240×216 game area.
     ///
-    /// Also resets both frame-hash caches:
-    /// - `prev_menu_frame_hash` → 0: next `draw_menu` always does a full repaint.
+    /// Also resets frame-hash caches and drops ratatui's menu buffers:
     /// - `prev_frame_hash` → 0: next `send_frame` always DMA-s the game area,
     ///   even if the native frame content is unchanged.  This is required because
     ///   `draw_menu` paints the entire 240×320 display (including the game area),
     ///   so the game area contains stale menu pixels after the menu closes; without
     ///   this reset, `send_frame` would see a matching hash and skip the DMA,
     ///   leaving menu remnants visible in the game region.
+    /// - `ui.release_terminal()`: frees ratatui's heap-backed cell buffers while
+    ///   the game and save-state load path are active.  The next menu render
+    ///   recreates the terminal and repaints the full screen from scratch.
     pub async fn draw_letterbox_bars(&mut self) {
-        self.prev_menu_frame_hash = 0;
         self.prev_frame_hash = 0; // force game-area DMA on first send_frame after menu
+        self.ui.release_terminal();
         info!("display: drawing letterbox bars");
 
         // Top bar: rows 0..51, colour C3
@@ -317,19 +356,21 @@ impl<'d> GameDisplay<'d> {
         }
         let (sy_start, sy_end) = Self::dirty_display_range(dirty).unwrap_or((0, 216));
         self.commit_frame_hash(hash);
-        // Pre-scale only the dirty row range into the exclusively-owned scale buffer.
-        scale_native_to_rgb565_range(native, self.scale_buf, sy_start, sy_end);
+        // Materialize the scale buffer as a transient `&mut` from the shared raw
+        // pointer.  SAFETY: no menu render is in flight (game and menu paths are
+        // mutually exclusive), so this is the only live `&mut` to the region; it
+        // points into `CORE0_SHARED_BUF`, not into `self`, so it does not alias
+        // the `&mut self.spi` / `&mut self.cs` borrows used below.
+        let scale_buf: &mut ScaledFrame = unsafe { &mut *self.scale_buf };
+        // Pre-scale only the dirty row range into the scale buffer.
+        scale_native_to_rgb565_range(native, scale_buf, sy_start, sy_end);
         // Blocking setup: CASET + RASET + RAMWR (~2 µs).  Completing synchronously
         // here ensures that the pixel-DMA future below is reached and armed within
         // the same `poll_once` call, so the DMA runs during the emulation step.
         self.setup_frame_range(sy_start, sy_end);
-        // Access `self.spi` and `self.cs` directly (not through a `&mut self`
-        // method) so that Rust's field-level borrow splitting allows the shared
-        // borrow of `self.scale_buf` (via `bytes`) and the mutable borrows of
-        // `self.spi` / `self.cs` to coexist.
         let pix_start = sy_start * 240;
         let pix_end = sy_end * 240;
-        let bytes: &[u8] = bytemuck::cast_slice(&self.scale_buf[pix_start..pix_end]);
+        let bytes: &[u8] = bytemuck::cast_slice(&scale_buf[pix_start..pix_end]);
         self.spi.write(bytes).await.ok();
         self.cs.set_high();
     }
@@ -342,85 +383,108 @@ impl<'d> GameDisplay<'d> {
     /// then streams via async pixel DMA; compatible with the `poll_once` /
     /// emulation-overlap pattern.
     pub async fn send_frame_raw(&mut self, native: &NativeFrame) {
-        scale_native_to_rgb565_range(native, self.scale_buf, 0, 216);
+        // SAFETY: see `send_frame` — transient sole `&mut` to the shared region,
+        // disjoint from `self`'s fields.
+        let scale_buf: &mut ScaledFrame = unsafe { &mut *self.scale_buf };
+        scale_native_to_rgb565_range(native, scale_buf, 0, 216);
         self.setup_frame_range(0, 216);
-        // Access fields directly (not via a `&mut self` method) so that the
-        // shared borrow of `self.scale_buf` and the mutable borrows of
-        // `self.spi` / `self.cs` coexist via field-level borrow splitting.
-        let bytes: &[u8] = bytemuck::cast_slice(self.scale_buf.as_ref());
+        let bytes: &[u8] = bytemuck::cast_slice(scale_buf.as_ref());
         self.spi.write(bytes).await.ok();
         self.cs.set_high();
     }
 
     /// Paint the full 240×320 screen with a ROM loading progress screen.
     ///
-    /// Uses a 480-byte stack buffer; no heap allocation.
+    /// Delegates to the ratatui UI layer.  Only the dirty pixel band is
+    /// transferred via async SPI DMA.
     pub async fn draw_loading_progress(&mut self, frame: LoadingFrame<'_>) {
-        self.draw_rendered_rows(RenderWindow::screen(), |y, row| {
-            render_loading_row(&frame, y, row);
-        })
-        .await;
-    }
-
-    /// Repaint only the loading progress bar. The title/filename stay static.
-    pub async fn draw_loading_bar(&mut self, progress: LoadingProgress) {
-        let frame = LoadingFrame::new("", progress, 0);
-        self.draw_rendered_rows(loading_bar_window(), |y, row| {
-            render_loading_row(&frame, y, row);
-        })
-        .await;
-    }
-
-    /// Paint the full 240×320 screen with a menu, row by row.
-    ///
-    /// Hashes the [`MenuFrame`] descriptor **before** rendering.  If the frame
-    /// is identical to the previously rendered one (same title, items, selected
-    /// cursor, enabled mask, marked slot, and crash badge state), the function
-    /// returns immediately without issuing any DMA — the display already shows
-    /// the correct content.
-    ///
-    /// The skip is transparent to all callers; no state-machine code needs to
-    /// change.  The cached hash is reset in `draw_letterbox_bars` so the first
-    /// `draw_menu` call after a game session always performs a full repaint.
-    ///
-    /// Uses a 480-byte stack buffer; no heap allocation.
-    pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
-        let hash = Self::hash_menu_frame(frame);
-        if hash == self.prev_menu_frame_hash {
-            return; // identical frame — display already shows this content
+        self.remember_loading_filename(frame.filename);
+        if let Some(window) = self.ui.render_loading(&frame) {
+            self.flush_fb_window(window).await;
         }
-        self.prev_menu_frame_hash = hash;
-        self.draw_rendered_rows(RenderWindow::screen(), |y, row| {
-            render_menu_row(frame, y, row);
-        })
-        .await;
     }
 
-    /// Repaint a single menu item row. Used by marquee animation to avoid
-    /// full-screen refresh jitter while the rest of the ROM menu is static.
-    pub async fn draw_menu_item(&mut self, frame: &MenuFrame<'_>, slot: usize) {
-        let Some(window) = menu_item_window(slot) else {
-            return;
+    /// Repaint only the loading progress bar.
+    ///
+    /// With ratatui cell-diffing this is equivalent to a full `draw_loading_progress`:
+    /// the terminal only emits changed cells, and only those rows land in the dirty band.
+    pub async fn draw_loading_bar(&mut self, progress: LoadingProgress) {
+        let window = {
+            let frame = LoadingFrame::new(self.loading_filename.as_str(), progress, 0);
+            self.ui.render_loading(&frame)
         };
-
-        self.draw_rendered_rows(window, |y, row| {
-            render_menu_row(frame, y, row);
-        })
-        .await;
+        if let Some(window) = window {
+            self.flush_fb_window(window).await;
+        }
     }
 
-    /// Repaint only the text window inside a menu item. This keeps marquee
-    /// animation from touching static rows, cursor, or loaded marker pixels.
-    pub async fn draw_menu_item_text(&mut self, frame: &MenuFrame<'_>, slot: usize) {
-        let marked = frame.marked == Some(slot);
-        let Some(window) = menu_item_text_window(slot, marked) else {
-            return;
-        };
+    /// Paint the menu, or just the changed cells if nothing moved.
+    ///
+    /// ratatui's persistent terminal diffs the current frame against the
+    /// previous one and only emits changed cells to the DrawTarget.  On
+    /// steady-state (no cursor move, no marquee) the dirty band is empty and
+    /// the function returns without issuing any DMA.
+    ///
+    /// After a game session `draw_letterbox_bars` drops the terminal buffers;
+    /// the next menu render recreates them, so the first `draw_menu` call
+    /// repaints the full screen.
+    pub async fn draw_menu(&mut self, frame: &MenuFrame<'_>) {
+        if let Some(window) = self.ui.render_menu(frame) {
+            self.flush_fb_window(window).await;
+        }
+    }
 
-        self.draw_rendered_rows(window, |y, row| {
-            render_menu_row(frame, y, row);
-        })
-        .await;
+    /// Repaint a single menu item row.
+    ///
+    /// With ratatui cell-diffing, this is now a thin wrapper over `draw_menu`:
+    /// the terminal only re-emits the cells that changed.  The `slot` parameter
+    /// is accepted for API compatibility but is not used to restrict the render
+    /// area — ratatui's diff is the efficient gate.
+    pub async fn draw_menu_item(&mut self, frame: &MenuFrame<'_>, _slot: usize) {
+        if let Some(window) = self.ui.render_menu(frame) {
+            self.flush_fb_window(window).await;
+        }
+    }
+
+    /// Repaint only the text area of a menu item.
+    ///
+    /// Thin wrapper over `draw_menu` — ratatui's cell diff naturally restricts
+    /// the dirty band to the cells that changed (typically one row of text).
+    pub async fn draw_menu_item_text(&mut self, frame: &MenuFrame<'_>, _slot: usize) {
+        if let Some(window) = self.ui.render_menu(frame) {
+            self.flush_fb_window(window).await;
+        }
+    }
+
+    // --- Framebuffer flush helper ---
+
+    /// DMA the rows in `window` from the ratatui Rgb565 framebuffer to the panel.
+    ///
+    /// Reads each row from `FbTarget` (via `Ui`) as big-endian bytes (480 bytes
+    /// per row) then streams via async SPI.  The same CASET/RASET/RAMWR setup
+    /// covers the entire band; the ILI9341 auto-increments its write pointer.
+    ///
+    /// Each row is read into a 480-byte stack buffer before the `.await` so that
+    /// the borrow of `self.ui` is released before `self.spi` is borrowed.
+    async fn flush_fb_window(&mut self, window: RenderWindow) {
+        if window.is_empty() {
+            return;
+        }
+        self.set_window(window);
+        self.write_command(0x2C, &[]);
+        self.dc.set_high();
+        self.cs.set_low();
+
+        let mut row_buf = [0u8; ROW_BYTES];
+        for y in window.y_start..window.y_end {
+            // Read row into local buffer (borrows self.ui, released before await).
+            self.ui
+                .terminal_backend_display_mut()
+                .read_row_be(y, &mut row_buf);
+            // Borrow of self.ui is now released; we can borrow self.spi.
+            self.spi.write(&row_buf).await.ok();
+        }
+        self.cs.set_high();
     }
 
     // --- differential DMA helpers ---
@@ -523,51 +587,13 @@ impl<'d> GameDisplay<'d> {
         self.prev_frame_hash = hash;
     }
 
-    /// Compute a fast hash of a [`MenuFrame`] descriptor.
-    ///
-    /// Hashes each field that affects rendering: title text, item strings,
-    /// cursor position (`selected`), animation counter (`marquee_frame`),
-    /// enabled mask, marked slot, and crash badge flag.
-    ///
-    /// Feeds each field's bytes through [`knuth_hash`], mixing the results
-    /// together with the same Knuth multiplicative step.  The result is
-    /// non-zero as long as any field contains non-zero bytes (seeded from
-    /// `knuth_hash`'s `0xdead_beef` seed), keeping 0 safe as the
-    /// "never-rendered" / "invalidated" sentinel stored in
-    /// `prev_menu_frame_hash`.
-    fn hash_menu_frame(frame: &MenuFrame<'_>) -> u32 {
-        const M: u32 = 0x9e37_79b9;
-        // Start from the title bytes.
-        let mut h = Self::knuth_hash(frame.title.as_bytes());
-        // Mix in each item string.
-        for item in frame.items {
-            h ^= Self::knuth_hash(item.as_bytes());
-            h = h.wrapping_mul(M);
-            h ^= h >> 16;
+    fn remember_loading_filename(&mut self, filename: &str) {
+        self.loading_filename.clear();
+        for ch in filename.chars() {
+            if self.loading_filename.push(ch).is_err() {
+                break;
+            }
         }
-        // Mix in selected cursor index.
-        h ^= frame.selected as u32;
-        h = h.wrapping_mul(M);
-        h ^= h >> 16;
-        // Mix in marquee animation counter.
-        h ^= frame.marquee_frame;
-        h = h.wrapping_mul(M);
-        h ^= h >> 16;
-        // Mix in the enabled-flag bitmask (one bool per item).
-        for &enabled in frame.enabled {
-            h ^= enabled as u32;
-            h = h.wrapping_mul(M);
-            h ^= h >> 16;
-        }
-        // Mix in the "currently loaded" marker (None → 0, Some(n) → n+1).
-        h ^= frame.marked.map_or(0u32, |n| n as u32 + 1);
-        h = h.wrapping_mul(M);
-        h ^= h >> 16;
-        // Mix in crash-badge flag.
-        h ^= frame.crash_pending as u32;
-        h = h.wrapping_mul(M);
-        h ^= h >> 16;
-        h
     }
 
     // --- helpers ---
@@ -659,37 +685,6 @@ impl<'d> GameDisplay<'d> {
 
     /// Render and DMA all rows in `window`.
     ///
-    /// For each row, calls `render_row(y, &mut row_buf)` to fill a 480-byte
-    /// pixel buffer, then streams the window's x-column slice to the display
-    /// via async SPI DMA.  A single CASET/RASET/RAMWR setup covers the entire
-    /// window; the ILI9341 auto-increments its write pointer across rows.
-    ///
-    /// Frame-level deduplication (whole-menu skip when nothing changed) is
-    /// handled by the callers — see [`draw_menu`].  This function always
-    /// renders and transfers every row it is given.
-    async fn draw_rendered_rows<F>(&mut self, window: RenderWindow, mut render_row: F)
-    where
-        F: FnMut(u16, &mut [u8; ROW_BYTES]),
-    {
-        if window.is_empty() {
-            return;
-        }
-
-        self.set_window(window);
-        self.write_command(0x2C, &[]);
-        self.dc.set_high();
-        self.cs.set_low();
-
-        let mut row = [0u8; ROW_BYTES];
-        let byte_range = window.byte_range();
-        for y in window.y_start..window.y_end {
-            render_row(y, &mut row);
-            self.spi.write(&row[byte_range.clone()]).await.ok();
-        }
-
-        self.cs.set_high();
-    }
-
     async fn fill_rect_raw(&mut self, n_pixels: usize, pixel_be: &[u8; 2]) {
         // Send 240 pixels (480 bytes) per row to keep the stack usage bounded.
         let mut row = [0u8; ROW_BYTES];

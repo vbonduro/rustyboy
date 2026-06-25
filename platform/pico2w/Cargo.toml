@@ -2,6 +2,7 @@
 name = "rustyboy-pico2w"
 version = "0.1.0"
 edition = "2021"
+default-run = "rustyboy-pico2w"
 
 [lib]
 name = "rustyboy_pico2w"
@@ -11,6 +12,12 @@ path = "src/lib.rs"
 name = "rustyboy-pico2w"
 path = "src/main.rs"
 required-features = ["firmware-bin"]
+test = false
+
+[[bin]]
+name = "menu-preview"
+path = "src/bin/menu_preview.rs"
+required-features = ["std"]
 test = false
 
 [features]
@@ -42,6 +49,7 @@ embedded-graphics = "0.8"
 [target.'cfg(not(target_arch = "arm"))'.dependencies]
 png = "0.17"
 heapless = { version = "0.9", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["portable-atomic"] }
 
 # ---------------------------------------------------------------------------
 # Embedded (ARM bare-metal) only — excluded from host test builds
@@ -103,3 +111,5 @@ embassy-net = { git = "https://github.com/embassy-rs/embassy", features = [
     "defmt", "tcp", "udp", "dhcpv4", "medium-ethernet",
 ] }
 embedded-io-async = { version = "0.7" }
+mousefood = { version = "0.5", default-features = false }
+ratatui = { version = "0.30", default-features = false, features = ["portable-atomic"] }

@@ -14,15 +14,31 @@ pub mod fb;
 pub mod font;
 #[cfg(target_arch = "arm")]
 pub mod hw;
-mod loading;
-mod menu;
+// ---------------------------------------------------------------------------
+// ratatui / mousefood UI layer
+// ---------------------------------------------------------------------------
+// eg_target is used by the ARM firmware and is host-compiled for framebuffer
+// adapter tests.
+pub mod eg_target;
+// ui.rs compiles on both ARM and host; ARM-specific parts are gated inside.
+pub mod ui;
+// `loading` is retained for the `LoadingFrame` / `LoadingProgress` descriptor
+// types consumed by the ratatui `ui` layer; `menu` / `text` are retained only
+// for host-side pixel tests. The firmware renders through `ui`, so the old
+// `render_*_row` paths are dead on ARM. TODO: relocate the descriptor types and
+// delete the dead renderers (`text`, `font`, `render_*_row`).
+pub mod loading;
+pub mod menu;
 mod text;
 
 pub use loading::{loading_bar_window, render_loading_row, LoadingFrame, LoadingProgress};
-pub use menu::{
-    menu_item_needs_marquee, menu_item_text_window, menu_item_window, render_menu_row,
-    MENU_MARQUEE_REDRAW_FRAMES,
-};
+pub use menu::{menu_item_text_window, menu_item_window, render_menu_row};
+
+// `menu_item_needs_marquee` and `MENU_MARQUEE_REDRAW_FRAMES` come from the
+// ratatui ui module on both ARM and host (column-based logic).
+// The old pixel-based versions in menu.rs are kept for host test coverage only
+// and remain accessible as `display::menu::menu_item_needs_marquee` etc.
+pub use ui::{menu_item_needs_marquee, MENU_MARQUEE_REDRAW_FRAMES};
 
 use core::ops::Range;
 use embedded_graphics::draw_target::DrawTarget;

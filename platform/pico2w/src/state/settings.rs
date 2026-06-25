@@ -6,7 +6,7 @@ use rustyboy_pico2w::flash_rom::OnboardFlash;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{MenuEffect, MenuInput, MenuLogic, SettingsMenu};
 
-use super::main_menu::MainMenuState;
+use super::{main_menu::MainMenuState, MENU_POLL_MS};
 use crate::{App, AppState};
 
 use super::wifi_menu::WifiMenuState;
@@ -31,7 +31,7 @@ impl SettingsState {
         input: &mut InputHandler<'static>,
         #[allow(unused_variables)] flash: &mut OnboardFlash<'_>,
     ) {
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(MENU_POLL_MS)).await;
 
         let (current_buttons, _) = input.poll();
         let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);

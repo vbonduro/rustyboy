@@ -3,7 +3,7 @@ use rustyboy_pico2w::display::hw::GameDisplay;
 use rustyboy_pico2w::input::InputHandler;
 use rustyboy_pico2w::menu::{MainMenu, MenuEffect, MenuInput, MenuLogic};
 
-use super::{RomListState, RunningState, SettingsState};
+use super::{RomListState, RunningState, SettingsState, MENU_POLL_MS};
 use crate::{App, AppState, PicoSdMgr};
 
 pub struct MainMenuState {
@@ -26,7 +26,7 @@ impl MainMenuState {
         input: &mut InputHandler<'static>,
         sd_mgr: &mut PicoSdMgr,
     ) {
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(MENU_POLL_MS)).await;
 
         let (current_buttons, _) = input.poll();
         let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);
