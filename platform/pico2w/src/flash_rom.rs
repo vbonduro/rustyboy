@@ -8,7 +8,9 @@ use rustyboy_core::memory::RomReader;
 use rustyboy_core::storage::{RomHasher, RomId};
 
 pub const FLASH_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
-pub const FIRMWARE_SLOT_BYTES: usize = 512 * 1024;
+/// Firmware image slot size.  Must match the `FLASH LENGTH` in `memory.x`.
+/// Expanded from 512 KiB to 640 KiB to accommodate ratatui/mousefood UI layer.
+pub const FIRMWARE_SLOT_BYTES: usize = 640 * 1024;
 pub const ROM_METADATA_BYTES: usize = ERASE_SIZE;
 pub const ROM_SLOT_OFFSET: usize = FIRMWARE_SLOT_BYTES;
 pub const ROM_DATA_OFFSET: usize = ROM_SLOT_OFFSET + ROM_METADATA_BYTES;

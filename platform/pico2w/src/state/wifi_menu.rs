@@ -10,7 +10,7 @@ use rustyboy_pico2w::menu::{MenuFrame, MenuInput};
 use rustyboy_pico2w::wifi::config::WifiConfig;
 use rustyboy_pico2w::wifi::portal::PORTAL_RESULT;
 
-use super::settings::SettingsState;
+use super::{settings::SettingsState, MENU_POLL_MS, PORTAL_POLL_MS};
 use crate::{App, AppState};
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -79,19 +79,16 @@ impl WifiMenuConfigured {
         app: &App,
         ssid: heapless::String<32>,
     ) -> Self {
-        let state = Self { ssid, selected: 0 };
+        let state = Self { ssid, selected: 1 };
         state.draw(game_disp, app).await;
         state
     }
 
     async fn draw(&self, game_disp: &mut GameDisplay<'static>, app: &App) {
-        // Build the SSID display string "SSID: <name>".  The menu item area only
-        // fits 13 chars (CHAR_W 8 * SCALE 2 = 16 px / glyph); "SSID: " eats 6, so
-        // the name is truncated to 7 chars (with a trailing '.' when cut) to keep
-        // the whole line on screen instead of being clipped mid-glyph.
+        // Keep the display-only SSID row inside the centered 34-column text area.
         let mut ssid_label = heapless::String::<40>::new();
         let _ = ssid_label.push_str("SSID: ");
-        const SSID_MAX: usize = 7;
+        const SSID_MAX: usize = 27;
         let name = self.ssid.as_str();
         let cut = name
             .char_indices()
@@ -124,7 +121,7 @@ impl WifiMenuConfigured {
         input: &mut InputHandler<'static>,
         flash: &mut OnboardFlash<'_>,
     ) {
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(MENU_POLL_MS)).await;
 
         let (current_buttons, _) = input.poll();
         let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);
@@ -140,14 +137,7 @@ impl WifiMenuConfigured {
             return;
         }
 
-        if menu_input.up && self.selected > 0 {
-            self.selected -= 1;
-            self.draw(game_disp, app).await;
-            return;
-        }
-        if menu_input.down && self.selected < 1 {
-            self.selected += 1;
-            self.draw(game_disp, app).await;
+        if menu_input.up || menu_input.down {
             return;
         }
 
@@ -187,20 +177,8 @@ impl WifiPortalScreen {
     }
 
     async fn draw(&self, game_disp: &mut GameDisplay<'static>, app: &App) {
-        // Custom info screen drawn as a menu with non-selectable text items.
-        // The menu text window is only 13 chars wide (CHAR_W 8 * SCALE 2 = 16 px
-        // per glyph across the 208 px item area), so every line must stay <= 13
-        // chars or render_menu_row truncates it — which previously clipped the
-        // instructions and dropped the last digit of the IP address.
-        let items: [&str; 6] = [
-            "",
-            "Join WiFi:",
-            " RustyBoy",
-            "Then visit:",
-            " 192.168.4.1",
-            "",
-        ];
-        let enabled = [false; 6];
+        let items: [&str; 4] = ["JOIN WIFI", "RustyBoy", "OPEN", "192.168.4.1"];
+        let enabled = [true; 4];
         let frame = MenuFrame {
             title: "WIFI SETUP",
             items: &items,
@@ -232,7 +210,7 @@ impl WifiPortalScreen {
             }
         }
 
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(PORTAL_POLL_MS)).await;
 
         let (current_buttons, _) = input.poll();
         let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);

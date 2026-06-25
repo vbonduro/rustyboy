@@ -8,7 +8,7 @@ use rustyboy_pico2w::menu::{
 };
 use rustyboy_pico2w::sd::RomListEntry;
 
-use super::{LoadingState, MainMenuState};
+use super::{LoadingState, MainMenuState, MENU_POLL_MS};
 use crate::{App, AppState, PicoSdMgr};
 
 const ROM_PAGE_SIZE: usize = 7;
@@ -175,7 +175,7 @@ impl RomListState {
         input: &mut InputHandler<'static>,
         sd_mgr: &mut PicoSdMgr,
     ) {
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(MENU_POLL_MS)).await;
 
         let menu_input = poll_menu_input(app, input);
         if !menu_input.any() {

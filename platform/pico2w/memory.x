@@ -5,9 +5,13 @@
  * RAM:   512KB striped across SRAM0-SRAM7 (8 × 64KB banks, best for general use)
  *        SRAM8/SRAM9: 4KB direct-mapped banks (dedicated use, e.g. per-core stacks)
  *
- * NOTE: the first 512 KiB of flash are reserved for the firmware image.
+ * NOTE: the first 640 KiB of flash are reserved for the firmware image.
  * The remaining flash is available to runtime-managed data (currently a staged
  * ROM slot).
+ *
+ * Flash budget was expanded from 512K to 640K to accommodate ratatui/mousefood
+ * UI layer added in the mousefood migration (adds ~82 KiB to .text/.rodata).
+ * The firmware slot constant in flash_rom.rs was updated to match.
  *
  * Bead 1 uses a single-app layout (no bootloader).
  * Bead 8 (OTA) will restructure this into dual-bank partitions
@@ -17,7 +21,7 @@
  *   APP_B      : ORIGIN = 0x10200000, LENGTH = ~2M   <- OTA staging slot
  */
 MEMORY {
-    FLASH       : ORIGIN = 0x10000000, LENGTH = 512K
+    FLASH       : ORIGIN = 0x10000000, LENGTH = 640K
     RAM         : ORIGIN = 0x20000000, LENGTH = 512K
     CORE1_STACK : ORIGIN = 0x20080000, LENGTH = 8K
 }

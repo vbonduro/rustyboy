@@ -7,7 +7,7 @@ use rustyboy_pico2w::menu::{InGameMenu, MenuEffect, MenuInput, MenuLogic};
 use rustyboy_pico2w::multicore::PicoGameBoy;
 use rustyboy_pico2w::save_storage::SaveSlot;
 
-use super::{MainMenuState, RunningState};
+use super::{MainMenuState, RunningState, MENU_POLL_MS};
 use crate::{flush_battery_save, App, AppState, PicoSdMgr};
 
 pub struct InGameMenuState {
@@ -31,7 +31,7 @@ impl InGameMenuState {
         input: &mut InputHandler<'static>,
         sd_mgr: &mut PicoSdMgr,
     ) {
-        Timer::after(Duration::from_millis(33)).await;
+        Timer::after(Duration::from_millis(MENU_POLL_MS)).await;
 
         let (current_buttons, _) = input.poll();
         let menu_input = MenuInput::from_diff(app.previous_buttons, current_buttons);

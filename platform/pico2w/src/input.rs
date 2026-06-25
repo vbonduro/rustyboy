@@ -18,7 +18,7 @@ use embassy_time::Instant;
 use rustyboy_core::cpu::peripheral::joypad::Button;
 
 /// Debounce window in milliseconds.
-const DEBOUNCE_MS: u64 = 10;
+const DEBOUNCE_MS: u64 = 5;
 /// How long Start+Select must be held together to trigger the menu combo.
 const MENU_HOLD_MS: u64 = 1_000;
 
@@ -354,10 +354,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Raw changes at t=0, stable at t=5 — not yet past 10 ms window
+        // Raw changes at t=0, stable at t=4 — not yet past the 5 ms window.
         state.update(pressed, 0);
-        let (deb, _) = state.update(pressed, 5);
-        assert!(!deb.a, "should not be debounced yet at 5 ms");
+        let (deb, _) = state.update(pressed, 4);
+        assert!(!deb.a, "should not be debounced yet at 4 ms");
     }
 
     #[test]
@@ -369,8 +369,8 @@ mod tests {
         };
 
         state.update(pressed, 0);
-        let (deb, _) = state.update(pressed, 10);
-        assert!(deb.a, "should be debounced after 10 ms");
+        let (deb, _) = state.update(pressed, 5);
+        assert!(deb.a, "should be debounced after 5 ms");
     }
 
     #[test]
