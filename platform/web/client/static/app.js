@@ -4,7 +4,9 @@
  * Loads rustyboy_wasm via wasm-bindgen --target web.
  */
 
-import init, { EmulatorHandle } from '/static/rustyboy_web_client.js';
+import init, { EmulatorHandle, WasmMenuRenderer } from '/static/rustyboy_web_client.js?v=gemini-title-bg-crisp-csp-20260627';
+
+const WASM_URL = '/static/rustyboy_web_client_bg.wasm?v=gemini-title-bg-crisp-csp-20260627';
 
 class Logger {
   #tag;
@@ -312,7 +314,8 @@ const screenBezel = screenInner.parentElement;
 
 async function boot() {
   try {
-    state.wasm = await init();
+    state.wasm = await init(WASM_URL);
+    window.RustyBoyWasmMenuRenderer = WasmMenuRenderer;
   } catch (err) {
     showError('WASM LOAD FAILED');
     log.error(err);
@@ -494,12 +497,10 @@ async function showMainMenu() {
   log.event('showMainMenu');
   menuOverlay.classList.add('hidden');
 
-  const hasSaves = state.user ? await fetchHasSaves() : false;
-
-  const items = [];
-  if (hasSaves) items.push({ label: 'CONTINUE', value: 'continue' });
-  items.push({ label: 'GAMES',  value: 'games' });
-  items.push({ label: 'LOGOUT', value: 'logout' });
+  const items = [
+    { label: 'CONTINUE', value: 'continue' },
+    { label: 'GAMES',    value: 'games' },
+  ];
 
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
@@ -515,13 +516,14 @@ async function showMainMenu() {
         await continueLatestSave();
       } else if (item.value === 'games') {
         showRomList();
-      } else if (item.value === 'logout') {
-        fetch('/auth/logout', { method: 'POST' }).finally(() => {
-          window.location.href = '/?logged_out=1';
-        });
       }
     },
     onBack: () => { showMainMenu(); }, // B on main menu → stay on main menu
+    onSelectBtn: () => {
+      fetch('/auth/logout', { method: 'POST' }).finally(() => {
+        window.location.href = '/?logged_out=1';
+      });
+    },
   });
 }
 
@@ -1044,7 +1046,11 @@ function bindButtons() {
 
     el.addEventListener('pointerdown', (e) => {
       e.preventDefault();
-      el.setPointerCapture(e.pointerId);
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch (_) {
+        // Synthetic PointerEvents in tests may not be active pointers.
+      }
       el.classList.add('pressed');
       held = true;
       sendButton(idx, true);

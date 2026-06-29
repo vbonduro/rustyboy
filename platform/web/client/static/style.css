@@ -4,8 +4,6 @@
    Mobile-first, tuned for iPhone 14+ viewport
    ============================================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Nunito:wght@400;700&display=swap');
-
 /* ── Reset & base ─────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -41,8 +39,18 @@
   --btn-mid-hi:      #B4B2AC;
   --btn-mid-shadow:  #6A6860;
 
-  --gb-w: min(370px, 92vw, 54vh);
+  --screen-scale: 2;
+  --screen-w: calc(160px * var(--screen-scale));
+  --screen-h: calc(144px * var(--screen-scale));
+  --screen-shell-extra-w: 76px;
+  --gb-w: calc(var(--screen-w) + var(--screen-shell-extra-w));
   --pixel: 'Press Start 2P', monospace;
+}
+
+@media (max-width: 395px) {
+  :root {
+    --gb-w: 92vw;
+  }
 }
 
 html {
@@ -285,11 +293,20 @@ body {
 
 .screen-inner {
   position: relative;
-  width: 100%;
-  aspect-ratio: 160 / 144;
+  width: var(--screen-w);
+  height: var(--screen-h);
+  margin: 0 auto;
   background: var(--screen-bg);
   border-radius: 1px;
   overflow: hidden;
+}
+
+@media (max-width: 395px) {
+  .screen-inner {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 160 / 144;
+  }
 }
 
 #gameCanvas {
@@ -666,10 +683,9 @@ button:focus-visible {
 
 /* ── Responsive ───────────────────────────────────────── */
 @media (min-width: 430px) {
-  :root { --gb-w: min(420px, 88vw, 56vh); }
+  :root { --gb-w: calc(var(--screen-w) + var(--screen-shell-extra-w)); }
 }
 @media (min-width: 600px) {
-  :root { --gb-w: min(420px, 60vh); }
   .scene { padding: 20px 0; }
 }
 

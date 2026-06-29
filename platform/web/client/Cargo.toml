@@ -11,5 +11,7 @@ debug-overlay = []
 
 [dependencies]
 rustyboy-core = { path = "../../../core" }
+font8x8 = "0.3"
+js-sys = "0.3"
+ratatui = { version = "0.30", default-features = false }
 wasm-bindgen = "0.2"
-
