@@ -1,5 +1,10 @@
 use wasm_bindgen::prelude::*;
 
+mod landscape_bg;
+mod web_menu;
+
+pub use web_menu::WasmMenuRenderer;
+
 use rustyboy_core::{
     cpu::{
         peripheral::joypad::Button,

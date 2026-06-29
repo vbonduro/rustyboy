@@ -47,8 +47,13 @@
       this._marqueePhase   = 'pause'; // 'pause' | 'scroll'
       this._marqueePhaseAt = 0;      // timestamp when current phase started
       this._marqueeRafId    = null;
+      this._animationRafId  = null;
       this._marqueeOverflow = 0;     // how many px the title overflows the header
       this._marqueeScrollMax = 0;    // total px to scroll before reset (title fully off-screen)
+      this._wasm = null;             // WasmMenuRenderer, when app.js has exposed it
+      this._offscreenCanvas = null;
+      this._offscreenCtx = null;
+      this._imageData = null;
     }
 
     // Compute the scale factor from the canvas's current physical buffer size.
@@ -73,18 +78,28 @@
       this._marqueePhaseAt = performance.now();
       this._active         = true;
       this._scaleCanvas();
+      this._initWasmRenderer(options);
       // Measure title overflow (needs font set first, using logical scale)
       this._ctx.save();
       this._ctx.scale(this._scale, this._scale);
       this._ctx.font = 'bold 8px monospace';
-      const titleW = this._ctx.measureText(options.title || '').width;
+      const titleW = this._wasm
+        ? this._wasm.title_width_px()
+        : this._ctx.measureText(options.title || '').width;
       this._ctx.restore();
       const available = W - TEXT_PAD * 2;
       this._marqueeOverflow  = Math.max(0, Math.ceil(titleW - available));
       this._marqueeScrollMax = Math.ceil(TEXT_PAD + titleW); // scroll until fully off-screen
       this.render();
       this._attachTouchListeners();
-      if (this._marqueeOverflow > 0) this._startMarquee();
+      // wasm menus render on a continuous time-driven loop so the title and the
+      // selected long name can scroll horizontally; the DOM fallback uses the
+      // JS title marquee.
+      if (this._wasm) {
+        this._startAnimation();
+      } else if (this._marqueeOverflow > 0) {
+        this._startMarquee();
+      }
     }
 
     hide() {
@@ -92,6 +107,9 @@
       this._opts   = null;
       this._detachTouchListeners();
       this._stopMarquee();
+      this._stopAnimation();
+      if (this._wasm && typeof this._wasm.free === 'function') this._wasm.free();
+      this._wasm = null;
       this._restoreCanvas();
     }
 
@@ -106,6 +124,13 @@
       switch (key) {
         case 'ArrowUp':
         case 'w':
+          if (this._wasm) {
+            this._syncPublicStateToWasm();
+            this._wasm.move_selection(-1);
+            this._syncFromWasm();
+            this.render();
+            break;
+          }
           this._selIdx = (this._selIdx - 1 + items.length) % items.length;
           this._clampScroll();
           this.render();
@@ -113,6 +138,13 @@
 
         case 'ArrowDown':
         case 's':
+          if (this._wasm) {
+            this._syncPublicStateToWasm();
+            this._wasm.move_selection(1);
+            this._syncFromWasm();
+            this.render();
+            break;
+          }
           this._selIdx = (this._selIdx + 1) % items.length;
           this._clampScroll();
           this.render();
@@ -120,6 +152,8 @@
 
         case 'Enter':
         case 'a':
+          this._syncPublicStateToWasm();
+          this._syncFromWasm();
           if (items.length > 0 && this._opts.onSelect) {
             const item = items[this._selIdx];
             const cb = this._opts.onSelect;
@@ -130,6 +164,8 @@
 
         case 'Escape':
         case 'b':
+          this._syncPublicStateToWasm();
+          this._syncFromWasm();
           if (this._opts.onBack) {
             const selIdx = this._selIdx;
             const cb = this._opts.onBack;
@@ -141,6 +177,8 @@
           break;
 
         case 'Select':
+          this._syncPublicStateToWasm();
+          this._syncFromWasm();
           if (this._opts.onSelectBtn) {
             const selIdx = this._selIdx;
             const cb = this._opts.onSelectBtn;
@@ -154,6 +192,21 @@
     handleTap(x, y) {
       if (!this._active || !this._opts) return;
       const items = this._opts.items || [];
+
+      if (this._wasm) {
+        this._syncPublicStateToWasm();
+        const itemIdx = this._wasm.item_at(x, y);
+        if (itemIdx < 0 || itemIdx >= items.length) return;
+        this._wasm.set_selected(itemIdx);
+        this._syncFromWasm();
+        if (this._opts.onSelect) {
+          const item = items[itemIdx];
+          const cb = this._opts.onSelect;
+          this.hide();
+          cb(item);
+        }
+        return;
+      }
 
       // Check if tap is in the list area
       if (y < LIST_TOP || y > LIST_BOTTOM) return;
@@ -172,6 +225,10 @@
 
     render() {
       if (!this._active || !this._opts) return;
+      if (this._wasm) {
+        this._renderWasm();
+        return;
+      }
       const ctx  = this._ctx;
       const items = this._opts.items || [];
 
@@ -258,6 +315,53 @@
 
     // ── Private ─────────────────────────────────────────────────────────────
 
+    _initWasmRenderer(options) {
+      const Ctor = window.RustyBoyWasmMenuRenderer;
+      if (typeof Ctor !== 'function') return;
+
+      try {
+        this._wasm = new Ctor();
+        const labels = (options.items || []).map(item => String(item.label || ''));
+        const footer = options.footer || '\u25b2\u25bc MOVE  A SELECT  B BACK';
+        this._wasm.show(String(options.title || ''), labels, String(footer));
+        this._syncFromWasm();
+
+        this._offscreenCanvas = document.createElement('canvas');
+        this._offscreenCanvas.width = W;
+        this._offscreenCanvas.height = H;
+        this._offscreenCtx = this._offscreenCanvas.getContext('2d');
+        this._imageData = this._offscreenCtx.createImageData(W, H);
+      } catch (err) {
+        console.warn('[rustyboy:menu] WASM menu renderer unavailable, falling back to JS canvas menu', err);
+        this._wasm = null;
+      }
+    }
+
+    _syncPublicStateToWasm() {
+      if (!this._wasm) return;
+      const items = (this._opts && this._opts.items) || [];
+      if (items.length === 0) return;
+      const idx = Number.isFinite(this._selIdx) ? this._selIdx : 0;
+      this._wasm.set_selected(Math.max(0, Math.min(idx, items.length - 1)));
+    }
+
+    _syncFromWasm() {
+      if (!this._wasm) return;
+      this._selIdx = this._wasm.selected_index();
+      this._scrollY = this._wasm.scroll_y();
+    }
+
+    _renderWasm() {
+      const frameArg = performance.now();
+      const rgba = this._wasm.render_rgba(frameArg);
+      this._imageData.data.set(rgba);
+      this._offscreenCtx.putImageData(this._imageData, 0, 0);
+      const ctx = this._ctx;
+      ctx.imageSmoothingEnabled = false;
+      ctx.clearRect(0, 0, this._canvas.width, this._canvas.height);
+      ctx.drawImage(this._offscreenCanvas, 0, 0, this._canvas.width, this._canvas.height);
+    }
+
     _startMarquee() {
       if (this._marqueeRafId !== null) return;
       const tick = (now) => {
@@ -273,6 +377,26 @@
       if (this._marqueeRafId !== null) {
         cancelAnimationFrame(this._marqueeRafId);
         this._marqueeRafId = null;
+      }
+    }
+
+    _startAnimation() {
+      if (this._animationRafId !== null) return;
+      const tick = () => {
+        if (!this._active || !this._wasm) {
+          this._animationRafId = null;
+          return;
+        }
+        this.render();
+        this._animationRafId = requestAnimationFrame(tick);
+      };
+      this._animationRafId = requestAnimationFrame(tick);
+    }
+
+    _stopAnimation() {
+      if (this._animationRafId !== null) {
+        cancelAnimationFrame(this._animationRafId);
+        this._animationRafId = null;
       }
     }
 
@@ -349,6 +473,13 @@
       if (Math.abs(dy) > 12) {
         // Swipe: scroll
         const delta = dy < 0 ? 1 : -1;
+        if (this._wasm) {
+          this._syncPublicStateToWasm();
+          this._wasm.scroll_by(delta);
+          this._syncFromWasm();
+          this.render();
+          return;
+        }
         this._scrollY = Math.max(0, Math.min(
           this._scrollY + delta,
           Math.max(0, items.length - MAX_VISIBLE)
