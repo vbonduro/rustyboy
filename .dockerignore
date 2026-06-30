@@ -19,3 +19,6 @@ target/
 
 # Local maps / logs
 *.map
+
+# Node (ts-builder runs npm ci fresh)
+**/node_modules/
