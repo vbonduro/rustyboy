@@ -2,3 +2,14 @@ target/
 lcov.info
 docs/dkl2-sprite-investigation.md
 *_PLAN.md
+
+# Tooling state (local)
+.beads/
+.claude/
+
+# Title-screen source media & experiments (kept locally, not committed)
+gemini_*
+Madagascar*
+ferris.png
+331269-*
+index.html?*
