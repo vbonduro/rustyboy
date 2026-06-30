@@ -875,7 +875,7 @@ function showPauseMenu(hasSaves: boolean, latestSaveId: string | null): void {
   menu.show({
     title,
     items:    buildPauseMenuItems(hasSaves),
-    footer:   '▲▼ MOVE  A SELECT  B RESUME',
+    footer:   '▲▼ MOVE A SELECT B RESUME',
     onSelect: (item) => handlePauseMenuSelect(item, latestSaveId),
     onBack:   () => { resumeEmulation(); },
   });
@@ -954,7 +954,7 @@ async function showSaveStateSlots(romName: string, onBack: () => void): Promise<
   menu.show({
     title:  'LOAD STATE',
     items,
-    footer: '▲▼ MOVE  A LOAD  SEL DEL  B BACK',
+    footer: '▲▼ A LOAD SEL DEL B BACK',
     onSelect: async (item) => {
       state.activeMenu = null;
       try {
