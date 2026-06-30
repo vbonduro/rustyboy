@@ -33,7 +33,7 @@ pub struct CbInstruction {
 }
 
 impl OpCode for CbInstruction {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.cb(self, memory)
     }

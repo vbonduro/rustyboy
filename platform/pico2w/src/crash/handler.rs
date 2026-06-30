@@ -287,12 +287,14 @@ fn commit_crash_and_reset(
 
     // Common flag bits: emulator state availability, stack overflow, core ID.
     let common_flags = if ctx.is_some() {
-            flags::HAS_GB_STATE | flags::HAS_ROM_INFO
-        } else {
-            0
-        }
-        | if overflowed { flags::HAS_STACK_OVERFLOW } else { 0 }
-        | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
+        flags::HAS_GB_STATE | flags::HAS_ROM_INFO
+    } else {
+        0
+    } | if overflowed {
+        flags::HAS_STACK_OVERFLOW
+    } else {
+        0
+    } | if core == 1 { flags::FAULT_ON_CORE1 } else { 0 };
 
     let f = kind_flags | common_flags;
 
@@ -305,7 +307,15 @@ fn commit_crash_and_reset(
     let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
     let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
 
-    write_watchdog_scratch(arm_pc, arm_lr, arm_cfsr, arm_hfsr, arm_fault_addr, packed6, packed7);
+    write_watchdog_scratch(
+        arm_pc,
+        arm_lr,
+        arm_cfsr,
+        arm_hfsr,
+        arm_fault_addr,
+        packed6,
+        packed7,
+    );
     write_powman_scratch_from_context(
         ctx.as_ref(),
         panic_file,

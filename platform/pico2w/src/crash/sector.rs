@@ -1,7 +1,7 @@
 //! On-flash sector header: [`SectorHeader`], [`SectorDecodeError`], slot discovery.
 
-use super::{RECORD_SIZE, SECTOR_MAGIC};
 use super::record::MAX_RECORDS_PER_SECTOR;
+use super::{RECORD_SIZE, SECTOR_MAGIC};
 
 // ---------------------------------------------------------------------------
 // Sector-level constants

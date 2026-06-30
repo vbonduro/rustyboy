@@ -631,4 +631,3 @@ async fn main(spawner: Spawner) {
         app.state = app.next_state.take().unwrap_or(state);
     }
 }
-

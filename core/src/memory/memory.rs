@@ -641,7 +641,9 @@ impl GameBoyMemory {
     /// memory through a direct fast path.
     #[inline(always)]
     pub fn enqueue_bus_event(&mut self, address: u16, value: u8) {
-        self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
+        self.events
+            .push(BusEvent { address, value })
+            .expect("bus event queue overflow");
     }
 
     /// Returns a read-only view of the IO register array (0xFF00–0xFF7F).
@@ -700,7 +702,9 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::Vram(offset) => {
                 self.vram[offset as usize] = value;
-                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
+                self.events
+                    .push(BusEvent { address, value })
+                    .expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Wram(offset) => {
@@ -710,12 +714,16 @@ impl Memory for GameBoyMemory {
             RegionMapping::EchoRam(_) => Err(Error::ReadOnly(address)),
             RegionMapping::Oam(offset) => {
                 self.oam[offset as usize] = value;
-                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
+                self.events
+                    .push(BusEvent { address, value })
+                    .expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Io(offset) => {
                 self.io[offset as usize] = value;
-                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
+                self.events
+                    .push(BusEvent { address, value })
+                    .expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Hram(offset) => {
@@ -724,7 +732,9 @@ impl Memory for GameBoyMemory {
             }
             RegionMapping::InterruptEnable => {
                 self.ie = value;
-                self.events.push(BusEvent { address, value }).expect("bus event queue overflow");
+                self.events
+                    .push(BusEvent { address, value })
+                    .expect("bus event queue overflow");
                 Ok(())
             }
             RegionMapping::Unmapped => Ok(()),

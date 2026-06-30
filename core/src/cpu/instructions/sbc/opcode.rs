@@ -10,7 +10,7 @@ pub struct Sbc8 {
 }
 
 impl OpCode for Sbc8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.sbc8(&self, memory)
     }

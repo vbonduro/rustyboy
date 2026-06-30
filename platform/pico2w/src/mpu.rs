@@ -110,12 +110,15 @@ pub unsafe fn setup_core1_mpu() {
     }
     let stack_bottom = core::ptr::addr_of!(_stack_end) as u32;
     let base = stack_bottom & !0x1F; // 32-byte aligned MPU region base
-    //   RBAR: BASE | SH=11(b4:3) | AP=10(b2:1) | XN=1(b0) = base | 0x1D
-    //   RLAR: LIMIT=0x2007FFE0 | AttrIndx=0(b3:1) | EN=1(b0) = 0x2007FFE1
+                                     //   RBAR: BASE | SH=11(b4:3) | AP=10(b2:1) | XN=1(b0) = base | 0x1D
+                                     //   RLAR: LIMIT=0x2007FFE0 | AttrIndx=0(b3:1) | EN=1(b0) = 0x2007FFE1
     MPU_RNR.write_volatile(0);
     MPU_RBAR.write_volatile(base | 0x1D);
     MPU_RLAR.write_volatile(0x2007_FFE1);
-    defmt::info!("core1 MPU region 0 base (from _stack_end) = 0x{=u32:08x}", base);
+    defmt::info!(
+        "core1 MPU region 0 base (from _stack_end) = 0x{=u32:08x}",
+        base
+    );
 
     cortex_m::asm::dsb();
     cortex_m::asm::isb();

@@ -16,7 +16,7 @@ pub struct Rotate {
 }
 
 impl OpCode for Rotate {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         cpu: &mut dyn Instructions,

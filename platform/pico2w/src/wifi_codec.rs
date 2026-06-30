@@ -747,5 +747,4 @@ mod tests {
         build_dns_response(&query, AP_IP, &mut out).unwrap();
         assert_eq!(&out[12..12 + q_section_len], &query[12..]);
     }
-
 }

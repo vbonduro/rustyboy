@@ -144,7 +144,13 @@ fn build_web(root: &Path, debug_overlay: bool) -> Result<()> {
     } else {
         println!("🔨 Building rustyboy-web Docker image…");
     }
-    let mut args = vec!["build", "-f", "platform/web/Dockerfile", "-t", "rustyboy-web"];
+    let mut args = vec![
+        "build",
+        "-f",
+        "platform/web/Dockerfile",
+        "-t",
+        "rustyboy-web",
+    ];
     if debug_overlay {
         args.extend_from_slice(&["--build-arg", "DEBUG_OVERLAY=1"]);
     }
@@ -238,7 +244,11 @@ fn deploy_pico(root: &Path) -> Result<()> {
     let elf = root.join("target/thumbv8m.main-none-eabihf/release/rustyboy-pico2w");
 
     println!("⚡ Flashing via picotool…");
-    cmd("picotool", &["load", "-f", "-t", "elf", elf.to_str().unwrap()], root)?;
+    cmd(
+        "picotool",
+        &["load", "-f", "-t", "elf", elf.to_str().unwrap()],
+        root,
+    )?;
     cmd("picotool", &["reboot"], root)?;
     println!("✅ Done — Pico 2W is rebooting into the new firmware.");
     Ok(())
@@ -364,7 +374,11 @@ fn setup_pico() -> Result<()> {
     reload_udev();
 
     let user = current_user();
-    cmd_best_effort("sudo", &["usermod", "-aG", "plugdev", &user], Path::new("/"));
+    cmd_best_effort(
+        "sudo",
+        &["usermod", "-aG", "plugdev", &user],
+        Path::new("/"),
+    );
 
     println!("\n✅ pico setup complete.");
     println!(
@@ -432,11 +446,7 @@ fn install_picotool() -> Result<()> {
 
     let sdk_path_arg = format!("-DPICO_SDK_PATH={}", sdk_dir.display());
     println!("🔨 Building picotool…");
-    cmd(
-        "cmake",
-        &["..", &sdk_path_arg],
-        &cmake_build,
-    )?;
+    cmd("cmake", &["..", &sdk_path_arg], &cmake_build)?;
 
     let jobs = nproc().to_string();
     cmd("make", &["-j", &jobs], &cmake_build)?;
