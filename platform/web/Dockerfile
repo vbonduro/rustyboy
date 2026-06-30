@@ -36,7 +36,24 @@ RUN if [ "$DEBUG_OVERLAY" = "1" ]; then \
         --release; \
     fi
 
-# ── Stage 2: Build the Axum server ─────────────────────────────────────────
+# ── Stage 2: Build TypeScript frontend ─────────────────────────────────────
+FROM node:20-slim AS ts-builder
+
+WORKDIR /build
+
+# Install deps first (layer cached until package.json changes)
+COPY platform/web/client/package.json platform/web/client/package-lock.json ./
+RUN npm ci
+
+# Copy TS sources and build script (type-checking is skipped in CI;
+# esbuild transpiles without tsc so no .d.ts files are needed here)
+COPY platform/web/client/build.mjs ./
+COPY platform/web/client/src-ts ./src-ts
+
+RUN npm run build
+# Output: ./static/app.js, ./static/menu.js, ./static/audio-processor.js
+
+# ── Stage 3: Build the Axum server ─────────────────────────────────────────
 FROM rust:1.88-slim AS server-builder
 
 WORKDIR /build
@@ -45,7 +62,7 @@ COPY . .
 
 RUN cargo build --release -p rustyboy-web-server
 
-# ── Stage 3: Runtime image ──────────────────────────────────────────────────
+# ── Stage 4: Runtime image ──────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -58,9 +75,13 @@ COPY --from=server-builder \
     /build/target/release/rustyboy-server \
     /usr/local/bin/rustyboy-server
 
-# Copy static assets: HTML/CSS/JS + WASM pkg
+# Copy static assets: HTML/CSS + WASM pkg
 COPY platform/web/client/static /static
 COPY --from=wasm-builder /build/platform/web/client/pkg /static
+# Overlay compiled TypeScript (replaces the hand-written JS in the static COPY above)
+COPY --from=ts-builder /build/static/app.js             /static/app.js
+COPY --from=ts-builder /build/static/menu.js            /static/menu.js
+COPY --from=ts-builder /build/static/audio-processor.js /static/audio-processor.js
 
 # Expose port and set defaults
 EXPOSE 8080
