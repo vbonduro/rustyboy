@@ -11,7 +11,6 @@ pub(super) const CELL_W: usize = 6;
 /// Cell pitch (taller than the glyph to add inter-row spacing).
 pub(super) const CELL_H: usize = 11;
 /// Actual glyph height inside the 11 px cell (~3 px gap between rows).
-pub(super) const MENU_GLYPH_H: usize = 8;
 
 pub(super) const TERM_W: u16 = (SCREEN_WIDTH / CELL_W) as u16; // 26
 pub(super) const TERM_H: u16 = (SCREEN_HEIGHT / CELL_H) as u16; // 13
