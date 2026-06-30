@@ -3,7 +3,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 
 use super::layout::{
-    CELL_H, CELL_W, MAIN_OPTION_CHAR_ADV, MENU_GLYPH_H, RGBA_LEN, SCREEN_HEIGHT, SCREEN_WIDTH,
+    CELL_H, CELL_W, MAIN_OPTION_CHAR_ADV, RGBA_LEN, SCREEN_HEIGHT, SCREEN_WIDTH,
 };
 use super::palette::{color_to_rgba, C0, C2, MENU_TEXT_NORMAL, MENU_TEXT_OUTLINE};
 
@@ -49,7 +49,70 @@ fn fill_cell(
 /// (rather than truncation) preserves stroke-width differences that floor()
 /// collapses, so the rendering is legible at any cell size without hand-tuned
 /// glyphs.
-pub(super) fn draw_basic_glyph_to_cell(
+/// A thin (1px-stroke) 5x7 menu font — a lighter alternative to the heavy
+/// 2px-stroke font8x8 face, so list/menu text reads as regular weight rather
+/// than bold. Bit `x` (1<<x) is column x (0 = leftmost). Text is uppercased
+/// upstream by `normalize_text`; unknown glyphs fall back to `?`.
+fn thin_glyph(ch: char) -> Option<[u8; 7]> {
+    match ch {
+        ' ' => Some([0, 0, 0, 0, 0, 0, 0]),
+        '!' => Some([4, 4, 4, 4, 4, 0, 4]),
+        '&' => Some([6, 9, 5, 2, 21, 9, 22]),
+        '\'' => Some([4, 4, 4, 0, 0, 0, 0]),
+        '(' => Some([4, 2, 2, 2, 2, 2, 4]),
+        ')' => Some([4, 8, 8, 8, 8, 8, 4]),
+        '+' => Some([0, 4, 4, 31, 4, 4, 0]),
+        ',' => Some([0, 0, 0, 0, 4, 4, 2]),
+        '-' => Some([0, 0, 0, 31, 0, 0, 0]),
+        '.' => Some([0, 0, 0, 0, 0, 4, 4]),
+        '/' => Some([16, 16, 8, 4, 2, 1, 1]),
+        '0' => Some([14, 17, 25, 21, 19, 17, 14]),
+        '1' => Some([4, 6, 4, 4, 4, 4, 14]),
+        '2' => Some([14, 17, 16, 12, 2, 1, 31]),
+        '3' => Some([15, 16, 16, 14, 16, 16, 15]),
+        '4' => Some([8, 12, 10, 9, 31, 8, 8]),
+        '5' => Some([31, 1, 15, 16, 16, 17, 14]),
+        '6' => Some([14, 1, 1, 15, 17, 17, 14]),
+        '7' => Some([31, 16, 8, 4, 2, 2, 2]),
+        '8' => Some([14, 17, 17, 14, 17, 17, 14]),
+        '9' => Some([14, 17, 17, 30, 16, 16, 14]),
+        ':' => Some([0, 4, 0, 0, 0, 4, 0]),
+        '<' => Some([16, 8, 4, 8, 16, 0, 0]),
+        '>' => Some([1, 2, 4, 2, 1, 0, 0]),
+        '?' => Some([14, 17, 16, 12, 4, 0, 4]),
+        'A' => Some([4, 10, 17, 17, 31, 17, 17]),
+        'B' => Some([15, 17, 17, 15, 17, 17, 15]),
+        'C' => Some([14, 17, 1, 1, 1, 17, 14]),
+        'D' => Some([15, 17, 17, 17, 17, 17, 15]),
+        'E' => Some([31, 1, 1, 15, 1, 1, 31]),
+        'F' => Some([31, 1, 1, 15, 1, 1, 1]),
+        'G' => Some([14, 17, 1, 29, 17, 17, 30]),
+        'H' => Some([17, 17, 17, 31, 17, 17, 17]),
+        'I' => Some([31, 4, 4, 4, 4, 4, 31]),
+        'J' => Some([15, 8, 8, 8, 9, 9, 6]),
+        'K' => Some([17, 9, 5, 3, 5, 9, 17]),
+        'L' => Some([1, 1, 1, 1, 1, 1, 31]),
+        'M' => Some([17, 27, 21, 21, 17, 17, 17]),
+        'N' => Some([17, 19, 21, 21, 25, 17, 17]),
+        'O' => Some([14, 17, 17, 17, 17, 17, 14]),
+        'P' => Some([15, 17, 17, 15, 1, 1, 1]),
+        'Q' => Some([14, 17, 17, 17, 21, 9, 22]),
+        'R' => Some([15, 17, 17, 15, 5, 9, 17]),
+        'S' => Some([30, 1, 1, 14, 16, 16, 15]),
+        'T' => Some([31, 4, 4, 4, 4, 4, 4]),
+        'U' => Some([17, 17, 17, 17, 17, 17, 14]),
+        'V' => Some([17, 17, 17, 17, 17, 10, 4]),
+        'W' => Some([17, 17, 17, 21, 21, 27, 17]),
+        'X' => Some([17, 17, 10, 4, 10, 17, 17]),
+        'Y' => Some([17, 17, 10, 4, 4, 4, 4]),
+        'Z' => Some([31, 16, 8, 4, 2, 1, 31]),
+        '^' => Some([4, 10, 17, 0, 0, 0, 0]),
+        _ => None,
+    }
+}
+
+/// Draw a thin 5x7 glyph centered within a `cell_w x cell_h` menu cell.
+pub(super) fn draw_thin_glyph_to_cell(
     rgba: &mut [u8],
     x0: usize,
     y0: usize,
@@ -58,21 +121,16 @@ pub(super) fn draw_basic_glyph_to_cell(
     ch: char,
     color: [u8; 4],
 ) {
-    let Some(glyph) = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?')) else {
+    let Some(glyph) = thin_glyph(ch).or_else(|| thin_glyph('?')) else {
         return;
     };
-    // Draw at a fixed height (`MENU_GLYPH_H`), vertically centered in the cell,
-    // so a taller cell pitch adds inter-row spacing without stretching letters.
-    let glyph_h = MENU_GLYPH_H.min(cell_h);
-    let y_off = (cell_h - glyph_h) / 2;
-    for (src_y, bits) in glyph.iter().copied().enumerate() {
-        let ty = (src_y * glyph_h + 4) / 8 + y_off;
-        for src_x in 0..8usize {
-            if bits & (1 << src_x) == 0 {
-                continue;
+    let x_off = cell_w.saturating_sub(5) / 2;
+    let y_off = cell_h.saturating_sub(7) / 2;
+    for (row, bits) in glyph.iter().copied().enumerate() {
+        for col in 0..5usize {
+            if bits & (1 << col) != 0 {
+                put_pixel(rgba, x0 + x_off + col, y0 + y_off + row, color);
             }
-            let tx = (src_x * cell_w + 4) / 8;
-            put_pixel(rgba, x0 + tx, y0 + ty, color);
         }
     }
 }
@@ -206,7 +264,7 @@ fn rasterize_buffer_with_cell(buffer: &Buffer, cell_w: usize, cell_h: usize) -> 
             fill_cell(&mut rgba, cell_x, cell_y, cell_w, cell_h, bg);
             let ch = cell.symbol().chars().next().unwrap_or(' ');
             if ch != ' ' {
-                draw_basic_glyph_to_cell(&mut rgba, cell_x * cell_w, cell_y * cell_h, cell_w, cell_h, ch, fg);
+                draw_thin_glyph_to_cell(&mut rgba, cell_x * cell_w, cell_y * cell_h, cell_w, cell_h, ch, fg);
             }
         }
     }
