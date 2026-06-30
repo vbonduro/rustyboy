@@ -252,7 +252,14 @@ pub(super) fn rasterize_buffer(buffer: &Buffer) -> Vec<u8> {
 }
 
 fn rasterize_buffer_with_cell(buffer: &Buffer, cell_w: usize, cell_h: usize) -> Vec<u8> {
+    // The cell grid (TERM_W×CELL_W = 156px, TERM_H×CELL_H = 143px) doesn't tile
+    // the full 160×144 screen, so pre-fill with the menu background; otherwise
+    // the leftover right/bottom strips stay transparent and the light DMG screen
+    // shows through as thin green bars.
     let mut rgba = vec![0u8; RGBA_LEN];
+    for chunk in rgba.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&C0);
+    }
     for cell_y in 0..buffer.area.height as usize {
         for cell_x in 0..buffer.area.width as usize {
             let cell = &buffer[(buffer.area.x + cell_x as u16, buffer.area.y + cell_y as u16)];
