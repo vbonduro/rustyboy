@@ -11,7 +11,7 @@ pub struct Inc8 {
 }
 
 impl OpCode for Inc8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.inc8(self, memory)
     }
@@ -25,7 +25,7 @@ pub struct Dec8 {
 }
 
 impl OpCode for Dec8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.dec8(self, memory)
     }
@@ -38,7 +38,7 @@ pub struct Inc16 {
 }
 
 impl OpCode for Inc16 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         cpu: &mut dyn Instructions,
@@ -55,7 +55,7 @@ pub struct Dec16 {
 }
 
 impl OpCode for Dec16 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(
         &self,
         cpu: &mut dyn Instructions,

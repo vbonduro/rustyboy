@@ -79,9 +79,7 @@ pub use record::{
 
 pub use sector::{find_next_empty_slot, SectorDecodeError, SectorHeader, SECTOR_FULL};
 
-pub use context::{
-    ScratchRegs, TransportSmashDiag, TransportSmashSnapshot, TRANSPORT_SMASH_DIAG,
-};
+pub use context::{ScratchRegs, TransportSmashDiag, TransportSmashSnapshot, TRANSPORT_SMASH_DIAG};
 
 #[cfg(target_arch = "arm")]
 pub use context::{CrashContext, CrashContextSnapshot, CRASH_CONTEXT};

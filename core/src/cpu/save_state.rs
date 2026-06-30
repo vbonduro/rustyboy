@@ -344,8 +344,13 @@ impl SaveState {
         // (MBC3+RTC = 18 bytes + 8-byte header) + cart RAM section if present.
         let cart_ram_len = memory.external_ram().map_or(0, |r| r.len());
         let capacity = MIN_BLOB_SIZE
-            + SECTION_HEADER_SIZE + 18
-            + if cart_ram_len > 0 { SECTION_HEADER_SIZE + cart_ram_len } else { 0 };
+            + SECTION_HEADER_SIZE
+            + 18
+            + if cart_ram_len > 0 {
+                SECTION_HEADER_SIZE + cart_ram_len
+            } else {
+                0
+            };
         let mut out = Vec::with_capacity(capacity);
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION_V2.to_le_bytes());

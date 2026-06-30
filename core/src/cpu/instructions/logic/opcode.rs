@@ -11,7 +11,7 @@ pub struct And8 {
 }
 
 impl OpCode for And8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.and8(&self, memory)
     }
@@ -25,7 +25,7 @@ pub struct Or8 {
 }
 
 impl OpCode for Or8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.or8(&self, memory)
     }
@@ -39,7 +39,7 @@ pub struct Xor8 {
 }
 
 impl OpCode for Xor8 {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.xor8(&self, memory)
     }

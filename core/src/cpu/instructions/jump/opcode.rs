@@ -31,7 +31,7 @@ pub struct Jump {
 }
 
 impl OpCode for Jump {
-#[cfg_attr(target_arch = "arm", link_section = ".data")]
+    #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn execute(&self, cpu: &mut dyn Instructions, memory: &mut GameBoyMemory) -> Result<u8, Error> {
         cpu.jump(&self, memory)
     }
