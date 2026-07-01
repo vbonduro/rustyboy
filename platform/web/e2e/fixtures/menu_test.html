@@ -3,6 +3,12 @@
 <head><meta charset="UTF-8"></head>
 <body>
   <canvas id="testCanvas" width="160" height="144"></canvas>
+  <!-- Expose the wasm menu renderer the same way app.ts does at boot, so the
+       WASM-backed MenuRenderer can actually render into the canvas. -->
+  <script type="module">
+    import { WasmMenuRenderer } from '/static/rustyboy_web_client.js';
+    window.RustyBoyWasmMenuRenderer = WasmMenuRenderer;
+  </script>
   <script src="/static/menu.js"></script>
 </body>
 </html>

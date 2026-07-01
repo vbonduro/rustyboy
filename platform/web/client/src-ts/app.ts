@@ -4,6 +4,7 @@
  */
 
 import init, { EmulatorHandle, WasmMenuRenderer } from 'rustyboy-wasm';
+import { create as createNipple } from 'nipplejs';
 import type { MenuItem, MenuOptions, MenuRendererInstance } from './types.js';
 
 // ── Wasm URL (must match ?v= in index.html) ───────────────────────────────────
@@ -392,6 +393,7 @@ async function boot(): Promise<void> {
 
   const authed = await checkAuth();
   bindButtons();
+  setupDpad();
   bindKeyboard();
   if (!authed) {
     showLoginScreen();
@@ -546,19 +548,34 @@ async function fetchHasSaves(romName: string | null, romId: string | null = stat
   } catch (_) { return false; }
 }
 
-async function showMainMenu(): Promise<void> {
+function showMainMenu(): void {
   log.event('showMainMenu');
   menuOverlay.classList.add('hidden');
+  const gen = ++state.menuGen;
 
-  const items: MenuItem[] = [
-    { label: 'CONTINUE', value: 'continue' },
-    { label: 'GAMES',    value: 'games' },
-  ];
+  // Render synchronously so a menu is active immediately — otherwise B/back
+  // (onBack → showMainMenu) would leave a window with no active menu while we
+  // await the save-state check. CONTINUE is prepended a moment later once we've
+  // confirmed a save exists; with none (the common case) the menu is stable.
+  renderMainMenu(false);
+
+  hasSaveState()
+    .then((has) => { if (has && state.menuGen === gen) renderMainMenu(true); })
+    .catch(() => {});
+}
+
+/** (Re)build the main menu. CONTINUE is only present when a save state exists. */
+function renderMainMenu(hasSave: boolean): void {
+  const items: MenuItem[] = [];
+  if (hasSave) items.push({ label: 'CONTINUE', value: 'continue' });
+  items.push({ label: 'GAMES',  value: 'games' });
+  items.push({ label: 'LOGOUT', value: 'logout' });
 
   const rawName = state.user?.display_name ?? state.user?.email ?? '';
   const name    = rawName.replace(/@[^@]+$/, '');
   const footer  = name ? `HELLO, ${name.toUpperCase()}` : '▲▼ MOVE  A SELECT';
 
+  state.activeMenu?.hide();
   const menu = new window.MenuRenderer(canvas);
   state.activeMenu = menu;
   menu.show({
@@ -569,17 +586,34 @@ async function showMainMenu(): Promise<void> {
       state.activeMenu = null;
       if (item.value === 'continue') {
         await continueLatestSave();
+      } else if (item.value === 'logout') {
+        doLogout();
       } else {
         showRomList();
       }
     },
     onBack: () => { showMainMenu(); },
-    onSelectBtn: () => {
-      fetch('/auth/logout', { method: 'POST' }).finally(() => {
-        window.location.href = '/?logged_out=1';
-      });
-    },
+    onSelectBtn: () => { doLogout(); },
   });
+}
+
+/** Log out server-side, then reload to the (now unauthenticated) login screen. */
+function doLogout(): void {
+  fetch('/auth/logout', { method: 'POST' }).finally(() => {
+    window.location.href = '/?logged_out=1';
+  });
+}
+
+/** Whether the user has at least one save state to resume via CONTINUE. */
+async function hasSaveState(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/save-states');
+    if (!res.ok) return false;
+    const roms = await res.json() as Array<{ rom_name: string }>;
+    return roms.length > 0;
+  } catch (_) {
+    return false;
+  }
 }
 
 /** CONTINUE: find the most recently saved game across all ROMs and resume it. */
@@ -1096,26 +1130,81 @@ const PAUSE_BUTTON_KEY_MAP: Record<number, string> = {
   6: 'Select',
 };
 
+const MENU_REPEAT_KEYS = new Set(['ArrowUp', 'ArrowDown', 'w', 's']);
+const MENU_REPEAT_DELAY_MS = 320;
+const MENU_REPEAT_INTERVAL_MS = 115;
+let menuRepeatKey: string | null = null;
+let menuRepeatDelayTimer: number | null = null;
+let menuRepeatIntervalTimer: number | null = null;
+
+function stopMenuRepeat(key?: string): void {
+  if (key && menuRepeatKey !== key) return;
+  if (menuRepeatDelayTimer !== null) {
+    window.clearTimeout(menuRepeatDelayTimer);
+    menuRepeatDelayTimer = null;
+  }
+  if (menuRepeatIntervalTimer !== null) {
+    window.clearInterval(menuRepeatIntervalTimer);
+    menuRepeatIntervalTimer = null;
+  }
+  menuRepeatKey = null;
+}
+
+function sendMenuKey(key: string): boolean {
+  if (!state.activeMenu?.isActive()) {
+    stopMenuRepeat();
+    return false;
+  }
+  state.activeMenu.handleInput(key);
+  return true;
+}
+
+function startMenuRepeat(key: string): void {
+  if (!MENU_REPEAT_KEYS.has(key)) {
+    sendMenuKey(key);
+    return;
+  }
+  if (menuRepeatKey === key) return;
+  stopMenuRepeat();
+
+  menuRepeatKey = key;
+  if (!sendMenuKey(key)) return;
+  menuRepeatDelayTimer = window.setTimeout(() => {
+    menuRepeatDelayTimer = null;
+    if (!sendMenuKey(key)) return;
+    menuRepeatIntervalTimer = window.setInterval(() => {
+      sendMenuKey(key);
+    }, MENU_REPEAT_INTERVAL_MS);
+  }, MENU_REPEAT_DELAY_MS);
+}
+
+function handleMenuButton(idx: number, pressed: boolean): boolean {
+  const key = PAUSE_BUTTON_KEY_MAP[idx];
+  if (!key || !state.activeMenu?.isActive()) return false;
+
+  if (MENU_REPEAT_KEYS.has(key)) {
+    if (pressed) startMenuRepeat(key);
+    else stopMenuRepeat(key);
+    return true;
+  }
+
+  if (!pressed) sendMenuKey(key);
+  return true;
+}
+
 function sendButton(idx: number, pressed: boolean): void {
   log.event(`sendButton idx=${idx} pressed=${pressed}`);
 
   if (state.paused) {
-    if (!pressed && state.activeMenu?.isActive()) {
-      const key = PAUSE_BUTTON_KEY_MAP[idx];
-      log.debug(`sendButton (paused) → menu key=${key}`);
-      if (key) state.activeMenu.handleInput(key);
-    }
+    if (handleMenuButton(idx, pressed)) log.debug(`sendButton (paused) → menu idx=${idx}`);
     return;
   }
 
   if (state.emulator) {
     state.emulator.set_button(idx, pressed);
+  } else if (handleMenuButton(idx, pressed)) {
+    log.debug(`sendButton → menu idx=${idx}`);
   } else if (!pressed) {
-    if (state.activeMenu?.isActive()) {
-      const key = PAUSE_BUTTON_KEY_MAP[idx];
-      log.debug(`sendButton → menu key=${key}`);
-      if (key) { state.activeMenu.handleInput(key); return; }
-    }
     handleMenuInput(idx);
   }
 }
@@ -1176,6 +1265,183 @@ function bindButtons(): void {
   powerBtn.addEventListener('pointercancel', () => { powerBtn.classList.remove('pressed'); });
 }
 
+// ── On-screen D-pad (nipplejs) ─────────────────────────────────────────────────
+//
+// The four directions used to be four separate <button data-btn> cells, each
+// grabbing a pointer capture on press. That capture is what made the controls
+// feel broken: once your thumb landed on a cell you couldn't roll onto a
+// diagonal or slide between directions, and sliding off a cell could strand a
+// held direction. We replace them with a single nipplejs static joystick over
+// the #dpadZone well. Its `move` event gives a normalized vector we threshold
+// into up to two simultaneous directions (real diagonals); `end` releases all.
+// Everything downstream still flows through sendButton(), so the menu/pause
+// handling and keyboard path are unchanged.
+
+const DPAD_DIR_IDX = { right: 0, left: 1, up: 2, down: 3 } as const;
+type DpadDir = keyof typeof DPAD_DIR_IDX;
+
+// Fraction of the joystick vector an axis must reach to register as pressed.
+// Keep vertical slightly stricter because its current activation zone feels
+// right; horizontal engages earlier so left/right are less far from center.
+const DPAD_X_THRESHOLD = 0.4;
+const DPAD_Y_THRESHOLD = 0.5;
+const DPAD_JOYSTICK_SIZE = 132;
+
+const dpadHeld: Record<DpadDir, boolean> = { right: false, left: false, up: false, down: false };
+const DPAD_RELEASED: Record<DpadDir, boolean> = { right: false, left: false, up: false, down: false };
+let activeDpadPointerId: number | null = null;
+const activeDpadTouchIds = new Set<number>();
+let dpadManager: ReturnType<typeof createNipple> | null = null;
+
+/** Diff the desired direction state against what's held and emit only changes. */
+function applyDpadState(next: Record<DpadDir, boolean>): void {
+  for (const dir of Object.keys(next) as DpadDir[]) {
+    if (next[dir] === dpadHeld[dir]) continue;
+    dpadHeld[dir] = next[dir];
+    sendButton(DPAD_DIR_IDX[dir], next[dir]);
+  }
+}
+
+function isDpadHeld(): boolean {
+  return Object.values(dpadHeld).some(Boolean);
+}
+
+function forceReleaseEmulatorDpadButtons(): void {
+  if (!state.emulator) return;
+  for (const dir of Object.keys(DPAD_DIR_IDX) as DpadDir[]) {
+    state.emulator.set_button(DPAD_DIR_IDX[dir], false);
+  }
+}
+
+function restDpadJoystick(): void {
+  try {
+    dpadManager?.getJoystickByUid()?.end();
+  } catch (_) {
+    // If nipplejs is already mid-cleanup, the app-level release above is still
+    // the important part. A fresh pointerdown will reuse/recreate the joystick.
+  }
+}
+
+function releaseDpad(resetJoystick = false): void {
+  activeDpadPointerId = null;
+  activeDpadTouchIds.clear();
+  stopMenuRepeat();
+  applyDpadState(DPAD_RELEASED);
+  if (resetJoystick) {
+    forceReleaseEmulatorDpadButtons();
+    restDpadJoystick();
+  }
+}
+
+function startMenuRepeatFromDpadPoint(clientX: number, clientY: number): void {
+  if (!state.activeMenu?.isActive()) return;
+  if (state.emulator && !state.paused) return;
+
+  const zone = document.getElementById('dpadZone');
+  if (!zone) return;
+
+  const rect = zone.getBoundingClientRect();
+  const centerY = rect.top + rect.height / 2;
+  const threshold = DPAD_Y_THRESHOLD * (DPAD_JOYSTICK_SIZE / 2);
+  const dy = clientY - centerY;
+
+  if (dy < -threshold) startMenuRepeat('ArrowUp');
+  else if (dy > threshold) startMenuRepeat('ArrowDown');
+}
+
+function trackDpadPointerStart(evt: PointerEvent): void {
+  if (activeDpadPointerId !== null && activeDpadPointerId !== evt.pointerId) {
+    releaseDpad(true);
+  }
+  activeDpadPointerId = evt.pointerId;
+  startMenuRepeatFromDpadPoint(evt.clientX, evt.clientY);
+}
+
+function releaseDpadPointer(evt: PointerEvent, resetJoystick = false): void {
+  if (activeDpadPointerId !== null && evt.pointerId !== activeDpadPointerId) return;
+  if (activeDpadPointerId === null && !isDpadHeld()) return;
+  releaseDpad(resetJoystick);
+}
+
+function releaseDpadPointerAndReset(evt: PointerEvent): void {
+  releaseDpadPointer(evt, true);
+}
+
+function trackDpadTouchStart(evt: TouchEvent): void {
+  if (activeDpadTouchIds.size > 0) releaseDpad(true);
+  for (const touch of Array.from(evt.changedTouches)) {
+    activeDpadTouchIds.add(touch.identifier);
+    startMenuRepeatFromDpadPoint(touch.clientX, touch.clientY);
+  }
+}
+
+function releaseDpadTouch(evt: TouchEvent): void {
+  if (activeDpadTouchIds.size === 0) {
+    if (isDpadHeld()) releaseDpad(true);
+    return;
+  }
+
+  for (const touch of Array.from(evt.changedTouches)) {
+    if (activeDpadTouchIds.has(touch.identifier)) {
+      releaseDpad(true);
+      return;
+    }
+  }
+}
+
+function releaseDpadOnHidden(): void {
+  if (document.visibilityState !== 'visible') releaseDpad(true);
+}
+
+function releaseDpadAndReset(): void {
+  releaseDpad(true);
+}
+
+function setupDpad(): void {
+  const zone = document.getElementById('dpadZone');
+  if (!zone) return; // e2e fixture / non-index pages have no d-pad zone
+
+  zone.addEventListener('pointerdown', trackDpadPointerStart, { capture: true });
+  document.addEventListener('pointerup', releaseDpadPointer, true);
+  document.addEventListener('pointercancel', releaseDpadPointerAndReset, true);
+  document.addEventListener('lostpointercapture', releaseDpadPointerAndReset, true);
+
+  zone.addEventListener('touchstart', trackDpadTouchStart, { capture: true, passive: true });
+  document.addEventListener('touchend', releaseDpadTouch, true);
+  document.addEventListener('touchcancel', releaseDpadTouch, true);
+
+  window.addEventListener('blur', releaseDpadAndReset);
+  window.addEventListener('pagehide', releaseDpadAndReset);
+  window.addEventListener('contextmenu', releaseDpadAndReset);
+  document.addEventListener('visibilitychange', releaseDpadOnHidden);
+
+  dpadManager = createNipple({
+    zone,
+    mode: 'static',
+    position: { top: '50%', left: '50%' },
+    size: 132,
+    threshold: 0.15,
+    fadeTime: 0,
+    restJoystick: true,
+    restOpacity: 1,
+    color: { back: 'transparent', front: '#6E7290' },
+  });
+
+  dpadManager.on('move', (evt) => {
+    const d = evt.data;
+    if (!d?.vector) return;
+    applyDpadState({
+      right: d.vector.x >  DPAD_X_THRESHOLD,
+      left:  d.vector.x < -DPAD_X_THRESHOLD,
+      up:    d.vector.y >  DPAD_Y_THRESHOLD,
+      down:  d.vector.y < -DPAD_Y_THRESHOLD,
+    });
+  });
+
+  // nipplejs does not emit a final centred `move` before `end`, so release here.
+  dpadManager.on('end', () => releaseDpad());
+}
+
 // ── Keyboard support ──────────────────────────────────────────────────────────
 
 const KEY_MAP: Record<string, number> = {
@@ -1202,7 +1468,9 @@ function bindKeyboard(): void {
 
     if (state.activeMenu?.isActive() && MENU_NAV_KEYS.has(e.key)) {
       e.preventDefault();
-      state.activeMenu.handleInput(e.key === 'Shift' ? 'Select' : e.key);
+      const menuKey = e.key === 'Shift' ? 'Select' : e.key;
+      if (MENU_REPEAT_KEYS.has(menuKey)) startMenuRepeat(menuKey);
+      else sendMenuKey(menuKey);
       return;
     }
 
@@ -1228,6 +1496,8 @@ function bindKeyboard(): void {
   document.addEventListener('keyup', (e) => {
     log.debug(`keyup key=${e.key}`);
     heldKeys.delete(e.key);
+    const menuKey = e.key === 'Shift' ? 'Select' : e.key;
+    if (MENU_REPEAT_KEYS.has(menuKey)) stopMenuRepeat(menuKey);
     const idx = KEY_MAP[e.key];
     if (idx === undefined || idx === -1) return;
     e.preventDefault();

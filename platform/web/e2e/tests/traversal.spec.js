@@ -15,7 +15,6 @@
  *     T2  Login screen: ArrowDown wraps (single item wraps back to 0)
  *     T3  Login screen: ArrowUp wraps (single item wraps back to 0)
  *     T4  Login screen: Enter triggers /auth/google → lands on main menu
- *     T5  Login screen: tap on item triggers login
  *
  *   Main menu:
  *     T6  Load while logged in → main menu shown (not login screen)
@@ -27,8 +26,7 @@
  *     T12 Main menu: ArrowDown + Enter on LOGOUT → login screen shown
  *
  *   ROM list:
- *     T13 ROM list: shows all ROMs
- *     T14 ROM list: ArrowDown moves selection
+ *     T14 ROM list: shows all ROMs and ArrowDown moves selection
  *     T15 ROM list: ArrowDown wraps at end
  *     T16 ROM list: ArrowUp from first item wraps to last
  *     T17 ROM list: Escape → back to main menu
@@ -44,24 +42,25 @@
  *     T23 Error screen: Escape → back to main menu
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 const BASE = 'http://localhost:3737';
 
 /** Reset mock server state before each test. */
-async function setServerState(request, state) {
-  await request.post(`${BASE}/test/control`, { data: state });
+async function setServerState(target, state) {
+  const api = target.request ?? target;
+  await api.post(`${BASE}/test/control`, { data: state });
 }
 
 /** Load the app fixture page and wait for boot() to finish. */
 async function loadApp(page) {
   await page.goto(`${BASE}/test/app`);
   // Wait for MenuRenderer to be available (menu.js loaded) and for boot() to
-  // have called showLoginScreen() or showMainMenu() (activeMenu set).
+  // have called showLoginScreen() or showMainMenu() (activeMenu active).
   await page.waitForFunction(
-    () => typeof window.MenuRenderer === 'function' && window.__appState && window.__appState.activeMenu !== undefined,
+    () => typeof window.MenuRenderer === 'function' && window.__appState?.activeMenu?.isActive?.(),
     { timeout: 5000 }
   );
 }
@@ -155,7 +154,7 @@ async function menuKey(page, key) {
 
 // T1: Unauthenticated → login screen
 test('T1: unauthenticated load shows login screen', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb'] });
   await loadApp(page);
 
   const title = await activeMenuTitle(page);
@@ -167,7 +166,7 @@ test('T1: unauthenticated load shows login screen', async ({ page, request }) =>
 
 // T2: Login screen ArrowDown wraps (single item)
 test('T2: login screen ArrowDown wraps on single item', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: [] });
+  await setServerState(page, { authed: false, roms: [] });
   await loadApp(page);
 
   await menuKey(page, 'ArrowDown');
@@ -177,7 +176,7 @@ test('T2: login screen ArrowDown wraps on single item', async ({ page, request }
 
 // T3: Login screen ArrowUp wraps
 test('T3: login screen ArrowUp wraps on single item', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: [] });
+  await setServerState(page, { authed: false, roms: [] });
   await loadApp(page);
 
   await menuKey(page, 'ArrowUp');
@@ -187,7 +186,7 @@ test('T3: login screen ArrowUp wraps on single item', async ({ page, request }) 
 
 // T4: Login screen Enter → navigates to /auth/google → lands on main menu
 test('T4: login Enter triggers auth and lands on main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb'] });
   await loadApp(page);
 
   // Verify we're on login
@@ -213,33 +212,9 @@ test('T4: login Enter triggers auth and lands on main menu', async ({ page, requ
   expect(await activeMenuItems(page)).toContain('games');
 });
 
-// T5: Login screen tap on item triggers login
-test('T5: login screen tap on first item triggers navigation to /auth/google', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb'] });
-  await loadApp(page);
-
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }),
-    page.evaluate(() => {
-      const s = window.__appState;
-      if (s && s.activeMenu) s.activeMenu.handleTap(80, 22); // tap first item row
-    }),
-  ]);
-
-  await page.waitForFunction(
-    () => window.__appState && window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.items &&
-          window.__appState.activeMenu._opts.items.some(i => i.value === 'games'),
-    { timeout: 5000 }
-  );
-
-  expect(await activeMenuItems(page)).toContain('games');
-});
-
 // T6: Authenticated load → main menu
 test('T6: authenticated load shows main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
 
   const title = await activeMenuTitle(page);
@@ -252,8 +227,9 @@ test('T6: authenticated load shows main menu', async ({ page, request }) => {
 
 // T7: Main menu default selection is GAMES (idx 0)
 test('T7: main menu default selection is GAMES', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   const idx = await activeMenuSelIdx(page);
   expect(idx).toBe(0);
@@ -264,8 +240,9 @@ test('T7: main menu default selection is GAMES', async ({ page, request }) => {
 
 // T8: Main menu ArrowDown moves to LOGOUT
 test('T8: main menu ArrowDown selects LOGOUT', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'ArrowDown');
 
@@ -278,8 +255,9 @@ test('T8: main menu ArrowDown selects LOGOUT', async ({ page, request }) => {
 
 // T9: Main menu ArrowDown wraps from LOGOUT back to PLAY
 test('T9: main menu ArrowDown wraps from last item to first', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'ArrowDown'); // → LOGOUT (idx 1)
   await menuKey(page, 'ArrowDown'); // → wraps to PLAY (idx 0)
@@ -290,8 +268,9 @@ test('T9: main menu ArrowDown wraps from last item to first', async ({ page, req
 
 // T10: Main menu ArrowUp from PLAY wraps to LOGOUT
 test('T10: main menu ArrowUp from first item wraps to last', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'ArrowUp'); // from PLAY → LOGOUT
 
@@ -304,8 +283,9 @@ test('T10: main menu ArrowUp from first item wraps to last', async ({ page, requ
 
 // T11: Main menu Enter on PLAY → ROM list
 test('T11: main menu Enter on PLAY shows ROM list', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // PLAY is default selection
 
@@ -321,8 +301,9 @@ test('T11: main menu Enter on PLAY shows ROM list', async ({ page, request }) =>
 
 // T12: Main menu LOGOUT → back to login screen
 test('T12: main menu LOGOUT shows login screen', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'ArrowDown'); // → LOGOUT
   await menuKey(page, 'Enter');
@@ -340,13 +321,13 @@ test('T12: main menu LOGOUT shows login screen', async ({ page, request }) => {
   expect(await activeMenuItems(page)).toContain('login');
 });
 
-// T13: ROM list shows all ROMs
-test('T13: ROM list shows all available ROMs', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
+// T14: ROM list shows ROMs and ArrowDown moves selection
+test('T14: ROM list shows ROMs and ArrowDown moves selection down', async ({ page, request }) => {
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // open ROM list
-
   await page.waitForFunction(
     () => window.__appState && window.__appState.activeMenu &&
           window.__appState.activeMenu._opts &&
@@ -359,20 +340,6 @@ test('T13: ROM list shows all available ROMs', async ({ page, request }) => {
   expect(items).toContain('Mario.gb');
   expect(items).toContain('Zelda.gb');
   expect(items).toHaveLength(3);
-});
-
-// T14: ROM list ArrowDown moves selection
-test('T14: ROM list ArrowDown moves selection down', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
-  await loadApp(page);
-
-  await menuKey(page, 'Enter'); // open ROM list
-  await page.waitForFunction(
-    () => window.__appState && window.__appState.activeMenu &&
-          window.__appState.activeMenu._opts &&
-          window.__appState.activeMenu._opts.title === 'SELECT GAME',
-    { timeout: 3000 }
-  );
 
   expect(await activeMenuSelIdx(page)).toBe(0);
   await menuKey(page, 'ArrowDown');
@@ -383,8 +350,9 @@ test('T14: ROM list ArrowDown moves selection down', async ({ page, request }) =
 
 // T15: ROM list ArrowDown wraps at end
 test('T15: ROM list ArrowDown wraps from last to first', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter');
   await page.waitForFunction(
@@ -403,8 +371,9 @@ test('T15: ROM list ArrowDown wraps from last to first', async ({ page, request 
 
 // T16: ROM list ArrowUp from first wraps to last
 test('T16: ROM list ArrowUp from first item wraps to last', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb', 'Zelda.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter');
   await page.waitForFunction(
@@ -423,8 +392,9 @@ test('T16: ROM list ArrowUp from first item wraps to last', async ({ page, reque
 
 // T17: ROM list Escape → back to main menu
 test('T17: ROM list Escape returns to main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // open ROM list
   await page.waitForFunction(
@@ -450,8 +420,9 @@ test('T17: ROM list Escape returns to main menu', async ({ page, request }) => {
 
 // T18: ROM list Enter launches selected ROM (menu dismissed, emulator running)
 test('T18: ROM list Enter on selected ROM launches emulator', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // open ROM list
   await page.waitForFunction(
@@ -474,8 +445,9 @@ test('T18: ROM list Enter on selected ROM launches emulator', async ({ page, req
 
 // T19: ROM list tap on item launches ROM
 test('T19: ROM list tap on item launches emulator', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // open ROM list
   await page.waitForFunction(
@@ -501,8 +473,9 @@ test('T19: ROM list tap on item launches emulator', async ({ page, request }) =>
 
 // T20: Power button during game → in-game pause menu (still running, paused)
 test('T20: power button while running shows in-game pause menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // GAMES
   await page.waitForFunction(
@@ -531,8 +504,9 @@ test('T20: power button while running shows in-game pause menu', async ({ page, 
 
 // T21: Backspace key during game → in-game pause menu
 test('T21: Backspace key while running shows in-game pause menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // GAMES
   await page.waitForFunction(
@@ -560,8 +534,9 @@ test('T21: Backspace key while running shows in-game pause menu', async ({ page,
 
 // T22: Zero ROMs → error screen
 test('T22: empty ROM list shows error screen', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: [] });
+  await setServerState(page, { authed: true, roms: [] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // PLAY
 
@@ -577,8 +552,9 @@ test('T22: empty ROM list shows error screen', async ({ page, request }) => {
 
 // T23: Error screen Escape → back to main menu
 test('T23: error screen Escape returns to main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: [] });
+  await setServerState(page, { authed: true, roms: [] });
   await loadApp(page);
+  await ensureMainMenu(page);
 
   await menuKey(page, 'Enter'); // PLAY → error screen
   await page.waitForFunction(
@@ -642,7 +618,7 @@ async function cycleLogin(page) {
 
 // T24: two full login→play→back→logout cycles verifying d-pad works after each B press
 test('T24: two full login→play→back→logout cycles without freeze', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
 
   // Cycle 1
@@ -672,7 +648,7 @@ test('T24: two full login→play→back→logout cycles without freeze', async (
 // verifies that activeMenu is correctly set and navigable after each transition,
 // which is the invariant that would have caught the real-world freeze.
 test('T25: two login→play→back→logout cycles — menu stays navigable throughout', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
 
   async function waitForItems(value) {
@@ -745,8 +721,9 @@ test('T25: two login→play→back→logout cycles — menu stays navigable thro
 
 // ── Mobile pointer-event tests ────────────────────────────────────────────────
 //
-// These simulate the actual mobile touch path: pointerdown + pointerup on
-// d-pad/action buttons, and touchend on canvas for menu item taps.
+// These simulate the actual mobile touch path: pointerdown/move/up on the
+// nipplejs D-pad zone, pointerdown/up on action buttons, and touchend on canvas
+// for menu item taps.
 // This is distinct from menuKey() which calls handleInput() directly.
 
 /** Simulate a button tap via pointerdown + pointerup on a [data-btn] element. */
@@ -757,6 +734,128 @@ async function tapButton(page, selector) {
     el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }));
     el.dispatchEvent(new PointerEvent('pointerup',   { bubbles: true, cancelable: true }));
   }, selector);
+}
+
+/** Simulate a nipplejs D-pad drag in the requested direction. */
+async function dpadGesture(page, direction, endType = 'pointerup') {
+  await page.evaluate(([dir, end]) => {
+    const zone = document.getElementById('dpadZone');
+    if (!zone) throw new Error('dpadGesture: no #dpadZone');
+
+    const rect = zone.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const distance = 58;
+    const offsets = {
+      up: [0, -distance],
+      down: [0, distance],
+      left: [-distance, 0],
+      right: [distance, 0],
+    };
+    const [dx, dy] = offsets[dir];
+    const pointerId = 17;
+
+    const fire = (target, type, x, y, buttons) => {
+      target.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId,
+        pointerType: 'touch',
+        isPrimary: true,
+        buttons,
+        clientX: x,
+        clientY: y,
+      }));
+    };
+
+    fire(zone, 'pointerdown', centerX, centerY, 1);
+    fire(document, 'pointermove', centerX + dx, centerY + dy, 1);
+    fire(document, end, centerX + dx, centerY + dy, 0);
+  }, [direction, endType]);
+}
+
+async function startDpadHold(page, direction, pointerId = 19) {
+  await page.evaluate(([dir, pid]) => {
+    const zone = document.getElementById('dpadZone');
+    if (!zone) throw new Error('startDpadHold: no #dpadZone');
+
+    const rect = zone.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const distance = 58;
+    const offsets = {
+      up: [0, -distance],
+      down: [0, distance],
+      left: [-distance, 0],
+      right: [distance, 0],
+    };
+    const [dx, dy] = offsets[dir];
+
+    const fire = (target, type, x, y, buttons) => {
+      target.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        pointerId: pid,
+        pointerType: 'touch',
+        isPrimary: true,
+        buttons,
+        clientX: x,
+        clientY: y,
+      }));
+    };
+
+    fire(zone, 'pointerdown', centerX, centerY, 1);
+    fire(document, 'pointermove', centerX + dx, centerY + dy, 1);
+  }, [direction, pointerId]);
+}
+
+async function startDpadPress(page, direction, pointerId = 21) {
+  await page.evaluate(([dir, pid]) => {
+    const zone = document.getElementById('dpadZone');
+    if (!zone) throw new Error('startDpadPress: no #dpadZone');
+
+    const rect = zone.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    const distance = 58;
+    const offsets = {
+      up: [0, -distance],
+      down: [0, distance],
+      left: [-distance, 0],
+      right: [distance, 0],
+    };
+    const [dx, dy] = offsets[dir];
+
+    zone.dispatchEvent(new PointerEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      pointerId: pid,
+      pointerType: 'touch',
+      isPrimary: true,
+      buttons: 1,
+      clientX: centerX + dx,
+      clientY: centerY + dy,
+    }));
+  }, [direction, pointerId]);
+}
+
+async function endDpadHold(page, pointerId = 19) {
+  await page.evaluate((pid) => {
+    const zone = document.getElementById('dpadZone');
+    if (!zone) throw new Error('endDpadHold: no #dpadZone');
+
+    const rect = zone.getBoundingClientRect();
+    document.dispatchEvent(new PointerEvent('pointerup', {
+      bubbles: true,
+      cancelable: true,
+      pointerId: pid,
+      pointerType: 'touch',
+      isPrimary: true,
+      buttons: 0,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    }));
+  }, pointerId);
 }
 
 /** Simulate a canvas tap at menu canvas-space coordinates (x, y). */
@@ -787,15 +886,37 @@ async function waitForMenuTitle(page, title) {
 }
 
 async function waitForMenuItems(page, value) {
-  await page.waitForFunction(
-    (v) => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === v),
-    value, { timeout: 3000 }
-  );
+  try {
+    await page.waitForFunction(
+      (v) => window.__appState?.activeMenu?._opts?.items?.some(i => i.value === v),
+      value, { timeout: 3000 }
+    );
+  } catch (err) {
+    const state = await page.evaluate(() => ({
+      href: window.location.href,
+      active: window.__appState?.activeMenu?.isActive?.() ?? null,
+      title: window.__appState?.activeMenu?._opts?.title ?? null,
+      items: window.__appState?.activeMenu?._opts?.items?.map(i => i.value) ?? [],
+      user: window.__appState?.user ?? null,
+    })).catch(e => ({ error: String(e) }));
+    throw new Error(`Timed out waiting for menu item "${value}"; state=${JSON.stringify(state)}; cause=${err}`);
+  }
+}
+
+async function ensureMainMenu(page) {
+  const items = await activeMenuItems(page);
+  if (items.includes('login')) {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'networkidle', timeout: 5000 }),
+      tapCanvas(page, 80, 23),
+    ]);
+  }
+  await waitForMenuItems(page, 'games');
 }
 
 // T26: mobile — tap login → main menu via canvas tap
 test('T26: mobile tap on login item navigates to main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb'] });
   await loadApp(page);
   await waitForMenuItems(page, 'login');
 
@@ -811,22 +932,73 @@ test('T26: mobile tap on login item navigates to main menu', async ({ page, requ
 
 // T27: mobile — d-pad down on main menu moves selection
 test('T27: mobile d-pad down moves main menu selection', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   expect(await activeMenuSelIdx(page)).toBe(0);
-  await tapButton(page, '[data-btn="3"]'); // Down
+  await dpadGesture(page, 'down');
   expect(await activeMenuSelIdx(page)).toBe(1);
-  await tapButton(page, '[data-btn="2"]'); // Up
+  await dpadGesture(page, 'up');
   expect(await activeMenuSelIdx(page)).toBe(0);
+});
+
+test('T27b: holding mobile d-pad down repeats menu selection', async ({ page, request }) => {
+  await setServerState(page, { authed: true, roms: ['A.gb', 'B.gb', 'C.gb', 'D.gb', 'E.gb', 'F.gb'] });
+  await loadApp(page);
+  await ensureMainMenu(page);
+
+  await tapButton(page, '[data-btn="4"]');
+  await waitForMenuTitle(page, 'SELECT GAME');
+  expect(await activeMenuSelIdx(page)).toBe(0);
+
+  await startDpadHold(page, 'down');
+  try {
+    await expect.poll(() => activeMenuSelIdx(page), { timeout: 1500 }).toBeGreaterThan(1);
+  } finally {
+    await endDpadHold(page);
+  }
+});
+
+test('T27d: holding lower d-pad zone without dragging repeats menu selection', async ({ page, request }) => {
+  await setServerState(page, { authed: true, roms: ['A.gb', 'B.gb', 'C.gb', 'D.gb', 'E.gb', 'F.gb'] });
+  await loadApp(page);
+  await ensureMainMenu(page);
+
+  await tapButton(page, '[data-btn="4"]');
+  await waitForMenuTitle(page, 'SELECT GAME');
+  expect(await activeMenuSelIdx(page)).toBe(0);
+
+  await startDpadPress(page, 'down');
+  try {
+    await expect.poll(() => activeMenuSelIdx(page), { timeout: 1500 }).toBeGreaterThan(1);
+  } finally {
+    await endDpadHold(page, 21);
+  }
+});
+
+test('T27c: holding keyboard ArrowDown repeats menu selection', async ({ page, request }) => {
+  await setServerState(page, { authed: true, roms: ['A.gb', 'B.gb', 'C.gb', 'D.gb', 'E.gb', 'F.gb'] });
+  await loadApp(page);
+  await ensureMainMenu(page);
+
+  await tapButton(page, '[data-btn="4"]');
+  await waitForMenuTitle(page, 'SELECT GAME');
+  expect(await activeMenuSelIdx(page)).toBe(0);
+
+  await page.keyboard.down('ArrowDown');
+  try {
+    await expect.poll(() => activeMenuSelIdx(page), { timeout: 1500 }).toBeGreaterThan(1);
+  } finally {
+    await page.keyboard.up('ArrowDown');
+  }
 });
 
 // T28: mobile — A button on PLAY opens ROM list
 test('T28: mobile A button on PLAY opens ROM list', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   await tapButton(page, '[data-btn="4"]'); // A
   await waitForMenuTitle(page, 'SELECT GAME');
@@ -834,9 +1006,9 @@ test('T28: mobile A button on PLAY opens ROM list', async ({ page, request }) =>
 
 // T29: mobile — B button on ROM list returns to main menu
 test('T29: mobile B button on ROM list returns to main menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   await tapButton(page, '[data-btn="4"]'); // A → ROM list
   await waitForMenuTitle(page, 'SELECT GAME');
@@ -848,9 +1020,9 @@ test('T29: mobile B button on ROM list returns to main menu', async ({ page, req
 // T30: mobile — d-pad still works on main menu after returning from ROM list via B
 // This is the regression test for the reported freeze.
 test('T30: mobile d-pad navigable on main menu after B back from ROM list', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // Go into ROM list and back
   await tapButton(page, '[data-btn="4"]'); // A → ROM list
@@ -860,16 +1032,16 @@ test('T30: mobile d-pad navigable on main menu after B back from ROM list', asyn
 
   // D-pad must still work — this is what froze on mobile
   expect(await activeMenuSelIdx(page)).toBe(0);
-  await tapButton(page, '[data-btn="3"]'); // Down
+  await dpadGesture(page, 'down');
   expect(await activeMenuSelIdx(page)).toBe(1);
-  await tapButton(page, '[data-btn="2"]'); // Up
+  await dpadGesture(page, 'up');
   expect(await activeMenuSelIdx(page)).toBe(0);
 });
 
 // T31: mobile — full cycle: login(tap) → play(A) → ROM list → B → logout(A) → login
 // Two cycles to catch any state accumulation bug.
 test('T31: mobile two full cycles without freeze', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: false, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
 
   for (let cycle = 1; cycle <= 2; cycle++) {
@@ -883,9 +1055,9 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
 
     // D-pad works on main menu
     expect(await activeMenuSelIdx(page)).toBe(0);
-    await tapButton(page, '[data-btn="3"]'); // Down
+    await dpadGesture(page, 'down');
     expect(await activeMenuSelIdx(page)).toBe(1);
-    await tapButton(page, '[data-btn="2"]'); // Up
+    await dpadGesture(page, 'up');
     expect(await activeMenuSelIdx(page)).toBe(0);
 
     // A → ROM list
@@ -893,9 +1065,9 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
     await waitForMenuTitle(page, 'SELECT GAME');
 
     // D-pad works on ROM list
-    await tapButton(page, '[data-btn="3"]'); // Down
+    await dpadGesture(page, 'down');
     expect(await activeMenuSelIdx(page)).toBe(1);
-    await tapButton(page, '[data-btn="2"]'); // Up
+    await dpadGesture(page, 'up');
     expect(await activeMenuSelIdx(page)).toBe(0);
 
     // B → back to main menu
@@ -904,9 +1076,9 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
 
     // D-pad still works after returning — the bug
     expect(await activeMenuSelIdx(page)).toBe(0);
-    await tapButton(page, '[data-btn="3"]');
+    await dpadGesture(page, 'down');
     expect(await activeMenuSelIdx(page)).toBe(1); // would be 0 if frozen
-    await tapButton(page, '[data-btn="2"]');
+    await dpadGesture(page, 'up');
     expect(await activeMenuSelIdx(page)).toBe(0);
 
     // Logout
@@ -921,9 +1093,9 @@ test('T31: mobile two full cycles without freeze', async ({ page, request }) => 
 // T32: mobile canvas tap fires both touch AND pointer events (real browser behavior)
 // If pointer events on canvas interfere with sendButton, this catches it.
 test('T32: canvas tap fires touch+pointer — d-pad still works after', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // A → ROM list via canvas tap (fires both touch and pointer events like real mobile)
   await page.evaluate(() => {
@@ -951,16 +1123,16 @@ test('T32: canvas tap fires touch+pointer — d-pad still works after', async ({
 
   // D-pad must work
   expect(await activeMenuSelIdx(page)).toBe(0);
-  await tapButton(page, '[data-btn="3"]');
+  await dpadGesture(page, 'down');
   expect(await activeMenuSelIdx(page)).toBe(1);
 });
 
 // T33: regression — touch starts on canvas, ends outside (simulates d-pad tap
 // with finger migrating from canvas area). Must NOT trigger menu tap.
 test('T33: touch ending outside canvas bounds does not trigger menu selection', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb', 'Mario.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // Touch starts on canvas (inside), ends at a position outside canvas bounds
   const triggered = await page.evaluate(() => {
@@ -996,22 +1168,22 @@ test('T33: touch ending outside canvas bounds does not trigger menu selection', 
 
 // T34: B button on main menu must not dismiss it (the confirmed freeze bug)
 test('T34: B button on main menu does not hide menu', async ({ page, request }) => {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   await tapButton(page, '[data-btn="5"]'); // B on main menu
 
   expect(await hasActiveMenu(page)).toBe(true);
   expect(await activeMenuTitle(page)).toBe('RUSTYBOY');
   // D-pad still works
-  await tapButton(page, '[data-btn="3"]'); // Down
+  await dpadGesture(page, 'down');
   expect(await activeMenuSelIdx(page)).toBe(1);
 });
 
 // T35: B button on login screen does not hide menu
 test('T35: B button on login screen does not hide menu', async ({ page, request }) => {
-  await setServerState(request, { authed: false, roms: [] });
+  await setServerState(page, { authed: false, roms: [] });
   await loadApp(page);
   await waitForMenuItems(page, 'login');
 
@@ -1025,9 +1197,9 @@ test('T35: B button on login screen does not hide menu', async ({ page, request 
 
 /** Helper: launch a game and wait until running. */
 async function launchGame(page, request) {
-  await setServerState(request, { authed: true, roms: ['Tetris.gb'], saveStates: [] });
+  await setServerState(page, { authed: true, roms: ['Tetris.gb'], saveStates: [] });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
   await menuKey(page, 'Enter'); // GAMES → ROM list
   await page.waitForFunction(
     () => window.__appState?.activeMenu?._opts?.title === 'SELECT GAME',
@@ -1205,7 +1377,7 @@ test('T38: pause menu opens correctly after multiple open/close cycles', async (
 // T40: Select button on LOAD STATE screen deletes the selected save slot
 // After deletion the slot is removed from the list; if list becomes empty, go back.
 test('T40: Select on load state screen deletes selected save slot', async ({ page, request }) => {
-  await setServerState(request, {
+  await setServerState(page, {
     authed: true,
     roms: ['Tetris.gb'],
     saveStates: [
@@ -1214,7 +1386,7 @@ test('T40: Select on load state screen deletes selected save slot', async ({ pag
     ],
   });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // Navigate to GAMES (may not be index 0 if CONTINUE is present)
   await page.waitForFunction(
@@ -1270,13 +1442,13 @@ test('T40: Select on load state screen deletes selected save slot', async ({ pag
 test('T43: marquee RAF loop stops after power-button resume on marquee-title game', async ({ page, request }) => {
   // Use a long ROM name that will overflow the 160px header and trigger marquee.
   const longRomName = 'A Very Long Game Title That Will Overflow The Header Area.gb';
-  await setServerState(request, {
+  await setServerState(page, {
     authed: true,
     roms: [longRomName],
     saveStates: [],
   });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // Navigate to GAMES → select the long-named ROM
   const mainItems = await activeMenuItems(page);
@@ -1324,7 +1496,7 @@ test('T43: marquee RAF loop stops after power-button resume on marquee-title gam
 
 // T41: Deleting the last save slot on the LOAD STATE screen goes back to pause menu
 test('T41: deleting last save slot returns to pause menu', async ({ page, request }) => {
-  await setServerState(request, {
+  await setServerState(page, {
     authed: true,
     roms: ['Tetris.gb'],
     saveStates: [
@@ -1332,7 +1504,7 @@ test('T41: deleting last save slot returns to pause menu', async ({ page, reques
     ],
   });
   await loadApp(page);
-  await waitForMenuItems(page, 'games');
+  await ensureMainMenu(page);
 
   // Navigate to GAMES
   await page.waitForFunction(

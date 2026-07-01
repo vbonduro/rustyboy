@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>rustyboy</title>
-  <link rel="stylesheet" href="/static/style.css?v=gemini-marquee-vcenter-20260629" />
+  <link rel="stylesheet" href="/static/style.css?v=nipplejs-dpad-20260701-touchrepeat" />
 </head>
 <body>
 
@@ -74,15 +74,9 @@
       <!-- Controls area -->
       <div class="controls-area">
 
-        <!-- Left: D-pad -->
+        <!-- Left: D-pad — nipplejs joystick zone (see setupDpad in app.ts) -->
         <div class="dpad-wrap">
-          <div class="dpad">
-            <button class="dpad-btn dpad-up"    data-btn="2" aria-label="Up"></button>
-            <button class="dpad-btn dpad-left"  data-btn="1" aria-label="Left"></button>
-            <div class="dpad-center"><div class="dpad-nub"></div></div>
-            <button class="dpad-btn dpad-right" data-btn="0" aria-label="Right"></button>
-            <button class="dpad-btn dpad-down"  data-btn="3" aria-label="Down"></button>
-          </div>
+          <div class="dpad-zone" id="dpadZone" role="group" aria-label="D-pad"></div>
         </div>
 
         <!-- Right: A / B (magenta, diagonal) -->
@@ -131,7 +125,7 @@
     </div>
   </div>
 
-  <script src="/static/menu.js?v=gemini-marquee-vcenter-20260629"></script>
-  <script type="module" src="/static/app.js?v=gemini-marquee-vcenter-20260629"></script>
+  <script src="/static/menu.js?v=nipplejs-dpad-20260701-touchrepeat"></script>
+  <script type="module" src="/static/app.js?v=nipplejs-dpad-20260701-touchrepeat"></script>
 </body>
 </html>

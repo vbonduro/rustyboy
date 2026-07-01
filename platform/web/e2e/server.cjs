@@ -14,22 +14,43 @@ const MIME = {
   '.wasm': 'application/wasm',
 };
 
-// Test state controlled by the test suite via POST /test/control
-let mockState = {
-  authed:     false,   // whether /api/me returns 200 or 401
-  roms:       ['Tetris.gb', 'Mario.gb', 'Zelda.gb'],
-  saveStates: [],      // array of {id, rom_name, slot_name, updated_at}
-};
+// Per-test isolated state. Each test sends a unique `x-rb-test` header (see
+// tests/fixtures.js); state is bucketed by that id so tests running in parallel
+// never share or clobber one another. Requests with no header fall back to a
+// single default bucket (only hit by ad-hoc manual browsing).
+const states = new Map();
+function defaultState() {
+  return {
+    authed:     false,   // whether /api/me returns 200 or 401
+    roms:       ['Tetris.gb', 'Mario.gb', 'Zelda.gb'],
+    saveStates: [],      // array of {id, rom_name, slot_name, updated_at}
+  };
+}
+function cookieValue(req, name) {
+  const cookie = req.headers.cookie || '';
+  const found = cookie
+    .split(';')
+    .map(part => part.trim())
+    .find(part => part.startsWith(`${name}=`));
+  return found ? decodeURIComponent(found.slice(name.length + 1)) : null;
+}
+function getState(req) {
+  const id = req.headers['x-rb-test'] || cookieValue(req, 'rbTestId') || '__default__';
+  let st = states.get(id);
+  if (!st) { st = defaultState(); states.set(id, st); }
+  return st;
+}
 
 http.createServer((req, res) => {
   const url = req.url.split('?')[0];
+  const st = getState(req);
 
   // ── Test control endpoint ──────────────────────────────────────────────────
   if (req.method === 'POST' && url === '/test/control') {
     let body = '';
     req.on('data', d => { body += d; });
     req.on('end', () => {
-      try { Object.assign(mockState, JSON.parse(body)); } catch (_) {}
+      try { Object.assign(st, JSON.parse(body)); } catch (_) {}
       res.writeHead(200);
       res.end('ok');
     });
@@ -38,7 +59,7 @@ http.createServer((req, res) => {
 
   // ── Mock API endpoints ─────────────────────────────────────────────────────
   if (url === '/api/me') {
-    if (mockState.authed) {
+    if (st.authed) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id: 'test-user', display_name: 'Test User', email: 'test@test.com', avatar_url: null }));
     } else {
@@ -50,13 +71,13 @@ http.createServer((req, res) => {
 
   if (url === '/api/roms') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(mockState.roms));
+    res.end(JSON.stringify(st.roms));
     return;
   }
 
   // /auth/google: simulate instant login by setting authed and redirecting back
   if (url === '/auth/google') {
-    mockState.authed = true;
+    st.authed = true;
     res.writeHead(302, { 'Location': '/test/app' });
     res.end();
     return;
@@ -64,7 +85,7 @@ http.createServer((req, res) => {
 
   // /auth/logout: clear auth, redirect to login
   if (req.method === 'POST' && url === '/auth/logout') {
-    mockState.authed = false;
+    st.authed = false;
     res.writeHead(200);
     res.end('ok');
     return;
@@ -79,9 +100,9 @@ http.createServer((req, res) => {
 
   // /api/save-states — list roms with saves
   if (req.method === 'GET' && url === '/api/save-states') {
-    const romsWithSaves = [...new Set(mockState.saveStates.map(s => s.rom_name))]
+    const romsWithSaves = [...new Set(st.saveStates.map(s => s.rom_name))]
       .map(rom => {
-        const latest = mockState.saveStates
+        const latest = st.saveStates
           .filter(s => s.rom_name === rom)
           .sort((a, b) => b.updated_at - a.updated_at)[0];
         return { rom_name: rom, last_saved: latest.updated_at };
@@ -96,7 +117,7 @@ http.createServer((req, res) => {
   const latestMatch = url.match(/^\/api\/save-states\/([^/]+)\/latest$/);
   if (req.method === 'GET' && latestMatch) {
     const rom = decodeURIComponent(latestMatch[1]);
-    const saves = mockState.saveStates
+    const saves = st.saveStates
       .filter(s => s.rom_name === rom)
       .sort((a, b) => b.updated_at - a.updated_at);
     if (saves.length === 0) {
@@ -112,7 +133,7 @@ http.createServer((req, res) => {
   if (romSavesMatch) {
     const rom = decodeURIComponent(romSavesMatch[1]);
     if (req.method === 'GET') {
-      const saves = mockState.saveStates
+      const saves = st.saveStates
         .filter(s => s.rom_name === rom)
         .sort((a, b) => b.updated_at - a.updated_at)
         .map(({ id, slot_name, updated_at }) => ({ id, slot_name, updated_at }));
@@ -124,7 +145,7 @@ http.createServer((req, res) => {
       const id = `mock-ss-${Date.now()}`;
       const slot_name = String(Date.now());
       const updated_at = Math.floor(Date.now() / 1000);
-      mockState.saveStates.push({ id, rom_name: rom, slot_name, updated_at });
+      st.saveStates.push({ id, rom_name: rom, slot_name, updated_at });
       res.writeHead(201, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ id, slot_name, updated_at }));
       return;
@@ -135,7 +156,7 @@ http.createServer((req, res) => {
   const deleteMatch = url.match(/^\/api\/save-states\/by-id\/([^/]+)$/);
   if (req.method === 'DELETE' && deleteMatch) {
     const id = deleteMatch[1];
-    mockState.saveStates = mockState.saveStates.filter(s => s.id !== id);
+    st.saveStates = st.saveStates.filter(s => s.id !== id);
     res.writeHead(204); res.end(); return;
   }
 
@@ -143,7 +164,7 @@ http.createServer((req, res) => {
   const dataMatch = url.match(/^\/api\/save-states\/by-id\/([^/]+)\/data$/);
   if (req.method === 'GET' && dataMatch) {
     const id = dataMatch[1];
-    const ss = mockState.saveStates.find(s => s.id === id);
+    const ss = st.saveStates.find(s => s.id === id);
     if (!ss) { res.writeHead(404); res.end(); return; }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
     res.end(Buffer.alloc(16)); // fake blob
