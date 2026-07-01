@@ -1204,13 +1204,7 @@ function sendButton(idx: number, pressed: boolean): void {
     state.emulator.set_button(idx, pressed);
   } else if (handleMenuButton(idx, pressed)) {
     log.debug(`sendButton → menu idx=${idx}`);
-  } else if (!pressed) {
-    handleMenuInput(idx);
   }
-}
-
-function handleMenuInput(_idx: number): void {
-  // No-op: all menu navigation is handled by MenuRenderer via sendButton → activeMenu
 }
 
 function bindButtons(): void {
