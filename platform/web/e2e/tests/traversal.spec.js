@@ -1140,7 +1140,7 @@ test('T33: touch ending outside canvas bounds does not trigger menu selection', 
     const rect = canvas.getBoundingClientRect();
     const insideX = rect.left + rect.width / 2;
     const insideY = rect.top  + rect.height / 2;
-    // End touch 500px below canvas (where d-pad buttons are)
+    // End touch 500px below the canvas, in the controls area.
     const outsideX = rect.left + rect.width / 2;
     const outsideY = rect.bottom + 500;
 
