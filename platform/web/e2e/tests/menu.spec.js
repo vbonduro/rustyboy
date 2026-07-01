@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures.js';
 
 // Helpers ----------------------------------------------------------------
 
@@ -7,7 +7,11 @@ import { test, expect } from '@playwright/test';
  */
 async function loadMenuPage(page) {
   await page.goto('/test/menu');
-  await page.waitForFunction(() => typeof window.MenuRenderer === 'function');
+  // Wait for both the adapter (menu.js) and the wasm renderer it delegates to.
+  await page.waitForFunction(
+    () => typeof window.MenuRenderer === 'function' &&
+          typeof window.RustyBoyWasmMenuRenderer === 'function'
+  );
   return page.locator('#testCanvas');
 }
 
@@ -219,59 +223,60 @@ test('tap on item calls onSelect', async ({ page }) => {
   expect(tapped.value).toBe('tetris');
 });
 
-// Marquee tests — title scrolling behavior
+// Rendering / animation — the adapter blits the wasm renderer's frame each RAF
+// tick. Title marquee scrolling itself lives in the wasm renderer and is
+// covered there; here we assert the adapter drives and reflects wasm state.
 
-test('short title has zero marquee offset', async ({ page }) => {
+test('animation loop runs while the menu is active', async ({ page }) => {
   await loadMenuPage(page);
   await showMenu(page, {
-    title: 'HI',
+    title: 'GAMES',
     items: [{ label: 'x', value: 'x' }],
   });
 
-  // Short title fits — marquee offset should stay 0
-  await page.waitForTimeout(200);
-  const offset = await page.evaluate(() => window._testMenu._marqueeOffset);
-  expect(offset).toBe(0);
+  // show() starts the RAF loop that re-blits the wasm frame each tick.
+  const rafActive = await page.evaluate(() => window._testMenu._marqueeRafId !== null);
+  expect(rafActive).toBe(true);
 });
 
-test('long title starts at zero offset then scrolls after 1s pause', async ({ page }) => {
+test('selection highlight renders at the selected item row', async ({ page }) => {
   await loadMenuPage(page);
-  // Title long enough to overflow the 160px header at 8px monospace
   await showMenu(page, {
-    title: 'SUPER LONG GAME TITLE THAT WILL NOT FIT',
-    items: [{ label: 'x', value: 'x' }],
+    title: 'GAMES',
+    items: [
+      { label: 'A', value: 'a' },
+      { label: 'B', value: 'b' },
+      { label: 'C', value: 'c' },
+    ],
   });
 
-  // Immediately after show, offset should be 0 (in the pause phase)
-  const offsetAtStart = await page.evaluate(() => window._testMenu._marqueeOffset);
-  expect(offsetAtStart).toBe(0);
+  // With selection at row 0, the highlight band (C1) covers y=16..23; a lower
+  // unselected row is background (C0). Proves wasm selection reaches the canvas.
+  const highlighted = await getPixel(page, 80, 20);
+  expect(highlighted.slice(0, 3)).toEqual(hexToRgb('#306230'));
 
-  // After >1s the scroll should have begun (offset > 0)
-  await page.waitForTimeout(1400);
-  const offsetAfterPause = await page.evaluate(() => window._testMenu._marqueeOffset);
-  expect(offsetAfterPause).toBeGreaterThan(0);
+  const background = await getPixel(page, 80, 40);
+  expect(background.slice(0, 3)).toEqual(hexToRgb('#0F380F'));
 });
 
-test('marquee resets to zero after title scrolls fully off screen', async ({ page }) => {
+test('rendered selection highlight follows keyboard navigation', async ({ page }) => {
   await loadMenuPage(page);
   await showMenu(page, {
-    title: 'SUPER LONG GAME TITLE THAT WILL NOT FIT',
-    items: [{ label: 'x', value: 'x' }],
+    title: 'GAMES',
+    items: [
+      { label: 'A', value: 'a' },
+      { label: 'B', value: 'b' },
+      { label: 'C', value: 'c' },
+    ],
   });
 
-  // _marqueeScrollMax is the total px to scroll before reset (TEXT_PAD + titleWidth)
-  // Fast-forward: force scroll phase with phaseAt far in the past so elapsed > scrollMax
-  await page.evaluate(() => {
-    const menu = window._testMenu;
-    menu._marqueePhase   = 'scroll';
-    menu._marqueePhaseAt = performance.now() - 100000; // 100s ago → way past any title width
-  });
+  // Move down one row; the highlight band moves from row 0 (y~20) to row 1 (y~28).
+  await page.evaluate(() => window._testMenu.handleInput('ArrowDown'));
 
-  // Give one RAF tick to process
-  await page.waitForTimeout(100);
-
-  const offset = await page.evaluate(() => window._testMenu._marqueeOffset);
-  expect(offset).toBe(0);
+  const row0 = await getPixel(page, 80, 20); // now background
+  const row1 = await getPixel(page, 80, 28); // now highlighted
+  expect(row0.slice(0, 3)).toEqual(hexToRgb('#0F380F'));
+  expect(row1.slice(0, 3)).toEqual(hexToRgb('#306230'));
 });
 
 test('marquee RAF loop stops when hide() is called', async ({ page }) => {

@@ -10,5 +10,8 @@
   "devDependencies": {
     "esbuild": "^0.25.5",
     "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "nipplejs": "^1.0.4"
   }
 }

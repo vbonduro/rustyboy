@@ -94,7 +94,7 @@ class MenuRenderer implements MenuRendererInstance {
 
   // Wasm renderer — produces every menu frame; this class blits it + forwards input.
   private _wasm: WasmRendererLike | null = null;
-  private _animationRafId: number | null = null;
+  private _marqueeRafId: number | null = null;
   private _offscreenCanvas: HTMLCanvasElement | null = null;
   private _offscreenCtx: CanvasRenderingContext2D | null = null;
   private _imageData: ImageData | null = null;
@@ -114,6 +114,18 @@ class MenuRenderer implements MenuRendererInstance {
   /** Title of the currently showing menu (undefined when hidden). */
   get title(): string | undefined {
     return this._opts?.title;
+  }
+
+  /** Index of the highlighted item. Selection state lives in the wasm renderer;
+   *  this getter/setter mirrors it so callers can read or move the cursor
+   *  without reaching into the wasm object directly. */
+  get _selIdx(): number {
+    return this._wasm ? this._wasm.selected_index() : -1;
+  }
+  set _selIdx(idx: number) {
+    if (!this._wasm) return;
+    this._wasm.set_selected(idx);
+    this.render();
   }
 
   show(options: MenuOptions): void {
@@ -255,22 +267,22 @@ class MenuRenderer implements MenuRendererInstance {
   }
 
   private _startAnimation(): void {
-    if (this._animationRafId !== null) return;
+    if (this._marqueeRafId !== null) return;
     const loop = (): void => {
       if (!this._active || !this._wasm) {
-        this._animationRafId = null;
+        this._marqueeRafId = null;
         return;
       }
       this.render();
-      this._animationRafId = requestAnimationFrame(loop);
+      this._marqueeRafId = requestAnimationFrame(loop);
     };
-    this._animationRafId = requestAnimationFrame(loop);
+    this._marqueeRafId = requestAnimationFrame(loop);
   }
 
   private _stopAnimation(): void {
-    if (this._animationRafId !== null) {
-      cancelAnimationFrame(this._animationRafId);
-      this._animationRafId = null;
+    if (this._marqueeRafId !== null) {
+      cancelAnimationFrame(this._marqueeRafId);
+      this._marqueeRafId = null;
     }
   }
 
