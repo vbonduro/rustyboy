@@ -1,3 +1,4 @@
+use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Timer};
 use rustyboy_pico2w::display::{
     hw::GameDisplay, menu_item_needs_marquee, MENU_MARQUEE_REDRAW_FRAMES,
@@ -33,8 +34,13 @@ impl RomListState {
         app: &App,
         game_disp: &mut GameDisplay<'static>,
         sd_mgr: &mut PicoSdMgr,
+        watchdog: &mut Watchdog,
     ) -> Self {
-        let (page, has_next, total_roms) = match sd_mgr.list_rom_page(0, ROM_PAGE_SIZE) {
+        // Feed while scanning: the traversal is synchronous and can outlast the
+        // watchdog window on a slow card. See `list_rom_page_with`.
+        let (page, has_next, total_roms) = match sd_mgr.list_rom_page_with(0, ROM_PAGE_SIZE, || {
+            watchdog.feed(Duration::from_millis(crate::WATCHDOG_WINDOW_MS));
+        }) {
             Ok(result) => (result.entries, result.has_next, result.total),
             Err(e) => {
                 defmt::error!("SD list failed: {:?}", defmt::Debug2Format(&e));
@@ -149,8 +155,11 @@ impl RomListState {
         new_offset: usize,
         sd_mgr: &mut PicoSdMgr,
         selection: RomPageSelection,
+        watchdog: &mut Watchdog,
     ) {
-        match sd_mgr.list_rom_page(new_offset, ROM_PAGE_SIZE) {
+        match sd_mgr.list_rom_page_with(new_offset, ROM_PAGE_SIZE, || {
+            watchdog.feed(Duration::from_millis(crate::WATCHDOG_WINDOW_MS));
+        }) {
             Ok(result) => {
                 let page_len: usize = result.entries.len();
                 self.page = result.entries;
@@ -174,6 +183,7 @@ impl RomListState {
         game_disp: &mut GameDisplay<'static>,
         input: &mut InputHandler<'static>,
         sd_mgr: &mut PicoSdMgr,
+        watchdog: &mut Watchdog,
     ) {
         Timer::after(Duration::from_millis(33)).await;
 
@@ -185,7 +195,7 @@ impl RomListState {
 
         let previous_selected = self.logic.selected();
         let effect = self.logic.handle(menu_input);
-        self.apply_effect(effect, previous_selected, app, game_disp, sd_mgr)
+        self.apply_effect(effect, previous_selected, app, game_disp, sd_mgr, watchdog)
             .await;
     }
 
@@ -207,6 +217,7 @@ impl RomListState {
         app: &mut App,
         game_disp: &mut GameDisplay<'static>,
         sd_mgr: &mut PicoSdMgr,
+        watchdog: &mut Watchdog,
     ) {
         match effect {
             RomListEffect::None => {
@@ -218,11 +229,11 @@ impl RomListState {
                 self.transition_to_selected_rom(app);
             }
             RomListEffect::NextPage => {
-                self.flip_requested_page(RomListEffect::NextPage, sd_mgr, app, game_disp)
+                self.flip_requested_page(RomListEffect::NextPage, sd_mgr, app, game_disp, watchdog)
                     .await;
             }
             RomListEffect::PrevPage => {
-                self.flip_requested_page(RomListEffect::PrevPage, sd_mgr, app, game_disp)
+                self.flip_requested_page(RomListEffect::PrevPage, sd_mgr, app, game_disp, watchdog)
                     .await;
             }
             RomListEffect::Back => {
@@ -280,13 +291,15 @@ impl RomListState {
         sd_mgr: &mut PicoSdMgr,
         app: &App,
         game_disp: &mut GameDisplay<'static>,
+        watchdog: &mut Watchdog,
     ) {
         self.marquee_frame = 0;
         let Some(page) = self.page_context().request(effect) else {
             return;
         };
 
-        self.flip_page(page.offset, sd_mgr, page.selection).await;
+        self.flip_page(page.offset, sd_mgr, page.selection, watchdog)
+            .await;
         self.draw(app, game_disp).await;
     }
 }

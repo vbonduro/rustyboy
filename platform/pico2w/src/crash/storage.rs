@@ -62,11 +62,23 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
 
     match write_record_to_flash(flash, |slot| {
         let mut rec = snap.to_crash_record(slot);
+        // Bug #5: fold in the stack window captured by the fault handler before
+        // the reset. `.uninit` carries it across the reset the same way the
+        // watchdog scratch registers carry the register state.
+        unsafe {
+            if let Some((_base, words)) = crate::crash::stack_snapshot::last_crash_stack() {
+                rec.stack_snapshot = words;
+                crate::crash::stack_snapshot::clear_crash_stack();
+            }
+        }
         unsafe {
             use crate::crash::handler::{DMA_CRASH_SNAPSHOT, DMA_SNAPSHOT_SENTINEL};
             if DMA_CRASH_SNAPSHOT[0] == DMA_SNAPSHOT_SENTINEL {
                 rec.dma_busy_mask = DMA_CRASH_SNAPSHOT[1];
-                for i in 0..7usize {
+                // Schema v2 keeps only ch0/ch1 in the record: a live read of all
+                // 16 channels showed ch2-15 permanently zero. Higher channels are
+                // still logged via defmt below.
+                for i in 0..rec.dma_write_addrs.len() {
                     rec.dma_write_addrs[i] = DMA_CRASH_SNAPSHOT[2 + i];
                 }
                 // Log high channels (ch7-ch15) via defmt — not stored in flash record.
@@ -229,7 +241,7 @@ impl ResetReasonSnapshot {
 
     fn to_crash_record(self, slot_seq: u8) -> CrashRecord {
         let mut record = CrashRecord {
-            schema_ver: 1,
+            schema_ver: 2,
             crash_kind: if self.watchdog_timer() {
                 super::CrashKind::WatchdogTimeout as u8
             } else {
@@ -394,7 +406,7 @@ fn clear_watchdog_reason() {
 #[cfg(target_arch = "arm")]
 fn build_watchdog_record(slot_seq: u8) -> super::CrashRecord {
     super::CrashRecord {
-        schema_ver: 1,
+        schema_ver: 2,
         crash_kind: super::CrashKind::WatchdogTimeout as u8,
         flags: 0,
         slot_seq,

@@ -290,7 +290,7 @@ impl ScratchRegs {
         panic_loc[4..8].copy_from_slice(&wd[15].to_le_bytes());
 
         CrashRecord {
-            schema_ver: 1,
+            schema_ver: 2,
             crash_kind,
             flags: flags_byte,
             slot_seq,

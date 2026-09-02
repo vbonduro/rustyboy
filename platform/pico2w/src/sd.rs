@@ -86,10 +86,19 @@ where
     ///
     /// Iterates the full root directory each call (up to 100 entries) and
     /// slices the requested page.
-    pub fn list_rom_page(
+    /// List a page of ROMs, calling `on_progress` for every directory entry
+    /// visited.
+    ///
+    /// The callback exists so the caller can feed the watchdog. This traversal
+    /// walks the WHOLE root directory (no early exit) and runs synchronously
+    /// inside a single main-loop iteration, so with a slow card it can outlast
+    /// the 16 s watchdog window — which is exactly what made entering the ROM
+    /// list hang and reset with no crash record.
+    pub fn list_rom_page_with(
         &self,
         page_offset: usize,
         page_size: usize,
+        mut on_progress: impl FnMut(),
     ) -> Result<RomPage, SdError<D::Error>> {
         let mut names: Vec<RomDirEntry> = Vec::new();
         names
@@ -104,6 +113,9 @@ where
         let _ = self
             .mgr
             .iterate_dir_lfn(root, &mut lfn_buffer, |entry, lfn| {
+                // Every entry, not just matches: the cost is the traversal, and
+                // a directory full of non-ROM files is exactly the slow case.
+                on_progress();
                 if !entry.attributes.is_directory() && is_rom_file(&entry.name) && names.len() < 100
                 {
                     let display_name = match lfn.filter(|name| !name.is_empty()) {
@@ -136,6 +148,15 @@ where
             has_next,
             total,
         })
+    }
+
+    /// Convenience wrapper for callers with no watchdog to feed.
+    pub fn list_rom_page(
+        &self,
+        page_offset: usize,
+        page_size: usize,
+    ) -> Result<RomPage, SdError<D::Error>> {
+        self.list_rom_page_with(page_offset, page_size, || {})
     }
 
     /// Open a specific ROM file by FAT filename (case-insensitive).

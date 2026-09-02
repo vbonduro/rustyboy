@@ -21,6 +21,7 @@
 //! never write the magic sentinel, so they are never confused with crashes.
 
 // Re-export sub-modules.
+pub mod stack_snapshot;
 pub mod storage;
 
 #[cfg(target_arch = "arm")]
@@ -94,7 +95,7 @@ mod tests {
 
     fn sample_record(slot: u8) -> CrashRecord {
         CrashRecord {
-            schema_ver: 1,
+            schema_ver: 2,
             crash_kind: CrashKind::HardFault as u8,
             flags: flags::HAS_ARM_REGS | flags::HAS_GB_STATE | flags::HAS_ROM_INFO,
             slot_seq: slot,

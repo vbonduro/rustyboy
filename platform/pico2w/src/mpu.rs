@@ -19,6 +19,7 @@
 pub unsafe fn setup_core0_data_mpu() {
     unsafe extern "C" {
         static _SEGGER_RTT: u8;
+        static __edata: u8;
     }
 
     const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
@@ -52,6 +53,83 @@ pub unsafe fn setup_core0_data_mpu() {
         MPU_RBAR.write_volatile(0x2000_001C);
         MPU_RLAR.write_volatile(data_limit as u32 | 1);
 
+        // Region 1: the REST of `.data`, above the RTT control block.
+        //
+        // Region 0's comment claims deriving the bound from `_SEGGER_RTT` stops
+        // the end of `.data` being silently writable. It does the opposite: the
+        // linker places `_SEGGER_RTT` in the MIDDLE of `.data`, so region 0 ends
+        // at 0x2000373f while `.data` actually runs to `__edata` (0x20003920) —
+        // leaving ~480 bytes unprotected, and those bytes are exactly the
+        // `__Thumbv7ABSLongThunk_*` long-branch table. That is the one part of
+        // `.data` we have direct crash evidence against (a fault whose branch
+        // target register held the CORRECT address for `cb::sla_u8`, whose thunk
+        // lives at 0x200037d4, yet landed at a wild heap PC — i.e. the thunk's
+        // own instructions/literal pool were corrupted). It is also why every
+        // "Core N never writes .data" result so far was vacuous for that range.
+        //
+        // Start above the RTT control block (SEGGER control block is 0x30 bytes
+        // and IS legitimately written by defmt), rounded up to the 32-byte MPU
+        // granule; end at `__edata`.
+        if dregion > 1 {
+            let thunks_base = ((rtt_addr + 0x30 + 0x1F) & !0x1F) as u32;
+            let edata = core::ptr::addr_of!(__edata) as u32;
+            // RLAR's LIMIT is INCLUSIVE and its low 5 bits are forced to 0x1F, so
+            // the region always ends at `limit | 0x1F` — i.e. it rounds UP to the
+            // enclosing 32-byte granule. `(edata - 1) & !0x1F` therefore covers
+            // PAST `__edata` and marks the first bytes of `.bss` read-only, since
+            // `__edata` is essentially never 32-byte aligned. That is a real fault
+            // generator, not a theoretical one: with `-Z stack-protector=strong`
+            // (`__edata = 0x20003ab4`) it made the firmware unbootable — a genuine
+            // DACCVIOL, MMFAR = 0x20003ab8 = `__sbss` exactly, faulting in an
+            // ordinary early `atomic_store::<u8>` into `.bss`.
+            // Step back a full granule so the region always ends BELOW `__edata`,
+            // giving up at most 32 bytes of thunk coverage to stay off `.bss`.
+            let thunks_limit = edata.saturating_sub(0x20) & !0x1F;
+            if thunks_limit > thunks_base {
+                MPU_RNR.write_volatile(1);
+                MPU_RBAR.write_volatile(thunks_base | 0x1C); // SH=11, AP=10 priv-RO, XN=0
+                MPU_RLAR.write_volatile(thunks_limit | 1);
+                defmt::info!(
+                    "core0 MPU region 1 armed: .data thunks RO [{=u32:#010x}..={=u32:#010x}]",
+                    thunks_base,
+                    thunks_limit + 0x1F
+                );
+            }
+        }
+
+        // Region 2: CORE 1's STACK, privileged-read-only *for core 0*.
+        //
+        // Core 0 must never write core 1's stack. The existing regions fence
+        // core 1 out of core 0's stack, but the symmetric direction was never
+        // covered — core 0 could scribble on CORE1_STACK with nothing to trap it.
+        //
+        // Evidence this matters (recovered 2026-08-05 from the WATCHDOG scratch
+        // registers, an uncommitted core-1 crash record that the normal crash log
+        // could never show because only CORE 1 reset, so no boot ever ran
+        // check_and_commit): core 1 took a precise bus fault
+        // (CFSR=0x00008200 BFARVALID|PRECISERR) at address 0x0c164015 with
+        // LR=0x20000325 = ApuPeripheral::produce_samples. The sample_buffer Vec
+        // was INTACT (cap=2048, ptr=0x2002b7bc), and ptr+len*2=0x2002b960 is
+        // nowhere near the faulting address — so the buffer was fine and `self`
+        // itself was garbage, i.e. the `worker` reference held on CORE 1's STACK
+        // had been clobbered. Same fault-address family as two earlier core-1
+        // crashes (0x0c0e0015, 0x0c160015).
+        //
+        // If core 0 is the writer, this region turns that silent clobber into an
+        // immediate DACCVIOL with MMFAR = the exact address and the stacked PC =
+        // the exact storing instruction. If it never fires, core 0 is excluded
+        // and the writer is core 1 itself or DMA.
+        //
+        // XN=1 here (unlike the .data regions): core 0 never executes from core
+        // 1's stack. CORE1_STACK is 0x20080000..0x20082000 (8 KiB, SRAM8/9), both
+        // ends already 32-byte aligned so no granule rounding is needed.
+        // NOTE: this region is NOT armed here — see `arm_core1_stack_fence()`.
+        // Core 0 legitimately writes core 1's stack while setting up its initial
+        // frame in `spawn_core1`, so arming it this early makes boot fault. That
+        // is not hypothetical: doing so produced an immediate
+        // CFSR=0x00000082 (MMARVALID|DACCVIOL), MMFAR=0x20081ffc (top word of
+        // CORE1_STACK), PC=core::ptr::write — which also proves the region works.
+
         // ENABLE=1, PRIVDEFENA=1 (other addresses use default map), HFNMIENA=0
         // (MPU disabled during fault handlers so the crash handler can read freely).
         MPU_CTRL.write_volatile(0x0000_0005);
@@ -65,14 +143,36 @@ pub unsafe fn setup_core0_data_mpu() {
 }
 
 #[cfg_attr(target_arch = "arm", link_section = ".data")]
-/// Configure Core 1's PMSAv8-M MPU to mark Core 0's stack as privileged-read-only.
+/// Configure Core 1's PMSAv8-M MPU with two privileged-read-only regions.
 ///
-/// Region 0: 0x20066B60–0x2007FFFF, AP=10 (priv RO), XN=1, SH=inner-shareable.
+/// Region 0: Core 0's MSP stack, AP=10 (priv RO), XN=1, SH=inner-shareable.
+/// Region 1: `.data` RAM code + long-branch thunk table, AP=10 (priv RO), **XN=0**
+///           (Core 1 *executes* `.data`-resident code such as
+///           `PpuPeripheral::render_scanline`, so execution must stay permitted —
+///           XN=1 here would fault instantly).
 /// PRIVDEFENA=1 leaves all other addresses with full default access.
 ///
-/// When Core 1 writes anywhere in this range → MemManage fault (CFSR.DACCVIOL=1,
+/// When Core 1 writes anywhere in either range → MemManage fault (CFSR.DACCVIOL=1,
 /// MMFAR=faulting address) → escalates to HardFault → existing handler records
 /// stacked PC = the exact corrupt store instruction.
+///
+/// # Why region 1 exists (bug #5)
+///
+/// Core 0 has protected `.data` since the region-0 setup in
+/// [`setup_core0_data_mpu`], and has never once tripped DACCVIOL — so Core 0 is
+/// not the writer. Core 1, however, was only ever fenced off from *Core 0's
+/// stack*; `.data` was left fully writable from Core 1, so the 2026-06-12
+/// "Core 1 definitively ruled out" result only ruled it out for stack writes and
+/// never covered `.data` at all.
+///
+/// That gap matters because `.data` (all code + literal pools, no mutable
+/// statics — any post-startup write to it is by definition the bug) holds the
+/// `__Thumbv7ABSLongThunk_*` long-branch table at its top. A live capture
+/// (git a8ea0259, cycle ~2.58B) faulted with `LR` = `Sm83::cb_reg`, `r12` =
+/// `cb::sla_u8` — i.e. the branch *target register was correct* — yet landed at
+/// `PC = 0x2002b5ec` (heap, INVSTATE). A correct target register with a wrong
+/// destination means the thunk's own instructions/literal pool were corrupted,
+/// not the register: the writer hit the thunk table itself.
 #[cfg(target_arch = "arm")]
 pub unsafe fn setup_core1_mpu() {
     const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
@@ -120,6 +220,60 @@ pub unsafe fn setup_core1_mpu() {
         base
     );
 
+    // Region 1: `.data` RAM code + thunk table, priv-RO but still executable.
+    // Same encoding and same `_SEGGER_RTT`-derived limit as Core 0's region 0
+    // (see `setup_core0_data_mpu`) so both cores fence exactly the same bytes.
+    //   RBAR: BASE=0x20000000 | SH=11 | AP=10 (priv-RO) | XN=0 → 0x2000_001C
+    //   RLAR: LIMIT | EN=1
+    let data_limit = if dregion > 1 {
+        unsafe extern "C" {
+            static _SEGGER_RTT: u8;
+            static __edata: u8;
+        }
+        let rtt_addr = core::ptr::addr_of!(_SEGGER_RTT) as usize;
+        let limit = ((rtt_addr - 1) & !0x1F) as u32;
+        MPU_RNR.write_volatile(1);
+        MPU_RBAR.write_volatile(0x2000_001C);
+        MPU_RLAR.write_volatile(limit | 1);
+
+        // Region 2: the thunk table above the RTT control block — see the long
+        // rationale on Core 0's region 1 in `setup_core0_data_mpu`. Region 1
+        // stops at the RTT block (which defmt legitimately writes), leaving the
+        // `__Thumbv7ABSLongThunk_*` table unprotected; that gap is why "Core 1
+        // never writes .data" did not actually cover the range we have crash
+        // evidence against.
+        if dregion > 2 {
+            let thunks_base = ((rtt_addr + 0x30 + 0x1F) & !0x1F) as u32;
+            let edata = core::ptr::addr_of!(__edata) as u32;
+            // RLAR's LIMIT is INCLUSIVE and its low 5 bits are forced to 0x1F, so
+            // the region always ends at `limit | 0x1F` — i.e. it rounds UP to the
+            // enclosing 32-byte granule. `(edata - 1) & !0x1F` therefore covers
+            // PAST `__edata` and marks the first bytes of `.bss` read-only, since
+            // `__edata` is essentially never 32-byte aligned. That is a real fault
+            // generator, not a theoretical one: with `-Z stack-protector=strong`
+            // (`__edata = 0x20003ab4`) it made the firmware unbootable — a genuine
+            // DACCVIOL, MMFAR = 0x20003ab8 = `__sbss` exactly, faulting in an
+            // ordinary early `atomic_store::<u8>` into `.bss`.
+            // Step back a full granule so the region always ends BELOW `__edata`,
+            // giving up at most 32 bytes of thunk coverage to stay off `.bss`.
+            let thunks_limit = edata.saturating_sub(0x20) & !0x1F;
+            if thunks_limit > thunks_base {
+                MPU_RNR.write_volatile(2);
+                MPU_RBAR.write_volatile(thunks_base | 0x1C); // SH=11, AP=10 priv-RO, XN=0
+                MPU_RLAR.write_volatile(thunks_limit | 1);
+                defmt::info!(
+                    "core1 MPU region 2 armed: .data thunks RO [{=u32:#010x}..={=u32:#010x}]",
+                    thunks_base,
+                    thunks_limit + 0x1F
+                );
+            }
+        }
+        limit
+    } else {
+        defmt::warn!("core1 MPU: <2 regions available — .data protection disabled");
+        0
+    };
+
     cortex_m::asm::dsb();
     cortex_m::asm::isb();
 
@@ -131,5 +285,48 @@ pub unsafe fn setup_core1_mpu() {
     cortex_m::asm::dsb();
     cortex_m::asm::isb();
 
-    defmt::info!("core1 MPU armed: region 0 = [0x20066B60, 0x2007FFFF] priv-RO (Core 0 stack)");
+    defmt::info!(
+        "core1 MPU armed: region 0 = [{=u32:#010x}, 0x2007FFFF] priv-RO (Core 0 stack), \
+         region 1 = [0x20000000, {=u32:#010x}] priv-RO+exec (.data RAM code/thunks)",
+        base,
+        data_limit + 0x1F
+    );
+}
+
+/// Fence CORE 0 out of CORE 1's stack (MPU region 2 on core 0).
+///
+/// MUST be called on core 0 and ONLY AFTER `spawn_core1` — core 0 legitimately
+/// writes core 1's initial stack frame during the spawn, so arming earlier
+/// faults during boot.
+///
+/// Why this exists: the MPU already fences core 1 out of core 0's stack, but the
+/// symmetric direction was never covered, so core 0 could clobber CORE1_STACK
+/// silently. A recovered (never-committed) core-1 crash record showed core 1
+/// taking a precise bus fault in `ApuPeripheral::produce_samples` through a
+/// garbage `self` while its `sample_buffer` Vec was intact — i.e. the `worker`
+/// reference held on CORE 1'S STACK had been clobbered. If core 0 is the writer,
+/// this converts that silent clobber into a DACCVIOL naming the exact storing
+/// instruction; if it never fires, core 0 is excluded.
+///
+/// XN=1: core 0 never executes from core 1's stack.
+#[cfg(target_arch = "arm")]
+pub unsafe fn arm_core1_stack_fence() {
+    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
+    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
+    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
+    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
+
+    let dregion = unsafe { (MPU_TYPE.read_volatile() >> 8) & 0xFF };
+    if dregion <= 2 {
+        defmt::warn!("core0 MPU: <3 regions — CORE1_STACK fence disabled");
+        return;
+    }
+    unsafe {
+        MPU_RNR.write_volatile(2);
+        MPU_RBAR.write_volatile(0x2008_0000 | 0x1D); // SH=11, AP=10 priv-RO, XN=1
+        MPU_RLAR.write_volatile(0x2008_1FE0 | 1);
+    }
+    cortex_m::asm::dsb();
+    cortex_m::asm::isb();
+    defmt::info!("core0 MPU region 2 armed: CORE1_STACK RO [0x20080000..=0x20081fff]");
 }
