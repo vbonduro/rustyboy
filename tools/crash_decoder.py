@@ -141,7 +141,9 @@ _RECORD_FMT = (
     "12s"  # panic_loc
     "H"    # panic_line
     "H"    # stack_headroom
-    "36x"  # _reserved [84..120]
+    "I"
+    "2I"
+    "6I"
     "I"    # crc32     [120..124]
     "4x"   # _pad4     [124..128]
 )
@@ -204,8 +206,18 @@ class CrashRecord:
             self.panic_loc_raw,
             self.panic_line,
             self.stack_headroom,
+            self.dma_busy_mask,
+            _dma0, _dma1,
+            _s0, _s1, _s2, _s3, _s4, _s5,
             self.crc32_stored,
         ) = fields
+        # schema v2 reclaimed DMA ch2-6 (proven permanently zero on this part)
+        # for a stack window. v1 records carry DMA data there, so gate on the
+        # schema byte rather than trusting the bytes.
+        self.dma_write_addrs = [_dma0, _dma1]
+        self.stack_snapshot = (
+            [_s0, _s1, _s2, _s3, _s4, _s5] if self.schema_ver >= 2 else []
+        )
 
         self.fw_version = tuple(fw)
         self.slot_index = slot_index
@@ -336,6 +348,12 @@ class CrashRecord:
                 "r4": f"0x{self.ext_r4:08x}",
                 "r12": f"0x{self.ext_r12:08x}",
             } if self.has_hardfault_ext_regs else None,
+            "stack_snapshot": [f"0x{w:08x}" for w in self.stack_snapshot]
+            if self.stack_snapshot
+            else None,
+            "dma_write_addrs": [f"0x{w:08x}" for w in self.dma_write_addrs]
+            if self.dma_busy_mask or any(self.dma_write_addrs)
+            else None,
             "stack": {
                 "headroom_bytes": self.stack_headroom,
                 "overflowed": self.has_stack_overflow,
@@ -442,7 +460,7 @@ def symbolize_record(record: CrashRecord, elf_path: Optional[str]) -> dict[str, 
     syms: dict[str, str] = {}
     if record.has_arm_regs and record.arm_pc:
         syms["pc"] = _symbolize(record.arm_pc, elf_path)
-    if record.has_arm_regs and record.arm_lr:
+    if (record.has_arm_regs or record.has_stack_chk_fail_lr) and record.arm_lr:
         syms["lr"] = _symbolize(record.arm_lr, elf_path)
     if record.has_hardfault_ext_regs:
         if record.ext_r4:
@@ -752,6 +770,18 @@ def print_report(header: Optional[SectorHeader], records: list[CrashRecord],
         # Panic location
         if rec.has_panic_loc and rec.panic_loc:
             console.print(f"  [bold]Panic  [/]  [yellow]{rec.panic_loc}:{rec.panic_line}[/]")
+
+        # -Z stack-protector=strong: arm_lr holds __stack_chk_fail's captured
+        # LR (the return address into the guarded function whose canary was
+        # smashed). For a pure Panic record (no exception frame) this is the
+        # only place that LR appears; skip when has_arm_regs already printed
+        # it above (the HardFault fallback path reuses the same ARM LR line).
+        if rec.has_stack_chk_fail_lr and rec.arm_lr and not rec.has_arm_regs:
+            lr_sym = syms.get("lr", "")
+            console.print(
+                f"  [bold]Canary [/]  [red]overrun in caller of[/]  [cyan]0x{rec.arm_lr:08x}[/]"
+                + (f"  → {lr_sym}" if lr_sym else "")
+            )
 
         # ROM info
         if rec.has_rom_info:

@@ -307,6 +307,27 @@ fn commit_crash_and_reset(
     let gb_pc = ctx.as_ref().map(|c| c.gb_pc).unwrap_or(0);
     let packed7 = ((rom_bank as u32) << 16) | (gb_pc as u32);
 
+    // Capture a stack window for the crash record. `commit_crash_and_reset` does
+    // not build the record here — it stashes state in the watchdog/POWMAN
+    // scratch registers and resets, and the record is assembled on the NEXT
+    // boot — so the window goes to `.uninit`, which survives the reset the same
+    // way the scratch registers do.
+    //
+    // For a HardFault `sp` is MSP with the 8-word exception frame already
+    // pushed, so the interesting region starts above it; the +4 accounts for the
+    // STKALIGN pad, which the stacked xPSR bit 9 reports. A panic has no
+    // exception frame, so read from `sp` directly.
+    #[cfg(target_arch = "arm")]
+    unsafe {
+        let base = if matches!(kind, CrashKind::HardFault) {
+            let stacked_xpsr = core::ptr::read_volatile((sp + 0x1c) as *const u32);
+            sp + 0x20 + if stacked_xpsr & (1 << 9) != 0 { 4 } else { 0 }
+        } else {
+            sp
+        };
+        crate::crash::stack_snapshot::capture_crash_stack(base);
+    }
+
     write_watchdog_scratch(
         arm_pc,
         arm_lr,

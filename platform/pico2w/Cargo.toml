@@ -23,6 +23,8 @@ std = []
 # CPU overclock options (clk_sys target). Default boot is 300MHz; see main.rs.
 oc-266 = []
 oc-280 = []
+# 288 MHz: one PLL grid step below 300 (FBDIV 120). Clean where 300 is not.
+oc-288 = []
 oc-300 = []
 # Log FPS to RTT every 60 frames.
 fps = []

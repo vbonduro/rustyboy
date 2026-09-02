@@ -3,6 +3,11 @@ name = "xtask"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# `src/bin/rb-flash.rs` is auto-discovered as a second binary alongside the
+# explicit `xtask` bin below; without this, `cargo run -p xtask` (and the
+# `cargo xtask` alias in the workspace .cargo/config.toml) can't tell which
+# one to run.
+default-run = "xtask"
 
 [[bin]]
 name = "xtask"

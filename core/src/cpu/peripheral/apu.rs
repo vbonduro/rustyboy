@@ -75,6 +75,7 @@ const TICK_GRAN: u16 = 32;
 /// About 804 stereo pairs are produced per Game Boy frame at 48 kHz.
 /// Reserve some headroom so the hot audio path doesn't regrow this buffer.
 const SAMPLE_BUFFER_CAPACITY_HINT: usize = 2048;
+
 /// Max possible mixer output before normalization: 4 channels * level 15 * volume 8.
 const MIXER_MAX: u32 = 4 * 15 * 8;
 
@@ -881,11 +882,17 @@ impl ApuPeripheral {
     /// while the generic batch path handles tests and any larger callers.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn produce_samples(&mut self, cycles: u16) {
+
         let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
         if cycles <= 4 {
             self.sample_acc += sample_inc;
+            // Bound by the compile-time constant, NOT the in-memory `cap` word:
+            // a `cap` corrupted upward makes this check pass and `Vec::push`
+            // then writes past the real allocation (push only grows when
+            // `len == cap`). See the long note in the `else` branch below.
             if self.sample_acc >= SAMPLE_PERIOD_NUM
-                && self.sample_buffer.len() + 2 <= self.sample_buffer.capacity()
+                && self.sample_buffer.len() + 2
+                    <= self.sample_buffer.capacity().min(SAMPLE_BUFFER_CAPACITY_HINT)
             {
                 self.sample_acc -= SAMPLE_PERIOD_NUM;
                 let (left, right) = self.mix_sample();
@@ -900,7 +907,40 @@ impl ApuPeripheral {
             self.sample_acc = (acc % SAMPLE_PERIOD_NUM as u64) as u32;
             if n_samples != 0 {
                 let cap = self.sample_buffer.capacity();
-                let pushable = ((cap - self.sample_buffer.len()) / 2).min(n_samples as usize);
+                // `saturating_sub`, NOT `-`: if `len > cap` the plain subtraction
+                // underflows (usize) to a huge value, `pushable` stops being
+                // clamped by capacity, and the loop below pushes past the end of
+                // the heap buffer. `Vec::push` does not save us — it only grows
+                // when `len == cap`, so a corrupted `cap` (observed live on device
+                // 2026-08-03: cap 2048 -> 0 while len was 338) is never equal to
+                // len and every subsequent push writes at `ptr + len*2`, running
+                // off the 4096-byte allocation into adjacent heap objects. That
+                // turns a single corrupted word into an unbounded heap overrun —
+                // the amplifier behind the wild-pointer crashes. Saturating keeps
+                // the overrun impossible regardless of how `cap` got corrupted.
+                //
+                // 2026-08-08: `cap` too SMALL was the case handled above, but
+                // `cap` too LARGE is the dangerous direction and was NOT
+                // covered. `Vec::push` only reallocates when `len == cap`, so a
+                // `cap` corrupted upward is never equal to `len` and every push
+                // writes at `ptr + len*2` straight off the end of the real
+                // 4096-byte allocation — an UNBOUNDED spray of i16 samples
+                // through whatever follows it.
+                //
+                // That is not hypothetical: the wild pointer values in the
+                // crash records decode as stereo i16 sample pairs —
+                // 0x00ffff01 = (-255, +255), 0x0c160015 = (21, 3094),
+                // 0xed6ef504 = (-2812, -4754) — the same magnitudes as the live
+                // AUDIO_QUEUE contents (1638, 546, 0). Audio data is landing in
+                // pointer slots on BOTH cores' stacks, which is this spray.
+                //
+                // So clamp against the compile-time capacity, never against the
+                // in-memory `cap` word. `with_capacity` may over-allocate, so
+                // the constant is always <= the true allocation and therefore
+                // safe no matter how `cap` is corrupted.
+                let trusted_cap = cap.min(SAMPLE_BUFFER_CAPACITY_HINT);
+                let pushable = (trusted_cap.saturating_sub(self.sample_buffer.len()) / 2)
+                    .min(n_samples as usize);
                 for _ in 0..pushable {
                     let (left, right) = self.mix_sample();
                     self.sample_buffer.push(left);

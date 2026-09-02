@@ -123,8 +123,19 @@ pub mod flags {
 //                                if HAS_STACK_OVERFLOW set → overflow depth,
 //                                else → remaining stack headroom
 //   [84..88]  dma_busy_mask      bitmask of DMA channels with BUSY=1 at crash time
-//   [88..116] dma_write_addrs    WRITE_ADDR for DMA channels 0-6 (7 × u32 LE)
-//   [116..120] _reserved         zero-filled (schema v2+; 0 in v1 records)
+//   [88..96]  dma_write_addrs    WRITE_ADDR for DMA channels 0-1 (2 × u32 LE)
+//                                Channels 2-6 were dropped in schema v2: a live
+//                                read of all 16 channels showed only ch0 (audio
+//                                -> PIO TX FIFO) and ch1 (scale buf -> SPI1 DR)
+//                                are ever non-zero. The reclaimed 20 bytes hold
+//                                the stack snapshot below.
+//   [96..120] stack_snapshot     6 × u32 LE: stack words starting at the
+//                                PRE-FAULT SP (i.e. above the 8-word exception
+//                                frame the fault pushed). For a wild-PC fault
+//                                out of a `pop {rlist, pc}` this window spans
+//                                the return-address slot and slot+8, which is
+//                                what the +8 SP-drift test needs.
+//                                Zero for schema v1 records.
 //   [120..124] crc32             CRC32 of bytes [0..120]
 //   [124..128] _pad4
 //
@@ -171,9 +182,16 @@ pub struct CrashRecord {
     /// Bitmask of DMA channels (0-7) that had CTRL_TRIG.BUSY=1 at crash time.
     /// Zero if DMA snapshot was not captured (schema v1 records).
     pub dma_busy_mask: u32,
-    /// WRITE_ADDR register snapshot for DMA channels 0-6 at crash time.
+    /// WRITE_ADDR register snapshot for DMA channels 0-1 at crash time.
     /// Zeros for schema v1 records or channels that were not snapshotted.
-    pub dma_write_addrs: [u32; 7],
+    /// Channels 2-6 were dropped in schema v2 — a live read of all 16 channels
+    /// found them permanently zero, so they were 20 bytes of dead record.
+    pub dma_write_addrs: [u32; 2],
+    /// Stack words starting at the PRE-FAULT SP (above the exception frame).
+    /// Spans the return-address slot and slot+8 for a `pop {rlist, pc}` fault,
+    /// which is what testing the +8 SP-drift prediction requires.
+    /// Zero for schema v1 records.
+    pub stack_snapshot: [u32; 6],
 }
 
 /// Opaque 128-byte wire representation.
@@ -220,6 +238,10 @@ impl CrashRecord {
         buf[80..82].copy_from_slice(&self.panic_line.to_le_bytes());
         buf[82..84].copy_from_slice(&self.stack_headroom.to_le_bytes());
         buf[84..88].copy_from_slice(&self.dma_busy_mask.to_le_bytes());
+        for (i, &w) in self.stack_snapshot.iter().enumerate() {
+            let off = 96 + i * 4;
+            buf[off..off + 4].copy_from_slice(&w.to_le_bytes());
+        }
         for (i, &addr) in self.dma_write_addrs.iter().enumerate() {
             let off = 88 + i * 4;
             buf[off..off + 4].copy_from_slice(&addr.to_le_bytes());
@@ -281,12 +303,25 @@ impl CrashRecord {
             stack_headroom: u16::from_le_bytes(buf[82..84].try_into().unwrap()),
             dma_busy_mask: u32::from_le_bytes(buf[84..88].try_into().unwrap()),
             dma_write_addrs: {
-                let mut addrs = [0u32; 7];
+                let mut addrs = [0u32; 2];
                 for (i, addr) in addrs.iter_mut().enumerate() {
                     let off = 88 + i * 4;
                     *addr = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
                 }
                 addrs
+            },
+            // Schema v1 wrote DMA channels 2-6 here; v2 reuses the space for the
+            // stack snapshot. v1 records decode as garbage in this field, which
+            // is why the reader must gate on `schema_ver >= 2`.
+            stack_snapshot: {
+                let mut w = [0u32; 6];
+                if buf[4] >= 2 {
+                    for (i, word) in w.iter_mut().enumerate() {
+                        let off = 96 + i * 4;
+                        *word = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                    }
+                }
+                w
             },
         })
     }
