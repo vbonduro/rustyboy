@@ -36,9 +36,7 @@ const IDX_BASE: usize = 1;
 const IDX_WORDS: usize = 2;
 
 /// The padding described above must always exceed the 32-byte MPU granule.
-const _: () = assert!(
-    (16 - (IDX_WORDS + CRASH_SNAP_WORDS)) * core::mem::size_of::<usize>() >= 32
-);
+const _: () = assert!((16 - (IDX_WORDS + CRASH_SNAP_WORDS)) * core::mem::size_of::<usize>() >= 32);
 const CRASH_SNAP_MAGIC: usize = 0x5CAF_0001;
 
 /// Number of stack words carried in a crash record. Must match

@@ -185,7 +185,14 @@ mod tests {
     #[test]
     fn stack_snapshot_roundtrips() {
         let mut rec = sample_record(4);
-        rec.stack_snapshot = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444, 0x5555_5555, 0x6666_6666];
+        rec.stack_snapshot = [
+            0x1111_1111,
+            0x2222_2222,
+            0x3333_3333,
+            0x4444_4444,
+            0x5555_5555,
+            0x6666_6666,
+        ];
         rec.dma_write_addrs = [0x5020_0010, 0x4008_8008];
         let back = CrashRecord::from_bytes(&rec.to_bytes()).expect("roundtrip");
         assert_eq!(back.stack_snapshot, rec.stack_snapshot);
@@ -199,10 +206,25 @@ mod tests {
     fn persisted_field_offsets_are_stable() {
         let mut rec = sample_record(5);
         rec.dma_write_addrs = [0xAAAA_AAAA, 0xBBBB_BBBB];
-        rec.stack_snapshot = [0xC0DE_0000, 0xC0DE_0001, 0xC0DE_0002, 0xC0DE_0003, 0xC0DE_0004, 0xC0DE_0005];
+        rec.stack_snapshot = [
+            0xC0DE_0000,
+            0xC0DE_0001,
+            0xC0DE_0002,
+            0xC0DE_0003,
+            0xC0DE_0004,
+            0xC0DE_0005,
+        ];
         let b = rec.to_bytes();
-        assert_eq!(&b[88..92], &0xAAAA_AAAAu32.to_le_bytes(), "dma ch0 @ [88..92]");
-        assert_eq!(&b[92..96], &0xBBBB_BBBBu32.to_le_bytes(), "dma ch1 @ [92..96]");
+        assert_eq!(
+            &b[88..92],
+            &0xAAAA_AAAAu32.to_le_bytes(),
+            "dma ch0 @ [88..92]"
+        );
+        assert_eq!(
+            &b[92..96],
+            &0xBBBB_BBBBu32.to_le_bytes(),
+            "dma ch1 @ [92..96]"
+        );
         for i in 0..6 {
             let off = 96 + i * 4;
             assert_eq!(

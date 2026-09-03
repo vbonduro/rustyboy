@@ -19,6 +19,9 @@ pub mod multicore;
 pub mod save_storage;
 #[cfg(target_arch = "arm")]
 pub mod sd;
+/// Crate-wide access to the watchdog peripheral. ARM-only (embassy-rp).
+#[cfg(target_arch = "arm")]
+pub mod wdt;
 pub mod xip_cartridge;
 
 /// Pure encode/decode helpers for WiFi credential storage and the captive

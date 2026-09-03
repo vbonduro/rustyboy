@@ -1,13 +1,13 @@
 use alloc::boxed::Box;
 
 use defmt::info;
-use embassy_rp::watchdog::Watchdog;
 use embassy_time::Duration;
 use rustyboy_pico2w::display::{hw::GameDisplay, LoadingFrame, LoadingProgress};
 use rustyboy_pico2w::flash_rom::{
     probe_staged_rom, FlashRomInfo, OnboardFlash, RomStager, WriteResult,
 };
 use rustyboy_pico2w::multicore::PicoGameBoy;
+use rustyboy_pico2w::wdt;
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
 use super::{MainMenuState, RunningState};
@@ -28,19 +28,16 @@ impl LoadingState {
         flash: &mut OnboardFlash<'_>,
         sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
-        watchdog: &mut Watchdog,
     ) {
         if let Some(existing_gb) = gameboy.as_deref() {
             flush_battery_save(app, sd_mgr, existing_gb);
         }
         let had_game = halt_running_game(gameboy);
-        let stage_result = self
-            .ensure_rom_staged(app, flash, sd_mgr, game_disp, watchdog)
-            .await;
+        let stage_result = self.ensure_rom_staged(app, flash, sd_mgr, game_disp).await;
 
         match stage_result {
             Ok(info) => {
-                self.enter_staged_rom(app, gameboy, sd_mgr, game_disp, watchdog, had_game, info)
+                self.enter_staged_rom(app, gameboy, sd_mgr, game_disp, had_game, info)
                     .await;
             }
             Err(_) => {
@@ -56,7 +53,6 @@ impl LoadingState {
         flash: &mut OnboardFlash<'_>,
         sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
-        watchdog: &mut Watchdog,
     ) -> Result<FlashRomInfo, ()> {
         // If the ROM is already staged in flash, skip the erase/write cycle.
         // Avoids the flash-pause handshake with the halted core1 and is
@@ -71,7 +67,6 @@ impl LoadingState {
             flash,
             sd_mgr,
             game_disp,
-            watchdog,
         )
         .await
     }
@@ -82,14 +77,13 @@ impl LoadingState {
         gameboy: &mut Option<Box<PicoGameBoy>>,
         sd_mgr: &mut PicoSdMgr,
         game_disp: &mut GameDisplay<'static>,
-        watchdog: &mut Watchdog,
         had_game: bool,
         info: FlashRomInfo,
     ) {
         app.staged_rom_name = Some(self.filename.clone());
         app.staged_rom_id = info.rom_id;
         if had_game {
-            restart_after_rom_switch(watchdog);
+            restart_after_rom_switch();
         } else {
             start_first_rom(app, gameboy, sd_mgr, game_disp, info).await;
         }
@@ -146,12 +140,11 @@ async fn start_first_rom(
     }
 }
 
-fn restart_after_rom_switch(watchdog: &mut Watchdog) -> ! {
+fn restart_after_rom_switch() -> ! {
     // ROM switch — core1 is halted; trigger watchdog reset to boot fresh with
     // the newly staged ROM.
     info!("ROM staged, restarting via watchdog");
-    watchdog.start(Duration::from_millis(100));
-    loop {}
+    wdt::force_reset()
 }
 
 async fn transition_to_main_menu(app: &mut App, game_disp: &mut GameDisplay<'static>) {
@@ -165,7 +158,6 @@ async fn stage_rom_from_sd(
     flash: &mut OnboardFlash<'_>,
     sd_mgr: &mut PicoSdMgr,
     game_disp: &mut GameDisplay<'static>,
-    watchdog: &mut Watchdog,
 ) -> Result<FlashRomInfo, ()> {
     let mut reader = sd_mgr.open_rom_reader(filename).map_err(|e| {
         defmt::error!("sd open failed: {:?}", defmt::Debug2Format(&e));
@@ -180,7 +172,7 @@ async fn stage_rom_from_sd(
 
     // RP2350 watchdog maximum is 16,777,215 µs (~16.7 s). Use 16 s so the
     // erase phase (which can take several seconds) does not starve the watchdog.
-    watchdog.feed(Duration::from_millis(16_000));
+    wdt::feed_for(Duration::from_millis(16_000));
     let mut stager = RomStager::begin(flash, &mut reader, filename).map_err(|e| {
         defmt::error!("stager begin failed: {:?}", defmt::Debug2Format(&e));
     })?;
@@ -194,7 +186,7 @@ async fn stage_rom_from_sd(
         .await;
 
     loop {
-        watchdog.feed(Duration::from_millis(5_000));
+        wdt::feed_for(Duration::from_millis(5_000));
         match stager.write_next_bank(flash, &mut reader).map_err(|e| {
             defmt::error!("bank write failed: {:?}", defmt::Debug2Format(&e));
         })? {

@@ -882,7 +882,9 @@ impl ApuPeripheral {
     /// from a correctly sized buffer.
     #[inline(always)]
     fn trusted_capacity(&self) -> usize {
-        self.sample_buffer.capacity().min(SAMPLE_BUFFER_CAPACITY_HINT)
+        self.sample_buffer
+            .capacity()
+            .min(SAMPLE_BUFFER_CAPACITY_HINT)
     }
 
     /// Downsample to 48 kHz and push stereo PCM pairs into `sample_buffer`.
@@ -892,7 +894,6 @@ impl ApuPeripheral {
     /// while the generic batch path handles tests and any larger callers.
     #[cfg_attr(target_arch = "arm", link_section = ".data")]
     fn produce_samples(&mut self, cycles: u16) {
-
         let sample_inc = cycles as u32 * SAMPLE_PERIOD_DEN;
         if cycles <= 4 {
             self.sample_acc += sample_inc;
@@ -918,7 +919,7 @@ impl ApuPeripheral {
                     .trusted_capacity()
                     .saturating_sub(self.sample_buffer.len())
                     / 2)
-                    .min(n_samples as usize);
+                .min(n_samples as usize);
                 for _ in 0..pushable {
                     let (left, right) = self.mix_sample();
                     self.sample_buffer.push(left);
