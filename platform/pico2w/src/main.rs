@@ -55,47 +55,68 @@ use rustyboy_pico2w::save_storage::{boot_load_saves, BootSaves, SaveSlot};
 use rustyboy_pico2w::sd::{self, DummyClock};
 use rustyboy_pico2w::xip_cartridge::XipCartridge;
 
-#[cfg(feature = "oc-300")]
-const TARGET_SYS_HZ: u32 = 300_000_000;
-// 16 s gives worst-case frame/flash-sync stalls plenty of headroom without false-tripping;
-// the multicore livelock that caused the old 5 s freeze→reset is separately fixed by WFE backpressure.
-const WATCHDOG_WINDOW_MS: u64 = 16_000;
-#[cfg(all(not(feature = "oc-300"), feature = "oc-288"))]
-// 288 MHz = PLL FBDIV 120 (VCO 1440) / POSTDIV 5 — one grid step below 300 on
-// the stock PLL config, and the fastest clock measured free of the SP-drift
-// fault. A frequency sweep (live PLL reprogramming, no rebuild) put the failure
-// cliff between 288 and 300: at 300 MHz the drift instrument logged 67.5 events
-// per 1000 work-ticks, while 288/276/264/252/240 logged ZERO across 13,567
-// ticks. A 24 h soak at 288 on the real firmware logged 0 crashes.
+// 16 s gives worst-case frame/flash-sync stalls plenty of headroom without
+// false-tripping; the multicore livelock that caused the old 5 s freeze→reset is
+// separately fixed by WFE backpressure.
 //
-// NOT proven safe: the cliff is bracketed only to (288, 300], so 288 may have as
-// little as 0.3% margin, and that is untested against temperature and
-// part-to-part spread. 266 is the more conservative shipping point.
-// See docs/investigations/sp-drift-root-cause.md.
-const TARGET_SYS_HZ: u32 = 288_000_000;
-#[cfg(all(not(feature = "oc-300"), not(feature = "oc-288"), feature = "oc-280"))]
-const TARGET_SYS_HZ: u32 = 280_000_000;
-#[cfg(all(
-    not(feature = "oc-300"),
-    not(feature = "oc-288"),
-    not(feature = "oc-280"),
-    feature = "oc-266"
-))]
-const TARGET_SYS_HZ: u32 = 266_000_000;
-#[cfg(all(
-    not(feature = "oc-300"),
-    not(feature = "oc-288"),
-    not(feature = "oc-280"),
-    not(feature = "oc-266")
-))]
-const TARGET_SYS_HZ: u32 = 300_000_000;
+// The RP2350 WATCHDOG.LOAD counter is 24-bit MICROSECONDS, so the largest window
+// the hardware can express is 16.777 s. The assert below keeps that a build
+// error rather than an embassy panic at boot.
+const WATCHDOG_WINDOW_MS: u64 = 16_000;
+const WATCHDOG_MAX_WINDOW_MS: u64 = (1 << 24) / 1_000;
+const _: () = assert!(WATCHDOG_WINDOW_MS <= WATCHDOG_MAX_WINDOW_MS);
 
-#[cfg(feature = "oc-300")]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_30;
-#[cfg(feature = "oc-280")]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_25;
-#[cfg(all(not(feature = "oc-300"), not(feature = "oc-280")))]
-const TARGET_CORE_VOLTAGE: embassy_rp::clocks::CoreVoltage = embassy_rp::clocks::CoreVoltage::V1_30;
+/// A clock operating point: frequency and the core voltage it was validated at.
+///
+/// Frequency and voltage are two halves of ONE decision, so they live in one
+/// place. They were previously two independent `#[cfg]` cascades keyed on
+/// overlapping-but-different feature sets, which had already drifted: `oc-266`
+/// selected 266 MHz but fell through to V1_30, silently *not* reproducing the
+/// "266 MHz @ V1_25" operating point it is named for.
+struct ClockProfile {
+    hz: u32,
+    voltage: embassy_rp::clocks::CoreVoltage,
+}
+
+use embassy_rp::clocks::CoreVoltage;
+
+/// Stock overclock. NOT free of the SP-drift fault — see `OC_288`.
+const OC_300: ClockProfile = ClockProfile { hz: 300_000_000, voltage: CoreVoltage::V1_30 };
+
+/// 288 MHz = PLL FBDIV 120 (VCO 1440) / POSTDIV 5 — one grid step below 300 on
+/// the stock PLL config, and the fastest clock measured free of the SP-drift
+/// fault. A frequency sweep by live PLL reprogramming put the failure cliff
+/// between 288 and 300: at 300 the drift instrument logged 67.5 events per 1000
+/// work-ticks, while 288/276/264/252/240 logged zero across 13,567 ticks. A 24 h
+/// soak at 288 on the real firmware logged 0 crashes.
+///
+/// NOT proven safe: the cliff is bracketed only to (288, 300], so 288 may have
+/// as little as 0.3% margin, untested against temperature and part-to-part
+/// spread. `OC_266` is the more conservative shipping point.
+/// See docs/investigations/sp-drift-root-cause.md.
+const OC_288: ClockProfile = ClockProfile { hz: 288_000_000, voltage: CoreVoltage::V1_30 };
+
+const OC_280: ClockProfile = ClockProfile { hz: 280_000_000, voltage: CoreVoltage::V1_25 };
+
+/// 9 h clean on record at V1_25 — the voltage is part of that result.
+const OC_266: ClockProfile = ClockProfile { hz: 266_000_000, voltage: CoreVoltage::V1_25 };
+
+/// Exactly one profile, chosen in priority order. Adding a profile is one const
+/// plus one arm; frequency and voltage cannot desync.
+const CLOCK: ClockProfile = if cfg!(feature = "oc-300") {
+    OC_300
+} else if cfg!(feature = "oc-288") {
+    OC_288
+} else if cfg!(feature = "oc-280") {
+    OC_280
+} else if cfg!(feature = "oc-266") {
+    OC_266
+} else {
+    OC_300
+};
+
+const TARGET_SYS_HZ: u32 = CLOCK.hz;
+const TARGET_CORE_VOLTAGE: CoreVoltage = CLOCK.voltage;
 
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const CYCLES_PER_FRAME: u64 = 70_224;
@@ -357,6 +378,12 @@ async fn main(spawner: Spawner) {
     );
 
     // SD card — always initialised so the ROM list is available.
+    // Drive the SD mode pin BEFORE any bus traffic. Nothing clocked SPI0 before
+    // this commit (SdCard construction is lazy), so its position did not matter;
+    // the power-up clocks below are the first transfer, and they must not be
+    // sent while this pin is still in its reset state.
+    let _sd_mode = Output::new(p.PIN_17, Level::High);
+
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = 400_000;
     let mut spi_bus = Spi::new_blocking(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, spi_cfg);
@@ -374,14 +401,23 @@ async fn main(spawner: Spawner) {
     }
 
     let spi_dev = ExclusiveDevice::new(spi_bus, cs, Delay);
-    // Bounded card acquisition. With no card each attempt costs ~340 ms (a CMD0
+    // Bounded card acquisition. With NO card each attempt costs ~340 ms (a CMD0
     // that times out, 255 flush bytes at 400 kHz, and a delay), so the crate
     // default of 50 retries takes ~17.1 s to return `CardNotFound`. The watchdog
     // window is 16 s and the RP2350 counter is 24-bit MICROSECONDS, capping the
     // window at 16.777 s — so a no-card boot could never fit and reset the board
-    // mid-init, every boot, producing only `WatchdogTimeout` records. 6 retries
-    // puts a no-card failure at ~2.4 s; a card that is present answers CMD0
-    // within the first few attempts (measured: 781 ms to a successful mount).
+    // mid-init, every boot, producing only `WatchdogTimeout` records.
+    //
+    // SCOPE OF THIS BOUND: `acquire_retries` bounds ONLY the CMD0 enter-SPI-mode
+    // loop. The CMD8 and ACMD41 loops that follow use the crate's hardcoded
+    // `DEFAULT_COMMAND_RETRIES` (10_000) and are NOT affected. So this caps the
+    // fully-absent-card case at ~2.4 s (measured), but a PARTIALLY responsive
+    // card — one that answers CMD0 and then stalls — can still take ~7-8 s.
+    // That fits the window with roughly 2x margin, not 6x. Bounding that case
+    // properly would need a wall-clock timeout around the whole call.
+    //
+    // A card that is present answers CMD0 in the first few attempts: measured
+    // 781 ms to a successful mount on this board.
     let sd_opts = embedded_sdmmc::sdcard::AcquireOpts {
         acquire_retries: 6,
         ..Default::default()
@@ -399,7 +435,6 @@ async fn main(spawner: Spawner) {
     // Check whether a ROM is already staged in flash.
     let staged = probe_staged_rom(&mut onboard_flash);
 
-    let _sd_mode = Output::new(p.PIN_17, Level::High);
     let Pio {
         mut common, sm0, ..
     } = Pio::new(p.PIO0, Irqs);
@@ -474,9 +509,15 @@ async fn main(spawner: Spawner) {
                         // One attempt is enough to know. If the card did not
                         // answer, every further read costs another full
                         // acquisition timeout and can only fail the same way.
-                        let sd_alive = save_state_res.is_ok();
-                        if !sd_alive {
-                            sd_available = false;
+                        // Only a transport failure means the card is absent. A
+                        // corrupt save-state file, or a transient allocation
+                        // failure, is an error from a HEALTHY card and must not
+                        // suppress the battery-save read below — doing so boots
+                        // with blank cart RAM and then overwrites a good `.sav`.
+                        if let Err(e) = save_state_res.as_ref() {
+                            if e.is_card_absent() {
+                                sd_available = false;
+                            }
                         }
                         let save_state_blob = save_state_res.unwrap_or_else(|e| {
                             defmt::warn!(
@@ -487,7 +528,7 @@ async fn main(spawner: Spawner) {
                         });
                         watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
                         let has_save_state = save_state_blob.is_some();
-                        let battery_data = if has_save_state || !sd_alive {
+                        let battery_data = if has_save_state || !sd_available {
                             None // save state includes cart RAM; skip battery read
                         } else {
                             watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
@@ -602,10 +643,12 @@ async fn main(spawner: Spawner) {
     };
     // Runs after the watchdog is armed and before the main loop's first feed, so
     // on a dead card its acquisition timeout would itself trip the watchdog.
+    // Skipped when the card did not respond: this runs after the watchdog is
+    // armed and before the main loop's first feed, so its acquisition timeout
+    // would itself trip the watchdog. `app.save_slot_available` is already
+    // false from construction.
     if sd_available {
         refresh_save_slot_available(&mut app, &sd_mgr);
-    } else {
-        app.save_slot_available = false;
     }
 
     #[cfg(feature = "fps")]

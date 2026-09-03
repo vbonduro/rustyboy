@@ -16,6 +16,51 @@
 /// function cannot silently leave the end of `.data` writable.
 #[cfg(target_arch = "arm")]
 #[inline(never)]
+
+/// Bounds of the RAM-resident `.data` thunk/code region, as an MPU (base, limit)
+/// pair — or `None` if the range is empty.
+///
+/// Start above the SEGGER RTT control block (0x30 bytes, legitimately written by
+/// defmt), rounded up to the 32-byte MPU granule.
+///
+/// The end needs care. RLAR's LIMIT is INCLUSIVE and its low 5 bits are forced
+/// to 0x1F, so a region always ends at `limit | 0x1F` — it rounds UP to the
+/// enclosing granule. `(edata - 1) & !0x1F` therefore reaches PAST `__edata` and
+/// marks the first bytes of `.bss` read-only, since `__edata` is essentially
+/// never 32-byte aligned. That is a real fault generator, not a theoretical one:
+/// with `-Z stack-protector=strong` (`__edata = 0x20003ab4`) it made the
+/// firmware unbootable — a genuine DACCVIOL, MMFAR = 0x20003ab8 = `__sbss`
+/// exactly, faulting in an ordinary early `atomic_store::<u8>` into `.bss`.
+/// Stepping back a full granule keeps the region below `__edata`, giving up at
+/// most 32 bytes of thunk coverage to stay off `.bss`.
+///
+/// Both cores call this so they fence exactly the same bytes; an asymmetric
+/// fence would produce a MemManage fault on one core only, which is miserable to
+/// diagnose.
+#[cfg(target_arch = "arm")]
+unsafe fn data_thunk_bounds() -> Option<(u32, u32)> {
+    unsafe extern "C" {
+        static _SEGGER_RTT: u8;
+        static __edata: u8;
+    }
+    let rtt_addr = core::ptr::addr_of!(_SEGGER_RTT) as usize;
+    let base = ((rtt_addr + 0x30 + 0x1F) & !0x1F) as u32;
+    let edata = core::ptr::addr_of!(__edata) as u32;
+    let limit = edata.saturating_sub(0x20) & !0x1F;
+    (limit > base).then_some((base, limit))
+}
+
+/// Arm `region` as privileged read-only, executable (XN=0), over `[base, limit]`.
+#[cfg(target_arch = "arm")]
+unsafe fn arm_ro_exec_region(region: u32, base: u32, limit: u32) {
+    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
+    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
+    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
+    MPU_RNR.write_volatile(region);
+    MPU_RBAR.write_volatile(base | 0x1C); // SH=11, AP=10 priv-RO, XN=0
+    MPU_RLAR.write_volatile(limit | 1);
+}
+
 pub unsafe fn setup_core0_data_mpu() {
     unsafe extern "C" {
         static _SEGGER_RTT: u8;
@@ -67,32 +112,15 @@ pub unsafe fn setup_core0_data_mpu() {
         // own instructions/literal pool were corrupted). It is also why every
         // "Core N never writes .data" result so far was vacuous for that range.
         //
-        // Start above the RTT control block (SEGGER control block is 0x30 bytes
-        // and IS legitimately written by defmt), rounded up to the 32-byte MPU
-        // granule; end at `__edata`.
+        // Bounds and the RLAR rounding hazard are documented on
+        // `data_thunk_bounds()`.
         if dregion > 1 {
-            let thunks_base = ((rtt_addr + 0x30 + 0x1F) & !0x1F) as u32;
-            let edata = core::ptr::addr_of!(__edata) as u32;
-            // RLAR's LIMIT is INCLUSIVE and its low 5 bits are forced to 0x1F, so
-            // the region always ends at `limit | 0x1F` — i.e. it rounds UP to the
-            // enclosing 32-byte granule. `(edata - 1) & !0x1F` therefore covers
-            // PAST `__edata` and marks the first bytes of `.bss` read-only, since
-            // `__edata` is essentially never 32-byte aligned. That is a real fault
-            // generator, not a theoretical one: with `-Z stack-protector=strong`
-            // (`__edata = 0x20003ab4`) it made the firmware unbootable — a genuine
-            // DACCVIOL, MMFAR = 0x20003ab8 = `__sbss` exactly, faulting in an
-            // ordinary early `atomic_store::<u8>` into `.bss`.
-            // Step back a full granule so the region always ends BELOW `__edata`,
-            // giving up at most 32 bytes of thunk coverage to stay off `.bss`.
-            let thunks_limit = edata.saturating_sub(0x20) & !0x1F;
-            if thunks_limit > thunks_base {
-                MPU_RNR.write_volatile(1);
-                MPU_RBAR.write_volatile(thunks_base | 0x1C); // SH=11, AP=10 priv-RO, XN=0
-                MPU_RLAR.write_volatile(thunks_limit | 1);
+            if let Some((base, limit)) = data_thunk_bounds() {
+                arm_ro_exec_region(1, base, limit);
                 defmt::info!(
                     "core0 MPU region 1 armed: .data thunks RO [{=u32:#010x}..={=u32:#010x}]",
-                    thunks_base,
-                    thunks_limit + 0x1F
+                    base,
+                    limit + 0x1F
                 );
             }
         }
@@ -123,7 +151,6 @@ pub unsafe fn setup_core0_data_mpu() {
         // XN=1 here (unlike the .data regions): core 0 never executes from core
         // 1's stack. CORE1_STACK is 0x20080000..0x20082000 (8 KiB, SRAM8/9), both
         // ends already 32-byte aligned so no granule rounding is needed.
-        // NOTE: this region is NOT armed here — see `arm_core1_stack_fence()`.
         // Core 0 legitimately writes core 1's stack while setting up its initial
         // frame in `spawn_core1`, so arming it this early makes boot fault. That
         // is not hypothetical: doing so produced an immediate
@@ -243,28 +270,12 @@ pub unsafe fn setup_core1_mpu() {
         // never writes .data" did not actually cover the range we have crash
         // evidence against.
         if dregion > 2 {
-            let thunks_base = ((rtt_addr + 0x30 + 0x1F) & !0x1F) as u32;
-            let edata = core::ptr::addr_of!(__edata) as u32;
-            // RLAR's LIMIT is INCLUSIVE and its low 5 bits are forced to 0x1F, so
-            // the region always ends at `limit | 0x1F` — i.e. it rounds UP to the
-            // enclosing 32-byte granule. `(edata - 1) & !0x1F` therefore covers
-            // PAST `__edata` and marks the first bytes of `.bss` read-only, since
-            // `__edata` is essentially never 32-byte aligned. That is a real fault
-            // generator, not a theoretical one: with `-Z stack-protector=strong`
-            // (`__edata = 0x20003ab4`) it made the firmware unbootable — a genuine
-            // DACCVIOL, MMFAR = 0x20003ab8 = `__sbss` exactly, faulting in an
-            // ordinary early `atomic_store::<u8>` into `.bss`.
-            // Step back a full granule so the region always ends BELOW `__edata`,
-            // giving up at most 32 bytes of thunk coverage to stay off `.bss`.
-            let thunks_limit = edata.saturating_sub(0x20) & !0x1F;
-            if thunks_limit > thunks_base {
-                MPU_RNR.write_volatile(2);
-                MPU_RBAR.write_volatile(thunks_base | 0x1C); // SH=11, AP=10 priv-RO, XN=0
-                MPU_RLAR.write_volatile(thunks_limit | 1);
+            if let Some((base, limit)) = data_thunk_bounds() {
+                arm_ro_exec_region(2, base, limit);
                 defmt::info!(
                     "core1 MPU region 2 armed: .data thunks RO [{=u32:#010x}..={=u32:#010x}]",
-                    thunks_base,
-                    thunks_limit + 0x1F
+                    base,
+                    limit + 0x1F
                 );
             }
         }
@@ -291,42 +302,4 @@ pub unsafe fn setup_core1_mpu() {
         base,
         data_limit + 0x1F
     );
-}
-
-/// Fence CORE 0 out of CORE 1's stack (MPU region 2 on core 0).
-///
-/// MUST be called on core 0 and ONLY AFTER `spawn_core1` — core 0 legitimately
-/// writes core 1's initial stack frame during the spawn, so arming earlier
-/// faults during boot.
-///
-/// Why this exists: the MPU already fences core 1 out of core 0's stack, but the
-/// symmetric direction was never covered, so core 0 could clobber CORE1_STACK
-/// silently. A recovered (never-committed) core-1 crash record showed core 1
-/// taking a precise bus fault in `ApuPeripheral::produce_samples` through a
-/// garbage `self` while its `sample_buffer` Vec was intact — i.e. the `worker`
-/// reference held on CORE 1'S STACK had been clobbered. If core 0 is the writer,
-/// this converts that silent clobber into a DACCVIOL naming the exact storing
-/// instruction; if it never fires, core 0 is excluded.
-///
-/// XN=1: core 0 never executes from core 1's stack.
-#[cfg(target_arch = "arm")]
-pub unsafe fn arm_core1_stack_fence() {
-    const MPU_RNR: *mut u32 = 0xE000_ED98 as *mut u32;
-    const MPU_RBAR: *mut u32 = 0xE000_ED9C as *mut u32;
-    const MPU_RLAR: *mut u32 = 0xE000_EDA0 as *mut u32;
-    const MPU_TYPE: *mut u32 = 0xE000_ED90 as *mut u32;
-
-    let dregion = unsafe { (MPU_TYPE.read_volatile() >> 8) & 0xFF };
-    if dregion <= 2 {
-        defmt::warn!("core0 MPU: <3 regions — CORE1_STACK fence disabled");
-        return;
-    }
-    unsafe {
-        MPU_RNR.write_volatile(2);
-        MPU_RBAR.write_volatile(0x2008_0000 | 0x1D); // SH=11, AP=10 priv-RO, XN=1
-        MPU_RLAR.write_volatile(0x2008_1FE0 | 1);
-    }
-    cortex_m::asm::dsb();
-    cortex_m::asm::isb();
-    defmt::info!("core0 MPU region 2 armed: CORE1_STACK RO [0x20080000..=0x20081fff]");
 }
