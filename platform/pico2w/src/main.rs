@@ -342,11 +342,32 @@ fn init_heap() {
     unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
 }
 
-/// Bring up the SD card on SPI0 and mount it.
+/// The SD manager bundled with the mode pin that must outlive it.
 ///
-/// Returns the manager together with the mode pin, which the caller MUST keep
-/// alive: dropping that `Output` releases GP17 and the card leaves SPI mode.
-#[allow(clippy::too_many_arguments)]
+/// GP17 selects SPI mode on the card module, so dropping that `Output` takes the
+/// card out of SPI mode. Owning it here makes the lifetime a type invariant
+/// rather than a comment asking the caller to keep a `let _sd_mode` binding
+/// alive — a binding whose leading underscore invites exactly the cleanup that
+/// would break it, with no compiler error at the point of the mistake.
+pub(crate) struct SdBus {
+    mgr: PicoSdMgr,
+    _mode: Output<'static>,
+}
+
+impl core::ops::Deref for SdBus {
+    type Target = PicoSdMgr;
+    fn deref(&self) -> &PicoSdMgr {
+        &self.mgr
+    }
+}
+
+impl core::ops::DerefMut for SdBus {
+    fn deref_mut(&mut self) -> &mut PicoSdMgr {
+        &mut self.mgr
+    }
+}
+
+/// Bring up the SD card on SPI0 and mount it.
 fn init_sd_card(
     mode_pin: Peri<'static, PIN_17>,
     spi0: Peri<'static, SPI0>,
@@ -354,7 +375,7 @@ fn init_sd_card(
     mosi: Peri<'static, PIN_7>,
     miso: Peri<'static, PIN_4>,
     cs_pin: Peri<'static, PIN_5>,
-) -> (PicoSdMgr, Output<'static>) {
+) -> SdBus {
     // SD card — always initialised so the ROM list is available.
     // Drive the SD mode pin BEFORE any bus traffic. Nothing clocked SPI0 before
     // this commit (SdCard construction is lazy), so its position did not matter;
@@ -401,7 +422,10 @@ fn init_sd_card(
         ..Default::default()
     };
     let sdcard = SdCard::new_with_options(spi_dev, Delay, sd_opts);
-    (PicoSdMgr::new(sdcard, DummyClock), sd_mode)
+    SdBus {
+        mgr: PicoSdMgr::new(sdcard, DummyClock),
+        _mode: sd_mode,
+    }
 }
 
 /// Restore cart RAM into a freshly built GameBoy from whatever the card holds.
@@ -413,9 +437,6 @@ fn init_sd_card(
 /// Feeds the watchdog around each SD read: these run before the main loop's
 /// first feed, and a slow card can otherwise outlast the window.
 fn restore_saves_on_boot(sd_mgr: &PicoSdMgr, rom_id: &RomId, gb: &mut PicoGameBoy) {
-    // A save state contains cart RAM, so prefer it and only
-    // read the battery file if no state is available. This
-    // avoids holding two large SD blobs at once during boot.
     let slot = SaveSlot::new(0).expect("slot 0 is valid");
     wdt::feed();
     let save_state_res = sd_mgr.read_save_state(rom_id, slot);
@@ -425,30 +446,19 @@ fn restore_saves_on_boot(sd_mgr: &PicoSdMgr, rom_id: &RomId, gb: &mut PicoGameBo
     });
     wdt::feed();
     let has_save_state = save_state_blob.is_some();
-    // A save state already contains cart RAM, so only fall
-    // back to the battery file when there is none. `with_card`
-    // skips the read outright on an absent card, where it
-    // would cost another full acquisition timeout and can
-    // only fail the same way.
-    //
-    // Note the card-present check is NOT a proxy for "the
-    // save-state read succeeded": a corrupt file or a
-    // transient allocation failure is an error from a HEALTHY
-    // card and must still fall through to the battery read.
-    // Conflating the two boots with blank cart RAM and then
-    // overwrites a good `.sav`.
+    // Gate on has_save_state ONLY. A failed save-state read is not evidence the
+    // card is bad: a corrupt file or a transient allocation failure comes from a
+    // HEALTHY card and must still fall through to the battery read. Conflating
+    // the two boots with blank cart RAM and then overwrites a good `.sav`.
+    // `read_battery_save` skips itself on a card already known absent.
     let battery_data = if has_save_state {
         None
     } else {
         wdt::feed();
-        sd_mgr
-            .with_card(|sd| {
-                sd.read_battery_save(rom_id).unwrap_or_else(|e| {
-                    defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e));
-                    None
-                })
-            })
-            .flatten()
+        sd_mgr.read_battery_save(rom_id).unwrap_or_else(|e| {
+            defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e));
+            None
+        })
     };
     match boot_load_saves(battery_data, save_state_blob) {
         None => {}
@@ -527,7 +537,7 @@ async fn main(spawner: Spawner) {
         p.PIN_21, p.PIN_22, p.PIN_26, p.PIN_27, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3,
     );
 
-    let (mut sd_mgr, _sd_mode) = init_sd_card(p.PIN_17, p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.PIN_5);
+    let mut sd_mgr = init_sd_card(p.PIN_17, p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.PIN_5);
 
     // Check for unread crash records so menus can show the crash-report badge.
     // (check_and_commit already ran earlier — before the splash.)
@@ -691,14 +701,10 @@ async fn main(spawner: Spawner) {
         wifi_periphs,
     };
     // Runs after the watchdog is armed and before the main loop's first feed, so
-    // on a dead card its acquisition timeout would itself trip the watchdog.
-    // Skipped when the card did not respond: this runs after the watchdog is
-    // armed and before the main loop's first feed, so its acquisition timeout
-    // would itself trip the watchdog. `app.save_slot_available` is already
-    // false from construction.
-    if sd_mgr.card_present() {
-        refresh_save_slot_available(&mut app, &sd_mgr);
-    }
+    // on a dead card an acquisition timeout here would itself trip the watchdog.
+    // `save_state_exists` short-circuits to false on a card already known
+    // absent, so that timeout is only ever paid once, at the boot read above.
+    refresh_save_slot_available(&mut app, &sd_mgr);
 
     #[cfg(feature = "fps")]
     let mut tracker = perf::PerfTracker::new();
