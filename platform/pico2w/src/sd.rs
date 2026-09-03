@@ -32,6 +32,26 @@ pub enum SdError<E: core::fmt::Debug> {
     OutOfMemory,
 }
 
+impl<E: core::fmt::Debug> SdError<E> {
+    /// True only when the failure means the CARD DID NOT RESPOND, as opposed to
+    /// the card answering fine and the *contents* being wrong.
+    ///
+    /// This distinction is load-bearing. `read_save_state` returns `Err` both
+    /// when the card is missing AND when a save-state file is present but fails
+    /// validation (`InvalidValue`), or when an allocation fails
+    /// (`OutOfMemory`). Treating all of those as "card absent" caused the boot
+    /// path to skip the battery-save read on a perfectly healthy card, boot
+    /// with blank cart RAM, and then overwrite a good `.sav` with it.
+    pub fn is_card_absent(&self) -> bool {
+        matches!(
+            self,
+            SdError::Sdmmc(
+                embedded_sdmmc::Error::DeviceError(_) | embedded_sdmmc::Error::NoSuchVolume
+            )
+        )
+    }
+}
+
 impl<E: core::fmt::Debug> From<embedded_sdmmc::Error<E>> for SdError<E> {
     fn from(e: embedded_sdmmc::Error<E>) -> Self {
         SdError::Sdmmc(e)
@@ -148,15 +168,6 @@ where
             has_next,
             total,
         })
-    }
-
-    /// Convenience wrapper for callers with no watchdog to feed.
-    pub fn list_rom_page(
-        &self,
-        page_offset: usize,
-        page_size: usize,
-    ) -> Result<RomPage, SdError<D::Error>> {
-        self.list_rom_page_with(page_offset, page_size, || {})
     }
 
     /// Open a specific ROM file by FAT filename (case-insensitive).

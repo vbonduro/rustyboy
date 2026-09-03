@@ -66,7 +66,11 @@ pub fn check_and_commit(flash: &mut OnboardFlash<'_>) -> bool {
         // the reset. `.uninit` carries it across the reset the same way the
         // watchdog scratch registers carry the register state.
         unsafe {
-            if let Some((_base, words)) = crate::crash::stack_snapshot::last_crash_stack() {
+            if let Some((base, words)) = crate::crash::stack_snapshot::last_crash_stack() {
+                // The record has no field for the base address, so log it: six
+                // hex words with no anchor cannot be located in a stack dump,
+                // which for an SP-offset measurement is the whole point.
+                defmt::info!("crash: stack window @ {=usize:#010x}", base);
                 rec.stack_snapshot = words;
                 crate::crash::stack_snapshot::clear_crash_stack();
             }

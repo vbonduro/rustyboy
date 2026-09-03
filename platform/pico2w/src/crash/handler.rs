@@ -313,19 +313,15 @@ fn commit_crash_and_reset(
     // boot — so the window goes to `.uninit`, which survives the reset the same
     // way the scratch registers do.
     //
-    // For a HardFault `sp` is MSP with the 8-word exception frame already
-    // pushed, so the interesting region starts above it; the +4 accounts for the
-    // STKALIGN pad, which the stacked xPSR bit 9 reports. A panic has no
-    // exception frame, so read from `sp` directly.
+    // `sp` is ALREADY the pre-fault stack pointer: `hard_fault_rust` passes
+    // `sp_before_exception()`, which has itself added the frame size (32 or 104
+    // for an FP-extended frame) and the STKALIGN pad. Do not re-add them — an
+    // earlier version did, which pushed the window 32 bytes past the return-
+    // address slot it exists to capture, and made its own xPSR probe read an
+    // unrelated word.
     #[cfg(target_arch = "arm")]
     unsafe {
-        let base = if matches!(kind, CrashKind::HardFault) {
-            let stacked_xpsr = core::ptr::read_volatile((sp + 0x1c) as *const u32);
-            sp + 0x20 + if stacked_xpsr & (1 << 9) != 0 { 4 } else { 0 }
-        } else {
-            sp
-        };
-        crate::crash::stack_snapshot::capture_crash_stack(base);
+        crate::crash::stack_snapshot::capture_stack_window(sp);
     }
 
     write_watchdog_scratch(

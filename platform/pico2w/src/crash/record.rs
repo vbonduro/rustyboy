@@ -246,7 +246,6 @@ impl CrashRecord {
             let off = 88 + i * 4;
             buf[off..off + 4].copy_from_slice(&addr.to_le_bytes());
         }
-        // buf[116..120] = 0 (reserved)
         // buf[124..128] = 0 (pad)
 
         let checksum = crc32(&buf[..120]);

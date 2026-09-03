@@ -141,9 +141,9 @@ _RECORD_FMT = (
     "12s"  # panic_loc
     "H"    # panic_line
     "H"    # stack_headroom
-    "I"
-    "2I"
-    "6I"
+    "I"     # dma_busy_mask        [84..88]
+    "2I"    # dma_write_addrs ch0-1 [88..96]
+    "6I"    # stack_snapshot       [96..120] (schema v2; v1 held DMA ch2-6)
     "I"    # crc32     [120..124]
     "4x"   # _pad4     [124..128]
 )
@@ -348,8 +348,11 @@ class CrashRecord:
                 "r4": f"0x{self.ext_r4:08x}",
                 "r12": f"0x{self.ext_r12:08x}",
             } if self.has_hardfault_ext_regs else None,
+            # `any(...)`, not truthiness: a WatchdogTimeout record is schema v2
+            # but has no capture point, so it carries six zero words. Report
+            # that as absent rather than as a captured window of zeros.
             "stack_snapshot": [f"0x{w:08x}" for w in self.stack_snapshot]
-            if self.stack_snapshot
+            if any(self.stack_snapshot)
             else None,
             "dma_write_addrs": [f"0x{w:08x}" for w in self.dma_write_addrs]
             if self.dma_busy_mask or any(self.dma_write_addrs)
