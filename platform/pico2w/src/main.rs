@@ -26,8 +26,8 @@ use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{
-    CORE1, DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, PIO0,
-    SPI0, SPI1,
+    CORE1, DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIN_17, PIN_4,
+    PIN_5, PIN_6, PIN_7, PIN_8, PIN_9, PIO0, SPI0, SPI1,
 };
 use embassy_rp::peripherals::{PIN_23, PIN_24, PIN_25, PIN_29, PIO1};
 use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
@@ -40,6 +40,7 @@ use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::SdCard;
 use rustyboy_core::storage::RomId;
+use rustyboy_pico2w::wdt;
 // defmt_rtt provides the RTT logging transport; the panic handler is our own
 // crash::handler implementation (panic-probe removed from Cargo.toml).
 use defmt_rtt as _;
@@ -81,7 +82,10 @@ struct ClockProfile {
 use embassy_rp::clocks::CoreVoltage;
 
 /// Stock overclock. NOT free of the SP-drift fault — see `OC_288`.
-const OC_300: ClockProfile = ClockProfile { hz: 300_000_000, voltage: CoreVoltage::V1_30 };
+const OC_300: ClockProfile = ClockProfile {
+    hz: 300_000_000,
+    voltage: CoreVoltage::V1_30,
+};
 
 /// 288 MHz = PLL FBDIV 120 (VCO 1440) / POSTDIV 5 — one grid step below 300 on
 /// the stock PLL config, and the fastest clock measured free of the SP-drift
@@ -94,12 +98,21 @@ const OC_300: ClockProfile = ClockProfile { hz: 300_000_000, voltage: CoreVoltag
 /// as little as 0.3% margin, untested against temperature and part-to-part
 /// spread. `OC_266` is the more conservative shipping point.
 /// See docs/investigations/sp-drift-root-cause.md.
-const OC_288: ClockProfile = ClockProfile { hz: 288_000_000, voltage: CoreVoltage::V1_30 };
+const OC_288: ClockProfile = ClockProfile {
+    hz: 288_000_000,
+    voltage: CoreVoltage::V1_30,
+};
 
-const OC_280: ClockProfile = ClockProfile { hz: 280_000_000, voltage: CoreVoltage::V1_25 };
+const OC_280: ClockProfile = ClockProfile {
+    hz: 280_000_000,
+    voltage: CoreVoltage::V1_25,
+};
 
 /// 9 h clean on record at V1_25 — the voltage is part of that result.
-const OC_266: ClockProfile = ClockProfile { hz: 266_000_000, voltage: CoreVoltage::V1_25 };
+const OC_266: ClockProfile = ClockProfile {
+    hz: 266_000_000,
+    voltage: CoreVoltage::V1_25,
+};
 
 /// Exactly one profile, chosen in priority order. Adding a profile is one const
 /// plus one arm; frequency and voltage cannot desync.
@@ -268,8 +281,15 @@ pub(crate) enum AppState {
 // Entry point
 // ---------------------------------------------------------------------------
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
+// ---------------------------------------------------------------------------
+// Boot-time setup
+// ---------------------------------------------------------------------------
+
+/// Arm the core-0 memory guards, before anything can run from RAM.
+///
+/// Ordering matters: the image check must precede any execution of `.data`
+/// RAM code, and the MPU region must be armed before that code can be written.
+fn arm_core0_memory_guards() {
     // Verify the .data load image before it can be executed as RAM code.
     rustyboy_pico2w::integrity::verify_image();
 
@@ -299,26 +319,160 @@ async fn main(spawner: Spawner) {
     // Protect .data / RAM-code region as priv-RO. Any write fires DACCVIOL;
     // MMFAR records the exact write address so we can identify the corruptor.
     unsafe { rustyboy_pico2w::mpu::setup_core0_data_mpu() };
+}
 
-    {
-        use core::mem::MaybeUninit;
-        // Save-state boot is the allocator high-water mark: by the time the
-        // boot path reads SLOT0.RBS, GameBoy and the core1 worker are live.
-        //
-        // Major live allocations measured from release symbols:
-        //   ~40 KiB Box<GameBoyMemory> and cartridge state
-        //   ~22 KiB GameBoy::front_buffer
-        //   ~31 KiB core1 PPU worker framebuffer/state
-        //   ~8 KiB  APU sample buffers, plus smaller CPU/opcode allocations
-        //   ~49 KiB SaveState blob for a 32 KiB cart-RAM game
-        //
-        // 160 KiB leaves room for GameBoy state plus the transient save-state
-        // blob while preserving core0 stack headroom. Allocation failures on
-        // this path are reported through `try_reserve_exact`, not HardFaults.
-        const HEAP_SIZE: usize = 160 * 1024;
-        static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
-        unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
+/// Hand the allocator its backing array.
+fn init_heap() {
+    use core::mem::MaybeUninit;
+    // Save-state boot is the allocator high-water mark: by the time the
+    // boot path reads SLOT0.RBS, GameBoy and the core1 worker are live.
+    //
+    // Major live allocations measured from release symbols:
+    //   ~40 KiB Box<GameBoyMemory> and cartridge state
+    //   ~22 KiB GameBoy::front_buffer
+    //   ~31 KiB core1 PPU worker framebuffer/state
+    //   ~8 KiB  APU sample buffers, plus smaller CPU/opcode allocations
+    //   ~49 KiB SaveState blob for a 32 KiB cart-RAM game
+    //
+    // 160 KiB leaves room for GameBoy state plus the transient save-state
+    // blob while preserving core0 stack headroom. Allocation failures on
+    // this path are reported through `try_reserve_exact`, not HardFaults.
+    const HEAP_SIZE: usize = 160 * 1024;
+    static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_SIZE] = [MaybeUninit::uninit(); HEAP_SIZE];
+    unsafe { HEAP.init(core::ptr::addr_of!(HEAP_MEM) as usize, HEAP_SIZE) }
+}
+
+/// Bring up the SD card on SPI0 and mount it.
+///
+/// Returns the manager together with the mode pin, which the caller MUST keep
+/// alive: dropping that `Output` releases GP17 and the card leaves SPI mode.
+#[allow(clippy::too_many_arguments)]
+fn init_sd_card(
+    mode_pin: Peri<'static, PIN_17>,
+    spi0: Peri<'static, SPI0>,
+    clk: Peri<'static, PIN_6>,
+    mosi: Peri<'static, PIN_7>,
+    miso: Peri<'static, PIN_4>,
+    cs_pin: Peri<'static, PIN_5>,
+) -> (PicoSdMgr, Output<'static>) {
+    // SD card — always initialised so the ROM list is available.
+    // Drive the SD mode pin BEFORE any bus traffic. Nothing clocked SPI0 before
+    // this commit (SdCard construction is lazy), so its position did not matter;
+    // the power-up clocks below are the first transfer, and they must not be
+    // sent while this pin is still in its reset state.
+    let sd_mode = Output::new(mode_pin, Level::High);
+
+    let mut spi_cfg = spi::Config::default();
+    spi_cfg.frequency = 400_000;
+    let mut spi_bus = Spi::new_blocking(spi0, clk, mosi, miso, spi_cfg);
+    rp_pac::PADS_BANK0.gpio(4).modify(|w| w.set_pue(true));
+
+    // SD power-up clocks. The SD spec requires >=74 clock cycles at 400 kHz with
+    // CS DEASSERTED before the card will enter SPI mode. `embedded-sdmmc` does
+    // not do this — its `SdCard` docs leave it to the caller ("some [cards] do,
+    // some don't") — and this firmware previously went straight from
+    // construction to CMD0. CS is therefore created FIRST, held high for the
+    // clocks, then moved into the ExclusiveDevice. 10 bytes = 80 clocks.
+    let cs = Output::new(cs_pin, Level::High);
+    if let Err(e) = spi_bus.blocking_write(&[0xFFu8; 10]) {
+        defmt::warn!("SD power-up clocks failed: {:?}", defmt::Debug2Format(&e));
     }
+
+    let spi_dev = ExclusiveDevice::new(spi_bus, cs, Delay);
+    // Bounded card acquisition. With NO card each attempt costs ~340 ms (a CMD0
+    // that times out, 255 flush bytes at 400 kHz, and a delay), so the crate
+    // default of 50 retries takes ~17.1 s to return `CardNotFound`. The watchdog
+    // window is 16 s and the RP2350 counter is 24-bit MICROSECONDS, capping the
+    // window at 16.777 s — so a no-card boot could never fit and reset the board
+    // mid-init, every boot, producing only `WatchdogTimeout` records.
+    //
+    // SCOPE OF THIS BOUND: `acquire_retries` bounds ONLY the CMD0 enter-SPI-mode
+    // loop. The CMD8 and ACMD41 loops that follow use the crate's hardcoded
+    // `DEFAULT_COMMAND_RETRIES` (10_000) and are NOT affected. So this caps the
+    // fully-absent-card case at ~2.4 s (measured), but a PARTIALLY responsive
+    // card — one that answers CMD0 and then stalls — can still take ~7-8 s.
+    // That fits the window with roughly 2x margin, not 6x. Bounding that case
+    // properly would need a wall-clock timeout around the whole call.
+    //
+    // A card that is present answers CMD0 in the first few attempts: measured
+    // 781 ms to a successful mount on this board.
+    let sd_opts = embedded_sdmmc::sdcard::AcquireOpts {
+        acquire_retries: 6,
+        ..Default::default()
+    };
+    let sdcard = SdCard::new_with_options(spi_dev, Delay, sd_opts);
+    (PicoSdMgr::new(sdcard, DummyClock), sd_mode)
+}
+
+/// Restore cart RAM into a freshly built GameBoy from whatever the card holds.
+///
+/// A save state already contains cart RAM, so the battery file is read only
+/// when there is no state. That ordering also avoids holding two large SD
+/// blobs in the heap at once, which is the allocator's high-water mark.
+///
+/// Feeds the watchdog around each SD read: these run before the main loop's
+/// first feed, and a slow card can otherwise outlast the window.
+fn restore_saves_on_boot(sd_mgr: &PicoSdMgr, rom_id: &RomId, gb: &mut PicoGameBoy) {
+    // A save state contains cart RAM, so prefer it and only
+    // read the battery file if no state is available. This
+    // avoids holding two large SD blobs at once during boot.
+    let slot = SaveSlot::new(0).expect("slot 0 is valid");
+    wdt::feed();
+    let save_state_res = sd_mgr.read_save_state(rom_id, slot);
+    let save_state_blob = save_state_res.unwrap_or_else(|e| {
+        defmt::warn!("boot save state read failed: {:?}", defmt::Debug2Format(&e));
+        None
+    });
+    wdt::feed();
+    let has_save_state = save_state_blob.is_some();
+    // A save state already contains cart RAM, so only fall
+    // back to the battery file when there is none. `with_card`
+    // skips the read outright on an absent card, where it
+    // would cost another full acquisition timeout and can
+    // only fail the same way.
+    //
+    // Note the card-present check is NOT a proxy for "the
+    // save-state read succeeded": a corrupt file or a
+    // transient allocation failure is an error from a HEALTHY
+    // card and must still fall through to the battery read.
+    // Conflating the two boots with blank cart RAM and then
+    // overwrites a good `.sav`.
+    let battery_data = if has_save_state {
+        None
+    } else {
+        wdt::feed();
+        sd_mgr
+            .with_card(|sd| {
+                sd.read_battery_save(rom_id).unwrap_or_else(|e| {
+                    defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e));
+                    None
+                })
+            })
+            .flatten()
+    };
+    match boot_load_saves(battery_data, save_state_blob) {
+        None => {}
+        Some(BootSaves::BatterySave(data)) => gb.set_external_ram(&data),
+        Some(BootSaves::SaveState(state)) => {
+            let _ = gb.load_state(state);
+            info!("save state loaded on boot");
+        }
+        Some(BootSaves::Both {
+            battery,
+            save_state,
+        }) => {
+            gb.set_external_ram(&battery);
+            let _ = gb.load_state(save_state);
+            info!("save state loaded on boot");
+        }
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    arm_core0_memory_guards();
+
+    init_heap();
 
     let p = {
         use embassy_rp::clocks::ClockConfig;
@@ -328,14 +482,10 @@ async fn main(spawner: Spawner) {
         embassy_rp::init(embassy_rp::config::Config::new(clk))
     };
 
-    let mut watchdog = Watchdog::new(p.WATCHDOG);
-    watchdog.start(Duration::from_millis(WATCHDOG_WINDOW_MS));
-    // Pause the watchdog while a debugger has the cores halted. embassy's
-    // `start()` clears the pause-on-debug bits, so without this the 10 s
-    // watchdog fires during a probe-rs flash or GDB halt — resetting the chip
-    // mid-operation (mid-flash page-write timeouts; GDB "core is running"
-    // fatal errors). No effect in production (no debugger => never paused).
-    watchdog.pause_on_debug(true);
+    wdt::init(
+        Watchdog::new(p.WATCHDOG),
+        Duration::from_millis(WATCHDOG_WINDOW_MS),
+    );
 
     info!(
         "rustyboy-pico2w v{} starting @{}MHz",
@@ -377,53 +527,7 @@ async fn main(spawner: Spawner) {
         p.PIN_21, p.PIN_22, p.PIN_26, p.PIN_27, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3,
     );
 
-    // SD card — always initialised so the ROM list is available.
-    // Drive the SD mode pin BEFORE any bus traffic. Nothing clocked SPI0 before
-    // this commit (SdCard construction is lazy), so its position did not matter;
-    // the power-up clocks below are the first transfer, and they must not be
-    // sent while this pin is still in its reset state.
-    let _sd_mode = Output::new(p.PIN_17, Level::High);
-
-    let mut spi_cfg = spi::Config::default();
-    spi_cfg.frequency = 400_000;
-    let mut spi_bus = Spi::new_blocking(p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, spi_cfg);
-    rp_pac::PADS_BANK0.gpio(4).modify(|w| w.set_pue(true));
-
-    // SD power-up clocks. The SD spec requires >=74 clock cycles at 400 kHz with
-    // CS DEASSERTED before the card will enter SPI mode. `embedded-sdmmc` does
-    // not do this — its `SdCard` docs leave it to the caller ("some [cards] do,
-    // some don't") — and this firmware previously went straight from
-    // construction to CMD0. CS is therefore created FIRST, held high for the
-    // clocks, then moved into the ExclusiveDevice. 10 bytes = 80 clocks.
-    let cs = Output::new(p.PIN_5, Level::High);
-    if let Err(e) = spi_bus.blocking_write(&[0xFFu8; 10]) {
-        defmt::warn!("SD power-up clocks failed: {:?}", defmt::Debug2Format(&e));
-    }
-
-    let spi_dev = ExclusiveDevice::new(spi_bus, cs, Delay);
-    // Bounded card acquisition. With NO card each attempt costs ~340 ms (a CMD0
-    // that times out, 255 flush bytes at 400 kHz, and a delay), so the crate
-    // default of 50 retries takes ~17.1 s to return `CardNotFound`. The watchdog
-    // window is 16 s and the RP2350 counter is 24-bit MICROSECONDS, capping the
-    // window at 16.777 s — so a no-card boot could never fit and reset the board
-    // mid-init, every boot, producing only `WatchdogTimeout` records.
-    //
-    // SCOPE OF THIS BOUND: `acquire_retries` bounds ONLY the CMD0 enter-SPI-mode
-    // loop. The CMD8 and ACMD41 loops that follow use the crate's hardcoded
-    // `DEFAULT_COMMAND_RETRIES` (10_000) and are NOT affected. So this caps the
-    // fully-absent-card case at ~2.4 s (measured), but a PARTIALLY responsive
-    // card — one that answers CMD0 and then stalls — can still take ~7-8 s.
-    // That fits the window with roughly 2x margin, not 6x. Bounding that case
-    // properly would need a wall-clock timeout around the whole call.
-    //
-    // A card that is present answers CMD0 in the first few attempts: measured
-    // 781 ms to a successful mount on this board.
-    let sd_opts = embedded_sdmmc::sdcard::AcquireOpts {
-        acquire_retries: 6,
-        ..Default::default()
-    };
-    let sdcard = SdCard::new_with_options(spi_dev, Delay, sd_opts);
-    let mut sd_mgr = PicoSdMgr::new(sdcard, DummyClock);
+    let (mut sd_mgr, _sd_mode) = init_sd_card(p.PIN_17, p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.PIN_5);
 
     // Check for unread crash records so menus can show the crash-report badge.
     // (check_and_commit already ran earlier — before the splash.)
@@ -471,9 +575,6 @@ async fn main(spawner: Spawner) {
     let mut audio_samples = Vec::with_capacity(2048);
 
     // Build initial state: Running if a ROM is staged, else MainMenu.
-    // Cleared as soon as any boot SD access reports the card missing. Each SD
-    // call costs a full acquisition timeout, so one failure is enough to know.
-    let mut sd_available = true;
     let (initial_state, gameboy_init, staged_rom_name, staged_rom_id, core1_token) = match staged {
         Some((info, name)) => {
             info!(
@@ -500,59 +601,7 @@ async fn main(spawner: Spawner) {
                     let mut gb: Box<PicoGameBoy> =
                         Box::new(PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart)));
                     if let Some(rom_id) = info.rom_id {
-                        // A save state contains cart RAM, so prefer it and only
-                        // read the battery file if no state is available. This
-                        // avoids holding two large SD blobs at once during boot.
-                        let slot = SaveSlot::new(0).expect("slot 0 is valid");
-                        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
-                        let save_state_res = sd_mgr.read_save_state(&rom_id, slot);
-                        // One attempt is enough to know. If the card did not
-                        // answer, every further read costs another full
-                        // acquisition timeout and can only fail the same way.
-                        // Only a transport failure means the card is absent. A
-                        // corrupt save-state file, or a transient allocation
-                        // failure, is an error from a HEALTHY card and must not
-                        // suppress the battery-save read below — doing so boots
-                        // with blank cart RAM and then overwrites a good `.sav`.
-                        if let Err(e) = save_state_res.as_ref() {
-                            if e.is_card_absent() {
-                                sd_available = false;
-                            }
-                        }
-                        let save_state_blob = save_state_res.unwrap_or_else(|e| {
-                            defmt::warn!(
-                                "boot save state read failed: {:?}",
-                                defmt::Debug2Format(&e)
-                            );
-                            None
-                        });
-                        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
-                        let has_save_state = save_state_blob.is_some();
-                        let battery_data = if has_save_state || !sd_available {
-                            None // save state includes cart RAM; skip battery read
-                        } else {
-                            watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
-                            sd_mgr.read_battery_save(&rom_id).unwrap_or_else(|e| {
-                                defmt::warn!("battery load failed: {:?}", defmt::Debug2Format(&e));
-                                None
-                            })
-                        };
-                        match boot_load_saves(battery_data, save_state_blob) {
-                            None => {}
-                            Some(BootSaves::BatterySave(data)) => gb.set_external_ram(&data),
-                            Some(BootSaves::SaveState(state)) => {
-                                let _ = gb.load_state(state);
-                                info!("save state loaded on boot");
-                            }
-                            Some(BootSaves::Both {
-                                battery,
-                                save_state,
-                            }) => {
-                                gb.set_external_ram(&battery);
-                                let _ = gb.load_state(save_state);
-                                info!("save state loaded on boot");
-                            }
-                        }
+                        restore_saves_on_boot(&sd_mgr, &rom_id, &mut gb);
                     }
                     info!("ROM loaded, entering main loop");
                     (
@@ -647,7 +696,7 @@ async fn main(spawner: Spawner) {
     // armed and before the main loop's first feed, so its acquisition timeout
     // would itself trip the watchdog. `app.save_slot_available` is already
     // false from construction.
-    if sd_available {
+    if sd_mgr.card_present() {
         refresh_save_slot_available(&mut app, &sd_mgr);
     }
 
@@ -655,7 +704,7 @@ async fn main(spawner: Spawner) {
     let mut tracker = perf::PerfTracker::new();
 
     loop {
-        watchdog.feed(Duration::from_millis(WATCHDOG_WINDOW_MS));
+        wdt::feed();
 
         // Take the current state out so we can pass &mut app into tick().
         let mut state = core::mem::replace(&mut app.state, AppState::Running(RunningState));
@@ -693,13 +742,13 @@ async fn main(spawner: Spawner) {
 
             AppState::MainMenu(menu_state) => {
                 menu_state
-                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr, &mut watchdog)
+                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr)
                     .await;
             }
 
             AppState::RomList(rom_list_state) => {
                 rom_list_state
-                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr, &mut watchdog)
+                    .tick(&mut app, &mut game_disp, &mut input, &mut sd_mgr)
                     .await;
             }
 
@@ -711,7 +760,6 @@ async fn main(spawner: Spawner) {
                         &mut onboard_flash,
                         &mut sd_mgr,
                         &mut game_disp,
-                        &mut watchdog,
                     )
                     .await;
             }

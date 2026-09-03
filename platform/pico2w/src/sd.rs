@@ -9,6 +9,7 @@ use embedded_sdmmc::{
 use crate::save_storage::{
     battery_save_filename, rom_save_dir_name, save_state_filename, SaveSlot, SAVE_ROOT_DIR,
 };
+use core::cell::Cell;
 use core::cmp::Ordering;
 use rustyboy_core::memory::RomReader;
 use rustyboy_core::storage::{BatterySaveBytes, RomId, SaveStateBytes, StorageValueError};
@@ -87,6 +88,12 @@ where
     T: TimeSource,
 {
     mgr: VolumeManager<D, T>,
+    /// Latched once any operation reports the card is physically absent.
+    ///
+    /// Every SD call costs a full acquisition timeout, so one transport
+    /// failure is enough to know: further calls can only fail the same way,
+    /// and at boot they burn watchdog window doing it.
+    card_absent: Cell<bool>,
 }
 
 impl<D, T> SdManager<D, T>
@@ -98,7 +105,38 @@ where
     pub fn new(device: D, timesource: T) -> Self {
         Self {
             mgr: VolumeManager::new(device, timesource),
+            card_absent: Cell::new(false),
         }
+    }
+
+    /// False once any operation has reported the card absent.
+    ///
+    /// Latching, never cleared: this type has no insertion event to clear it
+    /// on, and a re-seated card is not observable without a full re-acquire.
+    pub fn card_present(&self) -> bool {
+        !self.card_absent.get()
+    }
+
+    /// Run `f` only while the card is believed present, else `None`.
+    ///
+    /// Lets a caller skip work that would otherwise pay an acquisition
+    /// timeout for a result already known to be unavailable.
+    pub fn with_card<R>(&self, f: impl FnOnce(&Self) -> R) -> Option<R> {
+        self.card_present().then(|| f(self))
+    }
+
+    /// Open volume 0, latching `card_absent` on a transport failure.
+    ///
+    /// Every public operation begins here, which makes this the one place an
+    /// absent card is detectable regardless of which operation asked.
+    fn open_volume_tracked(&self) -> Result<RawVolume, SdError<D::Error>> {
+        self.mgr.open_raw_volume(VolumeIdx(0)).map_err(|e| {
+            let e = SdError::Sdmmc(e);
+            if e.is_card_absent() {
+                self.card_absent.set(true);
+            }
+            e
+        })
     }
 
     /// Return up to `page_size` ROM filenames starting at `page_offset`,
@@ -125,7 +163,7 @@ where
             .try_reserve_exact(100)
             .map_err(|_| SdError::OutOfMemory)?;
 
-        let volume = self.mgr.open_raw_volume(VolumeIdx(0))?;
+        let volume = self.open_volume_tracked()?;
         let root = self.mgr.open_root_dir(volume)?;
 
         let mut lfn_storage = [0u8; 260];
@@ -177,7 +215,7 @@ where
         &'a mut self,
         filename: &str,
     ) -> Result<SdRomReader<'a, D, T>, SdError<D::Error>> {
-        let volume = self.mgr.open_raw_volume(VolumeIdx(0))?;
+        let volume = self.open_volume_tracked()?;
         let root = self.mgr.open_root_dir(volume)?;
 
         let mut found_name: Option<ShortFileName> = None;
@@ -290,7 +328,7 @@ where
         create: bool,
         f: impl FnOnce(&VolumeManager<D, T>, RawDirectory) -> Result<R, SdError<D::Error>>,
     ) -> Result<R, SdError<D::Error>> {
-        let volume = self.mgr.open_raw_volume(VolumeIdx(0))?;
+        let volume = self.open_volume_tracked()?;
         let root = match self.mgr.open_root_dir(volume) {
             Ok(root) => root,
             Err(e) => {
