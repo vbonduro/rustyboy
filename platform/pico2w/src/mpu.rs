@@ -6,17 +6,6 @@
 /// (MemManage → HardFault) on an illicit write, with the stacked PC
 /// identifying the exact corrupt-store instruction.
 
-/// Configure Core 0's PMSAv8-M MPU with one privileged-read-only region:
-/// - region 0: .data RAM code from `__sdata` to immediately before `_SEGGER_RTT`
-///
-/// Core 0 never legitimately writes this range after startup. Any write
-/// fires DACCVIOL (MemManage → HardFault) with the exact writer PC stacked.
-///
-/// The upper bound is derived from `_SEGGER_RTT` so adding another RAM-resident
-/// function cannot silently leave the end of `.data` writable.
-#[cfg(target_arch = "arm")]
-#[inline(never)]
-
 /// Bounds of the RAM-resident `.data` thunk/code region, as an MPU (base, limit)
 /// pair — or `None` if the range is empty.
 ///
@@ -61,6 +50,16 @@ unsafe fn arm_ro_exec_region(region: u32, base: u32, limit: u32) {
     MPU_RLAR.write_volatile(limit | 1);
 }
 
+/// Configure Core 0's PMSAv8-M MPU with one privileged-read-only region:
+/// - region 0: .data RAM code from `__sdata` to immediately before `_SEGGER_RTT`
+///
+/// Core 0 never legitimately writes this range after startup. Any write
+/// fires DACCVIOL (MemManage → HardFault) with the exact writer PC stacked.
+///
+/// The upper bound is derived from `_SEGGER_RTT` so adding another RAM-resident
+/// function cannot silently leave the end of `.data` writable.
+#[cfg(target_arch = "arm")]
+#[inline(never)]
 pub unsafe fn setup_core0_data_mpu() {
     unsafe extern "C" {
         static _SEGGER_RTT: u8;
@@ -229,16 +228,30 @@ pub unsafe fn setup_core1_mpu() {
     // a stale hardcode (0x20066B60) sat ~1 KB below the real stack bottom, inside
     // the defmt RTT buffer (0x20066b3c–0x20066f3c); after the copy_dma_step .data
     // fix grew SRAM, legit core-1 RTT logging wrote into the covered range and
-    // crash-looped on MMFAR DACCVIOL. Aligning the base DOWN to the 32-byte MPU
-    // granule keeps it above the RTT buffer (which lives below _stack_end in
-    // .uninit) while still covering the entire core-0 stack.
+    // crash-looped on MMFAR DACCVIOL.
+    //
+    // Round the base UP to the 32-byte MPU granule, not down. `_stack_end` is the
+    // end of `.uninit` (`__euninit`) and is essentially never 32-byte aligned —
+    // it is 0x20066b08 as of this writing. Rounding DOWN puts the region base
+    // BELOW `__euninit`, which makes the tail of the last `.uninit` object
+    // privileged read-only for core 1. That object is `DMA_CRASH_SNAPSHOT`, and
+    // `capture_dma_snapshot()` writes all 18 of its words unconditionally from
+    // core 1's panic handler — which runs in thread mode with the MPU live,
+    // unlike the HardFault path (MPU_CTRL.HFNMIENA=0 disables the MPU there).
+    // The store took a DACCVIOL that escalated to HardFault, so a core-1 panic
+    // was recorded as a bogus HardFault and lost its file/line.
+    //
+    // Rounding up cannot do this: the base lands at or above `__euninit`, so no
+    // `.uninit` byte is ever inside the region. The cost is that up to 31 bytes
+    // at the very bottom of core 0's stack go unfenced by core 1 — the deepest
+    // point, reached only at near-overflow, which MSPLIM already traps.
     extern "C" {
         static _stack_end: u32;
     }
     let stack_bottom = core::ptr::addr_of!(_stack_end) as u32;
-    let base = stack_bottom & !0x1F; // 32-byte aligned MPU region base
-                                     //   RBAR: BASE | SH=11(b4:3) | AP=10(b2:1) | XN=1(b0) = base | 0x1D
-                                     //   RLAR: LIMIT=0x2007FFE0 | AttrIndx=0(b3:1) | EN=1(b0) = 0x2007FFE1
+    let base = (stack_bottom + 0x1F) & !0x1F; // 32-byte aligned, at or above __euninit
+                                              //   RBAR: BASE | SH=11(b4:3) | AP=10(b2:1) | XN=1(b0) = base | 0x1D
+                                              //   RLAR: LIMIT=0x2007FFE0 | AttrIndx=0(b3:1) | EN=1(b0) = 0x2007FFE1
     MPU_RNR.write_volatile(0);
     MPU_RBAR.write_volatile(base | 0x1D);
     MPU_RLAR.write_volatile(0x2007_FFE1);

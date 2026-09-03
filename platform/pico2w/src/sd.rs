@@ -43,13 +43,14 @@ impl<E: core::fmt::Debug> SdError<E> {
     /// (`OutOfMemory`). Treating all of those as "card absent" caused the boot
     /// path to skip the battery-save read on a perfectly healthy card, boot
     /// with blank cart RAM, and then overwrite a good `.sav` with it.
+    /// Only `DeviceError` qualifies. `NoSuchVolume` is NOT matched:
+    /// `open_raw_volume` returns it solely for `VolumeIdx >= 4` and this code
+    /// always opens volume 0, so that arm was unreachable. A card that answers
+    /// but is unformatted or has a bad MBR returns `FormatError`, which is
+    /// deliberately excluded — the card responded, so the contents are the
+    /// problem, not the transport.
     pub fn is_card_absent(&self) -> bool {
-        matches!(
-            self,
-            SdError::Sdmmc(
-                embedded_sdmmc::Error::DeviceError(_) | embedded_sdmmc::Error::NoSuchVolume
-            )
-        )
+        matches!(self, SdError::Sdmmc(embedded_sdmmc::Error::DeviceError(_)))
     }
 }
 
@@ -109,20 +110,18 @@ where
         }
     }
 
-    /// False once any operation has reported the card absent.
+    /// True once any operation has reported the card absent.
     ///
     /// Latching, never cleared: this type has no insertion event to clear it
     /// on, and a re-seated card is not observable without a full re-acquire.
-    pub fn card_present(&self) -> bool {
-        !self.card_absent.get()
-    }
-
-    /// Run `f` only while the card is believed present, else `None`.
     ///
-    /// Lets a caller skip work that would otherwise pay an acquisition
-    /// timeout for a result already known to be unavailable.
-    pub fn with_card<R>(&self, f: impl FnOnce(&Self) -> R) -> Option<R> {
-        self.card_present().then(|| f(self))
+    /// Private on purpose. Callers should not have to know there is a card —
+    /// the read paths below consult this themselves and report "nothing there"
+    /// instead of paying another acquisition timeout to be told the same. A
+    /// public accessor would put that decision back on every call site, which
+    /// is what it replaced.
+    fn card_absent(&self) -> bool {
+        self.card_absent.get()
     }
 
     /// Open volume 0, latching `card_absent` on a transport failure.
@@ -139,11 +138,6 @@ where
         })
     }
 
-    /// Return up to `page_size` ROM filenames starting at `page_offset`,
-    /// sorted alphabetically, plus a flag indicating whether more entries follow.
-    ///
-    /// Iterates the full root directory each call (up to 100 entries) and
-    /// slices the requested page.
     /// List a page of ROMs, calling `on_progress` for every directory entry
     /// visited.
     ///
@@ -262,6 +256,9 @@ where
     }
 
     pub fn read_battery_save(&self, rom_id: &RomId) -> Result<Option<Vec<u8>>, SdError<D::Error>> {
+        if self.card_absent() {
+            return Ok(None);
+        }
         let Some(data) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
             read_file_optional(mgr, dir, battery_save_filename())
         })?
@@ -293,6 +290,9 @@ where
         rom_id: &RomId,
         slot: SaveSlot,
     ) -> Result<Option<Vec<u8>>, SdError<D::Error>> {
+        if self.card_absent() {
+            return Ok(None);
+        }
         let filename = save_state_filename(slot);
         let Some(data) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
             read_file_optional(mgr, dir, filename.as_str())
@@ -312,6 +312,9 @@ where
         rom_id: &RomId,
         slot: SaveSlot,
     ) -> Result<bool, SdError<D::Error>> {
+        if self.card_absent() {
+            return Ok(false);
+        }
         let filename = save_state_filename(slot);
         let Some(exists) = self.with_existing_rom_save_dir(rom_id, |mgr, dir| {
             file_exists(mgr, dir, filename.as_str())

@@ -170,9 +170,8 @@ async fn stage_rom_from_sd(
         ))
         .await;
 
-    // RP2350 watchdog maximum is 16,777,215 µs (~16.7 s). Use 16 s so the
-    // erase phase (which can take several seconds) does not starve the watchdog.
-    wdt::feed_for(Duration::from_millis(16_000));
+    // The erase phase can take several seconds; re-arm the full window first.
+    wdt::feed();
     let mut stager = RomStager::begin(flash, &mut reader, filename).map_err(|e| {
         defmt::error!("stager begin failed: {:?}", defmt::Debug2Format(&e));
     })?;

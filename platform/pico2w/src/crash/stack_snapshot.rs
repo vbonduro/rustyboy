@@ -14,14 +14,17 @@
 //! `schema_ver = 2` with an all-zero window. The decoder cannot currently
 //! distinguish "captured, all zeros" from "never captured".
 
-/// `.uninit` backing store: 8 words used, 8 words of deliberate PADDING.
+/// `.uninit` backing store: 8 words used, 8 words of PADDING.
 ///
-/// Core 1's MPU region 0 base is `_stack_end & !0x1F`, so up to 31 bytes of the
-/// LAST `.uninit` object are privileged read-only for core 1. If that object is
-/// written by core 1 it takes a MemManage fault that escalates to HardFault and
-/// kills the core silently. The trailing 8 words absorb that if this array
-/// happens to be placed last. The static assert below keeps the padding from
-/// being "optimised" away by a future edit.
+/// The padding is slack, NOT a safety mechanism — this array is not the last
+/// `.uninit` object (`DMA_CRASH_SNAPSHOT` is, as of this writing), so padding
+/// here protects nothing. An earlier version of this comment claimed it fenced
+/// the "last `.uninit` object lands inside core 1's MPU region" hazard; it did
+/// not, and could not, because which object is last is a link-order accident.
+///
+/// That hazard is now fixed at its source: `setup_core1_mpu` rounds core 1's
+/// region base UP to the MPU granule, so the region can never start below
+/// `__euninit` and no `.uninit` object is reachable by it. See `mpu.rs`.
 #[no_mangle]
 #[link_section = ".uninit.CRASH_STACK_SNAP"]
 pub static mut CRASH_STACK_SNAP: [usize; 16] = [0; 16];
@@ -35,8 +38,8 @@ const IDX_MAGIC: usize = 0;
 const IDX_BASE: usize = 1;
 const IDX_WORDS: usize = 2;
 
-/// The padding described above must always exceed the 32-byte MPU granule.
-const _: () = assert!((16 - (IDX_WORDS + CRASH_SNAP_WORDS)) * core::mem::size_of::<usize>() >= 32);
+/// The array must actually be big enough for the header plus the window.
+const _: () = assert!(IDX_WORDS + CRASH_SNAP_WORDS <= 16);
 const CRASH_SNAP_MAGIC: usize = 0x5CAF_0001;
 
 /// Number of stack words carried in a crash record. Must match
@@ -45,13 +48,17 @@ pub const CRASH_SNAP_WORDS: usize = 6;
 
 /// Capture `CRASH_SNAP_WORDS` stack words starting at `base` (the PRE-FAULT
 /// stack pointer) into `.uninit`, for the next boot to fold into the crash
-/// record. The window therefore begins at the return-address slot, which is
-/// what makes a wild-PC fault out of a `pop {rlist, pc}` diagnosable.
+/// record. On the FAULT path the window therefore begins at the return-address
+/// slot, which is what makes a wild-PC fault out of a `pop {rlist, pc}`
+/// diagnosable. On the PANIC path `base` is the MSP inside the panic handler,
+/// so the window starts on handler locals instead — panics carry file and line,
+/// so this costs little, but the window means something different there.
 ///
 /// # Safety
 /// Called from a fault/panic handler with interrupts effectively quiesced.
-/// `base` is range-checked against the core-0 stack before any dereference, so
-/// a wild SP cannot turn this into an out-of-bounds read.
+/// `base` is clamped to physical SRAM before any dereference, so a wild SP
+/// cannot fault here. That is a "will not fault" bound, NOT an assertion that
+/// `base` points at a stack — see the inline note in the body.
 pub unsafe fn capture_stack_window(base: usize) {
     let f = &raw mut CRASH_STACK_SNAP;
     (*f)[IDX_MAGIC] = CRASH_SNAP_MAGIC;

@@ -43,6 +43,11 @@ pub fn init(mut watchdog: Watchdog, window: Duration) {
 }
 
 /// Re-arm with the configured window. The call every progress point wants.
+///
+/// A no-op before `init`, because the peripheral is not published yet — note it
+/// is the missing peripheral that makes this silent, NOT the zero window. A
+/// zero window reaching `Watchdog::feed` would write `LOAD = 0` and reset the
+/// chip on the next tick, which is the opposite of ignoring it.
 pub fn feed() {
     feed_for(Duration::from_millis(u64::from(
         WINDOW_MS.load(Ordering::Relaxed),
@@ -63,16 +68,27 @@ pub fn feed_for(window: Duration) {
     });
 }
 
-/// Arm a short window and spin, so the watchdog resets the chip.
+/// Reboot the chip. Used to boot into a newly staged ROM.
 ///
-/// Used to reboot into a newly staged ROM. Diverges: the reset lands before
-/// the loop can make progress.
+/// Arms a short watchdog window and spins; the reset lands before the loop can
+/// make progress. If the watchdog was never published — which the type system
+/// cannot rule out now that the peripheral lives behind a global — falls back
+/// to `SCB::sys_reset()` rather than spinning forever. Threading `&mut Watchdog`
+/// made that case unrepresentable; a global has to handle it explicitly, or a
+/// `-> !` function silently becomes a hang with the display frozen mid-switch.
 pub fn force_reset() -> ! {
-    critical_section::with(|cs| {
+    let armed = critical_section::with(|cs| {
         if let Some(w) = WATCHDOG.borrow(cs).borrow_mut().as_mut() {
             w.start(Duration::from_millis(100));
+            true
+        } else {
+            false
         }
     });
+    if !armed {
+        defmt::error!("wdt::force_reset before init — falling back to SCB::sys_reset");
+        cortex_m::peripheral::SCB::sys_reset();
+    }
     loop {
         cortex_m::asm::nop();
     }
