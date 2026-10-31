@@ -6,9 +6,8 @@
 
 use defmt::{info, warn};
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH1, PIN_10, PIN_11, PIN_12, PIN_13, PIN_8, PIN_9, SPI1};
+use embassy_rp::peripherals::{DMA_CH1, SPI1};
 use embassy_rp::spi::{Async, Blocking, Config as SpiConfig, Spi};
-use embassy_rp::Peri;
 use embassy_rp::{dma, interrupt};
 
 use display_interface_spi::SPIInterface;
@@ -24,6 +23,7 @@ use super::{
     render_menu_row, scale_native_to_rgb565_range, Display, LoadingFrame, LoadingProgress,
     NativeFrame, RenderWindow, ScaledFrame, SCALED_FRAME_PIXELS,
 };
+use crate::bsp::DisplayPeriphs;
 use crate::menu::MenuFrame;
 
 // ---------------------------------------------------------------------------
@@ -72,24 +72,25 @@ pub struct HwDisplay<'d> {
 impl<'d> HwDisplay<'d> {
     /// Initialise the ILI9341 and return a ready-to-use display.
     ///
+    /// Borrows the pins and SPI1 from `periphs` rather than consuming them, so
+    /// once this driver is dropped the bundle is free to hand to
+    /// [`GameDisplay::new_after_splash`] with no `steal()`.
+    ///
     /// The backlight is enabled immediately after hardware init.
-    pub fn new(
-        spi1: Peri<'d, SPI1>,
-        clk: Peri<'d, PIN_10>,
-        mosi: Peri<'d, PIN_11>,
-        cs_pin: Peri<'d, PIN_9>,
-        dc_pin: Peri<'d, PIN_8>,
-        rst_pin: Peri<'d, PIN_12>,
-        bl_pin: Peri<'d, PIN_13>,
-    ) -> Self {
+    pub fn new(periphs: &'d mut DisplayPeriphs) -> Self {
         let mut cfg = SpiConfig::default();
         cfg.frequency = DISPLAY_SPI_HZ;
 
-        let spi = Spi::new_blocking_txonly(spi1, clk, mosi, cfg);
-        let cs = Output::new(cs_pin, Level::High);
-        let dc = Output::new(dc_pin, Level::Low);
-        let rst = Output::new(rst_pin, Level::High);
-        let mut bl = Output::new(bl_pin, Level::Low);
+        let spi = Spi::new_blocking_txonly(
+            periphs.spi.reborrow(),
+            periphs.clk.reborrow(),
+            periphs.mosi.reborrow(),
+            cfg,
+        );
+        let cs = Output::new(periphs.cs.reborrow(), Level::High);
+        let dc = Output::new(periphs.dc.reborrow(), Level::Low);
+        let rst = Output::new(periphs.rst.reborrow(), Level::High);
+        let mut bl = Output::new(periphs.backlight.reborrow(), Level::Low);
 
         let spi_dev = ExclusiveDevice::new(spi, cs, embassy_time::Delay);
         let di = SPIInterface::new(spi_dev, dc);
@@ -176,18 +177,10 @@ pub struct GameDisplay<'d> {
 impl<'d> GameDisplay<'d> {
     /// Initialise async SPI for the game loop after `HwDisplay` has been dropped.
     ///
-    /// # Safety
-    /// `HwDisplay` must have been fully dropped before calling this so that SPI1
-    /// and all display GPIO pins are free to be re-claimed.
-    pub unsafe fn new_after_splash(
-        clk: Peri<'d, PIN_10>,
-        mosi: Peri<'d, PIN_11>,
-        cs_pin: Peri<'d, PIN_9>,
-        dc_pin: Peri<'d, PIN_8>,
-        rst_pin: Peri<'d, PIN_12>,
-        bl_pin: Peri<'d, PIN_13>,
-        spi1: Peri<'d, SPI1>,
-        dma: Peri<'d, DMA_CH1>,
+    /// `HwDisplay` borrows `periphs`, so the borrow checker guarantees it is
+    /// gone before this can be called.
+    pub fn new_after_splash(
+        periphs: DisplayPeriphs,
         irqs: impl interrupt::typelevel::Binding<
                 interrupt::typelevel::DMA_IRQ_0,
                 dma::InterruptHandler<DMA_CH1>,
@@ -213,11 +206,18 @@ impl<'d> GameDisplay<'d> {
         let mut cfg = SpiConfig::default();
         cfg.frequency = DISPLAY_SPI_HZ;
 
-        let spi = Spi::new_txonly(spi1, clk, mosi, dma, irqs, cfg);
-        let cs = Output::new(cs_pin, Level::High);
-        let dc = Output::new(dc_pin, Level::Low);
-        let rst = Output::new(rst_pin, Level::High);
-        let bl = Output::new(bl_pin, Level::High);
+        let spi = Spi::new_txonly(
+            periphs.spi,
+            periphs.clk,
+            periphs.mosi,
+            periphs.dma,
+            irqs,
+            cfg,
+        );
+        let cs = Output::new(periphs.cs, Level::High);
+        let dc = Output::new(periphs.dc, Level::Low);
+        let rst = Output::new(periphs.rst, Level::High);
+        let bl = Output::new(periphs.backlight, Level::High);
 
         info!("display: async SPI re-initialised for game loop");
         Self {
