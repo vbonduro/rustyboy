@@ -95,3 +95,31 @@ fn samples_i16_to_i2s(samples: &[i16], buf: &mut [u32]) -> usize {
     }
     pairs
 }
+
+/// Bring up the I2S output on PIO0 and start it.
+pub fn init_i2s(
+    periphs: crate::bsp::AudioPeriphs,
+    irqs: crate::bsp::Irqs,
+) -> embassy_rp::pio_programs::i2s::PioI2sOut<'static, embassy_rp::peripherals::PIO0, 0> {
+    use embassy_rp::pio::Pio;
+    use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
+
+    let Pio {
+        mut common, sm0, ..
+    } = Pio::new(periphs.pio, irqs);
+    let prog = PioI2sOutProgram::new(&mut common);
+    let mut i2s = PioI2sOut::new(
+        &mut common,
+        sm0,
+        periphs.dma,
+        irqs,
+        periphs.data,
+        periphs.bclk,
+        periphs.lrclk,
+        SAMPLE_RATE,
+        16,
+        &prog,
+    );
+    i2s.start();
+    i2s
+}

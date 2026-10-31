@@ -4,14 +4,12 @@
 //! All buttons are wired active-low (one side to GPIO, other to GND). Internal
 //! pull-ups are enabled so no external resistors are needed.
 //!
-//! Pin assignments are an application-level concern; see `main.rs`.
+//! Pin assignments are a board concern; see `bsp.rs`.
 
 #[cfg(target_arch = "arm")]
 use embassy_rp::gpio::{Input, Pull};
 #[cfg(target_arch = "arm")]
-use embassy_rp::peripherals::{PIN_0, PIN_1, PIN_2, PIN_21, PIN_22, PIN_26, PIN_27, PIN_3};
-#[cfg(target_arch = "arm")]
-use embassy_rp::Peri;
+use crate::bsp::ButtonPeriphs;
 #[cfg(target_arch = "arm")]
 use embassy_time::Instant;
 
@@ -204,25 +202,16 @@ pub struct InputHandler<'d> {
 
 #[cfg(target_arch = "arm")]
 impl<'d> InputHandler<'d> {
-    pub fn new(
-        up_pin: Peri<'d, PIN_21>,
-        down_pin: Peri<'d, PIN_22>,
-        left_pin: Peri<'d, PIN_26>,
-        right_pin: Peri<'d, PIN_27>,
-        a_pin: Peri<'d, PIN_0>,
-        b_pin: Peri<'d, PIN_1>,
-        start_pin: Peri<'d, PIN_2>,
-        select_pin: Peri<'d, PIN_3>,
-    ) -> Self {
+    pub fn new(pins: ButtonPeriphs) -> Self {
         Self {
-            up: Input::new(up_pin, Pull::Up),
-            down: Input::new(down_pin, Pull::Up),
-            left: Input::new(left_pin, Pull::Up),
-            right: Input::new(right_pin, Pull::Up),
-            a: Input::new(a_pin, Pull::Up),
-            b: Input::new(b_pin, Pull::Up),
-            start: Input::new(start_pin, Pull::Up),
-            select: Input::new(select_pin, Pull::Up),
+            up: Input::new(pins.up, Pull::Up),
+            down: Input::new(pins.down, Pull::Up),
+            left: Input::new(pins.left, Pull::Up),
+            right: Input::new(pins.right, Pull::Up),
+            a: Input::new(pins.a, Pull::Up),
+            b: Input::new(pins.b, Pull::Up),
+            start: Input::new(pins.start, Pull::Up),
+            select: Input::new(pins.select, Pull::Up),
             state: InputState::default(),
         }
     }

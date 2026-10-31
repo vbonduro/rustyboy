@@ -4,6 +4,9 @@ extern crate alloc;
 
 #[cfg(target_arch = "arm")]
 pub mod audio;
+/// Pin assignments, clock profile and peripheral grouping. ARM-only.
+#[cfg(target_arch = "arm")]
+pub mod bsp;
 pub mod crash;
 pub mod display;
 #[cfg(target_arch = "arm")]

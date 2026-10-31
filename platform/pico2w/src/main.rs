@@ -25,17 +25,11 @@ static HEAP: Heap = Heap::empty();
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{
-    CORE1, DMA_CH0, DMA_CH1, DMA_CH2, DMA_CH3, PIN_10, PIN_11, PIN_12, PIN_13, PIN_17, PIN_4,
-    PIN_5, PIN_6, PIN_7, PIN_8, PIN_9, PIO0, SPI0, SPI1,
-};
-use embassy_rp::peripherals::{PIN_23, PIN_24, PIN_25, PIN_29, PIO1};
-use embassy_rp::pio::{InterruptHandler as PioIrqHandler, Pio};
-use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
+use embassy_rp::peripherals::SPI0;
 use embassy_rp::spi::{self, Blocking, Spi};
+use embassy_rp::peripherals::CORE1;
 use embassy_rp::watchdog::Watchdog;
 use embassy_rp::Peri;
-use embassy_rp::{bind_interrupts, dma};
 use embassy_time::{Delay, Duration};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::SdCard;
@@ -47,7 +41,8 @@ use defmt_rtt as _;
 
 use rustyboy_pico2w::crash;
 
-use rustyboy_pico2w::audio::{AudioBuffers, SAMPLE_RATE};
+use rustyboy_pico2w::audio::{init_i2s, AudioBuffers};
+use rustyboy_pico2w::bsp::{Board, Irqs, SdPeriphs, WifiPeriphs};
 use rustyboy_pico2w::display::hw::{GameDisplay, HwDisplay};
 use rustyboy_pico2w::flash_rom::{new_onboard_flash, probe_staged_rom};
 use rustyboy_pico2w::input::{ButtonState, InputHandler};
@@ -67,88 +62,8 @@ const WATCHDOG_WINDOW_MS: u64 = 16_000;
 const WATCHDOG_MAX_WINDOW_MS: u64 = (1 << 24) / 1_000;
 const _: () = assert!(WATCHDOG_WINDOW_MS <= WATCHDOG_MAX_WINDOW_MS);
 
-/// A clock operating point: frequency and the core voltage it was validated at.
-///
-/// Frequency and voltage are two halves of ONE decision, so they live in one
-/// place. They were previously two independent `#[cfg]` cascades keyed on
-/// overlapping-but-different feature sets, which had already drifted: `oc-266`
-/// selected 266 MHz but fell through to V1_30, silently *not* reproducing the
-/// "266 MHz @ V1_25" operating point it is named for.
-struct ClockProfile {
-    hz: u32,
-    voltage: embassy_rp::clocks::CoreVoltage,
-}
-
-use embassy_rp::clocks::CoreVoltage;
-
-/// Stock overclock. NOT free of the SP-drift fault — see `OC_288`.
-const OC_300: ClockProfile = ClockProfile {
-    hz: 300_000_000,
-    voltage: CoreVoltage::V1_30,
-};
-
-/// 288 MHz = PLL FBDIV 120 (VCO 1440) / POSTDIV 5 — one grid step below 300 on
-/// the stock PLL config, and the fastest clock measured free of the SP-drift
-/// fault. A frequency sweep by live PLL reprogramming put the failure cliff
-/// between 288 and 300: at 300 the drift instrument logged 67.5 events per 1000
-/// work-ticks, while 288/276/264/252/240 logged zero across 13,567 ticks. A 24 h
-/// soak at 288 on the real firmware logged 0 crashes.
-///
-/// NOT proven safe: the cliff is bracketed only to (288, 300], so 288 may have
-/// as little as 0.3% margin, untested against temperature and part-to-part
-/// spread. `OC_266` is the more conservative shipping point.
-/// See docs/investigations/sp-drift-root-cause.md.
-const OC_288: ClockProfile = ClockProfile {
-    hz: 288_000_000,
-    voltage: CoreVoltage::V1_30,
-};
-
-const OC_280: ClockProfile = ClockProfile {
-    hz: 280_000_000,
-    voltage: CoreVoltage::V1_25,
-};
-
-/// 9 h clean on record at V1_25 — the voltage is part of that result.
-const OC_266: ClockProfile = ClockProfile {
-    hz: 266_000_000,
-    voltage: CoreVoltage::V1_25,
-};
-
-/// Exactly one profile, chosen in priority order. Adding a profile is one const
-/// plus one arm; frequency and voltage cannot desync.
-const CLOCK: ClockProfile = if cfg!(feature = "oc-300") {
-    OC_300
-} else if cfg!(feature = "oc-288") {
-    OC_288
-} else if cfg!(feature = "oc-280") {
-    OC_280
-} else if cfg!(feature = "oc-266") {
-    OC_266
-} else {
-    OC_300
-};
-
-const TARGET_SYS_HZ: u32 = CLOCK.hz;
-const TARGET_CORE_VOLTAGE: CoreVoltage = CLOCK.voltage;
-
 const FIRMWARE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const CYCLES_PER_FRAME: u64 = 70_224;
-
-bind_interrupts!(struct Irqs {
-    PIO0_IRQ_0 => PioIrqHandler<PIO0>;
-    // CH0 and CH1 are always needed (display DMA, audio DMA).
-    // CH2 and CH3 are reserved for the WiFi CYW43439 PIO SPI driver; binding
-    // them unconditionally is safe — the handlers are no-ops when unused.
-    DMA_IRQ_0  => dma::InterruptHandler<DMA_CH0>,
-                  dma::InterruptHandler<DMA_CH1>,
-                  dma::InterruptHandler<DMA_CH2>,
-                  dma::InterruptHandler<DMA_CH3>;
-});
-
-// WiFi uses PIO1: bind it separately, scoped to the wifi feature.
-bind_interrupts!(struct WifiIrqs {
-    PIO1_IRQ_0 => PioIrqHandler<PIO1>;
-});
 
 #[unsafe(link_section = ".bi_entries")]
 #[used]
@@ -181,28 +96,6 @@ pub(crate) fn poll_once<F: Future>(future: core::pin::Pin<&mut F>) -> bool {
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) };
     let mut cx = Context::from_waker(&waker);
     matches!(future.poll(&mut cx), Poll::Ready(_))
-}
-
-// ---------------------------------------------------------------------------
-// WiFi peripheral tokens (consumed once when the portal starts)
-// ---------------------------------------------------------------------------
-
-/// All CYW43439 peripheral tokens, bundled for clean transfer from `main` into
-/// [`App`] and ultimately into `WifiPortalScreen::start_portal`.
-///
-/// Wrapped in `Option` so they can be consumed (`take`) exactly once.
-pub(crate) struct WifiPeriphs {
-    pub pwr: Peri<'static, PIN_23>,
-    pub dio: Peri<'static, PIN_24>,
-    pub cs: Peri<'static, PIN_25>,
-    pub clk: Peri<'static, PIN_29>,
-    pub pio1: Peri<'static, PIO1>,
-    pub dma_ch2: Peri<'static, DMA_CH2>,
-    pub dma_ch3: Peri<'static, DMA_CH3>,
-    /// PIO1 interrupt binding (from `WifiIrqs`).
-    pub pio_irqs: WifiIrqs,
-    /// DMA CH2/CH3 interrupt binding (from `Irqs`, which binds all DMA_IRQ_0 channels).
-    pub dma_irqs: Irqs,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,24 +261,17 @@ impl core::ops::DerefMut for SdBus {
 }
 
 /// Bring up the SD card on SPI0 and mount it.
-fn init_sd_card(
-    mode_pin: Peri<'static, PIN_17>,
-    spi0: Peri<'static, SPI0>,
-    clk: Peri<'static, PIN_6>,
-    mosi: Peri<'static, PIN_7>,
-    miso: Peri<'static, PIN_4>,
-    cs_pin: Peri<'static, PIN_5>,
-) -> SdBus {
+fn init_sd_card(p: SdPeriphs) -> SdBus {
     // SD card — always initialised so the ROM list is available.
     // Drive the SD mode pin BEFORE any bus traffic. Nothing clocked SPI0 before
     // this commit (SdCard construction is lazy), so its position did not matter;
     // the power-up clocks below are the first transfer, and they must not be
     // sent while this pin is still in its reset state.
-    let sd_mode = Output::new(mode_pin, Level::High);
+    let sd_mode = Output::new(p.mode, Level::High);
 
     let mut spi_cfg = spi::Config::default();
     spi_cfg.frequency = 400_000;
-    let mut spi_bus = Spi::new_blocking(spi0, clk, mosi, miso, spi_cfg);
+    let mut spi_bus = Spi::new_blocking(p.spi, p.clk, p.mosi, p.miso, spi_cfg);
     rp_pac::PADS_BANK0.gpio(4).modify(|w| w.set_pue(true));
 
     // SD power-up clocks. The SD spec requires >=74 clock cycles at 400 kHz with
@@ -394,7 +280,7 @@ fn init_sd_card(
     // some don't") — and this firmware previously went straight from
     // construction to CMD0. CS is therefore created FIRST, held high for the
     // clocks, then moved into the ExclusiveDevice. 10 bytes = 80 clocks.
-    let cs = Output::new(cs_pin, Level::High);
+    let cs = Output::new(p.cs, Level::High);
     if let Err(e) = spi_bus.blocking_write(&[0xFFu8; 10]) {
         defmt::warn!("SD power-up clocks failed: {:?}", defmt::Debug2Format(&e));
     }
@@ -484,30 +370,24 @@ async fn main(spawner: Spawner) {
 
     init_heap();
 
-    let p = {
-        use embassy_rp::clocks::ClockConfig;
-        let mut clk =
-            ClockConfig::system_freq(TARGET_SYS_HZ).expect("valid PLL params for target clock");
-        clk.core_voltage = TARGET_CORE_VOLTAGE;
-        embassy_rp::init(embassy_rp::config::Config::new(clk))
-    };
+    let board = Board::init();
 
     wdt::init(
-        Watchdog::new(p.WATCHDOG),
+        Watchdog::new(board.watchdog),
         Duration::from_millis(WATCHDOG_WINDOW_MS),
     );
 
     info!(
         "rustyboy-pico2w v{} starting @{}MHz",
         FIRMWARE_VERSION,
-        TARGET_SYS_HZ / 1_000_000
+        Board::sys_hz() / 1_000_000
     );
 
     // Commit any pending crash record as the VERY FIRST thing after clocks are
     // up.  Flash only needs the system clock — no display, SD, or other
     // peripherals required.  Moving this before HwDisplay::new() ensures the
     // record is written even if the crash happens during the splash screen.
-    let mut onboard_flash = new_onboard_flash(p.FLASH);
+    let mut onboard_flash = new_onboard_flash(board.flash);
     if crash::storage::check_and_commit(&mut onboard_flash) {
         defmt::warn!("crash: committed crash record from previous boot");
     }
@@ -520,24 +400,18 @@ async fn main(spawner: Spawner) {
     // time it returns the 100 ms minimum off-time is satisfied. Setting GP20
     // high immediately after lets the 2.7 s splash cover the 250 ms power-up
     // window — no added delay visible to the user.
-    let mut sd_pwr = Output::new(p.PIN_20, Level::Low);
+    let mut sd_pwr = Output::new(board.sd_power, Level::Low);
 
-    // GP8=DC  GP9=CS  GP10=CLK  GP11=MOSI  GP12=RST  GP13=BL
-    let mut hw_disp = HwDisplay::new(
-        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_9, p.PIN_8, p.PIN_12, p.PIN_13,
-    );
+    let mut display_periphs = board.display;
+    let mut hw_disp = HwDisplay::new(&mut display_periphs);
     sd_pwr.set_high(); // SD module now has ≥265 ms off-time behind it; splash provides the 250 ms power-up window
     info!("starting splash");
     hw_disp.splash().await;
-    drop(hw_disp);
+    drop(hw_disp); // ends the borrow of display_periphs
 
-    // GP21=Up  GP22=Down  GP26=Left  GP27=Right
-    // GP0=A    GP1=B      GP2=Start  GP3=Select
-    let mut input = InputHandler::new(
-        p.PIN_21, p.PIN_22, p.PIN_26, p.PIN_27, p.PIN_0, p.PIN_1, p.PIN_2, p.PIN_3,
-    );
+    let mut input = InputHandler::new(board.buttons);
 
-    let mut sd_mgr = init_sd_card(p.PIN_17, p.SPI0, p.PIN_6, p.PIN_7, p.PIN_4, p.PIN_5);
+    let mut sd_mgr = init_sd_card(board.sd);
 
     // Check for unread crash records so menus can show the crash-report badge.
     // (check_and_commit already ran earlier — before the splash.)
@@ -549,38 +423,9 @@ async fn main(spawner: Spawner) {
     // Check whether a ROM is already staged in flash.
     let staged = probe_staged_rom(&mut onboard_flash);
 
-    let Pio {
-        mut common, sm0, ..
-    } = Pio::new(p.PIO0, Irqs);
-    let i2s_prog = PioI2sOutProgram::new(&mut common);
-    let mut i2s = PioI2sOut::new(
-        &mut common,
-        sm0,
-        p.DMA_CH0,
-        Irqs,
-        p.PIN_16,
-        p.PIN_14,
-        p.PIN_15,
-        SAMPLE_RATE,
-        16,
-        &i2s_prog,
-    );
-    i2s.start();
+    let mut i2s = init_i2s(board.audio, Irqs);
 
-    // SAFETY: hw_disp was dropped above; SPI1 and all display pins are free.
-    let mut game_disp = unsafe {
-        GameDisplay::new_after_splash(
-            PIN_10::steal(),
-            PIN_11::steal(),
-            PIN_9::steal(),
-            PIN_8::steal(),
-            PIN_12::steal(),
-            PIN_13::steal(),
-            SPI1::steal(),
-            p.DMA_CH1,
-            Irqs,
-        )
-    };
+    let mut game_disp = GameDisplay::new_after_splash(display_periphs, Irqs);
     let mut audio_buffers = AudioBuffers::new();
     let mut audio_samples = Vec::with_capacity(2048);
 
@@ -609,7 +454,7 @@ async fn main(spawner: Spawner) {
                     // would fault (MSTKERR false positive). See
                     // docs/investigations/memory-barrier-investigation-plan.md.
                     let mut gb: Box<PicoGameBoy> =
-                        Box::new(PicoGameBoy::with_cartridge(p.CORE1, Box::new(cart)));
+                        Box::new(PicoGameBoy::with_cartridge(board.core1, Box::new(cart)));
                     if let Some(rom_id) = info.rom_id {
                         restore_saves_on_boot(&sd_mgr, &rom_id, &mut gb);
                     }
@@ -637,7 +482,7 @@ async fn main(spawner: Spawner) {
                         wifi_periphs: None,
                     };
                     let next = MainMenuState::new(&mut game_disp, &stub_app).await;
-                    (AppState::MainMenu(next), None, None, None, Some(p.CORE1))
+                    (AppState::MainMenu(next), None, None, None, Some(board.core1))
                 }
             }
         }
@@ -661,7 +506,7 @@ async fn main(spawner: Spawner) {
                 None,
                 None,
                 None,
-                Some(p.CORE1),
+                Some(board.core1),
             )
         }
     };
@@ -676,18 +521,6 @@ async fn main(spawner: Spawner) {
     // bug #5 wild store runs. See docs/investigations/memory-barrier-investigation-plan.md.
     let mut gameboy: Option<Box<PicoGameBoy>> = gameboy_init;
 
-    let wifi_periphs = Some(WifiPeriphs {
-        pwr: p.PIN_23,
-        dio: p.PIN_24,
-        cs: p.PIN_25,
-        clk: p.PIN_29,
-        pio1: p.PIO1,
-        dma_ch2: p.DMA_CH2,
-        dma_ch3: p.DMA_CH3,
-        pio_irqs: WifiIrqs,
-        dma_irqs: Irqs,
-    });
-
     let mut app = App {
         state: initial_state,
         next_state: None,
@@ -698,7 +531,7 @@ async fn main(spawner: Spawner) {
         core1: core1_token,
         crash_pending,
         spawner,
-        wifi_periphs,
+        wifi_periphs: Some(board.wifi),
     };
     // Runs after the watchdog is armed and before the main loop's first feed, so
     // on a dead card an acquisition timeout here would itself trip the watchdog.
